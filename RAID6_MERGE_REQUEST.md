@@ -168,44 +168,127 @@ Also calls `hammer2_raid6_init()` during `hammer2_vfs_init()` to precompute GF(2
 
 **`cmd_raid.c`** (new):
 - `hammer2 raid status <devpath>` — displays RAID type, disk count, stripe unit, array size, flags, and per-disk states (online/failed/rebuilding/spare)
+- `hammer2 raid fail-disk <devpath>` — marks a disk as failed (sends `HAMMER2IOC_RAID_FAIL_DISK` ioctl, which calls `VOP_CLOSE` on the device so `vnconfig -u` succeeds)
+- `hammer2 raid replace <old_dev> <new_dev>` — triggers online resilver (`HAMMER2IOC_RAID_REPLACE`); blocks until complete
 
 **`main.c`** — Added `raid` subcommand dispatch and usage text
 
-### Phase 8: Testing (Not Yet Implemented)
+**`subs.c`** — Updated `hammer2_ioctl_handle()` to handle multi-device RAID6 paths
+(when `open()` fails on a `:` path, scans `getfsstat()` for a matching
+`f_mntfromname` and opens `f_mntonname` instead, so all ioctl commands work with
+`/dev/vn0:/dev/vn1:...@PFS`-style paths)
 
-Planned test strategy:
-1. **Unit test GF(2^8) math**: Standalone userspace test verifying `gf_mul(a,b) * gf_inv(b) = a` and syndrome generation + recovery roundtrip for all 2-failure combinations
-2. **Functional test on VM**: Create 4 virtual disks, format with RAID 6, mount, write files, verify checksums, simulate 1 and 2 disk failures, verify reads succeed
-3. **Stress test**: Heavy write workload during degraded operation
+### Phase 8.5: Additional Kernel Changes (Post-Initial-Commit)
+
+The following kernel changes were required to make the implementation correct and
+production-worthy; they are included in the final patch:
+
+**`hammer2_ioctl.c`**:
+- `HAMMER2IOC_RAID_FAIL_DISK` ioctl (`hammer2_ioctl_raid_fail_disk`): marks disk
+  failed in `hmp->raid_failed[]`, calls `VOP_CLOSE` on device vnode so it can
+  be unconfigured, sets `DEGRADED` flag in on-disk RAID config
+- `HAMMER2IOC_RAID_REPLACE` ioctl (`hammer2_ioctl_raid_replace`): triggers the
+  online resilver kernel function `hammer2_io_raid6_resilver()`
+- `HAMMER2IOC_RAID_RESILVER_STATUS` ioctl: returns resilver progress (0–100%)
+  by reading `hmp->resilver_stripes_done` / `hmp->resilver_stripes_total`
+
+**`hammer2_ioctl.h`**:
+- Added `hammer2_ioc_raid_replace_t`, `hammer2_ioc_raid_fail_disk_t`,
+  `hammer2_ioc_resilver_status_t` structs
+- Added ioctl numbers 98, 99, 100
+
+**`hammer2.h`** — Added to `hammer2_dev_t`:
+- `volatile uint64_t resilver_stripes_done` / `resilver_stripes_total` — progress tracking
+- `int resilver_disk_idx` — which disk is being resilvered (-1 = none)
+- `struct spinlock raid6_parity_spin` — protects parity work queue
+- `TAILQ_HEAD(, hammer2_parity_work) raid6_parity_q` — parity work queue
+- `thread_t raid6_parity_td` — background parity thread
+- `int raid6_parity_exiting` — thread exit flag
+- `hammer2_parity_work_t` struct definition (`pbase`, `psize`, `data`)
+- `int disk_idx` field in `hammer2_io_t` (replaces `unused01`) for O(1) disk failure checks
+
+**`hammer2_io.c`**:
+- `hammer2_io_raid6_write()` — complete stripe parity computation; moved to be
+  called from background parity thread (not from DIO lastdrop path, to avoid deadlock)
+- `hammer2_io_raid6_read_degraded()` — reconstructs missing column(s) from surviving
+  disks; called pre-emptively when target disk is in `hmp->raid_failed[]`
+- `hammer2_io_raid6_resilver()` — three-phase resilver: volume header, stripe data,
+  parity refresh; uses `hammer2_raid6_dual_recov()` for each stripe
+- `hammer2_parity_init()` / `hammer2_parity_uninit()` — background thread lifecycle
+- Pre-emptive degraded read in `_hammer2_io_getblk`: if the target disk is already
+  in the failed set, reconstruct directly rather than submitting I/O to the device
+
+**`hammer2_ondisk.c`**:
+- `hammer2_raid6_map()`: added `HAMMER2_ZONE_SEG64` to `*phys_off` to ensure RAID6
+  stripe data starts after the 4MB header zone on each disk
+  (without this, stripe 0 maps to physical offset 0, overwriting volume headers)
+
+### Phase 8: Testing (Complete)
+
+All tests implemented and passing in the VM environment:
+
+1. **Unit test GF(2^8) math** (`test_raid6.c`):
+   - 135,457/135,457 tests pass
+   - Tests: `gf_mul(a,b) * gf_inv(b) == a` for all non-zero pairs, syndrome
+     generation + recovery roundtrip for all single and dual failure combinations
+   - Run: `cc -o test_raid6 test_raid6.c hammer2_raid6.c && ./test_raid6`
+
+2. **Test A** — Parallel write + SHA-256 verify:
+   - 4 parallel workers each write 32MB of random data
+   - Hashes verified before and after: **PASS**
+
+3. **Test B** — Single disk failure, degraded read:
+   - Write data, mark disk failed via `hammer2 raid fail-disk`, verify reads in
+     degraded mode (disk still attached), then detach via `vnconfig -u` and verify
+     reads continue: **PASS**
+
+4. **Test C** — Dual disk failure, dual-degraded read:
+   - Extends Test B: marks a second disk failed, verifies reads with both disks
+     failed and detached: **PASS**
+
+5. **Test D** — Online resilver + remount integrity:
+   - Write data, fail disk, attach fresh image to replacement vnode, run online
+     resilver (`hammer2 raid replace`), verify data integrity, unmount and remount,
+     verify data integrity again: **PASS**
+
+6. **Stress test** — Parallel I/O during degraded operation:
+   - Concurrent writes and reads while in degraded mode: **PASS**
+
+Test scripts: `tests/test_b.sh`, `tests/test_c.sh`, `tests/test_d.sh`,
+`tests/test_stress.sh`, `tests/test_resilver.sh`, `tests/verify_parity.sh`
 
 ---
 
 ## Summary of Changes
 
-### New Files (3)
+### New Files (4)
 
 | File | Description |
 |------|-------------|
 | `sys/vfs/hammer2/hammer2_raid6.h` | GF(2^8) header: table declarations, inline mul/div/pow, syndrome/recovery prototypes |
 | `sys/vfs/hammer2/hammer2_raid6.c` | GF(2^8) math library: table init, syndrome generation (P+Q), all recovery modes |
-| `sbin/hammer2/cmd_raid.c` | Userspace `hammer2 raid status` command |
+| `sys/vfs/hammer2/test_raid6.c` | Standalone userspace unit test: 135,457 GF math + syndrome/recovery tests |
+| `sbin/hammer2/cmd_raid.c` | Userspace `hammer2 raid status/fail-disk/replace` commands |
 
-### Modified Files (12)
+### Modified Files (14)
 
 | File | Changes |
 |------|---------|
-| `sys/vfs/hammer2/hammer2_disk.h` | `hammer2_raid_config_t`, version 3 constant, RAID type defines, anonymous union in volume header |
-| `sys/vfs/hammer2/hammer2.h` | RAID state fields in `hammer2_dev_t`, RAID 6 function prototypes |
-| `sys/vfs/hammer2/hammer2_ondisk.c` | `hammer2_verify_volumes_3()`, version dispatch update, `hammer2_raid6_map()` |
-| `sys/vfs/hammer2/hammer2_io.c` | RAID-aware DIO allocation, `hammer2_io_raid6_write()`, `hammer2_io_raid6_read_degraded()` |
-| `sys/vfs/hammer2/hammer2_vfsops.c` | Mount-time RAID config loading, reduced total\_size, `hammer2_raid6_init()` call |
+| `sys/vfs/hammer2/hammer2_disk.h` | `hammer2_raid_config_t`, version 3 constant, RAID type/state/flag defines, anonymous union in volume header |
+| `sys/vfs/hammer2/hammer2.h` | RAID state fields and parity thread fields in `hammer2_dev_t`; `disk_idx` in `hammer2_io_t`; `hammer2_parity_work_t`; all RAID6 function prototypes |
+| `sys/vfs/hammer2/hammer2_ondisk.c` | `hammer2_verify_volumes_3()`, version dispatch update, `hammer2_raid6_map()` (with ZONE_SEG offset) |
+| `sys/vfs/hammer2/hammer2_io.c` | RAID-aware DIO allocation; `hammer2_io_raid6_write()`; `hammer2_io_raid6_read_degraded()`; `hammer2_io_raid6_resilver()`; `hammer2_parity_init/uninit()`; background parity thread; pre-emptive degraded read in `_hammer2_io_getblk` |
+| `sys/vfs/hammer2/hammer2_ioctl.c` | `HAMMER2IOC_RAID_FAIL_DISK`, `HAMMER2IOC_RAID_REPLACE`, `HAMMER2IOC_RAID_RESILVER_STATUS` ioctls |
+| `sys/vfs/hammer2/hammer2_ioctl.h` | New ioctl structs and ioctl numbers 98–100 |
+| `sys/vfs/hammer2/hammer2_vfsops.c` | Mount-time RAID config loading, reduced total\_size, `hammer2_raid6_init()` + `hammer2_parity_init()` calls; `hammer2_parity_uninit()` at unmount |
 | `sys/vfs/hammer2/Makefile` | Added `hammer2_raid6.c` to SRCS |
 | `sbin/newfs_hammer2/mkfs_hammer2.h` | Added `RaidType` to mkfs options |
 | `sbin/newfs_hammer2/newfs_hammer2.c` | `-R` option, RAID 6 validation (min 4 disks) |
-| `sbin/newfs_hammer2/mkfs_hammer2.c` | RAID config in volume header, adjusted total\_size for RAID 6 |
+| `sbin/newfs_hammer2/mkfs_hammer2.c` | RAID config in volume header; `format_raid6_pwrite()` with full parity recompute; `array_size` calculation with ZONE_SEG offset |
 | `sbin/hammer2/main.c` | `raid` subcommand dispatch, usage text |
 | `sbin/hammer2/hammer2.h` | `cmd_raid()` prototype |
 | `sbin/hammer2/Makefile` | Added `cmd_raid.c` to SRCS |
+| `sbin/hammer2/subs.c` | Multi-device path handling in `hammer2_ioctl_handle()` |
 
 ### Key Design Decisions
 
@@ -225,20 +308,51 @@ Planned test strategy:
 
 ### Usage
 
-Format a RAID 6 filesystem:
-```
+Format a RAID 6 filesystem (minimum 4 disks):
+```sh
 newfs_hammer2 -R 6 -L DATA /dev/da0 /dev/da1 /dev/da2 /dev/da3
 ```
 
-Check RAID status:
+Mount:
+```sh
+mount -t hammer2 /dev/da0:/dev/da1:/dev/da2:/dev/da3@DATA /mnt/data
 ```
+
+Check RAID status (no mount required):
+```sh
 hammer2 raid status /dev/da0
 ```
 
+Mark a failed disk and detach it:
+```sh
+hammer2 -s /mnt/data raid fail-disk /dev/da2
+vnconfig -u vn2   # on VM; use equivalent on physical hardware
+```
+
+Replace a failed disk (online resilver):
+```sh
+hammer2 -s /mnt/data raid replace /dev/da2 /dev/da4
+```
+
+### Known Issues Fixed During Development
+
+| Bug | Symptom | Fix |
+|-----|---------|-----|
+| ZONE_SEG offset missing from `hammer2_raid6_map()` | Stripe 0 wrote to physical offset 0, corrupting volume headers on remount | Added `HAMMER2_ZONE_SEG64` to `*phys_off` in `hammer2_raid6_map()` and `format_raid6_pwrite()` |
+| `bp` not reset before `breadnx` in write path | Fatal Trap 9 GPF in `vn_strategy` (uninitialized `bp` on stack) | Added `bp = NULL` before each `breadnx` call in all three RAID6 I/O functions |
+| Parity computed in DIO lastdrop path | Deadlock: `breadnx` for sibling reads blocked because vn device I/O was serialized under write locks | Moved parity computation to background `h2par-<dev>` kernel thread; DIO lastdrop only enqueues work |
+| `newfs` parity used delta-update on reused disk images | Stale P/Q from previous session contaminated fresh newfs parity | Changed to full parity recompute: read sibling data, compute P/Q from scratch |
+| `vnconfig -u` failed after `raid fail-disk` | `VOP_CLOSE` not called → device still open | Added `VOP_CLOSE` to `hammer2_ioctl_raid_fail_disk()` |
+| `bp = NULL` missing in resilver phases 1/2/3 | `panic: brelse` / Fatal Trap 12 | Added `bp = NULL` before every `breadnx` in all three resilver phases |
+| `hammer2 raid replace` / ioctl cmds fail on multi-device paths | `open()` rejects `:` in path | `hammer2_ioctl_handle()` in `subs.c` now scans `getfsstat()` for matching mntfromname |
+
 ### Future Work
 
-- Disk replacement and rebuild (`hammer2 raid replace`, `hammer2 raid rebuild`)
-- SIMD-optimized syndrome generation (SSE2/AVX2)
-- Stripe-aware freemap allocation (allocate full stripes at once for better write efficiency)
-- Hot spare support
-- Scrubbing (background parity verification and repair)
+- SIMD-optimized syndrome generation (SSE2/AVX2 for multi-threaded parity at wire speed)
+- Stripe-aware freemap allocation (allocate full stripes at once for better sequential write efficiency)
+- Hot spare support (auto-resilver on failure detection)
+- Background scrubbing (periodic parity verification and silent corruption repair)
+- Resilver abort ioctl (`HAMMER2IOC_RAID_RESILVER_ABORT`)
+- Non-blocking `hammer2 raid replace --no-wait` with polling via `HAMMER2IOC_RAID_RESILVER_STATUS`
+- Multi-array RAID6 (per-volume rather than per-mount config)
+- Promote `HAMMER2_VOL_VERSION_RAID6 = 3` to stable release version

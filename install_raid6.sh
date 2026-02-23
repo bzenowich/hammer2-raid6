@@ -8,6 +8,10 @@
 # Requires: DragonFlyBSD with /usr/src populated (matching running kernel)
 # Must be run as root.
 #
+# IMPORTANT: hammer2.ko cannot be kldunload'd while the root filesystem uses
+# it.  After installing, a reboot is required for the new module to take effect.
+# Use `cp hammer2.ko /boot/kernel/hammer2.ko` to stage the module before reboot.
+#
 
 set -e
 
@@ -85,27 +89,40 @@ do_build() {
 
 do_install() {
     echo "==> Installing HAMMER2 kernel module..."
-    cd "$SRCDIR/sys/vfs/hammer2"
-    make install
+    # Copy directly — make install may not handle kld path correctly on all setups
+    cp "$SRCDIR/sys/vfs/hammer2/hammer2.ko" /boot/kernel/hammer2.ko
+    echo "    hammer2.ko -> /boot/kernel/hammer2.ko"
 
     echo "==> Installing newfs_hammer2..."
-    cd "$SRCDIR/sbin/newfs_hammer2"
-    make install
+    # Use install(1), not cp — cp fails with "Text file busy" on running binaries
+    install -m 755 "$SRCDIR/sbin/newfs_hammer2/newfs_hammer2" /sbin/newfs_hammer2
+    echo "    newfs_hammer2 -> /sbin/newfs_hammer2"
 
     echo "==> Installing hammer2 utility..."
-    cd "$SRCDIR/sbin/hammer2"
-    make install
+    install -m 755 "$SRCDIR/sbin/hammer2/hammer2" /sbin/hammer2
+    echo "    hammer2 -> /sbin/hammer2"
 
+    echo ""
     echo "==> Installation complete"
     echo ""
-    echo "To use RAID 6, reload the hammer2 module or reboot:"
-    echo "  kldunload hammer2 && kldload hammer2"
+    echo "NOTE: hammer2.ko has been staged to /boot/kernel/hammer2.ko."
+    echo "      A reboot is required to activate the new kernel module"
+    echo "      (the root filesystem uses hammer2, so kldunload is not possible)."
     echo ""
-    echo "Format a RAID 6 filesystem (minimum 4 disks):"
+    echo "After reboot, format a RAID 6 filesystem (minimum 4 disks):"
     echo "  newfs_hammer2 -R 6 -L DATA /dev/da0 /dev/da1 /dev/da2 /dev/da3"
+    echo ""
+    echo "Mount it:"
+    echo "  mount -t hammer2 /dev/da0:/dev/da1:/dev/da2:/dev/da3@DATA /mnt/data"
     echo ""
     echo "Check RAID status:"
     echo "  hammer2 raid status /dev/da0"
+    echo ""
+    echo "Mark a disk as failed:"
+    echo "  hammer2 -s /mnt/data raid fail-disk /dev/da2"
+    echo ""
+    echo "Replace a failed disk (online resilver):"
+    echo "  hammer2 -s /mnt/data raid replace /dev/da2 /dev/da4"
 }
 
 # Parse command

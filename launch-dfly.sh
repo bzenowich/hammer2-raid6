@@ -46,6 +46,7 @@ exec qemu-system-x86_64 \
     -boot c \
     -enable-kvm \
     -cpu host \
-    -vga std \
+    -device VGA,edid=on,xres=1024,yres=768 \
+    -display gtk,window-close=off \
     -netdev tap,id=net0,ifname="$TAP_IF",script=no,downscript=no \
     -device virtio-net-pci,netdev=net0
