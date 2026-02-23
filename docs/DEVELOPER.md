@@ -570,7 +570,50 @@ cc -o test_raid6 test_raid6.c hammer2_raid6.c && ./test_raid6
 
 ---
 
-## 15. Future Work
+## 15. Unimplemented Upstream Features
+
+### `hammer2 volume-add` / `hammer2 volume-del`
+
+As of DragonFlyBSD 6.4.2, these commands **do not exist**. Only `hammer2 volume-list`
+is implemented. There is no `HAMMER2IOC_VOLUME_ADD` or `HAMMER2IOC_VOLUME_DEL` ioctl
+in the kernel, and no userspace handler in `cmd_volume.c` or `main.c`.
+
+The FlyNAS plan document references these as if they were available — they are
+aspirational/planned upstream features that were never implemented.
+
+**If `volume-add` / `volume-del` are ever added**, each handler must include an
+early RAID6 guard:
+
+```c
+static int
+hammer2_ioctl_volume_add(hammer2_inode_t *ip, void *data)
+{
+    hammer2_dev_t *hmp = ip->pmp->iroot->cluster.focus->hmp;
+
+    if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+        kprintf("hammer2: volume-add not supported on RAID6 arrays; "
+                "use 'hammer2 raid replace' to swap a failed disk\n");
+        return ENOTSUP;
+    }
+    /* ... JBOD implementation ... */
+}
+```
+
+The reason: JBOD `volume-add` is O(1) — it just extends the logical address space.
+Adding a disk to a RAID6 array requires a full re-stripe: every block must be read
+and rewritten under the new column rotation, and P/Q must be recomputed for every
+stripe. This is an O(total-data) operation that should never be silently triggered
+by an apparently routine command. Without this guard, a user running `volume-add`
+against an array they believed was JBOD (but is actually RAID6) could corrupt the
+array or trigger an unexpected multi-hour re-stripe.
+
+The same guard applies to `volume-del`. There is no graceful "remove a disk" in
+RAID6 — the only valid operations are `raid fail-disk` (failure path) and a future
+`raid shrink` command (capacity reduction, extremely complex, not yet designed).
+
+---
+
+## 16. Future Work
 
 | Item | Notes |
 |------|-------|
@@ -582,3 +625,4 @@ cc -o test_raid6 test_raid6.c hammer2_raid6.c && ./test_raid6
 | HAMMER2 version bump | `HAMMER2_VOL_VERSION_WIP = 4` currently; bump to 3 as stable |
 | ioctl for resilver abort | Allow cancelling an in-progress resilver |
 | Progress display in resilver | `hammer2 raid replace` currently blocks; add `-n` / polling |
+| Pool alias config (`/etc/hammer2.conf`) | Map short names to full device strings so `hammer2 raid status pool0` works instead of typing `/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3@TEST`; add `hammer2 pool-set/del/list` subcommands to manage entries; resolution goes in `hammer2_ioctl_handle()` in `subs.c` as an early lookup step before existing `open()` and `getfsstat()` attempts; applies to JBOD multi-volume paths too, not RAID6-specific |
