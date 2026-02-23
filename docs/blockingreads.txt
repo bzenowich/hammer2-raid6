@@ -1,0 +1,35 @@
+● Stuck on the parallel writes. Let me kill it and check what's happening on the VM:
+
+● Stop Task
+  ⎿  ~/code/dfly/dfly-exec.sh "sh /var/tmp/test_raid6_stress.sh" · stopped
+
+  ● Bash(~/code/dfly/dfly-exec.sh "sh -c 'ps aux | grep dd | grep -v grep'")
+    ⎿  root     866  0.0  0.0   6668    648 ??  D0      3:38AM   0:00.12 dd if=/dev/ur
+         root     867  0.0  0.0   6668    644 ??  D1      3:38AM   0:00.13 dd if=/dev/ur
+              root     868  0.0  0.0   6668    672 ??  D0      3:38AM   0:00.09 dd if=/dev/ur
+                   root     869  0.0  0.0   6668    640 ??  D1      3:38AM   0:00.10 dd if=/dev/ur
+
+                   ● All 4 dd processes are stuck in D state (blocked in kernel I/O). The writes are deadlocking. Let me kill them and investigate:
+
+                   ● Bash(~/code/dfly/dfly-exec.sh "sh -c 'kill 866 867 868 869; sleep 2; ps aux | grep dd | grep -v grep'")
+                     ⎿  root     866  0.0  0.0   6668    648 ??  D0      3:38AM   0:00.12 dd if=/dev/ur
+                          root     867  0.0  0.0   6668    644 ??  D1      3:38AM   0:00.13 dd if=/dev/ur
+                               root     868  0.0  0.0   6668    672 ??  D0      3:38AM   0:00.09 dd if=/dev/ur
+                                    root     869  0.0  0.0   6668    640 ??  D1      3:38AM   0:00.10 dd if=/dev/ur
+
+                                    ● Unkillable D-state means they're deadlocked inside the kernel. Let me look at what locks are held when hammer2_io_raid6_write is called, and whether breadnx+biowait inside it could deadlock:
+
+                                    ● Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+                                    ● The deadlock is clear: hammer2_io_raid6_write calls breadnx (blocking read) while still holding the DIO's bp locked. The buffer cache, under 4×32MB write pressure, can't evict dirty buffers because bp is held —
+                                      everything deadlocks waiting on each other.
+
+                                        Let me look at the full write-disposal block to plan the fix:
+
+                                        ● Read 1 file (ctrl+o to expand)
+
+                                        ● The fix is clear: breadnx does a blocking synchronous read while bp (the RAID6 data buffer) is still locked. Under 4×32MB write pressure, the buffer cache fills up, tries to evict dirty buffers, can't — because
+                                          bp is held — and everyone deadlocks waiting on each other.
+
+                                            The fix: replace breadnx with a non-blocking getblk(..., GETBLK_NOWAIT). In HAMMER2's COW model, writes always go to freshly allocated locations, so other columns in the same stripe will be zeros. If a block
+                                              happens to be in cache we use it; if not, we zero-fill — which is correct for new allocations and only risks stale parity in the pathological reuse case.
