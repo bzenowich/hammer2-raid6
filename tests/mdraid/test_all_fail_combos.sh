@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # HAMMER2 RAID6 Test: All failure combinations on 4-disk array
 #
 # Tests all 4 single-failure and all 6 dual-failure combinations,
@@ -7,6 +7,11 @@
 #
 # Left-symmetric RAID6 rotates P and Q across all disks, so failing
 # different disks exercises different reconstruction paths.
+#
+# NOTE: verify functions use foreground timeout, NOT background subshells.
+# Background subshells (&) reading from hammer2 leak kernel vnode references
+# across mount/unmount cycles on DragonFlyBSD, eventually causing
+# runningbufspace exhaustion and sync deadlock.
 
 DISKDIR=/var/tmp
 MNTPT=/mnt/test
@@ -65,49 +70,35 @@ write_ref_data() {
     sync; sync
 }
 
-# Verify with timeout — runs sha256 in background and waits up to SUBTEST_TIMEOUT
+# Verify reference data with foreground timeout
 verify_ref() {
     local label="$1"
-    (sha256 $MNTPT/testfile_a; sha256 $MNTPT/testfile_b) > /var/tmp/combo_check.txt 2>&1 &
-    local pid=$!
-    local deadline=$(($(date +%s) + SUBTEST_TIMEOUT))
-    while kill -0 $pid 2>/dev/null; do
-        if [ $(date +%s) -gt $deadline ]; then
-            echo "  TIMEOUT: verify_ref hung ($label)"
-            kill -9 $pid 2>/dev/null || true
-            result FAIL "$label (TIMEOUT)"
-            return 1
+    if timeout $SUBTEST_TIMEOUT sh -c \
+        'sha256 "$1"/testfile_a > /var/tmp/combo_check.txt 2>&1 && sha256 "$1"/testfile_b >> /var/tmp/combo_check.txt 2>&1' \
+        _ "$MNTPT"; then
+        if diff -q /var/tmp/combo_ref.txt /var/tmp/combo_check.txt > /dev/null 2>&1; then
+            result PASS "$label"
+        else
+            result FAIL "$label (checksum mismatch)"
         fi
-        sleep 1
-    done
-    wait $pid 2>/dev/null
-    if diff -q /var/tmp/combo_ref.txt /var/tmp/combo_check.txt > /dev/null 2>&1; then
-        result PASS "$label"
     else
-        result FAIL "$label"
+        result FAIL "$label (TIMEOUT)"
     fi
 }
 
-# Verify new data with timeout
+# Verify new data with foreground timeout
 verify_new() {
     local label="$1"
-    (sha256 $MNTPT/newfile_c; sha256 $MNTPT/newfile_d) > /var/tmp/combo_newchk.txt 2>&1 &
-    local pid=$!
-    local deadline=$(($(date +%s) + SUBTEST_TIMEOUT))
-    while kill -0 $pid 2>/dev/null; do
-        if [ $(date +%s) -gt $deadline ]; then
-            echo "  TIMEOUT: verify_new hung ($label)"
-            kill -9 $pid 2>/dev/null || true
-            result FAIL "$label (TIMEOUT)"
-            return 1
+    if timeout $SUBTEST_TIMEOUT sh -c \
+        'sha256 "$1"/newfile_c > /var/tmp/combo_newchk.txt 2>&1 && sha256 "$1"/newfile_d >> /var/tmp/combo_newchk.txt 2>&1' \
+        _ "$MNTPT"; then
+        if diff -q /var/tmp/combo_new.txt /var/tmp/combo_newchk.txt > /dev/null 2>&1; then
+            result PASS "$label"
+        else
+            result FAIL "$label (checksum mismatch)"
         fi
-        sleep 1
-    done
-    wait $pid 2>/dev/null
-    if diff -q /var/tmp/combo_new.txt /var/tmp/combo_newchk.txt > /dev/null 2>&1; then
-        result PASS "$label"
     else
-        result FAIL "$label"
+        result FAIL "$label (TIMEOUT)"
     fi
 }
 

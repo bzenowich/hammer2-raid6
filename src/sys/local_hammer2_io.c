@@ -795,7 +795,18 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				}
 
 				if (dio->refs & HAMMER2_DIO_FLUSH) {
-					if ((hce = hammer2_cluster_write) != 0) {
+					/*
+					 * Degraded mode: use synchronous
+					 * bwrite to prevent runningbufspace
+					 * accumulation.  Async data bawrites
+					 * can exhaust the buffer cache and
+					 * deadlock against the vn device's
+					 * UFS backing store.
+					 */
+					if (hmp->raid_nfailed > 0) {
+						bp->b_flags &= ~B_CLUSTEROK;
+						bwrite(bp);
+					} else if ((hce = hammer2_cluster_write) != 0) {
 						peof = (pbase + HAMMER2_SEGMASK64) &
 						       ~HAMMER2_SEGMASK64;
 						peof -= dio->dbase;
@@ -1292,7 +1303,19 @@ hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 				fail_q = 1;
 			}
 		} else {
-			/* Healthy sibling: blocking read (data, P, or Q). */
+			/*
+			 * Healthy sibling.  When old_data is available for
+			 * RMW delta, we only need P_old and Q_old — skip
+			 * reading data columns to reduce buffer cache
+			 * pressure.  Without this optimization, excessive
+			 * breadnx calls can exhaust the buffer cache and
+			 * deadlock against the vn device's UFS backing
+			 * store.
+			 */
+			if (old_data != NULL && col < ndata) {
+				/* RMW delta doesn't need sibling data */
+				continue;
+			}
 			vol = &hmp->volumes[phys_disk];
 			bp = NULL;
 			if (breadnx(vol->dev->devvp, phys_off,
@@ -1403,6 +1426,12 @@ parity_write:
 	 * Write out parity columns (P and Q) to healthy disks only.
 	 * Data columns are handled by the main thread via standard
 	 * buffer cache disposal.
+	 *
+	 * Use synchronous bwrite() when called inline from the
+	 * degraded flush path.  This prevents runningbufspace
+	 * accumulation that can deadlock against the vn device's
+	 * UFS backing store (buffer cache exhaustion).  The
+	 * background parity thread uses bawrite() for throughput.
 	 */
 	di = 0;
 	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
@@ -1427,7 +1456,10 @@ parity_write:
 		if (bp) {
 			bkvasync(bp);
 			bcopy(col_bufs[col], bp->b_data, stripe_unit);
-			bawrite(bp);
+			if (hmp->raid_nfailed > 0)
+				bwrite(bp);
+			else
+				bawrite(bp);
 		}
 	}
 
