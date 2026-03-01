@@ -2,7 +2,9 @@
 
 ISO="dfly-x86_64-6.4.2_REL.iso"
 DISK="dfly-disk.qcow2"
+ROOT_DISK="dfly-root.qcow2"
 DISK_SIZE="20G"
+ROOT_DISK_SIZE="8G"
 RAM="2G"
 CPUS="2"
 BRIDGE="br0"
@@ -13,6 +15,12 @@ TAP_IF="tap0"
 if [ ! -f "$DISK" ]; then
     echo "Creating disk image ($DISK_SIZE)..."
     qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
+fi
+
+# Create root disk image if it doesn't exist
+if [ ! -f "$ROOT_DISK" ]; then
+    echo "Creating UFS root disk image ($ROOT_DISK_SIZE)..."
+    qemu-img create -f qcow2 "$ROOT_DISK" "$ROOT_DISK_SIZE"
 fi
 
 # Set up bridge networking if not already configured
@@ -43,6 +51,7 @@ exec qemu-system-x86_64 \
     -smp "$CPUS" \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -hda "$DISK" \
+    -hdb "$ROOT_DISK" \
     -boot c \
     -enable-kvm \
     -cpu host \

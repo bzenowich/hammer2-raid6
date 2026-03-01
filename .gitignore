@@ -1,0 +1,8 @@
+*.qcow2
+*.qcow2.failed
+*.patch.backup
+*~
+session-*.json
+mnt/
+src/diag/diag_map
+src/diag/h2raid6_test
