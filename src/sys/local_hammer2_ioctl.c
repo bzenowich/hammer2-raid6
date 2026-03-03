@@ -1629,11 +1629,8 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 			 * Ensure all pending parity writes complete before
 			 * marking the disk failed.
 			 */
-			kprintf("hammer2: fail-disk %d: syncing pmp\n", i);
 			hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
-			kprintf("hammer2: fail-disk %d: draining parity\n", i);
 			hammer2_parity_drain(hmp);
-			kprintf("hammer2: fail-disk %d: marking failed\n", i);
 			hmp->raid_failed[i] = 1;
 			atomic_add_int(&hmp->raid_nfailed, 1);
 			/* Update on-disk disk_state */
@@ -1647,17 +1644,14 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 			 * Release the open file reference on the failed disk.
 			 */
 			if (hmp->volumes[i].dev->open) {
-				kprintf("hammer2: fail-disk %d: vinvalbuf\n", i);
 				vn_lock(hmp->volumes[i].dev->devvp,
 					LK_EXCLUSIVE | LK_RETRY);
 				vinvalbuf(hmp->volumes[i].dev->devvp,
 					  0, 0, 0);
-				kprintf("hammer2: fail-disk %d: VOP_CLOSE\n", i);
 				VOP_CLOSE(hmp->volumes[i].dev->devvp,
 					  FREAD | FWRITE, NULL);
 				vn_unlock(hmp->volumes[i].dev->devvp);
 				hmp->volumes[i].dev->open = 0;
-				kprintf("hammer2: fail-disk %d: closed\n", i);
 			}
 			kprintf("hammer2: RAID6 disk %d (%s) marked failed; "
 				"operating in degraded mode\n",

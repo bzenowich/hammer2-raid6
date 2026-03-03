@@ -217,19 +217,40 @@ HAMMER2's COW design writes every block to a freshly allocated location. Normal
 writes do:
 
 1. `_hammer2_io_putblk` is called when a dirty DIO is disposed (lastdrop)
-2. Data is copied to `parity_work->data` and the bio is released via `bdwrite`
-3. A `hammer2_parity_work_t` item `{pbase, psize, data}` is enqueued to
+2. A pre-modification copy of the buffer is saved in `dio->raid6_old_data`
+   before any modifications (for RMW delta parity computation)
+3. Data is copied to `parity_work->data` and the bio is released via `bdwrite`
+4. A `hammer2_parity_work_t` item `{pbase, psize, data, old_data}` is enqueued to
    `hmp->raid6_parity_q`
-4. The background parity thread dequeues and calls `hammer2_io_raid6_write`
+5. The background parity thread dequeues and calls `hammer2_io_raid6_write`
 
-### `hammer2_io_raid6_write(hmp, logical_off, data, bytes)`
+**Degraded-mode exception**: When `hmp->raid_nfailed > 0`, parity is computed
+**inline** (synchronously) in `_hammer2_io_putblk` instead of being queued to
+the background thread. This avoids a race where flush reads back a block via
+degraded reconstruction before the parity thread has updated P/Q.
+
+### `hammer2_io_raid6_write(hmp, logical_off, data, old_data, bytes)`
+
+Uses **RMW delta** parity update (always, not just in degraded mode):
+
+```
+P_new = P_old XOR D_old XOR D_new
+Q_new = Q_old XOR (gf_coeff * D_old) XOR (gf_coeff * D_new)
+```
 
 1. Calls `hammer2_raid6_map()` to find which disk/column this DIO covers
-2. Reads all sibling data columns using blocking `breadnx` (one `breadnx` per column)
-3. Reads the current P and Q columns
-4. Calls `hammer2_raid6_gen_syndrome()` with all data (including the new data for
-   this column) to compute fresh P and Q
-5. Writes new P and Q to their physical disks via `bwrite`
+2. Reads P_old and Q_old from their respective disks
+3. Computes delta parity using `old_data` (pre-modification) and `data` (new)
+4. Writes new P and Q to their physical disks
+
+When `old_data` is available, sibling data columns are **not** read — the delta
+formula only needs P_old, Q_old, D_old, and D_new. This significantly reduces
+buffer cache pressure during degraded-mode flush.
+
+**Write modes by context**:
+- Healthy mode (background thread): `bawrite` for P/Q (async, throughput)
+- Degraded mode (inline): `bwrite` for data and P/Q (synchronous, prevents
+  runningbufspace deadlock)
 
 **IMPORTANT**: Each `breadnx` call must be preceded by `bp = NULL`. `breadnx` checks
 `*bpp` and will reuse a stale/freed pointer if it's non-NULL. This has caused
@@ -276,6 +297,11 @@ Protects the queue with `hmp->raid6_parity_spin` (spinlock). The thread sleeps o
 the parity work. By the time the parity thread calls `breadnx` for sibling columns,
 the buffer holding the data write is no longer locked. The parity thread holds no
 filesystem locks — it's a plain kernel thread doing I/O.
+
+**Note**: In degraded mode (`raid_nfailed > 0`), parity is computed inline in
+`_hammer2_io_putblk` instead of being queued to the background thread. This ensures
+parity is up-to-date before any subsequent degraded-reconstruction read of the same
+block. The background thread is still used for healthy-mode writes.
 
 ---
 
@@ -497,6 +523,31 @@ volume headers (corrupting them silently).
 `hammer2_ioctl_raid_fail_disk` must call `VOP_CLOSE` on the device vnode before
 returning. Without this, `vnconfig -u` fails with "device busy".
 
+### Always Use RMW Delta Parity (Not Full Recompute)
+
+When two data columns in the same stripe are modified in the same flush cycle,
+reading the sibling's data from disk for full parity recompute returns stale data
+(the sibling's `bdwrite` is async and may not have reached disk). The fix is to
+**always** use the RMW delta formula: `P_new = P_old XOR D_old XOR D_new`. This
+only needs the pre-modification buffer (`old_data`), not sibling data. The
+`old_data` buffer is saved in `dio->raid6_old_data` before any modifications.
+
+### Pre-emptive Degraded Check Covers All DIO Ops
+
+The pre-emptive degraded check in `_hammer2_io_getblk` must handle all DIO
+operations (READ, NEW, NEWNZ), not just READ. Sub-buffer `DOP_NEW` operations
+(e.g., inode creation: 1KB within a 64KB DIO) on a failed disk will call
+`breadnx` on a closed vnode, producing I/O errors and garbage `old_data`.
+
+### Synchronous I/O in Degraded Mode Prevents Deadlock
+
+During degraded-mode flush, async `bawrite` for data and parity buffers can
+exhaust `runningbufspace` faster than the backing store can drain it. This
+causes a circular deadlock: hammer2 flush → `bawrite` → vn driver → UFS →
+buffer cache → needs prior `bawrite`s to complete. Fix: use synchronous
+`bwrite` for both data and parity in degraded mode (`raid_nfailed > 0` and
+`DIO_FLUSH` set).
+
 ### Parity Thread Must Exit Before Closing Vnodes
 
 `hammer2_parity_uninit` must be called before closing device vnodes during unmount.
@@ -531,17 +582,22 @@ diagnostic messages, not errors.
 
 ## 14. Testing
 
-All test scripts are in `tests/`:
+All test scripts are in `tests/mdraid/`:
 
-| Script | What it tests |
-|--------|---------------|
-| `tests/test_b.sh` | Single disk failure: write data, mark disk failed, verify degraded reads, detach disk, verify reads continue |
-| `tests/test_c.sh` | Dual disk failure: extends Test B, marks a second disk failed, verifies dual-degraded reads |
-| `tests/test_d.sh` | Online resilver: format, write, fail disk, resilver to replacement, verify data, unmount+remount |
-| `tests/test_stress.sh` | Parallel I/O stress: 4 workers write 32MB each, verify hashes, then degrade/dual-degrade |
-| `tests/test_resilver.sh` | Standalone resilver test (needs data already written) |
-| `tests/verify_parity.sh` | Full parity verification cycle: newfs → write → unmount → check |
-| `tests/test_parity_after_mount.sh` | Parity check after newfs on zero/reused disk images |
+| Script | What it tests | Status |
+|--------|---------------|--------|
+| `test_b.sh` | Single disk failure: write data, mark disk failed, verify degraded reads, detach disk | PASS |
+| `test_c.sh` | Dual disk failure: extends Test B, marks a second disk failed, verifies dual-degraded reads | PASS |
+| `test_d.sh` | Online resilver: format, write, fail disk, resilver to replacement, verify data, unmount+remount | PASS |
+| `test_e_write_degraded.sh` | Write during degraded mode: 4 scenarios with single/dual failure and data integrity | 4/4 PASS |
+| `test_f_sequential_fail.sh` | Sequential disk failures: fail one, write, fail another, verify all data | 3/3 PASS |
+| `test_g_repair_no_destroy.sh` | Repair without data loss (needs h2parity_fix on VM) | Skipped |
+| `test_h_mount_missing.sh` | Mount with absent disk scenarios | 3/4 PASS |
+| `test_i_write_during_resilver.sh` | Write during active resilver | 2/3 PASS |
+| `test_j_unclean_unmount.sh` | Unclean unmount recovery | 3/4 PASS |
+| `test_k_concurrent_io.sh` | Concurrent I/O during degraded + resilver, deadlock detection | 6/6 PASS |
+| `test_all_fail_combos.sh` | All 4 single-fail + 6 dual-fail read + 6 dual-fail write combinations | 32/32 PASS |
+| `test_l_snapshot_compression.sh` | Snapshots during degraded mode, COW with snapshots, LZ4 compression with disk failures | 18/18 PASS |
 
 ### Parity Checker (`h2parity_fix`)
 

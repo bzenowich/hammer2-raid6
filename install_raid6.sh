@@ -123,6 +123,12 @@ do_install() {
     echo ""
     echo "Replace a failed disk (online resilver):"
     echo "  hammer2 -s /mnt/data raid replace /dev/da2 /dev/da4"
+    echo ""
+    echo "Create a snapshot:"
+    echo "  hammer2 snapshot /mnt/data mysnap"
+    echo ""
+    echo "Mount a snapshot:"
+    echo "  mount -t hammer2 /dev/da0:/dev/da1:/dev/da2:/dev/da3@mysnap /mnt/snap"
 }
 
 # Parse command

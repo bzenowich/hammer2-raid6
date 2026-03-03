@@ -666,8 +666,74 @@ index 58124151..f78a15cd 100644
  
  #define HAMMER2_NUM_VOLHDRS		4
  
+diff --git a/sys/vfs/hammer2/hammer2_flush.c b/sys/vfs/hammer2/hammer2_flush.c
+index d940d170..7e30a89d 100644
+--- a/sys/vfs/hammer2/hammer2_flush.c
++++ b/sys/vfs/hammer2/hammer2_flush.c
+@@ -1468,6 +1468,12 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+ 	TAILQ_FOREACH(e, &hmp->devvpl, entry) {
+ 		devvp = e->devvp;
+ 		KKASSERT(devvp);
++		/*
++		 * Skip failed/closed disks — VOP_FSYNC on a closed
++		 * devvp returns ENXIO and spams the console.
++		 */
++		if (!e->open)
++			continue;
+ 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+ 		fsync_error = VOP_FSYNC(devvp, MNT_WAIT, 0);
+ 		vn_unlock(devvp);
+@@ -1487,6 +1493,21 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+ 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
+ 		struct buf *bp;
+ 		int vol_error = 0;
++		struct vnode *voldevvp;
++
++		/*
++		 * Find a healthy device for volume header write.
++		 * hmp->devvp is always disk 0 which may be failed.
++		 */
++		voldevvp = NULL;
++		TAILQ_FOREACH(e, &hmp->devvpl, entry) {
++			if (e->open) {
++				voldevvp = e->devvp;
++				break;
++			}
++		}
++		if (voldevvp == NULL)
++			goto skip_volhdr;
+ 
+ 		/*
+ 		 * Synchronize the disk before flushing the volume
+@@ -1499,7 +1520,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+ 		bp->b_cmd = BUF_CMD_FLUSH;
+ 		bp->b_bio1.bio_done = biodone_sync;
+ 		bp->b_bio1.bio_flags |= BIO_SYNC;
+-		vn_strategy(hmp->devvp, &bp->b_bio1);
++		vn_strategy(voldevvp, &bp->b_bio1);
+ 		fsync_error = biowait(&bp->b_bio1, "h2vol");
+ 		relpbuf(bp, NULL);
+ 
+@@ -1521,7 +1542,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+ 			kprintf("sync volhdr %d %jd\n",
+ 				j, (intmax_t)hmp->volsync.volu_size);
+ 		}
+-		bp = getblk(hmp->devvp, j * HAMMER2_ZONE_BYTES64,
++		bp = getblk(voldevvp, j * HAMMER2_ZONE_BYTES64,
+ 			    HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+ 		atomic_clear_int(&hmp->vchain.flags,
+ 				 HAMMER2_CHAIN_VOLUMESYNC);
+@@ -1531,6 +1552,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+ 		hmp->volhdrno = j;
+ 		if (vol_error)
+ 			fsync_error = vol_error;
++skip_volhdr:
++		;
+ 	}
+ 	if (flush_error)
+ 		total_error = flush_error;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 68a47162..d0bf3f11 100644
+index 68a47162..84cbf59d 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,7 @@
@@ -719,16 +785,19 @@ index 68a47162..d0bf3f11 100644
  		dio->pbase = pbase;
  		dio->psize = psize;
  		dio->btype = btype;
-@@ -254,6 +279,19 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -254,6 +279,22 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  				cpu_mfence();
  			bkvasync(dio->bp);
  
 +			/*
-+			 * RAID6 degraded: save pre-modification data
-+			 * for RMW delta parity computation.
++			 * RAID6: save pre-modification data for RMW
++			 * delta parity computation.  Always saved (not
++			 * just degraded) to handle the case where both
++			 * data columns in a stripe are modified — the
++			 * sibling's bdwrite may not have flushed when
++			 * the parity thread reads it from disk.
 +			 */
 +			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-+			    hmp->raid_nfailed > 0 &&
 +			    dio->raid6_old_data == NULL) {
 +				dio->raid6_old_data = kmalloc(dio->psize,
 +				    M_HAMMER2, M_WAITOK);
@@ -739,19 +808,21 @@ index 68a47162..d0bf3f11 100644
  			switch(op) {
  			case HAMMER2_DOP_NEW:
  				bzero(hammer2_io_data(dio, lbase), lsize);
-@@ -300,17 +338,78 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -300,17 +341,133 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  
  	error = 0;
  	dev_pbase = dio->pbase - dio->dbase;
 +
 +	/*
 +	 * RAID6 degraded pre-emption: if this disk is already marked
-+	 * failed, skip the device read entirely and reconstruct the
-+	 * data from parity right now.  This avoids I/O to a closed
-+	 * devvp (after hammer2 raid fail-disk releases VOP_OPEN).
++	 * failed, skip device I/O entirely and reconstruct the data
++	 * from parity right now.  This avoids I/O to a closed devvp
++	 * (after hammer2 raid fail-disk releases VOP_OPEN).
++	 *
++	 * Handles all ops (READ, NEW, NEWNZ) uniformly for both
++	 * full-buffer and sub-buffer cases.
 +	 */
-+	if (op == HAMMER2_DOP_READ &&
-+	    hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
++	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 +	    hmp->raid_nfailed > 0 &&
 +	    dio->disk_idx >= 0 &&
 +	    hmp->raid_failed[dio->disk_idx]) {
@@ -767,6 +838,24 @@ index 68a47162..d0bf3f11 100644
 +				    M_HAMMER2, M_WAITOK);
 +				bcopy(dio->bp->b_data,
 +				    dio->raid6_old_data, dio->psize);
++			}
++			switch(op) {
++			case HAMMER2_DOP_NEW:
++				if (dio->pbase ==
++				    (lbase & ~HAMMER2_OFF_MASK_RADIX) &&
++				    dio->psize == lsize)
++					bzero(dio->bp->b_data, dio->psize);
++				else
++					bzero(hammer2_io_data(dio, lbase),
++					      lsize);
++				/* fall through */
++			case HAMMER2_DOP_NEWNZ:
++				atomic_set_long(&dio->refs,
++						HAMMER2_DIO_DIRTY);
++				break;
++			case HAMMER2_DOP_READ:
++			default:
++				break;
 +			}
 +		}
 +		dio->error = error;
@@ -785,11 +874,46 @@ index 68a47162..d0bf3f11 100644
 -				bkvasync(dio->bp);
 -				bzero(dio->bp->b_data, dio->psize);
 +			/*
-+			 * RAID6 degraded: read old data before clearing
-+			 * so we can compute RMW delta parity later.
++			 * RAID6: read old data before clearing so we
++			 * can compute RMW delta parity later.  Always
++			 * done (not just degraded) to avoid parity race
++			 * when both data columns in a stripe are modified.
++			 *
++			 * Failed disk: reconstruct from parity.
++			 * Healthy disk: read directly via breadnx.
++			 * Non-RAID6: original getblk (no I/O needed).
 +			 */
 +			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-+			    hmp->raid_nfailed > 0) {
++			    hmp->raid_nfailed > 0 &&
++			    dio->disk_idx >= 0 &&
++			    hmp->raid_failed[dio->disk_idx]) {
++				/*
++				 * DIO is on the failed disk: reconstruct
++				 * old content from parity.
++				 */
++				dio->bp = getblk(dio->devvp, dev_pbase,
++				    dio->psize, GETBLK_KVABIO, 0);
++				if (dio->bp) {
++					bkvasync(dio->bp);
++					error = hammer2_io_raid6_read_degraded(
++					    hmp, dio->pbase,
++					    dio->bp->b_data, dio->psize);
++					if (error == 0) {
++						dio->raid6_old_data = kmalloc(
++						    dio->psize, M_HAMMER2,
++						    M_WAITOK);
++						bcopy(dio->bp->b_data,
++						    dio->raid6_old_data,
++						    dio->psize);
++					}
++					if (op == HAMMER2_DOP_NEW)
++						bzero(dio->bp->b_data,
++						    dio->psize);
++				}
++			} else if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
++				/*
++				 * Healthy disk: read old data directly.
++				 */
 +				error = breadnx(dio->devvp, dev_pbase,
 +				    dio->psize, bflags,
 +				    NULL, NULL, 0, &dio->bp);
@@ -824,16 +948,15 @@ index 68a47162..d0bf3f11 100644
  			}
  			atomic_set_long(&dio->refs, HAMMER2_DIO_DIRTY);
  			break;
-@@ -335,6 +434,20 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -335,6 +492,19 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  						dio->psize, bflags,
  					        NULL, NULL, 0, &dio->bp);
  			}
 +			/*
-+			 * RAID6 degraded: save data just read for RMW
-+			 * delta parity computation.
++			 * RAID6: save data just read for RMW delta
++			 * parity computation.
 +			 */
 +			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-+			    hmp->raid_nfailed > 0 &&
 +			    error == 0 && dio->bp &&
 +			    dio->raid6_old_data == NULL) {
 +				bkvasync(dio->bp);
@@ -845,16 +968,15 @@ index 68a47162..d0bf3f11 100644
  			break;
  		}
  	} else {
-@@ -356,6 +469,21 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -356,6 +526,20 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  					NULL, NULL, 0, &dio->bp);
  		}
  		if (dio->bp) {
 +			/*
-+			 * RAID6 degraded: save data just read for RMW
-+			 * delta parity computation (before NEW zeroing).
++			 * RAID6: save data just read for RMW delta
++			 * parity computation (before NEW zeroing).
 +			 */
 +			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-+			    hmp->raid_nfailed > 0 &&
 +			    error == 0 &&
 +			    dio->raid6_old_data == NULL) {
 +				bkvasync(dio->bp);
@@ -867,7 +989,7 @@ index 68a47162..d0bf3f11 100644
  			/*
  			 * Handle NEW flags
  			 */
-@@ -388,6 +516,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -388,6 +572,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		}
  	}
  
@@ -875,7 +997,7 @@ index 68a47162..d0bf3f11 100644
  	if (dio->bp) {
  		bkvasync(dio->bp);
  		BUF_KERNPROC(dio->bp);
-@@ -396,6 +525,35 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -396,6 +581,46 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  	}
  	dio->error = error;
  
@@ -904,6 +1026,17 @@ index 68a47162..d0bf3f11 100644
 +						hmp, dio->pbase,
 +						dio->bp->b_data, dio->psize);
 +				dio->error = error;
++				/*
++				 * Save reconstructed data as old_data
++				 * for RMW delta parity computation.
++				 */
++				if (error == 0 &&
++				    dio->raid6_old_data == NULL) {
++					dio->raid6_old_data = kmalloc(
++					    dio->psize, M_HAMMER2, M_WAITOK);
++					bcopy(dio->bp->b_data,
++					    dio->raid6_old_data, dio->psize);
++				}
 +			}
 +		}
 +	}
@@ -911,7 +1044,7 @@ index 68a47162..d0bf3f11 100644
  	/*
  	 * Clear INPROG and WAITING, set GOOD wake up anyone waiting.
  	 */
-@@ -506,8 +664,37 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -506,8 +731,37 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		 * Non-errored disposal of bp
  		 */
  		if (orefs & HAMMER2_DIO_DIRTY) {
@@ -949,7 +1082,7 @@ index 68a47162..d0bf3f11 100644
  			/*
  			 * Allows dirty buffers to accumulate and
  			 * possibly be canceled (e.g. by a 'rm'),
-@@ -523,22 +710,43 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -523,22 +777,88 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  			 * write.  This typically occurs in the write-behind
  			 * case when writing to large files.
  			 */
@@ -965,8 +1098,33 @@ index 68a47162..d0bf3f11 100644
 +			if (bp) {
 +				off_t peof;
 +				int hce;
++
++				/*
++				 * Debug: log writes to failed disk devvps
++				 */
++				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
++				    dio->disk_idx >= 0 &&
++				    !hmp->volumes[dio->disk_idx].dev->open) {
++					kprintf("hammer2: WARNING putblk "
++					    "bdwrite to closed disk %d "
++					    "pbase=%jx\n",
++					    dio->disk_idx,
++					    (intmax_t)pbase);
++				}
++
 +				if (dio->refs & HAMMER2_DIO_FLUSH) {
-+					if ((hce = hammer2_cluster_write) != 0) {
++					/*
++					 * Degraded mode: use synchronous
++					 * bwrite to prevent runningbufspace
++					 * accumulation.  Async data bawrites
++					 * can exhaust the buffer cache and
++					 * deadlock against the vn device's
++					 * UFS backing store.
++					 */
++					if (hmp->raid_nfailed > 0) {
++						bp->b_flags &= ~B_CLUSTEROK;
++						bwrite(bp);
++					} else if ((hce = hammer2_cluster_write) != 0) {
 +						peof = (pbase + HAMMER2_SEGMASK64) &
 +						       ~HAMMER2_SEGMASK64;
 +						peof -= dio->dbase;
@@ -986,27 +1144,47 @@ index 68a47162..d0bf3f11 100644
 -				bdwrite(bp);
 +			}
 +			/*
-+			 * RAID6: enqueue parity work to the background parity
-+			 * thread.  The thread does blocking sibling reads with
-+			 * no HAMMER2 locks held, avoiding buffer cache deadlock.
++			 * RAID6 parity update.
++			 *
++			 * Degraded mode: process parity inline (synchronous)
++			 * so that subsequent degraded reads reconstruct the
++			 * correct data.  The buffer has been released above
++			 * (brelse for failed disk, bdwrite for healthy), so
++			 * no vn device locks are held — blocking sibling
++			 * reads are safe here.
++			 *
++			 * Healthy mode: enqueue to background parity thread
++			 * as before (data stays in buffer cache via bdwrite,
++			 * so reads don't need parity reconstruction).
 +			 */
-+			if (raid6_data) {
++			if (raid6_data && hmp->raid_nfailed > 0) {
++				hammer2_io_raid6_write(hmp, pbase,
++				    raid6_data, dio->raid6_old_data,
++				    psize);
++				kfree(raid6_data, M_HAMMER2);
++				if (dio->raid6_old_data) {
++					kfree(dio->raid6_old_data, M_HAMMER2);
++					dio->raid6_old_data = NULL;
++				}
++				raid6_data = NULL;
++			} else if (raid6_data) {
 +				hammer2_parity_work_t *pw;
 +
 +				pw = kmalloc(sizeof(*pw), M_HAMMER2, M_WAITOK);
 +				pw->pbase = pbase;
 +				pw->psize = psize;
-+				pw->data = raid6_data; /* thread owns, will free */
++				pw->data = raid6_data;
 +				pw->old_data = dio->raid6_old_data;
 +				dio->raid6_old_data = NULL;
 +				spin_lock(&hmp->raid6_parity_spin);
-+				TAILQ_INSERT_TAIL(&hmp->raid6_parity_q, pw, entry);
++				TAILQ_INSERT_TAIL(&hmp->raid6_parity_q,
++				    pw, entry);
 +				spin_unlock(&hmp->raid6_parity_spin);
 +				wakeup(&hmp->raid6_parity_q);
  			}
  		} else if (bp->b_flags & (B_ERROR | B_INVAL | B_RELBUF)) {
  			brelse(bp);
-@@ -552,6 +760,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -552,6 +872,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		brelse(bp);
  	}
  
@@ -1021,7 +1199,7 @@ index 68a47162..d0bf3f11 100644
  	/*
  	 * Update iofree_count before disposing of the dio
  	 */
-@@ -646,6 +862,10 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
+@@ -646,6 +974,10 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
  				"%016jx/%d (bp=%p)\n",
  				dio->pbase, dio->psize, dio->bp);
  		}
@@ -1032,7 +1210,7 @@ index 68a47162..d0bf3f11 100644
  		kfree_obj(dio, hmp->mio);
  		atomic_add_int(&hammer2_dio_count, -1);
  		atomic_add_int(&hmp->iofree_count, -1);
-@@ -889,3 +1109,714 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -889,3 +1221,738 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
  	atomic_add_64(&dio->refs, 1);
  }
@@ -1118,7 +1296,19 @@ index 68a47162..d0bf3f11 100644
 +				fail_q = 1;
 +			}
 +		} else {
-+			/* Healthy sibling: blocking read (data, P, or Q). */
++			/*
++			 * Healthy sibling.  When old_data is available for
++			 * RMW delta, we only need P_old and Q_old — skip
++			 * reading data columns to reduce buffer cache
++			 * pressure.  Without this optimization, excessive
++			 * breadnx calls can exhaust the buffer cache and
++			 * deadlock against the vn device's UFS backing
++			 * store.
++			 */
++			if (old_data != NULL && col < ndata) {
++				/* RMW delta doesn't need sibling data */
++				continue;
++			}
 +			vol = &hmp->volumes[phys_disk];
 +			bp = NULL;
 +			if (breadnx(vol->dev->devvp, phys_off,
@@ -1146,32 +1336,35 @@ index 68a47162..d0bf3f11 100644
 +	}
 +
 +	/*
-+	 * RMW delta path: when old_data is available and we have failed
-+	 * data disk(s), apply delta directly to P_old and Q_old instead
-+	 * of trying to reconstruct the failed column (which requires
-+	 * reading data we can't access).
++	 * RMW delta path: when old_data is available, apply delta
++	 * directly to P_old and Q_old.  This is always correct and
++	 * avoids two problems:
++	 *  1) Degraded mode: we can't read the failed sibling column.
++	 *  2) Healthy mode: sibling's bdwrite may not have flushed,
++	 *     so reading it from disk gets stale data — corrupting
++	 *     parity when both columns in a stripe are modified.
 +	 *
 +	 * P_new = P_old XOR D_old XOR D_new
 +	 * Q_new = Q_old XOR gf_mul(2^my_col, D_old XOR D_new)
-+	 *
-+	 * The failed disk's data cancels out — we never need it.
 +	 */
-+	if (fail_data_a != -1 && old_data != NULL) {
++	if (old_data != NULL) {
 +		uint8_t *od = (uint8_t *)old_data;
 +		uint8_t *nd = (uint8_t *)data;
 +		uint8_t coeff = hammer2_gf_exp[my_col];
++		uint8_t *p;
++		uint8_t *q;
 +		size_t si;
 +
-+		if (!fail_p && col_bufs[ndata]) {
-+			uint8_t *p = (uint8_t *)col_bufs[ndata];
++		p = col_bufs[ndata];
++		if (!fail_p && p != NULL) {
 +			for (si = 0; si < stripe_unit; si++)
 +				p[si] ^= od[si] ^ nd[si];
 +		}
-+		if (!fail_q && col_bufs[ndata + 1]) {
-+			uint8_t *q = (uint8_t *)col_bufs[ndata + 1];
++		q = col_bufs[ndata + 1];
++		if (!fail_q && q != NULL) {
 +			for (si = 0; si < stripe_unit; si++)
 +				q[si] ^= hammer2_gf_mul(coeff,
-+							 od[si] ^ nd[si]);
++						od[si] ^ nd[si]);
 +		}
 +		goto parity_write;
 +	}
@@ -1226,6 +1419,12 @@ index 68a47162..d0bf3f11 100644
 +	 * Write out parity columns (P and Q) to healthy disks only.
 +	 * Data columns are handled by the main thread via standard
 +	 * buffer cache disposal.
++	 *
++	 * Use synchronous bwrite() when called inline from the
++	 * degraded flush path.  This prevents runningbufspace
++	 * accumulation that can deadlock against the vn device's
++	 * UFS backing store (buffer cache exhaustion).  The
++	 * background parity thread uses bawrite() for throughput.
 +	 */
 +	di = 0;
 +	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
@@ -1250,7 +1449,10 @@ index 68a47162..d0bf3f11 100644
 +		if (bp) {
 +			bkvasync(bp);
 +			bcopy(col_bufs[col], bp->b_data, stripe_unit);
-+			bawrite(bp);
++			if (hmp->raid_nfailed > 0)
++				bwrite(bp);
++			else
++				bawrite(bp);
 +		}
 +	}
 +
@@ -1748,7 +1950,7 @@ index 68a47162..d0bf3f11 100644
 +	return error;
 +}
 diff --git a/sys/vfs/hammer2/hammer2_ioctl.c b/sys/vfs/hammer2/hammer2_ioctl.c
-index 8765b23c..26e80e96 100644
+index 8765b23c..834a500a 100644
 --- a/sys/vfs/hammer2/hammer2_ioctl.c
 +++ b/sys/vfs/hammer2/hammer2_ioctl.c
 @@ -41,8 +41,10 @@
@@ -1791,7 +1993,7 @@ index 8765b23c..26e80e96 100644
  	default:
  		error = EOPNOTSUPP;
  		break;
-@@ -1437,3 +1454,268 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
+@@ -1437,3 +1454,260 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
  
  	return error;
  }
@@ -1917,7 +2119,15 @@ index 8765b23c..26e80e96 100644
 +	/* Flush the updated config to all disks */
 +	hammer2_vfs_sync(ip->pmp->mp, MNT_WAIT);
 +
-+	kprintf("hammer2: RAID6 resilver disk %d complete\n", failed_disk_idx);
++	if (hmp->raid_nfailed == 0) {
++		kprintf("hammer2: RAID6 disk %d online; "
++			"array fully healthy (%d disks)\n",
++			failed_disk_idx, hmp->raid_config.ndisks);
++	} else {
++		kprintf("hammer2: RAID6 disk %d online; "
++			"%d disk(s) still failed\n",
++			failed_disk_idx, hmp->raid_nfailed);
++	}
 +	rr->error = 0;
 +	rr->progress = 100;
 +
@@ -1961,19 +2171,6 @@ index 8765b23c..26e80e96 100644
 +			/*
 +			 * Ensure all pending parity writes complete before
 +			 * marking the disk failed.
-+			 *
-+			 * sync(8) uses MNT_NOWAIT so the HAMMER2 flush may
-+			 * still be running when this ioctl executes.  We
-+			 * need to:
-+			 *   1. Flush all dirty chains synchronously so that
-+			 *      every dirty DIO is disposed via putblk and
-+			 *      every parity work item is enqueued.
-+			 *   2. Drain the parity queue so those items are
-+			 *      fully written to disk.
-+			 *
-+			 * Only then is it safe to mark the disk failed,
-+			 * because degraded reads reconstruct missing columns
-+			 * from P/Q and those must be current.
 +			 */
 +			hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
 +			hammer2_parity_drain(hmp);
@@ -1988,15 +2185,12 @@ index 8765b23c..26e80e96 100644
 +			hammer2_voldata_unlock(hmp);
 +			/*
 +			 * Release the open file reference on the failed disk.
-+			 * This allows the block device to be detached
-+			 * (e.g. vnconfig -u) without EBUSY.
-+			 * The vnode itself remains valid (still referenced
-+			 * via dev->devvp), and the parity thread skips I/O
-+			 * to failed disks.
 +			 */
 +			if (hmp->volumes[i].dev->open) {
 +				vn_lock(hmp->volumes[i].dev->devvp,
 +					LK_EXCLUSIVE | LK_RETRY);
++				vinvalbuf(hmp->volumes[i].dev->devvp,
++					  0, 0, 0);
 +				VOP_CLOSE(hmp->volumes[i].dev->devvp,
 +					  FREAD | FWRITE, NULL);
 +				vn_unlock(hmp->volumes[i].dev->devvp);
@@ -2123,7 +2317,7 @@ index 20e92bb3..55803c52 100644
  
  #endif /* !_VFS_HAMMER2_IOCTL_H_ */
 diff --git a/sys/vfs/hammer2/hammer2_ondisk.c b/sys/vfs/hammer2/hammer2_ondisk.c
-index 8e5c4bd7..de4cfa97 100644
+index 8e5c4bd7..48d165fd 100644
 --- a/sys/vfs/hammer2/hammer2_ondisk.c
 +++ b/sys/vfs/hammer2/hammer2_ondisk.c
 @@ -46,6 +46,7 @@
@@ -2134,7 +2328,53 @@ index 8e5c4bd7..de4cfa97 100644
  
  #define hprintf(X, ...)	kprintf("hammer2_ondisk: " X, ## __VA_ARGS__)
  
-@@ -450,6 +451,62 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
+@@ -138,11 +139,45 @@ hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
+ 		devvp = e->devvp;
+ 		KKASSERT(devvp);
+ 		if (e->open) {
++			struct buf *bp;
++
++			/*
++			 * Issue a device-level flush barrier to wait for
++			 * all in-flight async I/O (bawrite/cluster_write)
++			 * to complete.  vinvalbuf only sees buffers still
++			 * on the vnode's buffer lists, but bawrite moves
++			 * them off-list into the driver.  Without this
++			 * barrier, vnconfig -u after unmount can destroy
++			 * the device while I/O is in flight, permanently
++			 * leaking runningbufspace.
++			 */
+ 			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
++			bp = getpbuf(NULL);
++			bp->b_bio1.bio_offset = 0;
++			bp->b_bufsize = 0;
++			bp->b_bcount = 0;
++			bp->b_cmd = BUF_CMD_FLUSH;
++			bp->b_bio1.bio_done = biodone_sync;
++			bp->b_bio1.bio_flags |= BIO_SYNC;
++			vn_strategy(devvp, &bp->b_bio1);
++			biowait(&bp->b_bio1, "h2cls");
++			relpbuf(bp, NULL);
++
+ 			vinvalbuf(devvp, (ronly ? 0 : V_SAVE), 0, 0);
+ 			VOP_CLOSE(devvp, (ronly ? FREAD : FREAD|FWRITE), NULL);
+ 			vn_unlock(devvp);
+ 			e->open = 0;
++		} else {
++			/*
++			 * Device already closed (failed disk).  Discard
++			 * any buffers in the buffer cache that reference
++			 * this devvp.  Without this, orphaned dirty
++			 * buffers can permanently leak runningbufspace
++			 * when the device is later destroyed (vnconfig -u).
++			 */
++			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
++			vinvalbuf(devvp, 0, 0, 0);
++			vn_unlock(devvp);
+ 		}
+ 	}
+ 
+@@ -450,6 +485,62 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
  	return 0;
  }
  
@@ -2197,7 +2437,7 @@ index 8e5c4bd7..de4cfa97 100644
  static int
  hammer2_verify_volumes(const hammer2_volume_t *volumes,
  		       const hammer2_volume_data_t *rootvoldata)
-@@ -460,7 +517,9 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
+@@ -460,7 +551,9 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
  	if (error)
  		return error;
  
@@ -2208,7 +2448,7 @@ index 8e5c4bd7..de4cfa97 100644
  		return hammer2_verify_volumes_2(volumes, rootvoldata);
  	else
  		return hammer2_verify_volumes_1(volumes, rootvoldata);
-@@ -726,3 +785,64 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
+@@ -726,3 +819,64 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
  
  	return ret;
  }
@@ -2274,7 +2514,7 @@ index 8e5c4bd7..de4cfa97 100644
 +		    (logical_off % stripe_unit);
 +}
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 0dfed0c4..3fa83afe 100644
+index 0dfed0c4..a4a45d55 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -48,6 +48,7 @@
@@ -2294,7 +2534,7 @@ index 0dfed0c4..3fa83afe 100644
  	return (error);
  }
  
-@@ -1246,7 +1249,16 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1246,7 +1249,30 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		 * Must use hmp instead of volume header for these two
  		 * in order to handle volume versions transparently.
  		 */
@@ -2305,14 +2545,71 @@ index 0dfed0c4..3fa83afe 100644
 +			hmp->raid_type = hmp->voldata.raid_config.raid_type;
 +			bcopy(&hmp->voldata.raid_config, &hmp->raid_config,
 +			      sizeof(hmp->raid_config));
++
++			/*
++			 * Restore failed disk state from on-disk config.
++			 * If a disk was marked failed before unmount, keep
++			 * it failed so we don't read stale/corrupt data
++			 * from it.  The admin must explicitly resilver.
++			 */
 +			hmp->raid_nfailed = 0;
 +			bzero(hmp->raid_failed, sizeof(hmp->raid_failed));
++			for (i = 0; i < hmp->nvolumes; i++) {
++				if (hmp->raid_config.disk_state[i] ==
++				    HAMMER2_RAID6_DISK_FAILED) {
++					hmp->raid_failed[i] = 1;
++					hmp->raid_nfailed++;
++				}
++			}
 +		} else if (hmp->voldata.version >=
 +			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
  			hmp->nvolumes = hmp->voldata.nvolumes;
  			hmp->total_size = hmp->voldata.total_size;
  		} else {
-@@ -1362,6 +1374,7 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1266,6 +1292,42 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		KKASSERT(TAILQ_EMPTY(&devvpl));
+ 		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
+ 
++		/*
++		 * Log RAID6 array status at mount time.  If any disks
++		 * were previously failed, release VOP_OPEN on them so
++		 * they can be detached/replaced.
++		 */
++		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
++			if (hmp->raid_nfailed == 0) {
++				kprintf("hammer2: RAID6 array mounted: "
++					"%d disks (%d data + P + Q), "
++					"all disks online\n",
++					hmp->raid_config.ndisks,
++					hmp->raid_config.ndata);
++			} else {
++				for (i = 0; i < hmp->nvolumes; i++) {
++					if (!hmp->raid_failed[i])
++						continue;
++					kprintf("hammer2: RAID6 disk %d "
++						"(%s) marked failed; "
++						"operating in degraded "
++						"mode\n", i,
++						hmp->volumes[i].dev->path);
++					if (hmp->volumes[i].dev->open) {
++						vn_lock(hmp->volumes[i].dev->devvp,
++							LK_EXCLUSIVE |
++							LK_RETRY);
++						VOP_CLOSE(
++						    hmp->volumes[i].dev->devvp,
++						    FREAD | FWRITE, NULL);
++						vn_unlock(
++						    hmp->volumes[i].dev->devvp);
++						hmp->volumes[i].dev->open = 0;
++					}
++				}
++			}
++		}
++
+ 		/*
+ 		 * Really important to get these right or the flush and
+ 		 * teardown code will get confused.
+@@ -1362,6 +1424,7 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		hammer2_update_pmps(hmp);
  		hammer2_iocom_init(hmp);
  		hammer2_bulkfree_init(hmp);
@@ -2320,7 +2617,7 @@ index 0dfed0c4..3fa83afe 100644
  
  		/*
  		 * Ref the cluster management messaging descriptor.  The mount
-@@ -1835,6 +1848,13 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+@@ -1835,6 +1898,13 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
  
  	hammer2_pfsfree_scan(hmp, 1);
  
@@ -2334,3 +2631,1632 @@ index 0dfed0c4..3fa83afe 100644
  	KKASSERT(hmp->spmp == NULL);
  
  	/*
+diff --git a/sbin/hammer2/cmd_raid.c b/sbin/hammer2/cmd_raid.c
+new file mode 100644
+--- /dev/null
++++ b/sbin/hammer2/cmd_raid.c
+@@ -0,0 +1,     270 @@
++/*
++ * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name of The DragonFly Project nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific, prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include "hammer2.h"
++
++static const char *
++raid_disk_state_str(uint8_t state)
++{
++	switch (state) {
++	case HAMMER2_RAID6_DISK_ONLINE:
++		return "online";
++	case HAMMER2_RAID6_DISK_FAILED:
++		return "FAILED";
++	case HAMMER2_RAID6_DISK_REBUILDING:
++		return "rebuilding";
++	case HAMMER2_RAID6_DISK_SPARE:
++		return "spare";
++	default:
++		return "unknown";
++	}
++}
++
++/*
++ * Display RAID status for a HAMMER2 filesystem.
++ * Reads the volume header directly from the device to show the
++ * RAID configuration and disk states.
++ */
++static int
++cmd_raid_status(const char *devpath)
++{
++	hammer2_volume_data_t voldata;
++	hammer2_raid_config_t *rc;
++	int fd, i;
++
++	fd = open(devpath, O_RDONLY);
++	if (fd < 0) {
++		fprintf(stderr, "Cannot open %s: %s\n",
++			devpath, strerror(errno));
++		return 1;
++	}
++	if (hammer2_read_volume_header(fd, devpath, &voldata) < 0) {
++		fprintf(stderr, "Cannot read volume header from %s\n",
++			devpath);
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	if (voldata.version < HAMMER2_VOL_VERSION_RAID6) {
++		printf("Filesystem version %d does not support RAID\n",
++		       voldata.version);
++		return 0;
++	}
++
++	rc = &voldata.raid_config;
++	if (rc->raid_type == 0) {
++		printf("RAID type:       JBOD (no RAID)\n");
++		return 0;
++	}
++
++	printf("RAID type:       RAID %d\n", rc->raid_type);
++	printf("Total disks:     %d\n", rc->ndisks);
++	printf("Data disks:      %d\n", rc->ndata);
++	printf("Parity disks:    2 (P + Q)\n");
++	printf("Stripe unit:     %s (%jd bytes)\n",
++	       sizetostr(rc->stripe_unit), (intmax_t)rc->stripe_unit);
++	printf("Array size:      %s (%jd bytes)\n",
++	       sizetostr(rc->array_size), (intmax_t)rc->array_size);
++	printf("Flags:           0x%08x", rc->flags);
++	if (rc->flags & HAMMER2_RAID6_FLAG_DEGRADED)
++		printf(" DEGRADED");
++	if (rc->flags & HAMMER2_RAID6_FLAG_REBUILDING)
++		printf(" REBUILDING");
++	printf("\n");
++
++	printf("\nDisk states:\n");
++	for (i = 0; i < rc->ndisks; i++) {
++		printf("  disk %2d: %s\n", i,
++		       raid_disk_state_str(rc->disk_state[i]));
++	}
++
++	return 0;
++}
++
++/*
++ * Explicitly mark a RAID6 disk as failed.
++ * After this call the kernel stops submitting I/O to the device, so it
++ * can be detached (e.g. vnconfig -u) without EBUSY.
++ * The filesystem continues to operate in degraded mode.
++ */
++static int
++cmd_raid_fail_disk(const char *sel_path, const char *dev)
++{
++	hammer2_ioc_raid_fail_disk_t rfd;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rfd, sizeof(rfd));
++	snprintf(rfd.dev, sizeof(rfd.dev), "%s", dev);
++
++	if (ioctl(fd, HAMMER2IOC_RAID_FAIL_DISK, &rfd) < 0) {
++		fprintf(stderr, "raid fail-disk: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	printf("Disk %s (index %d) marked as failed.\n", dev, rfd.disk_idx);
++	printf("Filesystem is operating in degraded mode.\n");
++	printf("You may now detach the device, then run:\n");
++	printf("  hammer2 -s <mountpoint> raid replace %s <new_dev>\n", dev);
++	return 0;
++}
++
++/*
++ * Online resilver: replace a failed RAID6 disk with a new one.
++ * The filesystem must be mounted.  The ioctl reconstructs all data
++ * from surviving disks and parity, then atomically swaps in the new disk.
++ */
++static int
++cmd_raid_replace(const char *sel_path, const char *old_dev,
++		 const char *new_dev)
++{
++	hammer2_ioc_raid_replace_t rr;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rr, sizeof(rr));
++	snprintf(rr.old_dev, sizeof(rr.old_dev), "%s", old_dev);
++	snprintf(rr.new_dev, sizeof(rr.new_dev), "%s", new_dev);
++
++	if (ioctl(fd, HAMMER2IOC_RAID_REPLACE, &rr) < 0) {
++		fprintf(stderr, "raid replace: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	printf("Resilver complete: disk %s replaced by %s\n",
++	       old_dev, new_dev);
++	return 0;
++}
++
++/*
++ * Query resilver progress from the running kernel.
++ * Prints a single human-readable line; also suitable for polling from
++ * a Web UI (add -j for JSON output once needed).
++ */
++static int
++cmd_raid_resilver_status(const char *sel_path)
++{
++	hammer2_ioc_resilver_status_t rs;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rs, sizeof(rs));
++	if (ioctl(fd, HAMMER2IOC_RAID_RESILVER_STATUS, &rs) < 0) {
++		fprintf(stderr, "raid resilver-status: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	if (!rs.running) {
++		printf("resilver: idle (no resilver in progress)\n");
++	} else {
++		printf("resilver: disk %d  %llu / %llu stripes  %d%%\n",
++		       rs.disk_idx,
++		       (unsigned long long)rs.stripes_done,
++		       (unsigned long long)rs.stripes_total,
++		       rs.progress);
++	}
++	return 0;
++}
++
++/*
++ * Dispatch RAID subcommands.
++ */
++int
++cmd_raid(const char *sel_path, int ac, const char **av)
++{
++	if (ac < 1) {
++		fprintf(stderr,
++			"raid: missing subcommand\n"
++			"    raid status <devpath>           "
++				"Show RAID status\n"
++			"    raid fail-disk <dev>            "
++				"Mark a disk failed (degraded mode)\n"
++			"    raid replace <old> <new>        "
++				"Replace a failed disk (online resilver)\n"
++			"    raid resilver-status            "
++				"Query resilver progress\n");
++		return 1;
++	}
++
++	if (strcmp(av[0], "status") == 0) {
++		if (ac < 2) {
++			fprintf(stderr, "raid status: requires device path\n");
++			return 1;
++		}
++		return cmd_raid_status(av[1]);
++	} else if (strcmp(av[0], "fail-disk") == 0) {
++		if (ac < 2) {
++			fprintf(stderr, "raid fail-disk: requires <dev>\n");
++			return 1;
++		}
++		return cmd_raid_fail_disk(sel_path, av[1]);
++	} else if (strcmp(av[0], "replace") == 0) {
++		if (ac < 3) {
++			fprintf(stderr,
++				"raid replace: requires <old_dev> <new_dev>\n");
++			return 1;
++		}
++		return cmd_raid_replace(sel_path, av[1], av[2]);
++	} else if (strcmp(av[0], "resilver-status") == 0) {
++		return cmd_raid_resilver_status(sel_path);
++	} else {
++		fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
++		fprintf(stderr,
++			"    raid status <devpath>           "
++				"Show RAID status\n"
++			"    raid fail-disk <dev>            "
++				"Mark a disk failed (degraded mode)\n"
++			"    raid replace <old> <new>        "
++				"Replace a failed disk (online resilver)\n"
++			"    raid resilver-status            "
++				"Query resilver progress\n");
++		return 1;
++	}
++}
+diff --git a/sys/vfs/hammer2/hammer2_raid6.c b/sys/vfs/hammer2/hammer2_raid6.c
+new file mode 100644
+--- /dev/null
++++ b/sys/vfs/hammer2/hammer2_raid6.c
+@@ -0,0 +1,     331 @@
++/*
++ * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name of The DragonFly Project nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific, prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * HAMMER2 RAID 6 - GF(2^8) Arithmetic and Syndrome Operations
++ *
++ * Implements dual-parity (P+Q) RAID using Reed-Solomon coding in GF(2^8)
++ * with the irreducible polynomial x^8 + x^4 + x^3 + x^2 + 1 (0x11d).
++ *
++ * P = XOR of all data disks (same as RAID 5)
++ * Q = sum of (data[i] * 2^i) in GF(2^8)
++ *
++ * This allows recovery from any combination of up to 2 disk failures.
++ */
++
++#include "hammer2.h"
++#include "hammer2_raid6.h"
++
++/*
++ * GF(2^8) lookup tables - initialized by hammer2_raid6_init().
++ */
++uint8_t hammer2_gf_exp[256];		/* generator powers: 2^i mod poly */
++uint8_t hammer2_gf_log[256];		/* discrete logarithm base 2 */
++uint8_t hammer2_gf_inv[256];		/* multiplicative inverse */
++uint8_t hammer2_gf_mul_table[256][256];	/* full multiplication table */
++
++/*
++ * Initialize all GF(2^8) lookup tables.
++ * Must be called once at module load time.
++ */
++void
++hammer2_raid6_init(void)
++{
++	int i, j;
++	uint8_t x;
++
++	/*
++	 * Build exp and log tables.  The generator is 2.
++	 * exp[i] = 2^i in GF(2^8), log[exp[i]] = i.
++	 */
++	x = 1;
++	for (i = 0; i < 255; i++) {
++		hammer2_gf_exp[i] = x;
++		hammer2_gf_log[x] = (uint8_t)i;
++		x = hammer2_gf_mul2(x);
++	}
++	/* log[0] is undefined, set to 0 for safety */
++	hammer2_gf_log[0] = 0;
++	/* exp[255] wraps to exp[0] = 1 */
++	hammer2_gf_exp[255] = hammer2_gf_exp[0];
++
++	/*
++	 * Build inverse table.  inv[x] = x^254 = x^(-1) in GF(2^8).
++	 * Since the multiplicative group has order 255, x^255 = 1,
++	 * so x^(-1) = x^254 = 2^((log[x] * 254) mod 255).
++	 */
++	hammer2_gf_inv[0] = 0;	/* 0 has no inverse */
++	for (i = 1; i < 256; i++) {
++		/* inv[x] = exp[(255 - log[x]) % 255] */
++		hammer2_gf_inv[i] = hammer2_gf_exp[255 - hammer2_gf_log[i]];
++	}
++
++	/*
++	 * Build full multiplication table using exp/log.
++	 * mul[a][b] = exp[(log[a] + log[b]) % 255] for a,b != 0.
++	 */
++	for (i = 0; i < 256; i++) {
++		hammer2_gf_mul_table[i][0] = 0;
++		hammer2_gf_mul_table[0][i] = 0;
++	}
++	for (i = 1; i < 256; i++) {
++		for (j = 1; j < 256; j++) {
++			int log_sum = (int)hammer2_gf_log[i] +
++				      (int)hammer2_gf_log[j];
++			if (log_sum >= 255)
++				log_sum -= 255;
++			hammer2_gf_mul_table[i][j] =
++				hammer2_gf_exp[log_sum];
++		}
++	}
++}
++
++/*
++ * Generate P and Q syndromes for the given disk array.
++ *
++ * ptrs[0..ndisks-3] = data disk buffers
++ * ptrs[ndisks-2]    = P parity buffer (output)
++ * ptrs[ndisks-1]    = Q parity buffer (output)
++ *
++ * P = data[0] ^ data[1] ^ ... ^ data[ndata-1]
++ * Q = data[0]*2^0 ^ data[1]*2^1 ^ ... ^ data[ndata-1]*2^(ndata-1)
++ *   simplified using Horner's method (evaluate from highest to lowest):
++ * Q = (...((data[ndata-1] * 2) ^ data[ndata-2]) * 2 ^ ...) * 2 ^ data[0]
++ */
++void
++hammer2_raid6_gen_syndrome(int ndisks, size_t bytes, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	size_t d;
++	int z;
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t pv = 0;
++		uint8_t qv = 0;
++		for (z = 0; z < ndata; z++) {
++			uint8_t c = ((uint8_t **)ptrs)[z][d];
++			pv ^= c;
++			qv ^= hammer2_gf_mul(hammer2_gf_exp[z], c);
++		}
++		p[d] = pv;
++		q[d] = qv;
++	}
++}
++
++/*
++ * Recover two failed data disks using P and Q syndromes.
++ *
++ * faila < failb, both are data disk indices (0..ndata-1).
++ *
++ * Given:
++ *   P_ok = XOR of surviving data = P ^ data[faila] ^ data[failb]
++ *   Q_ok = Q syndrome of surviving data = Q ^ (data[faila]*2^faila)
++ *                                            ^ (data[failb]*2^failb)
++ *
++ * We need to solve:
++ *   data[faila] ^ data[failb] = P ^ P_ok           (equation from P)
++ *   data[faila]*2^faila ^ data[failb]*2^failb = Q ^ Q_ok  (equation from Q)
++ *
++ * Let A = data[faila], B = data[failb]:
++ *   A ^ B = Pxy
++ *   A*2^faila ^ B*2^failb = Qxy
++ *
++ * Multiply first equation by 2^faila:
++ *   A*2^faila ^ B*2^faila = Pxy*2^faila
++ * XOR with second equation:
++ *   B*(2^faila ^ 2^failb) = Pxy*2^faila ^ Qxy
++ *   B = (Pxy*2^faila ^ Qxy) / (2^faila ^ 2^failb)
++ *   A = Pxy ^ B
++ */
++void
++hammer2_raid6_2data_recov(int ndisks, size_t bytes,
++			  int faila, int failb, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	uint8_t *dpa, *dpb;
++	uint8_t coeff_a, coeff_b, coeff_diff_inv;
++	size_t d;
++	int z;
++
++	dpa = ptrs[faila];
++	dpb = ptrs[failb];
++
++	/* Precompute coefficients */
++	coeff_a = hammer2_gf_exp[faila];		/* 2^faila */
++	coeff_b = hammer2_gf_exp[failb];		/* 2^failb */
++	coeff_diff_inv = hammer2_gf_inv[coeff_a ^ coeff_b]; /* 1/(2^a ^ 2^b) */
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t Pxy, Qxy, B, A;
++
++		/*
++		 * Compute Pxy = P ^ XOR of all surviving data disks.
++		 * This equals data[faila] ^ data[failb].
++		 */
++		Pxy = p[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila && z != failb)
++				Pxy ^= ((uint8_t *)ptrs[z])[d];
++		}
++
++		/*
++		 * Compute Qxy = Q ^ syndrome of all surviving data disks.
++		 * This equals data[faila]*2^faila ^ data[failb]*2^failb.
++		 */
++		Qxy = q[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila && z != failb)
++				Qxy ^= hammer2_gf_mul(hammer2_gf_exp[z],
++						       ((uint8_t *)ptrs[z])[d]);
++		}
++
++		/*
++		 * Solve: B = (Pxy * 2^faila ^ Qxy) / (2^faila ^ 2^failb)
++		 *        A = Pxy ^ B
++		 */
++		B = hammer2_gf_mul(hammer2_gf_mul(Pxy, coeff_a) ^ Qxy,
++				   coeff_diff_inv);
++		A = Pxy ^ B;
++
++		dpa[d] = A;
++		dpb[d] = B;
++	}
++}
++
++/*
++ * Recover one failed data disk + P parity using Q.
++ *
++ * faila = failed data disk index (0..ndata-1).
++ * P is also bad/missing.
++ *
++ * From Q:
++ *   Q = sum(data[i]*2^i)
++ *   data[faila]*2^faila = Q ^ sum(surviving data[i]*2^i)
++ *   data[faila] = (Q ^ sum(surviving data[i]*2^i)) / 2^faila
++ *
++ * Then recompute P from all data disks.
++ */
++void
++hammer2_raid6_datap_recov(int ndisks, size_t bytes, int faila, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	uint8_t *dpa;
++	uint8_t coeff_inv;
++	size_t d;
++	int z;
++
++	dpa = ptrs[faila];
++	coeff_inv = hammer2_gf_inv[hammer2_gf_exp[faila]]; /* 1/2^faila */
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t Qx;
++
++		/* Compute Qx = Q ^ syndrome of surviving disks */
++		Qx = q[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila)
++				Qx ^= hammer2_gf_mul(hammer2_gf_exp[z],
++						      ((uint8_t *)ptrs[z])[d]);
++		}
++
++		/* data[faila] = Qx / 2^faila */
++		dpa[d] = hammer2_gf_mul(Qx, coeff_inv);
++	}
++
++	/* Recompute P from all data disks */
++	for (d = 0; d < bytes; d++) {
++		uint8_t pv = 0;
++		for (z = 0; z < ndata; z++)
++			pv ^= ((uint8_t *)ptrs[z])[d];
++		p[d] = pv;
++	}
++}
++
++/*
++ * Router: recover from 2 disk failures.
++ *
++ * faila, failb are physical disk indices (0..ndisks-1) with faila < failb.
++ * Dispatches to the appropriate recovery function based on which disks failed.
++ */
++void
++hammer2_raid6_dual_recov(int ndisks, size_t bytes,
++			 int faila, int failb, void **ptrs)
++{
++	int ndata = ndisks - 2;
++
++	if (faila >= ndata) {
++		/*
++		 * Both P and Q failed - just regenerate them.
++		 */
++		hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
++	} else if (failb >= ndata) {
++		if (failb == ndisks - 1) {
++			/*
++			 * One data disk + Q failed.
++			 * Recover data from P, then regenerate Q.
++			 *
++			 * data[faila] = P ^ XOR(surviving data)
++			 */
++			uint8_t *p = ptrs[ndisks - 2];
++			uint8_t *dpa = ptrs[faila];
++			size_t d;
++			int z;
++
++			for (d = 0; d < bytes; d++) {
++				uint8_t val = p[d];
++				for (z = 0; z < ndata; z++) {
++					if (z != faila)
++						val ^= ((uint8_t *)ptrs[z])[d];
++				}
++				dpa[d] = val;
++			}
++			/* Regenerate Q */
++			hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
++		} else {
++			/*
++			 * One data disk + P failed.
++			 * Recover data from Q, then regenerate P.
++			 */
++			hammer2_raid6_datap_recov(ndisks, bytes, faila, ptrs);
++		}
++	} else {
++		/*
++		 * Two data disks failed.
++		 */
++		hammer2_raid6_2data_recov(ndisks, bytes, faila, failb, ptrs);
++	}
++}
+diff --git a/sys/vfs/hammer2/hammer2_raid6.h b/sys/vfs/hammer2/hammer2_raid6.h
+new file mode 100644
+--- /dev/null
++++ b/sys/vfs/hammer2/hammer2_raid6.h
+@@ -0,0 +1,     116 @@
++/*
++ * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name of The DragonFly Project nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific, prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#ifndef _VFS_HAMMER2_RAID6_H_
++#define _VFS_HAMMER2_RAID6_H_
++
++/*
++ * HAMMER2 RAID 6 Support
++ *
++ * GF(2^8) arithmetic using polynomial x^8 + x^4 + x^3 + x^2 + 1
++ * (0x11d, reduction constant 0x1d).
++ *
++ * P parity = XOR of all data disks
++ * Q parity = Reed-Solomon syndrome using generator 2 in GF(2^8)
++ */
++
++#define HAMMER2_RAID6_POLY	0x1d	/* x^8+x^4+x^3+x^2+1 reduction */
++#define HAMMER2_RAID6_MIN_DISKS	4	/* minimum: 2 data + 2 parity */
++
++/*
++ * RAID 6 disk states
++ */
++#define HAMMER2_RAID6_DISK_ONLINE	0
++#define HAMMER2_RAID6_DISK_FAILED	1
++#define HAMMER2_RAID6_DISK_REBUILDING	2
++#define HAMMER2_RAID6_DISK_SPARE	3
++
++/*
++ * RAID 6 array flags
++ */
++#define HAMMER2_RAID6_FLAG_DEGRADED	0x0001
++#define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
++
++/*
++ * GF(2^8) lookup tables.
++ */
++extern uint8_t hammer2_gf_exp[256];
++extern uint8_t hammer2_gf_log[256];
++extern uint8_t hammer2_gf_inv[256];
++extern uint8_t hammer2_gf_mul_table[256][256];
++
++/*
++ * Inline GF(2^8) multiply by 2 (generator).
++ */
++static __inline uint8_t
++hammer2_gf_mul2(uint8_t x)
++{
++	return (x << 1) ^ ((x & 0x80) ? HAMMER2_RAID6_POLY : 0);
++}
++
++/*
++ * Inline GF(2^8) multiply using table.
++ */
++static __inline uint8_t
++hammer2_gf_mul(uint8_t a, uint8_t b)
++{
++	return hammer2_gf_mul_table[a][b];
++}
++
++/*
++ * Inline GF(2^8) division using table + inverse.
++ */
++static __inline uint8_t
++hammer2_gf_div(uint8_t a, uint8_t b)
++{
++	return hammer2_gf_mul_table[a][hammer2_gf_inv[b]];
++}
++
++/*
++ * Inline GF(2^8) power using exp/log tables.
++ */
++static __inline uint8_t
++hammer2_gf_pow(uint8_t base, uint8_t exp)
++{
++	int log_base;
++
++	if (base == 0)
++		return 0;
++	log_base = hammer2_gf_log[base];
++	return hammer2_gf_exp[((int)log_base * exp) % 255];
++}
++
++/*
++ * Function prototypes are declared in hammer2.h (which all kernel
++ * files include) to avoid redundant-declaration warnings.
++ */
++
++#endif /* !_VFS_HAMMER2_RAID6_H_ */
+diff --git a/sys/vfs/hammer2/test_raid6.c b/sys/vfs/hammer2/test_raid6.c
+new file mode 100644
+--- /dev/null
++++ b/sys/vfs/hammer2/test_raid6.c
+@@ -0,0 +1,     892 @@
++/*
++ * test_raid6.c — Standalone unit test for HAMMER2 GF(2^8) math and RAID 6
++ *                syndrome generation / recovery.
++ *
++ * Build:  cc -O2 -o test_raid6 test_raid6.c
++ * Run:    ./test_raid6
++ *
++ * This is a userspace test.  It includes the RAID 6 source directly
++ * with a minimal shim to avoid kernel headers.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include <assert.h>
++#include <time.h>
++
++/* Shim: hammer2_raid6.c includes "hammer2.h" which is kernel-only.
++ * We provide just enough to satisfy the include.
++ */
++#define _HAMMER2_SHIM_
++#ifndef _HAMMER2_SHIM_DONE_
++#define _HAMMER2_SHIM_DONE_
++
++/* Provide the hammer2.h include as a no-op by defining the guard */
++#define HAMMER2_H_
++
++/* hammer2_raid6.h needs uint8_t and __inline */
++#define __inline inline
++
++#endif /* _HAMMER2_SHIM_DONE_ */
++
++/* Now include the actual RAID 6 implementation directly */
++#include "hammer2_raid6.h"
++
++/* Paste the implementation — we redefine the include of hammer2.h */
++/* Instead of #include "hammer2.h", we already have stdint.h etc */
++
++/* ---- Inline the table definitions and functions from hammer2_raid6.c ---- */
++
++uint8_t hammer2_gf_exp[256];
++uint8_t hammer2_gf_log[256];
++uint8_t hammer2_gf_inv[256];
++uint8_t hammer2_gf_mul_table[256][256];
++
++void
++hammer2_raid6_init(void)
++{
++	int i, j;
++	uint8_t x;
++
++	x = 1;
++	for (i = 0; i < 255; i++) {
++		hammer2_gf_exp[i] = x;
++		hammer2_gf_log[x] = (uint8_t)i;
++		x = hammer2_gf_mul2(x);
++	}
++	hammer2_gf_log[0] = 0;
++	hammer2_gf_exp[255] = hammer2_gf_exp[0];
++
++	hammer2_gf_inv[0] = 0;
++	for (i = 1; i < 256; i++) {
++		hammer2_gf_inv[i] = hammer2_gf_exp[255 - hammer2_gf_log[i]];
++	}
++
++	for (i = 0; i < 256; i++) {
++		hammer2_gf_mul_table[i][0] = 0;
++		hammer2_gf_mul_table[0][i] = 0;
++	}
++	for (i = 1; i < 256; i++) {
++		for (j = 1; j < 256; j++) {
++			int log_sum = (int)hammer2_gf_log[i] +
++				      (int)hammer2_gf_log[j];
++			if (log_sum >= 255)
++				log_sum -= 255;
++			hammer2_gf_mul_table[i][j] =
++				hammer2_gf_exp[log_sum];
++		}
++	}
++}
++
++void
++hammer2_raid6_gen_syndrome(int ndisks, size_t bytes, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	uint8_t *dp;
++	size_t d;
++	int z;
++
++	dp = ptrs[ndata - 1];
++	for (d = 0; d < bytes; d++) {
++		p[d] = dp[d];
++		q[d] = dp[d];
++	}
++
++	for (z = ndata - 2; z >= 0; z--) {
++		dp = ptrs[z];
++		for (d = 0; d < bytes; d++) {
++			p[d] ^= dp[d];
++			q[d] = hammer2_gf_mul2(q[d]) ^ dp[d];
++		}
++	}
++}
++
++void
++hammer2_raid6_2data_recov(int ndisks, size_t bytes,
++			  int faila, int failb, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	uint8_t *dpa, *dpb;
++	uint8_t coeff_a, coeff_b, coeff_diff_inv;
++	size_t d;
++	int z;
++
++	dpa = ptrs[faila];
++	dpb = ptrs[failb];
++
++	coeff_a = hammer2_gf_exp[faila];
++	coeff_b = hammer2_gf_exp[failb];
++	coeff_diff_inv = hammer2_gf_inv[coeff_a ^ coeff_b];
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t Pxy, Qxy, B, A;
++
++		Pxy = p[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila && z != failb)
++				Pxy ^= ((uint8_t *)ptrs[z])[d];
++		}
++
++		Qxy = q[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila && z != failb)
++				Qxy ^= hammer2_gf_mul(hammer2_gf_exp[z],
++						       ((uint8_t *)ptrs[z])[d]);
++		}
++
++		B = hammer2_gf_mul(hammer2_gf_mul(Pxy, coeff_a) ^ Qxy,
++				   coeff_diff_inv);
++		A = Pxy ^ B;
++
++		dpa[d] = A;
++		dpb[d] = B;
++	}
++}
++
++void
++hammer2_raid6_datap_recov(int ndisks, size_t bytes, int faila, void **ptrs)
++{
++	int ndata = ndisks - 2;
++	uint8_t *p = ptrs[ndisks - 2];
++	uint8_t *q = ptrs[ndisks - 1];
++	uint8_t *dpa;
++	uint8_t coeff_inv;
++	size_t d;
++	int z;
++
++	dpa = ptrs[faila];
++	coeff_inv = hammer2_gf_inv[hammer2_gf_exp[faila]];
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t Qx;
++
++		Qx = q[d];
++		for (z = 0; z < ndata; z++) {
++			if (z != faila)
++				Qx ^= hammer2_gf_mul(hammer2_gf_exp[z],
++						      ((uint8_t *)ptrs[z])[d]);
++		}
++
++		dpa[d] = hammer2_gf_mul(Qx, coeff_inv);
++	}
++
++	for (d = 0; d < bytes; d++) {
++		uint8_t pv = 0;
++		for (z = 0; z < ndata; z++)
++			pv ^= ((uint8_t *)ptrs[z])[d];
++		p[d] = pv;
++	}
++}
++
++void
++hammer2_raid6_dual_recov(int ndisks, size_t bytes,
++			 int faila, int failb, void **ptrs)
++{
++	int ndata = ndisks - 2;
++
++	if (faila >= ndata) {
++		hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
++	} else if (failb >= ndata) {
++		if (failb == ndisks - 1) {
++			uint8_t *p = ptrs[ndisks - 2];
++			uint8_t *dpa = ptrs[faila];
++			size_t d;
++			int z;
++
++			for (d = 0; d < bytes; d++) {
++				uint8_t val = p[d];
++				for (z = 0; z < ndata; z++) {
++					if (z != faila)
++						val ^= ((uint8_t *)ptrs[z])[d];
++				}
++				dpa[d] = val;
++			}
++			hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
++		} else {
++			hammer2_raid6_datap_recov(ndisks, bytes, faila, ptrs);
++		}
++	} else {
++		hammer2_raid6_2data_recov(ndisks, bytes, faila, failb, ptrs);
++	}
++}
++
++/* ===== Test infrastructure ===== */
++
++static int tests_run = 0;
++static int tests_passed = 0;
++static int tests_failed = 0;
++
++#define TEST_BLOCK_SIZE	4096	/* test with 4KB blocks */
++
++#define CHECK(cond, fmt, ...) do {					\
++	tests_run++;							\
++	if (!(cond)) {							\
++		printf("FAIL: " fmt "\n", ##__VA_ARGS__);		\
++		tests_failed++;						\
++	} else {							\
++		tests_passed++;						\
++	}								\
++} while (0)
++
++/*
++ * Fill buffer with pseudo-random data seeded by disk index + stripe.
++ */
++static void
++fill_random(uint8_t *buf, size_t len, unsigned int seed)
++{
++	unsigned int state = seed ^ 0xdeadbeef;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		state = state * 1103515245 + 12345;
++		buf[i] = (uint8_t)(state >> 16);
++	}
++}
++
++/* ===== Test 1: GF(2^8) field properties ===== */
++static void
++test_gf_field_properties(void)
++{
++	int a, b, c;
++
++	printf("  Test 1: GF(2^8) field properties\n");
++
++	/* Identity: a * 1 = a */
++	for (a = 0; a < 256; a++) {
++		CHECK(hammer2_gf_mul(a, 1) == a,
++		    "mul identity: %d * 1 = %d (expected %d)",
++		    a, hammer2_gf_mul(a, 1), a);
++	}
++
++	/* Zero: a * 0 = 0 */
++	for (a = 0; a < 256; a++) {
++		CHECK(hammer2_gf_mul(a, 0) == 0,
++		    "mul zero: %d * 0 = %d",
++		    a, hammer2_gf_mul(a, 0));
++	}
++
++	/* Commutativity: a * b = b * a */
++	for (a = 0; a < 256; a++) {
++		for (b = 0; b < 256; b++) {
++			CHECK(hammer2_gf_mul(a, b) == hammer2_gf_mul(b, a),
++			    "commutativity: %d*%d=%d, %d*%d=%d",
++			    a, b, hammer2_gf_mul(a, b),
++			    b, a, hammer2_gf_mul(b, a));
++		}
++	}
++
++	/* Inverse: a * inv(a) = 1 for all a != 0 */
++	for (a = 1; a < 256; a++) {
++		uint8_t inv = hammer2_gf_inv[a];
++		CHECK(hammer2_gf_mul(a, inv) == 1,
++		    "inverse: %d * inv(%d)=%d = %d (expected 1)",
++		    a, a, inv, hammer2_gf_mul(a, inv));
++	}
++
++	/* Division: (a * b) / b = a for all b != 0 */
++	for (a = 0; a < 256; a++) {
++		for (b = 1; b < 256; b++) {
++			uint8_t prod = hammer2_gf_mul(a, b);
++			CHECK(hammer2_gf_div(prod, b) == a,
++			    "division: (%d*%d)/%d = %d (expected %d)",
++			    a, b, b, hammer2_gf_div(prod, b), a);
++		}
++	}
++
++	/* mul2 consistency: mul2(a) = mul_table[a][2] */
++	for (a = 0; a < 256; a++) {
++		CHECK(hammer2_gf_mul2(a) == hammer2_gf_mul(a, 2),
++		    "mul2 consistency: mul2(%d)=%d, table=%d",
++		    a, hammer2_gf_mul2(a), hammer2_gf_mul(a, 2));
++	}
++
++	/* Associativity (spot check): (a*b)*c = a*(b*c) */
++	for (a = 0; a < 256; a += 17) {
++		for (b = 0; b < 256; b += 19) {
++			for (c = 0; c < 256; c += 23) {
++				uint8_t ab_c = hammer2_gf_mul(
++				    hammer2_gf_mul(a, b), c);
++				uint8_t a_bc = hammer2_gf_mul(
++				    a, hammer2_gf_mul(b, c));
++				CHECK(ab_c == a_bc,
++				    "assoc: (%d*%d)*%d=%d, %d*(%d*%d)=%d",
++				    a, b, c, ab_c, a, b, c, a_bc);
++			}
++		}
++	}
++
++	/* Exp/log consistency: exp[log[a]] = a for a != 0 */
++	for (a = 1; a < 256; a++) {
++		CHECK(hammer2_gf_exp[hammer2_gf_log[a]] == a,
++		    "exp/log: exp[log[%d]] = %d",
++		    a, hammer2_gf_exp[hammer2_gf_log[a]]);
++	}
++
++	/* Power: gf_pow(2, i) = gf_exp[i] for i < 255 */
++	for (a = 0; a < 255; a++) {
++		CHECK(hammer2_gf_pow(2, a) == hammer2_gf_exp[a],
++		    "pow: pow(2,%d)=%d, exp[%d]=%d",
++		    a, hammer2_gf_pow(2, a), a, hammer2_gf_exp[a]);
++	}
++
++	/* Generator order: 2^255 = 1 (wraps) */
++	{
++		uint8_t x = 1;
++		int i;
++		for (i = 0; i < 255; i++)
++			x = hammer2_gf_mul2(x);
++		CHECK(x == 1, "generator order: 2^255 = %d (expected 1)", x);
++	}
++
++	printf("    Field properties: %d tests\n", tests_run);
++}
++
++/* ===== Test 2: Syndrome generation ===== */
++static void
++test_syndrome_generation(void)
++{
++	int ndisks, ndata;
++	int prev = tests_run;
++
++	printf("  Test 2: Syndrome generation\n");
++
++	/*
++	 * Test with 4..8 total disks.
++	 * Verify P = XOR of all data, Q matches manual computation.
++	 */
++	for (ndisks = 4; ndisks <= 8; ndisks++) {
++		uint8_t *bufs[8];
++		void *ptrs[8];
++		uint8_t *p_verify, *q_verify;
++		size_t d;
++		int i, z;
++
++		ndata = ndisks - 2;
++
++		/* Allocate and fill data disks */
++		for (i = 0; i < ndisks; i++) {
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		for (i = 0; i < ndata; i++)
++			fill_random(bufs[i], TEST_BLOCK_SIZE, i * 1000 + ndisks);
++		/* P and Q will be computed */
++		memset(bufs[ndisks - 2], 0, TEST_BLOCK_SIZE);
++		memset(bufs[ndisks - 1], 0, TEST_BLOCK_SIZE);
++
++		/* Generate syndromes */
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++
++		/* Verify P = XOR of all data disks */
++		p_verify = calloc(1, TEST_BLOCK_SIZE);
++		for (i = 0; i < ndata; i++) {
++			for (d = 0; d < TEST_BLOCK_SIZE; d++)
++				p_verify[d] ^= bufs[i][d];
++		}
++		CHECK(memcmp(bufs[ndisks - 2], p_verify, TEST_BLOCK_SIZE) == 0,
++		    "P parity mismatch for ndisks=%d", ndisks);
++
++		/* Verify Q = sum(data[i] * 2^i) */
++		q_verify = calloc(1, TEST_BLOCK_SIZE);
++		for (i = 0; i < ndata; i++) {
++			for (d = 0; d < TEST_BLOCK_SIZE; d++) {
++				q_verify[d] ^= hammer2_gf_mul(
++				    hammer2_gf_exp[i], bufs[i][d]);
++			}
++		}
++		CHECK(memcmp(bufs[ndisks - 1], q_verify, TEST_BLOCK_SIZE) == 0,
++		    "Q parity mismatch for ndisks=%d", ndisks);
++
++		free(p_verify);
++		free(q_verify);
++		for (i = 0; i < ndisks; i++)
++			free(bufs[i]);
++	}
++
++	printf("    Syndrome generation: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 3: Two data disk recovery ===== */
++static void
++test_2data_recovery(void)
++{
++	int ndisks, ndata;
++	int prev = tests_run;
++
++	printf("  Test 3: Two data disk recovery (all combinations)\n");
++
++	for (ndisks = 4; ndisks <= 8; ndisks++) {
++		uint8_t *orig[8];
++		uint8_t *bufs[8];
++		void *ptrs[8];
++		int i, fa, fb;
++
++		ndata = ndisks - 2;
++
++		/* Allocate original data and working copies */
++		for (i = 0; i < ndisks; i++) {
++			orig[i] = malloc(TEST_BLOCK_SIZE);
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		for (i = 0; i < ndata; i++)
++			fill_random(orig[i], TEST_BLOCK_SIZE, i * 7 + ndisks * 13);
++
++		/* Generate reference P and Q */
++		for (i = 0; i < ndisks; i++)
++			memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++		/* Save computed P and Q as original */
++		memcpy(orig[ndisks - 2], bufs[ndisks - 2], TEST_BLOCK_SIZE);
++		memcpy(orig[ndisks - 1], bufs[ndisks - 1], TEST_BLOCK_SIZE);
++
++		/* Test every pair of data disk failures */
++		for (fa = 0; fa < ndata; fa++) {
++			for (fb = fa + 1; fb < ndata; fb++) {
++				/* Restore all disks */
++				for (i = 0; i < ndisks; i++)
++					memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++
++				/* Zero out failed disks */
++				memset(bufs[fa], 0, TEST_BLOCK_SIZE);
++				memset(bufs[fb], 0, TEST_BLOCK_SIZE);
++
++				/* Recover */
++				hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE,
++				    fa, fb, ptrs);
++
++				CHECK(memcmp(bufs[fa], orig[fa], TEST_BLOCK_SIZE) == 0,
++				    "2data recovery disk %d failed (ndisks=%d, fail=%d,%d)",
++				    fa, ndisks, fa, fb);
++				CHECK(memcmp(bufs[fb], orig[fb], TEST_BLOCK_SIZE) == 0,
++				    "2data recovery disk %d failed (ndisks=%d, fail=%d,%d)",
++				    fb, ndisks, fa, fb);
++			}
++		}
++
++		for (i = 0; i < ndisks; i++) {
++			free(orig[i]);
++			free(bufs[i]);
++		}
++	}
++
++	printf("    2-data recovery: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 4: Data + P recovery ===== */
++static void
++test_datap_recovery(void)
++{
++	int ndisks, ndata;
++	int prev = tests_run;
++
++	printf("  Test 4: Data + P parity recovery\n");
++
++	for (ndisks = 4; ndisks <= 8; ndisks++) {
++		uint8_t *orig[8];
++		uint8_t *bufs[8];
++		void *ptrs[8];
++		int i, fa;
++
++		ndata = ndisks - 2;
++
++		for (i = 0; i < ndisks; i++) {
++			orig[i] = malloc(TEST_BLOCK_SIZE);
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		for (i = 0; i < ndata; i++)
++			fill_random(orig[i], TEST_BLOCK_SIZE, i * 31 + ndisks * 97);
++
++		for (i = 0; i < ndisks; i++)
++			memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++		memcpy(orig[ndisks - 2], bufs[ndisks - 2], TEST_BLOCK_SIZE);
++		memcpy(orig[ndisks - 1], bufs[ndisks - 1], TEST_BLOCK_SIZE);
++
++		/* Fail each data disk + P */
++		for (fa = 0; fa < ndata; fa++) {
++			int p_idx = ndisks - 2;
++
++			for (i = 0; i < ndisks; i++)
++				memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++
++			memset(bufs[fa], 0, TEST_BLOCK_SIZE);
++			memset(bufs[p_idx], 0, TEST_BLOCK_SIZE);
++
++			hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE,
++			    fa, p_idx, ptrs);
++
++			CHECK(memcmp(bufs[fa], orig[fa], TEST_BLOCK_SIZE) == 0,
++			    "data+P recovery disk %d failed (ndisks=%d)",
++			    fa, ndisks);
++			CHECK(memcmp(bufs[p_idx], orig[p_idx], TEST_BLOCK_SIZE) == 0,
++			    "data+P recovery P failed (ndisks=%d, data fail=%d)",
++			    ndisks, fa);
++		}
++
++		for (i = 0; i < ndisks; i++) {
++			free(orig[i]);
++			free(bufs[i]);
++		}
++	}
++
++	printf("    Data+P recovery: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 5: Data + Q recovery ===== */
++static void
++test_dataq_recovery(void)
++{
++	int ndisks, ndata;
++	int prev = tests_run;
++
++	printf("  Test 5: Data + Q parity recovery\n");
++
++	for (ndisks = 4; ndisks <= 8; ndisks++) {
++		uint8_t *orig[8];
++		uint8_t *bufs[8];
++		void *ptrs[8];
++		int i, fa;
++
++		ndata = ndisks - 2;
++
++		for (i = 0; i < ndisks; i++) {
++			orig[i] = malloc(TEST_BLOCK_SIZE);
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		for (i = 0; i < ndata; i++)
++			fill_random(orig[i], TEST_BLOCK_SIZE, i * 41 + ndisks * 53);
++
++		for (i = 0; i < ndisks; i++)
++			memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++		memcpy(orig[ndisks - 2], bufs[ndisks - 2], TEST_BLOCK_SIZE);
++		memcpy(orig[ndisks - 1], bufs[ndisks - 1], TEST_BLOCK_SIZE);
++
++		/* Fail each data disk + Q */
++		for (fa = 0; fa < ndata; fa++) {
++			int q_idx = ndisks - 1;
++
++			for (i = 0; i < ndisks; i++)
++				memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++
++			memset(bufs[fa], 0, TEST_BLOCK_SIZE);
++			memset(bufs[q_idx], 0, TEST_BLOCK_SIZE);
++
++			hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE,
++			    fa, q_idx, ptrs);
++
++			CHECK(memcmp(bufs[fa], orig[fa], TEST_BLOCK_SIZE) == 0,
++			    "data+Q recovery disk %d failed (ndisks=%d)",
++			    fa, ndisks);
++			CHECK(memcmp(bufs[q_idx], orig[q_idx], TEST_BLOCK_SIZE) == 0,
++			    "data+Q recovery Q failed (ndisks=%d, data fail=%d)",
++			    ndisks, fa);
++		}
++
++		for (i = 0; i < ndisks; i++) {
++			free(orig[i]);
++			free(bufs[i]);
++		}
++	}
++
++	printf("    Data+Q recovery: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 6: P + Q recovery (both parity) ===== */
++static void
++test_pq_recovery(void)
++{
++	int ndisks, ndata;
++	int prev = tests_run;
++
++	printf("  Test 6: P + Q parity recovery (regenerate)\n");
++
++	for (ndisks = 4; ndisks <= 8; ndisks++) {
++		uint8_t *orig[8];
++		uint8_t *bufs[8];
++		void *ptrs[8];
++		int i;
++
++		ndata = ndisks - 2;
++
++		for (i = 0; i < ndisks; i++) {
++			orig[i] = malloc(TEST_BLOCK_SIZE);
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		for (i = 0; i < ndata; i++)
++			fill_random(orig[i], TEST_BLOCK_SIZE, i * 61 + ndisks * 71);
++
++		for (i = 0; i < ndisks; i++)
++			memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++		memcpy(orig[ndisks - 2], bufs[ndisks - 2], TEST_BLOCK_SIZE);
++		memcpy(orig[ndisks - 1], bufs[ndisks - 1], TEST_BLOCK_SIZE);
++
++		/* Zero out both P and Q */
++		memset(bufs[ndisks - 2], 0, TEST_BLOCK_SIZE);
++		memset(bufs[ndisks - 1], 0, TEST_BLOCK_SIZE);
++
++		hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE,
++		    ndisks - 2, ndisks - 1, ptrs);
++
++		CHECK(memcmp(bufs[ndisks - 2], orig[ndisks - 2], TEST_BLOCK_SIZE) == 0,
++		    "P+Q recovery P failed (ndisks=%d)", ndisks);
++		CHECK(memcmp(bufs[ndisks - 1], orig[ndisks - 1], TEST_BLOCK_SIZE) == 0,
++		    "P+Q recovery Q failed (ndisks=%d)", ndisks);
++
++		for (i = 0; i < ndisks; i++) {
++			free(orig[i]);
++			free(bufs[i]);
++		}
++	}
++
++	printf("    P+Q recovery: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 7: Edge cases ===== */
++static void
++test_edge_cases(void)
++{
++	int prev = tests_run;
++
++	printf("  Test 7: Edge cases\n");
++
++	/* All-zero data */
++	{
++		int ndisks = 4;
++		uint8_t *bufs[4];
++		void *ptrs[4];
++		int i;
++
++		for (i = 0; i < ndisks; i++) {
++			bufs[i] = calloc(1, TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++
++		/* P and Q of all-zero data should be all zeros */
++		{
++			uint8_t *zero = calloc(1, TEST_BLOCK_SIZE);
++			CHECK(memcmp(bufs[2], zero, TEST_BLOCK_SIZE) == 0,
++			    "all-zero data: P not zero");
++			CHECK(memcmp(bufs[3], zero, TEST_BLOCK_SIZE) == 0,
++			    "all-zero data: Q not zero");
++			free(zero);
++		}
++
++		for (i = 0; i < ndisks; i++)
++			free(bufs[i]);
++	}
++
++	/* All-0xFF data */
++	{
++		int ndisks = 4;
++		uint8_t *bufs[4];
++		void *ptrs[4];
++		uint8_t *orig_p, *orig_q;
++		int i;
++
++		for (i = 0; i < ndisks; i++) {
++			bufs[i] = malloc(TEST_BLOCK_SIZE);
++			ptrs[i] = bufs[i];
++		}
++		memset(bufs[0], 0xFF, TEST_BLOCK_SIZE);
++		memset(bufs[1], 0xFF, TEST_BLOCK_SIZE);
++
++		hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++
++		/* P = 0xFF ^ 0xFF = 0x00 for 2 data disks */
++		{
++			size_t d;
++			int p_ok = 1;
++			for (d = 0; d < TEST_BLOCK_SIZE; d++) {
++				if (bufs[2][d] != 0x00) {
++					p_ok = 0;
++					break;
++				}
++			}
++			CHECK(p_ok, "all-0xFF P should be 0x00 for 2 data disks");
++		}
++
++		/* Save P, Q, then test recovery */
++		orig_p = malloc(TEST_BLOCK_SIZE);
++		orig_q = malloc(TEST_BLOCK_SIZE);
++		memcpy(orig_p, bufs[2], TEST_BLOCK_SIZE);
++		memcpy(orig_q, bufs[3], TEST_BLOCK_SIZE);
++
++		/* Fail both data disks */
++		memset(bufs[0], 0, TEST_BLOCK_SIZE);
++		memset(bufs[1], 0, TEST_BLOCK_SIZE);
++		hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE, 0, 1, ptrs);
++		{
++			uint8_t *ff = malloc(TEST_BLOCK_SIZE);
++			memset(ff, 0xFF, TEST_BLOCK_SIZE);
++			CHECK(memcmp(bufs[0], ff, TEST_BLOCK_SIZE) == 0,
++			    "all-0xFF recovery disk 0");
++			CHECK(memcmp(bufs[1], ff, TEST_BLOCK_SIZE) == 0,
++			    "all-0xFF recovery disk 1");
++			free(ff);
++		}
++
++		free(orig_p);
++		free(orig_q);
++		for (i = 0; i < ndisks; i++)
++			free(bufs[i]);
++	}
++
++	/* Single byte blocks */
++	{
++		int ndisks = 4;
++		uint8_t d0 = 0x42, d1 = 0x99;
++		uint8_t p, q;
++		uint8_t *bufs[4];
++		void *ptrs[4];
++		uint8_t orig0, orig1;
++
++		bufs[0] = &d0;
++		bufs[1] = &d1;
++		bufs[2] = &p;
++		bufs[3] = &q;
++		ptrs[0] = bufs[0]; ptrs[1] = bufs[1];
++		ptrs[2] = bufs[2]; ptrs[3] = bufs[3];
++
++		hammer2_raid6_gen_syndrome(4, 1, ptrs);
++
++		CHECK(p == (d0 ^ d1),
++		    "single byte P: got 0x%02x expected 0x%02x",
++		    p, d0 ^ d1);
++
++		/* Q = d0 * 2^0 ^ d1 * 2^1 = d0 ^ mul2(d1) */
++		CHECK(q == (d0 ^ hammer2_gf_mul2(d1)),
++		    "single byte Q: got 0x%02x expected 0x%02x",
++		    q, d0 ^ hammer2_gf_mul2(d1));
++
++		/* Recover from 2 data failures on single byte */
++		orig0 = d0;
++		orig1 = d1;
++		d0 = 0;
++		d1 = 0;
++		hammer2_raid6_dual_recov(4, 1, 0, 1, ptrs);
++		CHECK(d0 == orig0, "single byte recovery d0: got 0x%02x expected 0x%02x",
++		    d0, orig0);
++		CHECK(d1 == orig1, "single byte recovery d1: got 0x%02x expected 0x%02x",
++		    d1, orig1);
++	}
++
++	printf("    Edge cases: %d tests\n", tests_run - prev);
++}
++
++/* ===== Test 8: Large array (max disks) ===== */
++static void
++test_large_array(void)
++{
++	int ndisks = 16;	/* 14 data + 2 parity */
++	int ndata = ndisks - 2;
++	uint8_t *orig[16];
++	uint8_t *bufs[16];
++	void *ptrs[16];
++	int prev = tests_run;
++	int i, fa, fb;
++
++	printf("  Test 8: Large array (%d disks, all 2-failure combos)\n", ndisks);
++
++	for (i = 0; i < ndisks; i++) {
++		orig[i] = malloc(TEST_BLOCK_SIZE);
++		bufs[i] = malloc(TEST_BLOCK_SIZE);
++		ptrs[i] = bufs[i];
++	}
++	for (i = 0; i < ndata; i++)
++		fill_random(orig[i], TEST_BLOCK_SIZE, i * 137 + 42);
++
++	for (i = 0; i < ndisks; i++)
++		memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++	hammer2_raid6_gen_syndrome(ndisks, TEST_BLOCK_SIZE, ptrs);
++	memcpy(orig[ndisks - 2], bufs[ndisks - 2], TEST_BLOCK_SIZE);
++	memcpy(orig[ndisks - 1], bufs[ndisks - 1], TEST_BLOCK_SIZE);
++
++	/* Test all C(16,2) = 120 failure pairs */
++	for (fa = 0; fa < ndisks; fa++) {
++		for (fb = fa + 1; fb < ndisks; fb++) {
++			for (i = 0; i < ndisks; i++)
++				memcpy(bufs[i], orig[i], TEST_BLOCK_SIZE);
++
++			memset(bufs[fa], 0, TEST_BLOCK_SIZE);
++			memset(bufs[fb], 0, TEST_BLOCK_SIZE);
++
++			hammer2_raid6_dual_recov(ndisks, TEST_BLOCK_SIZE,
++			    fa, fb, ptrs);
++
++			CHECK(memcmp(bufs[fa], orig[fa], TEST_BLOCK_SIZE) == 0,
++			    "large array recovery disk %d (fail %d,%d)",
++			    fa, fa, fb);
++			CHECK(memcmp(bufs[fb], orig[fb], TEST_BLOCK_SIZE) == 0,
++			    "large array recovery disk %d (fail %d,%d)",
++			    fb, fa, fb);
++		}
++	}
++
++	for (i = 0; i < ndisks; i++) {
++		free(orig[i]);
++		free(bufs[i]);
++	}
++
++	printf("    Large array: %d tests (%d failure combinations)\n",
++	    tests_run - prev, ndisks * (ndisks - 1) / 2);
++}
++
++/* ===== Main ===== */
++int
++main(int argc, char **argv)
++{
++	clock_t start, end;
++
++	printf("HAMMER2 RAID 6 GF(2^8) Unit Tests\n");
++	printf("==================================\n\n");
++
++	printf("Initializing GF(2^8) tables...\n");
++	start = clock();
++	hammer2_raid6_init();
++	end = clock();
++	printf("  Table init: %.3f ms\n\n",
++	    (double)(end - start) / CLOCKS_PER_SEC * 1000.0);
++
++	printf("Running tests (block size = %d bytes):\n\n", TEST_BLOCK_SIZE);
++
++	test_gf_field_properties();
++	printf("\n");
++	test_syndrome_generation();
++	printf("\n");
++	test_2data_recovery();
++	printf("\n");
++	test_datap_recovery();
++	printf("\n");
++	test_dataq_recovery();
++	printf("\n");
++	test_pq_recovery();
++	printf("\n");
++	test_edge_cases();
++	printf("\n");
++	test_large_array();
++
++	printf("\n==================================\n");
++	printf("Results: %d passed, %d failed, %d total\n",
++	    tests_passed, tests_failed, tests_run);
++
++	if (tests_failed > 0) {
++		printf("SOME TESTS FAILED\n");
++		return 1;
++	}
++	printf("ALL TESTS PASSED\n");
++	return 0;
++}
