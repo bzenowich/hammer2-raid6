@@ -51,20 +51,28 @@ umount $MNTPT
 echo "Base setup done."
 
 # =============================================================
-# Scenario 1: Mount with device not configured at all
+# Scenario 1: Mount with device not configured (degraded mount)
 # =============================================================
 echo ""
-echo "--- Scenario 1: mount with vn2 not configured ---"
+echo "--- Scenario 1: mount with vn2 not configured (degraded) ---"
 
 # Unconfigure vn2 entirely (no disk image behind it)
 vnconfig -u vn2 2>/dev/null || true
 
-# Attempt mount — expect failure
+# Attempt mount — should succeed in degraded mode
 if mount -t hammer2 $PFSPATH $MNTPT 2>/dev/null; then
-    result FAIL "mount should have failed with vn2 unconfigured but succeeded"
-    umount $MNTPT 2>/dev/null || true
+    result PASS "mount succeeded in degraded mode (vn2 not configured)"
+
+    # Verify data is readable
+    sha256 $MNTPT/testfile > /var/tmp/test_h_check1.txt
+    if diff -q /var/tmp/test_h_sha.txt /var/tmp/test_h_check1.txt > /dev/null 2>&1; then
+        result PASS "data readable in degraded mode (scenario 1)"
+    else
+        result FAIL "data not readable in degraded mode (scenario 1)"
+    fi
+    umount $MNTPT
 else
-    result PASS "mount correctly refused with vn2 unconfigured"
+    result FAIL "mount failed with vn2 not configured (degraded mount)"
 fi
 
 # Restore vn2

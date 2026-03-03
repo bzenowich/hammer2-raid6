@@ -1493,40 +1493,22 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		struct buf *bp;
 		int vol_error = 0;
-		struct vnode *voldevvp;
+		int have_open_dev = 0;
 
 		/*
-		 * Find a healthy device for volume header write.
-		 * hmp->devvp is always disk 0 which may be failed.
+		 * Check that at least one device is open.
 		 */
-		voldevvp = NULL;
 		TAILQ_FOREACH(e, &hmp->devvpl, entry) {
-			if (e->open) {
-				voldevvp = e->devvp;
+			if (e->open && e->devvp) {
+				have_open_dev = 1;
 				break;
 			}
 		}
-		if (voldevvp == NULL)
+		if (!have_open_dev)
 			goto skip_volhdr;
 
 		/*
-		 * Synchronize the disk before flushing the volume
-		 * header.
-		 */
-		bp = getpbuf(NULL);
-		bp->b_bio1.bio_offset = 0;
-		bp->b_bufsize = 0;
-		bp->b_bcount = 0;
-		bp->b_cmd = BUF_CMD_FLUSH;
-		bp->b_bio1.bio_done = biodone_sync;
-		bp->b_bio1.bio_flags |= BIO_SYNC;
-		vn_strategy(voldevvp, &bp->b_bio1);
-		fsync_error = biowait(&bp->b_bio1, "h2vol");
-		relpbuf(bp, NULL);
-
-		/*
-		 * Then we can safely flush the version of the
-		 * volume header synchronized by the flush code.
+		 * Compute the next volume header zone number.
 		 */
 		j = hmp->volhdrno + 1;
 		if (j < 0)
@@ -1542,16 +1524,86 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			kprintf("sync volhdr %d %jd\n",
 				j, (intmax_t)hmp->volsync.volu_size);
 		}
-		bp = getblk(voldevvp, j * HAMMER2_ZONE_BYTES64,
-			    HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+
 		atomic_clear_int(&hmp->vchain.flags,
 				 HAMMER2_CHAIN_VOLUMESYNC);
-		bkvasync(bp);
-		bcopy(&hmp->volsync, bp->b_data, HAMMER2_PBUFSIZE);
-		vol_error = bwrite(bp);
+
+		/*
+		 * Write the volume header to ALL open devices.
+		 * This ensures RAID config changes (DEGRADED flag,
+		 * disk_state) propagate to all surviving disks on
+		 * every sync, so remounting from any disk picks up
+		 * the latest state.
+		 */
+		TAILQ_FOREACH(e, &hmp->devvpl, entry) {
+			if (!e->open || e->devvp == NULL)
+				continue;
+
+			/*
+			 * Synchronize the disk before flushing the
+			 * volume header.
+			 */
+			bp = getpbuf(NULL);
+			bp->b_bio1.bio_offset = 0;
+			bp->b_bufsize = 0;
+			bp->b_bcount = 0;
+			bp->b_cmd = BUF_CMD_FLUSH;
+			bp->b_bio1.bio_done = biodone_sync;
+			bp->b_bio1.bio_flags |= BIO_SYNC;
+			vn_strategy(e->devvp, &bp->b_bio1);
+			vol_error = biowait(&bp->b_bio1, "h2vol");
+			relpbuf(bp, NULL);
+
+			if (vol_error) {
+				fsync_error = vol_error;
+				continue;
+			}
+
+			/*
+			 * Write the volume header.
+			 */
+			bp = getblk(e->devvp,
+				    j * HAMMER2_ZONE_BYTES64,
+				    HAMMER2_PBUFSIZE,
+				    GETBLK_KVABIO, 0);
+			bkvasync(bp);
+			bcopy(&hmp->volsync, bp->b_data,
+			      HAMMER2_PBUFSIZE);
+			/*
+			 * Each disk must retain its own volu_id.
+			 * volsync has the root volume's id (0),
+			 * so fix up the copy for non-root disks
+			 * and recalculate the CRCs.
+			 */
+			{
+				hammer2_volume_data_t *vd;
+				int vi;
+
+				vd = (hammer2_volume_data_t *)bp->b_data;
+				for (vi = 0; vi < hmp->nvolumes; vi++) {
+					if (hmp->volumes[vi].dev == e) {
+						if (vd->volu_id != vi) {
+							vd->volu_id = vi;
+							vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0] =
+							    hammer2_icrc32(
+								(char *)vd +
+								HAMMER2_VOLUME_ICRC0_OFF,
+								HAMMER2_VOLUME_ICRC0_SIZE);
+							vd->icrc_volheader =
+							    hammer2_icrc32(
+								(char *)vd +
+								HAMMER2_VOLUME_ICRCVH_OFF,
+								HAMMER2_VOLUME_ICRCVH_SIZE);
+						}
+						break;
+					}
+				}
+			}
+			vol_error = bwrite(bp);
+			if (vol_error)
+				fsync_error = vol_error;
+		}
 		hmp->volhdrno = j;
-		if (vol_error)
-			fsync_error = vol_error;
 skip_volhdr:
 		;
 	}

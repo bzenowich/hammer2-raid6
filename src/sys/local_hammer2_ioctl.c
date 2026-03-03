@@ -1485,7 +1485,8 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 
 	/* Find which disk index matches old_dev */
 	for (i = 0; i < hmp->nvolumes; i++) {
-		if (hmp->volumes[i].dev->path &&
+		if (hmp->volumes[i].dev &&
+		    hmp->volumes[i].dev->path &&
 		    strcmp(hmp->volumes[i].dev->path, rr->old_dev) == 0) {
 			failed_disk_idx = i;
 			break;
@@ -1619,7 +1620,8 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 	rfd->dev[sizeof(rfd->dev) - 1] = 0;
 
 	for (i = 0; i < hmp->nvolumes; i++) {
-		if (hmp->volumes[i].dev->path == NULL)
+		if (hmp->volumes[i].dev == NULL ||
+		    hmp->volumes[i].dev->path == NULL)
 			continue;
 		if (strcmp(hmp->volumes[i].dev->path, rfd->dev) != 0)
 			continue;

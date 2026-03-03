@@ -1086,10 +1086,13 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
 				int devvp_found = 0;
 				TAILQ_FOREACH(e, &devvpl, entry) {
-					KKASSERT(e->devvp);
+					/* Skip absent devices (dummy vnodes) */
+					if (e->devvp->v_rdev == NULL)
+						continue;
 					if (e_tmp->devvp == e->devvp)
 						devvp_found = 1;
-					if (e_tmp->devvp->v_rdev &&
+					if (e_tmp->devvp &&
+					    e_tmp->devvp->v_rdev &&
 					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
 						devvp_found = 1;
 				}
@@ -1110,7 +1113,9 @@ next_hmp:
 		if (hmp == NULL) {
 			TAILQ_FOREACH(e, &devvpl, entry) {
 				struct vnode *devvp = e->devvp;
-				KKASSERT(devvp);
+				/* Skip absent devices (dummy vnodes) */
+				if (devvp->v_rdev == NULL)
+					continue;
 				error = vfs_mountedon(devvp);
 				if (error) {
 					kprintf("hammer2_mount: %s mounted %d\n",
@@ -1271,6 +1276,23 @@ next_hmp:
 					hmp->raid_nfailed++;
 				}
 			}
+
+			/*
+			 * Mark any absent disks (device unavailable at
+			 * mount time) as failed.  This handles degraded
+			 * mounts where a disk has been physically removed
+			 * or detached.
+			 */
+			for (i = 0; i < hmp->nvolumes; i++) {
+				if (hmp->volumes[i].dev == NULL ||
+				    hmp->volumes[i].dev->devvp == NULL ||
+				    !hmp->volumes[i].dev->open) {
+					if (!hmp->raid_failed[i]) {
+						hmp->raid_failed[i] = 1;
+						hmp->raid_nfailed++;
+					}
+				}
+			}
 		} else if (hmp->voldata.version >=
 			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
 			hmp->nvolumes = hmp->voldata.nvolumes;
@@ -1312,8 +1334,12 @@ next_hmp:
 						"(%s) marked failed; "
 						"operating in degraded "
 						"mode\n", i,
-						hmp->volumes[i].dev->path);
-					if (hmp->volumes[i].dev->open) {
+						hmp->volumes[i].dev ?
+						    hmp->volumes[i].dev->path :
+						    "(absent)");
+					if (hmp->volumes[i].dev &&
+					    hmp->volumes[i].dev->devvp &&
+					    hmp->volumes[i].dev->open) {
 						vn_lock(hmp->volumes[i].dev->devvp,
 							LK_EXCLUSIVE |
 							LK_RETRY);

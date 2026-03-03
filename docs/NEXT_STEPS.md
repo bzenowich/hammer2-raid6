@@ -1,6 +1,51 @@
-# RAID6 Test Status — 2026-03-01
+# RAID6 Test Status — 2026-03-03
 
-## Completed This Session
+## Completed 2026-03-03
+
+### Degraded Mount Support
+Implemented mounting with 1-2 disks absent (physically removed / vnconfig -u):
+- `hammer2_init_devvp()`: dummy vnode placeholder when device node doesn't exist
+- `hammer2_open_devvp()`: tolerate VOP_OPEN failures for multi-device mounts
+- `hammer2_init_volumes()`: tolerate volume header read failures, assign absent entries to empty volume slots, fallback rootvoldevvp for absent root disk
+- `hammer2_verify_volumes_3()`: allow `nvolumes >= ndisks-2` for degraded RAID6
+- `hammer2_vfsops.c`: mark absent disks as failed at mount time, NULL-safe logging
+- `hammer2_flush.c`: write volume headers to ALL open disks (not just first), with per-disk volu_id fixup and CRC recalculation
+- `hammer2_ioctl.c`: NULL dev guards for absent volumes
+
+### Bug Fixed: volu_id Overwrite in Multi-Disk Volume Header Write
+The multi-disk volume header write was copying `hmp->volsync` (with `volu_id=0` from root volume) to all disks. After mount→sync→unmount, all disks had `volu_id=0`, causing "volume id 0 already initialized" on remount. Fixed by setting the correct `volu_id` per disk and recalculating SECT0 + volume header CRCs.
+
+### Test Results (2026-03-03)
+| Test | Result | Notes |
+|------|--------|-------|
+| Test H (mount missing) | **6/6 PASS** | Was 3/4 — now all 3 scenarios pass |
+| Combo test | **32/32 PASS** | No regressions |
+| Test L (snapshot/compression) | **18/18 PASS** | No regressions |
+| Test I (write during resilver) | 1/3 PASS | Pre-existing resilver bug |
+| Test J (unclean unmount) | Panic | Indirect block CHECK FAIL in degraded flush |
+
+## Remaining Issues
+
+### Issue 1: CHECK FAIL on Indirect Blocks During Degraded Flush (Test J panic)
+**Symptom**: After `fail-disk` + writing large files (>= 8MB, enough to require indirect blocks) + sync, the flush reads an indirect block via degraded reconstruction and gets a CRC mismatch. This cascades into:
+```
+chain 000000000900800c.02 (indirect) meth=30 CHECK FAIL
+CHILD ERROR DURING FLUSH LOCK
+panic: assertion "parent->error == 0" failed in hammer2_chain_create at hammer2_chain.c:3320
+```
+**Why combo test passes**: Combo test writes only 1×64KB files — no indirect blocks needed. Test J writes 128×64KB (8MB), which requires indirect block allocation.
+**Root cause hypothesis**: During degraded flush, the filesystem reads back an indirect block for CRC verification. The degraded reconstruction (from P/Q + surviving data) returns incorrect data for indirect blocks. May be related to the block's physical location landing on the failed disk and the reconstruction path not handling metadata blocks correctly.
+**Secondary issue**: Even if CHECK FAIL occurs, the kernel should not panic. The assertion `parent->error == 0` in `hammer2_chain_create` (hammer2_chain.c:3320) is too aggressive — it should propagate the error instead of asserting.
+
+### Issue 2: Data Corruption During Concurrent Resilver Writes (Test I)
+**Symptom**: When writing new files concurrently with an ongoing resilver, some files have CRC mismatches after resilver completes. On remount, the super-root inode itself fails CRC validation ("error Check Error reading super-root"), preventing mount.
+**Test I result**: 1/3 PASS (resilver completes, but data verification and remount both fail).
+**Relation to sequential resilver**: Memory notes `test_sequential_resilver.sh` had 11/20 pass — resilver has known bugs independent of the degraded mount work.
+
+### Issue 3: Test G (h2parity_fix verification)
+Needs `h2parity_fix` compiled on VM. Not yet attempted.
+
+## Completed 2026-03-01
 
 ### Test Scripts Created (4 new scripts)
 - `tests/mdraid/test_all_fail_combos.sh` — 4-disk, all 4 single + 6 dual-fail read + 6 dual-fail write = 16 sub-tests
@@ -34,23 +79,16 @@
 
 ## Next Steps
 
-### Immediate (after VM reboot)
-1. **Verify sync error fix** — run `dmesg_full.sh` test and confirm no more "sync error" messages
-2. **Check partition table error** — `vn0: reading primary partition table: error...` is from `vnconfig -u`, benign vn driver noise, may still appear (not a hammer2 issue)
-3. **Run `test_all_fail_combos.sh`** — should get 16/16 pass with 0 CHECK FAILs and 0 sync errors
-4. **Run `test_sequential_resilver.sh`**
-5. **Run `test_5disk.sh`** and **`test_6disk.sh`**
+### High Priority
+1. **Investigate indirect block CHECK FAIL** (Issue 1) — reproduce with smaller test, add debug kprintfs to trace degraded reconstruction of indirect blocks during flush
+2. **Investigate resilver data corruption** (Issue 2) — run `test_sequential_resilver.sh`, compare with concurrent resilver to isolate race condition
+3. **Soften assertion in hammer2_chain_create** — `parent->error == 0` at hammer2_chain.c:3320 should propagate error, not panic
 
-### Volume Header Write During Degraded Mode
-The flush code at `hammer2_flush.c:1492-1540` only writes the volume header to `hmp->devvp` (the first device). In RAID6:
-- If disk 0 is failed, `hmp->devvp` is the failed disk's devvp — volume header write fails silently
-- Volume headers should be written to all healthy disks
-- Not critical for correctness (data is in parity), but should be addressed
-
-### Remaining Work from Previous Sessions
-- Mount with absent disk (Tests H/I/J scenario 3) — not yet implemented
-- Test G: needs `h2parity_fix` compiled on VM
-- Regenerate patch from VM git repo
+### Medium Priority
+4. **Test G**: compile `h2parity_fix` on VM and run
+5. **Run `test_5disk.sh`** and **`test_6disk.sh`** (need vn4/vn5 via clone handler)
+6. **Regenerate patch** from VM git repo
+7. **Commit degraded mount changes** to git
 
 ## File Locations
 - Fixed flush source: `src/sys/local_hammer2_flush.c` (local) → `/usr/src/sys/vfs/hammer2/hammer2_flush.c` (VM)

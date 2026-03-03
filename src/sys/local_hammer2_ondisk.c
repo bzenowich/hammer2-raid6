@@ -98,12 +98,25 @@ hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 	hammer2_devvp_t *e;
 	struct vnode *devvp;
 	const char *path;
-	int count, error;
+	int count, error, ndevs, nopen;
+
+	ndevs = 0;
+	nopen = 0;
+	TAILQ_FOREACH(e, devvpl, entry)
+		ndevs++;
 
 	TAILQ_FOREACH(e, devvpl, entry) {
 		devvp = e->devvp;
 		path = e->path;
-		KKASSERT(devvp);
+		/*
+		 * Skip dummy vnodes for absent devices (degraded mount).
+		 * These have v_rdev == NULL because they were not
+		 * associated with a real device.
+		 */
+		if (devvp->v_rdev == NULL) {
+			e->open = 0;
+			continue;
+		}
 		count = vcount(devvp);
 		if (count > 0) {
 			hprintf("%s already has %d references\n", path, count);
@@ -121,9 +134,32 @@ hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 				hprintf("failed to open %s %d\n", path, error);
 		}
 		vn_unlock(devvp);
-		if (error)
+		if (error) {
+			/*
+			 * For multi-device RAID, tolerate open failures.
+			 * The device exists but can't be opened — mark it
+			 * as not-open and continue.  Downstream code will
+			 * treat it as a failed disk.
+			 */
+			if (ndevs > 1) {
+				hprintf("%s open failed (%d), "
+					"will attempt degraded mount\n",
+					path, error);
+				e->open = 0;
+				continue;
+			}
 			return error;
-		KKASSERT(e->open);
+		}
+		nopen++;
+	}
+
+	/*
+	 * For multi-device mounts, ensure at least some devices opened.
+	 * Detailed count checks happen later in verify_volumes.
+	 */
+	if (ndevs > 1 && nopen == 0) {
+		hprintf("no devices could be opened\n");
+		return ENXIO;
 	}
 
 	return 0;
@@ -137,7 +173,8 @@ hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 
 	TAILQ_FOREACH(e, devvpl, entry) {
 		devvp = e->devvp;
-		KKASSERT(devvp);
+		if (devvp == NULL)
+			continue;
 		if (e->open) {
 			struct buf *bp;
 
@@ -233,6 +270,42 @@ hammer2_init_devvp(const char *blkdevs, int rootmount,
 		error = hammer2_lookup_device(path, rootmount, &devvp);
 		if (error) {
 			KKASSERT(!devvp);
+			/*
+			 * For multi-device RAID configurations, tolerate
+			 * device lookup failures.  Create a placeholder
+			 * entry with devvp=NULL so the mount can proceed
+			 * in degraded mode.  Single-device mounts still
+			 * fail immediately.
+			 */
+			if (*p != '\0' || !TAILQ_EMPTY(devvpl)) {
+				struct vnode *dummy_vp;
+
+				hprintf("device %s not found (%d), "
+					"will attempt degraded mount\n",
+					path, error);
+				/*
+				 * Create a dummy vnode so the buffer cache
+				 * has a valid anchor for degraded I/O paths
+				 * (getblk/brelse).  Uses dead vnode ops so
+				 * any accidental I/O returns an error.
+				 */
+				if (getspecialvnode(VT_NON, NULL,
+				    &dead_vnode_vops_p, &dummy_vp, 0, 0)) {
+					hprintf("cannot allocate dummy "
+						"vnode for %s\n", path);
+					break;
+				}
+				dummy_vp->v_type = VCHR;
+				vx_unlock(dummy_vp);
+				e = kmalloc(sizeof(*e), M_HAMMER2,
+					    M_WAITOK | M_ZERO);
+				e->devvp = dummy_vp;
+				e->path = kstrdup(path, M_HAMMER2);
+				e->open = 0;
+				TAILQ_INSERT_TAIL(devvpl, e, entry);
+				error = 0;
+				continue;
+			}
 			hprintf("failed to lookup %s %d\n", path, error);
 			break;
 		}
@@ -256,10 +329,11 @@ hammer2_cleanup_devvp(hammer2_devvp_list_t *devvpl)
 		e = TAILQ_FIRST(devvpl);
 		TAILQ_REMOVE(devvpl, e, entry);
 		/* devvp */
-		KKASSERT(e->devvp);
-		if (e->devvp->v_rdev)
-			e->devvp->v_rdev->si_mountpoint = NULL;
-		vrele(e->devvp);
+		if (e->devvp) {
+			if (e->devvp->v_rdev)
+				e->devvp->v_rdev->si_mountpoint = NULL;
+			vrele(e->devvp);
+		}
 		e->devvp = NULL;
 		/* path */
 		KKASSERT(e->path);
@@ -282,11 +356,12 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes)
 		if (vol->id == -1)
 			continue;
 		path = vol->dev->path;
-		/* check volume fields are initialized */
-		if (!vol->dev->devvp) {
-			hprintf("%s has NULL devvp\n", path);
-			return EINVAL;
-		}
+		/*
+		 * Skip volumes with unavailable devices (degraded mount).
+		 * Absent disks have a dummy devvp but open=0.
+		 */
+		if (!vol->dev->open)
+			continue;
 		if (vol->offset == (hammer2_off_t)-1) {
 			hprintf("%s has bad offset 0x%016jx\n", path,
 				(intmax_t)vol->offset);
@@ -498,10 +573,10 @@ hammer2_verify_volumes_3(const hammer2_volume_t *volumes,
 	int i, nvolumes = 0;
 	hammer2_off_t min_size = (hammer2_off_t)-1;
 
-	/* check initialized volume count */
+	/* count present (open) volumes */
 	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
 		vol = &volumes[i];
-		if (vol->id != -1) {
+		if (vol->id != -1 && vol->dev && vol->dev->open) {
 			nvolumes++;
 			if (vol->size < min_size)
 				min_size = vol->size;
@@ -517,10 +592,14 @@ hammer2_verify_volumes_3(const hammer2_volume_t *volumes,
 			HAMMER2_RAID6_MIN_DISKS, rc->ndisks);
 		return EINVAL;
 	}
-	if (nvolumes != rc->ndisks) {
-		hprintf("volume header requires %d disks, %d found\n",
-			rc->ndisks, nvolumes);
+	if (nvolumes > rc->ndisks || nvolumes < rc->ndisks - 2) {
+		hprintf("RAID6 requires %d-%d disks, %d found\n",
+			rc->ndisks - 2, rc->ndisks, nvolumes);
 		return EINVAL;
+	}
+	if (nvolumes < rc->ndisks) {
+		hprintf("RAID6 degraded mount: %d of %d disks present\n",
+			nvolumes, rc->ndisks);
 	}
 	if (rc->ndata != rc->ndisks - 2) {
 		hprintf("ndata %d inconsistent with ndisks %d\n",
@@ -532,7 +611,8 @@ hammer2_verify_volumes_3(const hammer2_volume_t *volumes,
 			(intmax_t)rc->stripe_unit, HAMMER2_PBUFSIZE);
 		return EINVAL;
 	}
-	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME) {
+	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME &&
+	    nvolumes == rc->ndisks) {
 		hprintf("volume id %d must be %d\n",
 			rootvoldata->volu_id, HAMMER2_ROOT_VOLUME);
 		return EINVAL;
@@ -692,14 +772,52 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	bzero(&fstype, sizeof(fstype));
 	bzero(rootvoldata, sizeof(*rootvoldata));
 
+	/*
+	 * Count total entries to detect multi-device configurations.
+	 */
+	{
+		int nentries = 0;
+		TAILQ_FOREACH(e, devvpl, entry)
+			nentries++;
+		nvolumes = nentries; /* reuse, reset below */
+	}
+
 	TAILQ_FOREACH(e, devvpl, entry) {
 		devvp = e->devvp;
 		path = e->path;
-		KKASSERT(devvp);
+
+		/*
+		 * Skip devices that failed lookup or open (degraded mount).
+		 * These will be assigned to uninitialized volume slots below.
+		 */
+		if (devvp == NULL || !e->open) {
+			hprintf("\"%s\" skipped (device unavailable)\n", path);
+			continue;
+		}
 
 		/* returns negative error or positive zone# */
 		error = hammer2_read_volume_header(devvp, path, voldata);
 		if (error < 0) {
+			/*
+			 * For multi-device RAID, tolerate volume header
+			 * read failures.  The device may exist (e.g.,
+			 * deconfigured vn device) but have no data.
+			 * Mark it as unavailable and continue.
+			 */
+			if (nvolumes > 1) {
+				hprintf("%s: volume header unreadable, "
+					"treating as failed disk\n", path);
+				/*
+				 * Close the device since we can't use it.
+				 */
+				vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+				VOP_CLOSE(devvp,
+					  FREAD | FWRITE, NULL);
+				vn_unlock(devvp);
+				e->open = 0;
+				error = 0;
+				continue;
+			}
 			hprintf("failed to read %s's volume header\n", path);
 			error = -error;
 			goto done;
@@ -768,11 +886,55 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 			*rootvolzone = zone;
 			KKASSERT(*rootvoldevvp == NULL);
 			*rootvoldevvp = e->devvp;
+		} else if (*rootvoldevvp == NULL) {
+			/*
+			 * Root volume disk is absent (degraded mount).
+			 * Use this disk's header as rootvoldata since
+			 * all RAID6 disks carry the same metadata.
+			 * Set rootvoldevvp to the first available disk.
+			 */
+			bcopy(voldata, rootvoldata, sizeof(*rootvoldata));
+			*rootvolzone = zone;
+			*rootvoldevvp = e->devvp;
 		}
 		devvp->v_rdev->si_mountpoint = mp;
 		hprintf("\"%s\" zone=%d id=%d offset=0x%016jx size=0x%016jx\n",
 			path, zone, vol->id, (intmax_t)vol->offset,
 			(intmax_t)vol->size);
+	}
+
+	/*
+	 * For RAID6 degraded mounts: assign unavailable device entries
+	 * to uninitialized volume slots so vol->dev is non-NULL for all
+	 * volumes.  This allows code that accesses vol->dev->path or
+	 * vol->dev->open to work without NULL checks everywhere.
+	 */
+	if (!error && rootvoldata->version >= HAMMER2_VOL_VERSION_RAID6) {
+		hammer2_raid_config_t *rc = &rootvoldata->raid_config;
+		int slot;
+
+		e = TAILQ_FIRST(devvpl);
+		for (slot = 0; slot < rc->ndisks && e != NULL; slot++) {
+			vol = &volumes[slot];
+			if (vol->id != -1)
+				continue;
+			/* Find next unavailable entry */
+			while (e != NULL && e->devvp != NULL && e->open)
+				e = TAILQ_NEXT(e, entry);
+			if (e == NULL)
+				break;
+			vol->dev = e;
+			vol->id = slot;
+			/*
+			 * Use volume geometry from rootvoldata since we
+			 * can't read this disk's header.
+			 */
+			vol->offset = rootvoldata->volu_loff[slot];
+			vol->size = rootvoldata->volu_size;
+			hprintf("\"%s\" id=%d assigned as failed "
+				"(degraded mount)\n", e->path, slot);
+			e = TAILQ_NEXT(e, entry);
+		}
 	}
 done:
 	if (!error) {
