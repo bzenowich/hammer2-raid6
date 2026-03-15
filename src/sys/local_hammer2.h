@@ -1158,6 +1158,9 @@ struct hammer2_dev {
 	volatile uint64_t resilver_stripes_total;
 	volatile int	resilver_running;	/* 1 while resilver active */
 	int		resilver_disk_idx;	/* disk being resilvered (-1=none) */
+	/* Stripes written during active resilver — need second pass */
+	uint64_t	resilver_dirty_lo;	/* min stripe written during pass */
+	uint64_t	resilver_dirty_hi;	/* max stripe written during pass */
 
 	/* RAID6 parity worker thread */
 	struct spinlock	raid6_parity_spin;
@@ -1987,8 +1990,8 @@ int hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		void *data, void *old_data, size_t bytes);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, void *buf, size_t bytes);
-int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, int failed_disk_idx,
-		struct vnode *new_devvp);
+int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
+		int failed_disk_idx, struct vnode *new_devvp);
 
 /*
  * More complex inlines

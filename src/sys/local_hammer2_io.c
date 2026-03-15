@@ -355,6 +355,10 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	    hmp->raid_nfailed > 0 &&
 	    dio->disk_idx >= 0 &&
 	    hmp->raid_failed[dio->disk_idx]) {
+		kprintf("h2getblk_deg: pbase=0x%016jx disk=%d op=%d "
+			"btype=0x%02x\n",
+			(uintmax_t)dio->pbase, dio->disk_idx, op,
+			(int)btype);
 		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
 				 GETBLK_KVABIO, 0);
 		if (dio->bp) {
@@ -839,6 +843,22 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				hammer2_io_raid6_write(hmp, pbase,
 				    raid6_data, dio->raid6_old_data,
 				    psize);
+				/*
+				 * Track stripes written during an active
+				 * resilver so the resilver can do a second
+				 * pass over them after a sync.
+				 */
+				if (hmp->resilver_running) {
+					uint64_t sn = pbase /
+					    ((uint64_t)hmp->raid_config.ndata *
+					     hmp->raid_config.stripe_unit);
+					hammer2_spin_ex(&hmp->io_spin);
+					if (sn < hmp->resilver_dirty_lo)
+						hmp->resilver_dirty_lo = sn;
+					if (sn > hmp->resilver_dirty_hi)
+						hmp->resilver_dirty_hi = sn;
+					hammer2_spin_unex(&hmp->io_spin);
+				}
 				kfree(raid6_data, M_HAMMER2);
 				if (dio->raid6_old_data) {
 					kfree(dio->raid6_old_data, M_HAMMER2);
@@ -1616,6 +1636,11 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	/* Logical column index of the block we're reconstructing */
 	target_col = (int)((logical_off / stripe_unit) % ndata);
 
+	kprintf("h2r6deg: loff=0x%016jx stripe=%llu tgt_col=%d "
+		"p_disk=%d q_disk=%d\n",
+		(uintmax_t)logical_off, (unsigned long long)stripe_num,
+		target_col, p_disk, q_disk);
+
 	/*
 	 * Read all columns in the stripe (data + P + Q) in one loop.
 	 */
@@ -1686,6 +1711,9 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		}
 	}
 
+	kprintf("h2r6deg: after read: fail_a=%d fail_b=%d fail_p=%d fail_q=%d\n",
+		fail_data_a, fail_data_b, fail_p, fail_q);
+
 	/* Perform recovery */
 	error = 0;
 	if (fail_data_a != -1) {
@@ -1729,6 +1757,8 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	if (error == 0) {
 		bcopy(ptrs[target_col], buf, stripe_unit);
 	}
+	kprintf("h2r6deg: done error=%d phys_off=0x%016jx\n",
+		error, (uintmax_t)(HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit));
 
 	/* Free temporary buffers */
 	for (col = 0; col <= ndata + 1; col++) {
@@ -1736,7 +1766,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 			kfree(col_bufs[col], M_HAMMER2);
 	}
 
-	return 0;
+	return error;
 }
 
 /*
@@ -1752,8 +1782,8 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
  * Returns 0 on success, errno on failure.
  */
 int
-hammer2_io_raid6_resilver(hammer2_dev_t *hmp, int failed_disk_idx,
-			  struct vnode *new_devvp)
+hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
+			  int failed_disk_idx, struct vnode *new_devvp)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
@@ -1860,7 +1890,16 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, int failed_disk_idx,
 
 	/*
 	 * Phase 3: Rebuild each stripe.
+	 *
+	 * Flush all pending writes first so that parity on surviving disks
+	 * is up-to-date before we read it.  Concurrent degraded writes that
+	 * happen AFTER this sync go to new stripes; we track them in
+	 * resilver_dirty_lo/hi for a second pass below.
 	 */
+	hmp->resilver_dirty_lo = UINT64_MAX;
+	hmp->resilver_dirty_hi = 0;
+	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
 		phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
 
@@ -1943,6 +1982,96 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, int failed_disk_idx,
 		if ((stripe_num & 255) == 255) {
 			hmp->resilver_stripes_done = stripe_num + 1;
 			lwkt_yield();
+		}
+	}
+
+	/*
+	 * Phase 4: Second pass over stripes written during Phase 3.
+	 *
+	 * A concurrent degraded write (bwrite P, bwrite Q) may have raced
+	 * with Phase 3 reading P/Q: the resilver read old parity (zeros for
+	 * new stripes) and wrote zeros to the replacement disk.  After a
+	 * full sync the parity is correct; re-resilver the dirty range.
+	 */
+	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+
+	if (hmp->resilver_dirty_lo <= hmp->resilver_dirty_hi) {
+		uint64_t lo = hmp->resilver_dirty_lo;
+		uint64_t hi = hmp->resilver_dirty_hi;
+
+		kprintf("hammer2: resilver phase 4: re-processing stripes "
+			"%ju..%ju\n", (uintmax_t)lo, (uintmax_t)hi);
+
+		for (stripe_num = lo; stripe_num <= hi; stripe_num++) {
+			phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
+			p_disk = (int)(stripe_num % ndisks);
+			q_disk = (p_disk + 1) % ndisks;
+
+			di = 0;
+			for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
+				if (phys_disk == p_disk)
+					phys_to_lcol[phys_disk] = ndata;
+				else if (phys_disk == q_disk)
+					phys_to_lcol[phys_disk] = ndata + 1;
+				else
+					phys_to_lcol[phys_disk] = di++;
+			}
+
+			failed_col = phys_to_lcol[failed_disk_idx];
+
+			other_failed_col = -1;
+			for (i = 0; i < ndisks; i++) {
+				if (i != failed_disk_idx && hmp->raid_failed[i]) {
+					other_failed_col = phys_to_lcol[i];
+					break;
+				}
+			}
+
+			for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
+				col = phys_to_lcol[phys_disk];
+				bzero(col_bufs[col], stripe_unit);
+				ptrs[col] = col_bufs[col];
+				if (phys_disk == failed_disk_idx)
+					continue;
+				if (hmp->raid_failed[phys_disk])
+					continue;
+				vol = &hmp->volumes[phys_disk];
+				bp = NULL;
+				error = breadnx(vol->dev->devvp, phys_off,
+					stripe_unit, 0, NULL, NULL, 0, &bp);
+				if (error == 0 && bp) {
+					bkvasync(bp);
+					bcopy(bp->b_data, col_bufs[col],
+					      stripe_unit);
+					brelse(bp);
+				} else {
+					if (bp)
+						brelse(bp);
+				}
+				error = 0;
+			}
+
+			if (other_failed_col >= 0) {
+				hammer2_raid6_dual_recov(ndisks, stripe_unit,
+							 failed_col,
+							 other_failed_col, ptrs);
+			} else {
+				hammer2_raid6_dual_recov(ndisks, stripe_unit,
+							 failed_col,
+							 ndisks - 1, ptrs);
+			}
+
+			wbp = getblk(new_devvp, phys_off, stripe_unit,
+				     GETBLK_KVABIO, 0);
+			if (wbp) {
+				bkvasync(wbp);
+				bcopy(ptrs[failed_col], wbp->b_data,
+				      stripe_unit);
+				bwrite(wbp);
+			}
+
+			if ((stripe_num & 255) == 255)
+				lwkt_yield();
 		}
 	}
 

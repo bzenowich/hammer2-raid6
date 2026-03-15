@@ -1530,7 +1530,7 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		failed_disk_idx, rr->old_dev, rr->new_dev);
 
 	/* Run the resilver (this may take a long time) */
-	error = hammer2_io_raid6_resilver(hmp, failed_disk_idx, new_devvp);
+	error = hammer2_io_raid6_resilver(hmp, ip->pmp, failed_disk_idx, new_devvp);
 	if (error) {
 		kprintf("hammer2: resilver failed: %d\n", error);
 		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
@@ -1567,9 +1567,15 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		atomic_add_int(&hmp->raid_nfailed, -1);
 	}
 
-	/* Update on-disk RAID config disk state */
+	/* Update on-disk RAID config disk state (both runtime and persisted) */
 	hmp->raid_config.disk_state[failed_disk_idx] =
 		HAMMER2_RAID6_DISK_ONLINE;
+	hmp->voldata.raid_config.disk_state[failed_disk_idx] =
+		HAMMER2_RAID6_DISK_ONLINE;
+	if (hmp->raid_nfailed == 0) {
+		hmp->raid_config.flags &= ~HAMMER2_RAID6_FLAG_DEGRADED;
+		hmp->voldata.raid_config.flags &= ~HAMMER2_RAID6_FLAG_DEGRADED;
+	}
 	hammer2_voldata_modify(hmp);
 
 	hammer2_voldata_unlock(hmp);
@@ -1635,11 +1641,15 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 			hammer2_parity_drain(hmp);
 			hmp->raid_failed[i] = 1;
 			atomic_add_int(&hmp->raid_nfailed, 1);
-			/* Update on-disk disk_state */
+			/* Update on-disk disk_state (both runtime and persisted) */
 			hammer2_voldata_lock(hmp);
 			hmp->raid_config.disk_state[i] =
 				HAMMER2_RAID6_DISK_FAILED;
 			hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+			hmp->voldata.raid_config.disk_state[i] =
+				HAMMER2_RAID6_DISK_FAILED;
+			hmp->voldata.raid_config.flags |=
+				HAMMER2_RAID6_FLAG_DEGRADED;
 			hammer2_voldata_modify(hmp);
 			hammer2_voldata_unlock(hmp);
 			/*
