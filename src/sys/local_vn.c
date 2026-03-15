@@ -348,7 +348,19 @@ vnstrategy(struct dev_strategy_args *ap)
 
 		case (BUF_CMD_WRITE):
 			vn_lock(vn->sc_vp, LK_EXCLUSIVE | LK_RETRY);
-			error = VOP_WRITE(vn->sc_vp, &auio, IO_RECURSE,
+			/*
+			 * IO_SYNC: write each UFS buffer synchronously
+			 * (bwrite rather than bdwrite).  This ensures that
+			 * by the time vnstrategy returns, the data is committed
+			 * to the backing file on disk — not merely sitting in
+			 * the UFS page cache waiting for buf_daemon.  Without
+			 * this, repeated bwrite()s to a vn device accumulate
+			 * async UFS writes in runningbufspace; if runningbufspace
+			 * exceeds hirunningspace, a subsequent sync(2) call
+			 * blocks indefinitely in waitrunningbufspace().
+			 */
+			error = VOP_WRITE(vn->sc_vp, &auio,
+					  IO_RECURSE | IO_SYNC,
 					  vn->sc_cred);
 			break;
 
