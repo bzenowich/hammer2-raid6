@@ -3317,7 +3317,12 @@ hammer2_chain_create(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
 	parent = *parentp;
 	if (parent) {
 		KKASSERT(hammer2_mtx_owned(&parent->lock));
-		KKASSERT(parent->error == 0);
+		if (parent->error) {
+			kprintf("hammer2_chain_create: parent error %08x\n",
+				parent->error);
+			*chainp = NULL;
+			return (parent->error);
+		}
 		hmp = parent->hmp;
 	}
 	chain = *chainp;
@@ -3657,7 +3662,11 @@ hammer2_chain_rename(hammer2_chain_t **parentp, hammer2_chain_t *chain,
 	if (parentp && (parent = *parentp) != NULL) {
 		KKASSERT(hammer2_mtx_owned(&parent->lock));
 		KKASSERT(parent->refs > 0);
-		KKASSERT(parent->error == 0);
+		if (parent->error) {
+			kprintf("hammer2_chain_rename: parent error %08x\n",
+				parent->error);
+			return;
+		}
 
 		hammer2_chain_create(parentp, &chain, NULL, chain->pmp,
 				     HAMMER2_METH_DEFAULT,
@@ -3745,7 +3754,12 @@ _hammer2_chain_delete_helper(hammer2_chain_t *parent, hammer2_chain_t *chain,
 		int count;
 
 		KKASSERT(parent != NULL);
-		KKASSERT(parent->error == 0);
+		if (parent->error) {
+			kprintf("hammer2_chain_delete_helper: "
+				"parent error %08x\n", parent->error);
+			error = parent->error;
+			goto done;
+		}
 		KKASSERT((parent->flags & HAMMER2_CHAIN_INITIAL) == 0);
 		error = hammer2_chain_modify(parent, mtid, 0, 0);
 		if (error)
