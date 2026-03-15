@@ -29,9 +29,13 @@ check_parity() {
     local label="$1"
     local out
     out=$($H2FIX -n $DISKDIR/disk0.img $DISKDIR/disk1.img \
-                    $DISKDIR/disk2.img $DISKDIR/disk3.img 2>&1 | tail -3)
+                    $DISKDIR/disk2.img $DISKDIR/disk3.img 2>&1 | tail -4)
     echo "$out"
-    if echo "$out" | grep -q "0 mismatches"; then
+    # h2parity_fix outputs "P stripes fixed: N" / "Q stripes fixed: N" /
+    # "I/O errors: N" — all three must be 0 for a clean array.
+    if echo "$out" | grep -q "P stripes fixed:  0" && \
+       echo "$out" | grep -q "Q stripes fixed:  0" && \
+       echo "$out" | grep -q "I/O errors:       0"; then
         result PASS "$label: 0 parity mismatches"
     else
         result FAIL "$label: parity mismatches found"
