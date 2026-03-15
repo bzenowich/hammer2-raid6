@@ -278,18 +278,36 @@ hammer2_raid6_datap_recov(int ndisks, size_t bytes, int faila, void **ptrs)
 /*
  * Router: recover from 2 disk failures.
  *
- * faila, failb are physical disk indices (0..ndisks-1) with faila < failb.
- * Dispatches to the appropriate recovery function based on which disks failed.
+ * faila, failb are logical column indices (0..ndisks-1).
+ * Data columns are 0..ndata-1; P = ndata; Q = ndata+1.
+ *
+ * The dispatch logic expects: if one failure is a data column and the other
+ * is a parity column, faila must be the DATA column.  Callers from the
+ * resilver pass (failed_col, other_failed_col) which may violate this when
+ * the resilvered disk holds P or Q for a given stripe.  Normalize here.
  */
 void
 hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 			 int faila, int failb, void **ptrs)
 {
 	int ndata = ndisks - 2;
+	int tmp;
+
+	/*
+	 * Normalize: if faila is a parity column but failb is a data column,
+	 * swap them.  The branches below rely on faila being the data column
+	 * whenever exactly one failure is a data column.
+	 */
+	if (faila >= ndata && failb < ndata) {
+		tmp = faila;
+		faila = failb;
+		failb = tmp;
+	}
 
 	if (faila >= ndata) {
 		/*
-		 * Both P and Q failed - just regenerate them.
+		 * Both P and Q failed - just regenerate them from surviving
+		 * data columns (which must be intact).
 		 */
 		hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
 	} else if (failb >= ndata) {
