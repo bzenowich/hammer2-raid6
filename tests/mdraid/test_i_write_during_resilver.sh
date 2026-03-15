@@ -35,9 +35,12 @@ if df | grep -q "$MNTPT"; then
 fi
 for i in 0 1 2 3; do
     vnconfig -u vn$i 2>/dev/null || true
+    rm -f $DISKDIR/disk${i}.img
+    truncate -s 1073741824 $DISKDIR/disk${i}.img
     vnconfig vn$i $DISKDIR/disk${i}.img
 done
-# Ensure fresh spare disk
+# Fresh spare disk
+rm -f $DISKDIR/disk4.img
 truncate -s 1073741824 $DISKDIR/disk4.img
 mkdir -p $MNTPT
 newfs_hammer2 -R 6 -L TEST /dev/vn0 /dev/vn1 /dev/vn2 /dev/vn3 > /dev/null 2>&1

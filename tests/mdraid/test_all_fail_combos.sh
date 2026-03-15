@@ -113,6 +113,13 @@ teardown() {
     for i in 0 1 2 3; do
         vnconfig -u vn$i 2>/dev/null || true
     done
+    # Drain pending UFS writes from vn device backing files before next subtest.
+    # Each degraded bwrite() triggers async UFS I/Os that accumulate in
+    # runningbufspace across subtests.  Without this drain, the 12th subtest's
+    # sync blocks in waitrunningbufspace waiting for 11 subtests worth of UFS
+    # I/O to complete (disk saturation deadlock).  With hammer2 unmounted and
+    # vn devices detached, there is no circular dependency and sync completes.
+    sync
 }
 
 echo "=== HAMMER2 RAID6: All Failure Combinations (4-disk) ==="
