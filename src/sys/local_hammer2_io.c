@@ -355,10 +355,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	    hmp->raid_nfailed > 0 &&
 	    dio->disk_idx >= 0 &&
 	    hmp->raid_failed[dio->disk_idx]) {
-		kprintf("h2getblk_deg: pbase=0x%016jx disk=%d op=%d "
-			"btype=0x%02x\n",
-			(uintmax_t)dio->pbase, dio->disk_idx, op,
-			(int)btype);
 		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
 				 GETBLK_KVABIO, 0);
 		if (dio->bp) {
@@ -1636,11 +1632,6 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	/* Logical column index of the block we're reconstructing */
 	target_col = (int)((logical_off / stripe_unit) % ndata);
 
-	kprintf("h2r6deg: loff=0x%016jx stripe=%llu tgt_col=%d "
-		"p_disk=%d q_disk=%d\n",
-		(uintmax_t)logical_off, (unsigned long long)stripe_num,
-		target_col, p_disk, q_disk);
-
 	/*
 	 * Read all columns in the stripe (data + P + Q) in one loop.
 	 */
@@ -1711,9 +1702,6 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		}
 	}
 
-	kprintf("h2r6deg: after read: fail_a=%d fail_b=%d fail_p=%d fail_q=%d\n",
-		fail_data_a, fail_data_b, fail_p, fail_q);
-
 	/* Perform recovery */
 	error = 0;
 	if (fail_data_a != -1) {
@@ -1757,9 +1745,6 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	if (error == 0) {
 		bcopy(ptrs[target_col], buf, stripe_unit);
 	}
-	kprintf("h2r6deg: done error=%d phys_off=0x%016jx\n",
-		error, (uintmax_t)(HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit));
-
 	/* Free temporary buffers */
 	for (col = 0; col <= ndata + 1; col++) {
 		if (col_bufs[col])
