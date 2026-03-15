@@ -461,6 +461,31 @@ index 6fde079c8b..6d43d7a323 100644
  	);
  	exit(1);
  }
+diff --git a/sys/dev/disk/vn/vn.c b/sys/dev/disk/vn/vn.c
+index 8972ac44ff..df54738840 100644
+--- a/sys/dev/disk/vn/vn.c
++++ b/sys/dev/disk/vn/vn.c
+@@ -348,7 +348,19 @@ vnstrategy(struct dev_strategy_args *ap)
+ 
+ 		case (BUF_CMD_WRITE):
+ 			vn_lock(vn->sc_vp, LK_EXCLUSIVE | LK_RETRY);
+-			error = VOP_WRITE(vn->sc_vp, &auio, IO_RECURSE,
++			/*
++			 * IO_SYNC: write each UFS buffer synchronously
++			 * (bwrite rather than bdwrite).  This ensures that
++			 * by the time vnstrategy returns, the data is committed
++			 * to the backing file on disk — not merely sitting in
++			 * the UFS page cache waiting for buf_daemon.  Without
++			 * this, repeated bwrite()s to a vn device accumulate
++			 * async UFS writes in runningbufspace; if runningbufspace
++			 * exceeds hirunningspace, a subsequent sync(2) call
++			 * blocks indefinitely in waitrunningbufspace().
++			 */
++			error = VOP_WRITE(vn->sc_vp, &auio,
++					  IO_RECURSE | IO_SYNC,
+ 					  vn->sc_cred);
+ 			break;
+ 
 diff --git a/sys/vfs/hammer2/Makefile b/sys/vfs/hammer2/Makefile
 index 9c5abb19e3..b563bcea46 100644
 --- a/sys/vfs/hammer2/Makefile
