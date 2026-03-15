@@ -369,6 +369,85 @@ Again, `bp = NULL` before each `breadnx`.
 `HAMMER2IOC_RAID_RESILVER_STATUS` ioctl reads `hmp->resilver_stripes_done` /
 `hmp->resilver_stripes_total` and computes 0–100%.
 
+### Concurrent Writes During Resilver
+
+**The problem**: The resilver reads P/Q from surviving disks using `breadnx`. A
+concurrent degraded write updates P/Q in two separate synchronous `bwrite` calls
+(data first, then P/Q via `hammer2_io_raid6_write`). If the resilver reads parity
+between those two bwrites — or before either, for a freshly allocated stripe where
+parity is still zero — it reconstructs stale/zero data and writes it to the
+replacement disk.
+
+**Our solution — two-pass resilver with dirty-range tracking**:
+
+1. **Pre-sync** (`hammer2_vfs_sync_pmp(pmp, MNT_WAIT)`) before Phase 3 drains all
+   in-flight degraded writes, so parity on surviving disks is current when we start.
+
+2. **Dirty-range tracking** (`hmp->resilver_dirty_lo / resilver_dirty_hi`): whenever
+   `_hammer2_io_putblk` completes a degraded parity update while `resilver_running`,
+   it records the stripe number. Because HAMMER2's sequential allocator
+   (`allocator_beg`) gives new COW blocks increasing stripe numbers, the dirty range
+   is small and bounded.
+
+3. **Phase 4 — second pass**: after the main loop, sync again and re-resilver only
+   `resilver_dirty_lo..resilver_dirty_hi`. The second pass reads committed parity and
+   writes the correct data to the replacement disk.
+
+**Why this works for HAMMER2**: COW semantics guarantee that new writes go to new
+physical addresses (new stripes), never overwriting existing stripes. The dirty range
+captures the small set of stripes allocated during Phase 3 that may have raced. A
+single additional pass after a sync is sufficient.
+
+### Comparison with md RAID
+
+md RAID5/6 solves the same problem with a fundamentally different mechanism.
+
+**md's approach — recovery checkpoint (`recovery_cp`) + stripe cache locking**:
+
+md maintains a `recovery_cp` cursor that divides the array into two regions and
+routes concurrent writes differently depending on which side of the checkpoint they
+fall:
+
+- **Ahead of checkpoint** (not yet recovered): writes go to surviving disks only.
+  The replacement disk is not touched — the resilver will reach that sector later
+  and reconstruct it correctly from the then-current parity.
+- **Behind checkpoint** (already recovered): writes go to **all** disks including
+  the replacement, since the resilver has already written correct data there.
+
+The boundary stripe is handled by a **per-stripe lock in the stripe cache** (md's
+in-memory LRU of active RAID stripes). A concurrent write to a stripe being actively
+resilvered blocks until the resilver commits that stripe, then the write proceeds to
+all disks. No parity-read race is possible.
+
+The `recovery_cp` is also persisted to disk (via the **write intent bitmap**), so a
+crash during recovery only requires re-syncing the unprocessed region.
+
+**Comparison table**:
+
+| Aspect | Our approach | md RAID |
+|--------|-------------|---------|
+| Concurrency control | Pre-sync + dirty-range second pass | Per-stripe lock (stripe cache) |
+| Write routing during recovery | Unchanged (always to surviving disks) | Checkpoint-aware (all or surviving only) |
+| Correctness guarantee | Bounded — second pass fixes races | Strict — no races possible |
+| Handles in-place overwrites | No (relies on COW) | Yes |
+| Crash-safe recovery position | No | Yes (write intent bitmap) |
+| Complexity | Low | High |
+
+**Why COW lets us use the simpler approach**: in HAMMER2 a write never overwrites
+an existing stripe. New data always goes to a new physical address. Concurrent
+writes during resilver therefore land on new, high-addressed stripes that the
+resilver has not yet reached. The dirty-range second pass catches the small
+number that race with Phase 3. For md, which must handle in-place overwrites to
+arbitrary stripes, the stripe-cache lock and checkpoint routing are necessary for
+correctness.
+
+**Remaining limitation**: Phase 4 does only one additional pass. Under sustained
+heavy write load throughout a long resilver, writes could race with Phase 4 itself.
+For a correct solution under that workload, the md approach (per-stripe locking or
+a forward checkpoint) would be required. For typical HAMMER2 usage (mostly
+quiescent during resilver, or writes concentrated at the high end of the allocation
+range), Phase 4 is sufficient.
+
 ### Post-Resilver State
 
 After resilver completes:

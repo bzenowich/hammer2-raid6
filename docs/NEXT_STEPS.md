@@ -85,10 +85,10 @@ Needs `h2parity_fix` compiled on VM. Not yet attempted.
 3. **Soften assertion in hammer2_chain_create** — `parent->error == 0` at hammer2_chain.c:3320 should propagate error, not panic
 
 ### Medium Priority
-4. **Test G**: compile `h2parity_fix` on VM and run
-5. **Run `test_5disk.sh`** and **`test_6disk.sh`** (need vn4/vn5 via clone handler)
-6. **Regenerate patch** from VM git repo
-7. **Commit degraded mount changes** to git
+4. **Set up DragonFlyBSD vkernel** — vkernel runs a kernel in userspace, so panics don't crash the host. Use for iterating on hammer2.ko changes without full VM reboots. Especially useful for debugging the indirect block CHECK FAIL (Issue 1) which currently panics the VM.
+5. **Test G**: compile `h2parity_fix` on VM and run
+6. **Run `test_5disk.sh`** and **`test_6disk.sh`** (need vn4/vn5 via clone handler)
+7. **Regenerate patch** from VM git repo
 
 ## File Locations
 - Fixed flush source: `src/sys/local_hammer2_flush.c` (local) → `/usr/src/sys/vfs/hammer2/hammer2_flush.c` (VM)
