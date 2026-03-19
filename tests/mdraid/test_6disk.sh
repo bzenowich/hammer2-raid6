@@ -8,9 +8,6 @@
 DISKDIR=/var/tmp
 MNTPT=/mnt/test
 kldstat -q -m hammer2 || kldload hammer2
-# Create extra vn devices via clone handler (only vn0-vn3 exist by default)
-[ -e /dev/vn4 ] || true > /dev/vn
-[ -e /dev/vn5 ] || true > /dev/vn
 NDISKS=6
 DEVSPEC="/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3:/dev/vn4:/dev/vn5"
 PFSPATH="${DEVSPEC}@TEST"
@@ -83,6 +80,11 @@ teardown() {
     for i in 0 1 2 3 4 5; do
         vnconfig -u vn$i 2>/dev/null || true
     done
+    # Drain accumulated UFS async writes before next subtest.
+    # bwrite(vn_bp) → VOP_WRITE → UFS bdwrite; these UFS async writes
+    # accumulate in runningbufspace across subtests.  With hammer2 unmounted
+    # and vn devices detached, sync drains them safely (no circular dependency).
+    sync
 }
 
 echo "=== HAMMER2 RAID6: 6-Disk Array Tests ==="
