@@ -648,14 +648,171 @@ operations (READ, NEW, NEWNZ), not just READ. Sub-buffer `DOP_NEW` operations
 (e.g., inode creation: 1KB within a 64KB DIO) on a failed disk will call
 `breadnx` on a closed vnode, producing I/O errors and garbage `old_data`.
 
-### Synchronous I/O in Degraded Mode Prevents Deadlock
+### Degraded-Write runningbufspace Deadlock
 
-During degraded-mode flush, async `bawrite` for data and parity buffers can
-exhaust `runningbufspace` faster than the backing store can drain it. This
-causes a circular deadlock: hammer2 flush → `bawrite` → vn driver → UFS →
-buffer cache → needs prior `bawrite`s to complete. Fix: use synchronous
-`bwrite` for both data and parity in degraded mode (`raid_nfailed > 0` and
-`DIO_FLUSH` set).
+This is one of the most subtle bugs in the implementation. It took several
+sessions to diagnose because the real root cause is in a system component
+(the vn driver) that appears unrelated to HAMMER2.
+
+#### Symptom
+
+After failing a disk and writing a moderate amount of data (~16 MB) in
+degraded mode, calling `sync(2)` blocks forever. The process is stuck in
+`waitrunningbufspace()` (wait channel `wdrn1`). No crash, no panic — just
+a permanent stall.
+
+#### What is runningbufspace?
+
+DragonFlyBSD's buffer cache tracks the number of bytes in buffers that have
+been submitted for async I/O but not yet completed, in a global counter called
+`runningbufspace`. When this counter exceeds `vfs.hirunningspace` (~6 MB by
+default), `waitrunningbufspace()` blocks until async writes drain below
+`vfs.lorunningspace`. The purpose is to throttle the rate at which the kernel
+queues async writes to disk.
+
+`sync(2)` calls `waitrunningbufspace()` before returning to ensure all async
+writes have completed. If async writes are queued faster than they complete,
+`runningbufspace` never falls below the threshold and `sync` stalls.
+
+#### The full call chain
+
+```
+HAMMER2 degraded flush
+  _hammer2_io_putblk (DIO_FLUSH set, raid_nfailed > 0)
+    bwrite(data_bp)            ← synchronous HAMMER2 buffer write
+      vn_strategy(BUF_CMD_WRITE)
+        VOP_WRITE(sc_vp, IO_RECURSE)   ← NO IO_SYNC
+          UFS bdwrite(ufs_bp)          ← async! adds to runningbufspace
+            [returns immediately]
+          [returns immediately]
+        [returns immediately]
+      bwrite returns
+  hammer2_io_raid6_write (parity)
+    bwrite(P_bp), bwrite(Q_bp)
+      [same chain: UFS bdwrite for each]
+      [returns immediately each time]
+...
+[after 100+ stripe writes, runningbufspace > hirunningspace]
+...
+sync(2)
+  waitrunningbufspace()        ← BLOCKS: counter > hirunningspace
+    buf_daemon is draining UFS dirty blocks to ad1...
+    [but buf_daemon's writes set b_runningbufspace too, so counter
+     does not decrease until the underlying ad1 writes complete]
+    [stalls forever if something interferes with ad1 completion]
+```
+
+The key insight: `bwrite(hammer2_bp)` completes synchronously from HAMMER2's
+perspective (the buffer cache write to the vn device returns), but it only
+moves the data one layer down — from HAMMER2's buffer cache into UFS's buffer
+cache as a dirty block. UFS uses `bdwrite` (async) because `VOP_WRITE` is
+called without `IO_SYNC`. The data has not reached the physical disk yet.
+
+Each `bwrite` in HAMMER2 leaves one dirty UFS buffer behind. A 16 MB degraded
+write with 2 parity blocks per stripe produces roughly 3× as many UFS dirty
+blocks as a healthy write. These accumulate until `buf_daemon` drains them.
+
+#### Why bwrite-instead-of-bawrite was insufficient (Fix 10)
+
+The first fix changed HAMMER2's degraded writes from `bawrite` to `bwrite`.
+This was necessary and correct: `bawrite` queued HAMMER2-level buffers for
+async completion, which added to `runningbufspace` at the HAMMER2 level as
+well. Switching to `bwrite` eliminated that first layer of accumulation.
+
+However, `bwrite` on a vn device does not flush the underlying UFS dirty
+block to disk — it only ensures the write reached the vn device synchronously.
+The UFS dirty block is still there, still counted in `runningbufspace` until
+`buf_daemon` writes it to `ad1`.
+
+#### Why IO_SYNC in vn.c didn't work
+
+The natural fix is to pass `IO_SYNC` to `VOP_WRITE` in `vnstrategy`, forcing
+UFS to use `bwrite` instead of `bdwrite`. This was implemented in `vn.c` and
+appeared to work in unit tests, but had zero effect in practice.
+
+The reason: **vn is statically compiled into the DragonFlyBSD kernel.** It is
+not a loadable module. The file `sys/dev/disk/vn/vn.c` exists in the kernel
+source tree but the build system compiles it directly into the kernel binary.
+`kldload /boot/kernel/vn.ko` returns "module already loaded or in kernel" —
+the `.ko` file is never used. Changes to `vn.c`, rebuilt into `vn.ko` and
+installed to `/boot/kernel`, have absolutely no effect on the running system.
+The built-in vn code always calls `VOP_WRITE` without `IO_SYNC`.
+
+This was confirmed by running `kldstat` and attempting `kldload vn.ko`.
+
+#### Why a counting semaphore in hammer2_io.c didn't work
+
+A counting semaphore (`hammer2_degraded_bwrite`) was tried to throttle
+HAMMER2's rate of `bwrite` calls. The logic: if `runningbufspace` is already
+high, block in HAMMER2 before submitting more writes, giving `buf_daemon` time
+to drain.
+
+This failed because `buf_daemon` can independently flush dirty HAMMER2 DIO
+buffers that were written with `bdwrite`. Those writes bypass the semaphore
+entirely, going directly through the buffer cache to the vn device, generating
+new UFS dirty blocks without incrementing the semaphore counter. The semaphore
+counted HAMMER2's `bwrite` calls but not `buf_daemon`'s independent activity.
+
+#### The actual fix: BUF_CMD_FLUSH after chain flush
+
+The correct fix is to force UFS to flush its dirty blocks to the physical disk
+immediately after HAMMER2 finishes writing all dirty DIOs to the vn devices.
+This is done by submitting a `BUF_CMD_FLUSH` bio to each vn device.
+
+When `vn_strategy` receives a `BUF_CMD_FLUSH` bio, it calls
+`VOP_FSYNC(sc_vp, MNT_WAIT, 0)` — a full synchronous fsync on the backing
+UFS file. This drains all dirty UFS blocks for that backing file to disk
+before returning. After this completes for all vn volumes, there are no
+pending async UFS writes outstanding, so `sync(2)`'s `waitrunningbufspace()`
+has nothing to wait for and returns immediately.
+
+Implementation in `hammer2_io.c`:
+
+```c
+void
+hammer2_flush_vn_backing(hammer2_dev_t *hmp)
+{
+    for (i = 0; i < hmp->nvolumes; i++) {
+        vol = &hmp->volumes[i];
+        /* ... null checks ... */
+
+        bp = getpbuf(NULL);
+        bio = &bp->b_bio1;
+        bp->b_cmd = BUF_CMD_FLUSH;
+        bp->b_bcount = 0;
+        bp->b_resid = 0;
+        bio->bio_offset = 0;
+        bio->bio_done = biodone_sync;
+        bio->bio_flags |= BIO_SYNC;
+
+        dev_dstrategy(vol->dev->devvp->v_rdev, bio);
+        biowait(bio, "h2vnfl");   /* blocks until VOP_FSYNC completes */
+
+        relpbuf(bp, NULL);
+    }
+}
+```
+
+This is called from `hammer2_vfs_sync_pmp` after
+`hammer2_inode_chain_flush(VOLHDR)` completes (all dirty DIOs written), but
+only when `hmp->raid_nfailed > 0`. Healthy-mode operation generates far fewer
+UFS dirty blocks and does not trigger the threshold; adding the extra fsync
+in healthy mode would only harm throughput.
+
+The `BIO_SYNC` + `biodone_sync` pattern is the standard DragonFlyBSD
+mechanism for synchronous bio submission without a completion callback:
+set `bio->bio_done = biodone_sync`, set `bio->bio_flags |= BIO_SYNC`,
+call `dev_dstrategy`, then `biowait` — the `BIO_SYNC` flag causes
+`biodone_sync` to wake the caller rather than freeing the bio.
+
+#### Summary of why each attempt failed / succeeded
+
+| Approach | Result | Why |
+|----------|--------|-----|
+| `bawrite` → `bwrite` for degraded data/parity (Fix 10) | Partial fix | Eliminated HAMMER2-level runningbufspace accumulation but UFS dirty blocks still accumulate below |
+| `IO_SYNC` in `VOP_WRITE` (vn.c change) | No effect | vn is kernel built-in; vn.ko is never loaded |
+| Counting semaphore in HAMMER2 | No effect | `buf_daemon` bypasses it, generating UFS dirty blocks independently |
+| `BUF_CMD_FLUSH` bio after chain flush | **Fix** | Calls `VOP_FSYNC(MNT_WAIT)` on UFS backing file, draining all dirty blocks before sync(2) checks |
 
 ### Parity Thread Must Exit Before Closing Vnodes
 
