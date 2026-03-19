@@ -137,6 +137,36 @@ hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 **Critical**: Both the kernel mapper and `newfs_hammer2` must use identical
 left-symmetric formulas or parity/data placement will be inconsistent.
 
+### Why Distributed Parity Instead of Dedicated P/Q Drives
+
+A natural alternative is **dedicated parity**: fix vn0=P, vn1=Q, and treat
+vn2..vnN as pure data drives. This is how some early hardware RAID controllers
+worked. We use **distributed parity** (the left-symmetric layout above) instead,
+for the same reasons Linux md RAID6 and ZFS raidz2 do:
+
+**Write hotspot and wear imbalance.** With dedicated P and Q drives, every
+single write to any data block requires a corresponding write to vn0 (P) and
+vn1 (Q). Those two drives accumulate roughly `(ndisks - 2)x` the write load of
+any data drive. With distributed parity, each drive receives the same average
+write load — P/Q columns rotate so every drive is P for `1/ndisks` of all
+stripes and Q for another `1/ndisks`. For spinning disks this is a significant
+durability advantage; for SSDs it evens wear leveling across all devices.
+
+**Read performance.** Healthy reads never touch the P or Q columns. With
+dedicated parity, vn0 and vn1 are permanently excluded from read I/O, limiting
+read bandwidth to N-2 drives. With distributed parity all N drives participate
+in reads equally, giving full N-drive read throughput.
+
+**Would dedicated parity simplify degraded operation or resilvering?**
+No — the same `GF(2^8)` reconstruction algorithms are required either way.
+Even with fixed P/Q drives you can simultaneously lose a data drive and one
+parity drive (e.g., vn2 + vn0), so `dual_recov` still needs to handle every
+mixed data+parity combination. The savings would be a handful of lines in
+`hammer2_raid6_map` (constants `p_disk=0, q_disk=1` instead of per-stripe
+modular arithmetic). Every bug we have fixed — the runningbufspace deadlock,
+the RMW delta parity race, the disk_state persistence issue, the resilver dirty
+range — is orthogonal to which topology is chosen.
+
 ---
 
 ## 4. GF(2^8) Math Library
