@@ -645,6 +645,55 @@ io_done:
 }
 
 /*
+ * Flush the UFS backing files for all vn device volumes.
+ *
+ * When HAMMER2 runs on vn devices backed by UFS files, bwrite() calls on
+ * vn device buffers go through vn_strategy → VOP_WRITE (without IO_SYNC)
+ * → UFS bdwrite.  This leaves dirty UFS blocks in the buffer cache that
+ * buf_daemon flushes asynchronously.  If enough accumulate, sync(2) blocks
+ * indefinitely in waitrunningbufspace() because the running count of async
+ * writes to the underlying disk exceeds hirunningspace.
+ *
+ * Submitting a BUF_CMD_FLUSH bio to each vn device triggers
+ * vn_strategy(BUF_CMD_FLUSH) → VOP_FSYNC(sc_vp, MNT_WAIT), which drains
+ * all dirty UFS blocks for the backing file to disk synchronously.  After
+ * this returns, sync(2)'s waitrunningbufspace() has nothing to wait for.
+ *
+ * Must be called after all dirty DIOs have been bwritten to vn devices
+ * (i.e., after hammer2_inode_chain_flush with VOLHDR completes).
+ */
+void
+hammer2_flush_vn_backing(hammer2_dev_t *hmp)
+{
+	hammer2_volume_t *vol;
+	struct buf *bp;
+	struct bio *bio;
+	int i;
+
+	for (i = 0; i < hmp->nvolumes; i++) {
+		vol = &hmp->volumes[i];
+		if (vol->dev == NULL || vol->dev->devvp == NULL)
+			continue;
+		if (vol->dev->devvp->v_rdev == NULL)
+			continue;
+
+		bp = getpbuf(NULL);
+		bio = &bp->b_bio1;
+		bp->b_cmd = BUF_CMD_FLUSH;
+		bp->b_bcount = 0;
+		bp->b_resid = 0;
+		bio->bio_offset = 0;
+		bio->bio_done = biodone_sync;
+		bio->bio_flags |= BIO_SYNC;
+
+		dev_dstrategy(vol->dev->devvp->v_rdev, bio);
+		biowait(bio, "h2vnfl");
+
+		relpbuf(bp, NULL);
+	}
+}
+
+/*
  * Release our ref on *diop.
  *
  * On the 1->0 transition we clear DIO_GOOD, set DIO_INPROG, and dispose
@@ -795,14 +844,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				}
 
 				if (dio->refs & HAMMER2_DIO_FLUSH) {
-					/*
-					 * Degraded mode: use synchronous
-					 * bwrite to prevent runningbufspace
-					 * accumulation.  Async data bawrites
-					 * can exhaust the buffer cache and
-					 * deadlock against the vn device's
-					 * UFS backing store.
-					 */
 					if (hmp->raid_nfailed > 0) {
 						bp->b_flags &= ~B_CLUSTEROK;
 						bwrite(bp);
@@ -1443,11 +1484,11 @@ parity_write:
 	 * Data columns are handled by the main thread via standard
 	 * buffer cache disposal.
 	 *
-	 * Use synchronous bwrite() when called inline from the
-	 * degraded flush path.  This prevents runningbufspace
-	 * accumulation that can deadlock against the vn device's
-	 * UFS backing store (buffer cache exhaustion).  The
-	 * background parity thread uses bawrite() for throughput.
+	 * Degraded mode: use synchronous bwrite() so that parity is
+	 * on-disk before the inline flush returns.  This ensures that
+	 * a subsequent degraded read can reconstruct the correct data.
+	 * Background parity thread (healthy mode) uses bawrite() for
+	 * throughput.
 	 */
 	di = 0;
 	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
