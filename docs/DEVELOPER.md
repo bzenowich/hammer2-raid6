@@ -22,7 +22,8 @@ I/O architecture, parity write path, failure/resilver mechanics, and known pitfa
 12. [Userspace Tool Changes (hammer2)](#12-userspace-tool-changes)
 13. [Key Invariants and Pitfalls](#13-key-invariants-and-pitfalls)
 14. [Testing](#14-testing)
-15. [Future Work](#15-future-work)
+15. [Unimplemented Upstream Features](#15-unimplemented-upstream-features)
+16. [Future Work](#16-future-work)
 
 ---
 
@@ -42,6 +43,43 @@ freemap). The freemap sees a single logical address space; striping is invisible
   per-disk vnode I/O (breadnx/bwrite)
           │
   /dev/vn0  /dev/vn1  /dev/vn2  /dev/vn3
+```
+
+### Read and Write Path Branches
+
+The I/O layer has two distinct code paths for reads and writes depending on
+whether the array is healthy or degraded. Understanding these branches is the
+key to navigating the codebase.
+
+```
+READ PATH (_hammer2_io_getblk)
+
+  _hammer2_io_getblk(logical_off)
+          │
+          ├─ disk online? ──→  breadnx(disk_idx)          [normal path]
+          │
+          └─ disk failed? ──→  hammer2_io_raid6_read_degraded
+                                 reads all N columns via breadnx
+                                 zeros failed-disk slots
+                                 calls hammer2_raid6_dual_recov
+                                 copies reconstructed column to caller
+
+
+WRITE PATH (_hammer2_io_putblk, dirty DIO lastdrop)
+
+  _hammer2_io_putblk(dio)
+          │
+          ├─ healthy (raid_nfailed == 0):
+          │     bdwrite(data_bp)                           [async]
+          │     enqueue hammer2_parity_work{data, old_data}
+          │     → background thread h2par-<dev>:
+          │         hammer2_io_raid6_write (bawrite for P/Q)
+          │
+          └─ degraded (raid_nfailed > 0):
+                bwrite(data_bp)                            [sync]
+                hammer2_io_raid6_write inline              [sync bwrite for P/Q]
+                ↓ (after all DIOs flushed, in vfs_sync_pmp)
+                hammer2_flush_vn_backing                   [BUF_CMD_FLUSH per volume]
 ```
 
 Key design choices:
@@ -137,6 +175,39 @@ hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 **Critical**: Both the kernel mapper and `newfs_hammer2` must use identical
 left-symmetric formulas or parity/data placement will be inconsistent.
 
+### Worked Example (ndisks=4, ndata=2)
+
+With a 4-disk array the P/Q columns rotate through all four disks every 4
+stripes. Each disk is P for exactly 1 in 4 stripes and Q for exactly 1 in 4,
+giving equal write load across all disks:
+
+| Stripe | Disk 0 | Disk 1 | Disk 2 | Disk 3 |
+|--------|--------|--------|--------|--------|
+| 0      | P      | Q      | D[0]   | D[1]   |
+| 1      | D[0]   | P      | Q      | D[1]   |
+| 2      | D[0]   | D[1]   | P      | Q      |
+| 3      | Q      | D[0]   | D[1]   | P      |
+| 4      | P      | Q      | D[0]   | D[1]   | ← repeats
+
+To trace a specific logical offset through `hammer2_raid6_map`:
+
+```
+logical_off = 0x30000  (192 KB = stripe_unit * 3)
+ndata = 2, stripe_unit = 65536
+
+stripe_num = 0x30000 / (2 * 65536) = 1
+col        = (0x30000 / 65536) % 2  = 1   ← second data column (D[1])
+p_disk     = 1 % 4 = 1
+q_disk     = 2 % 4 = 2
+data_disks = [0, 3]  (all disks except p_disk=1 and q_disk=2, in order)
+→ col 1 maps to disk 3
+
+phys_off   = stripe_num * stripe_unit + HAMMER2_ZONE_SEG
+           = 65536 + 4194304 = 0x401000
+```
+
+So logical offset 0x30000 lives on disk 3 at physical offset 0x401000.
+
 ### Why Distributed Parity Instead of Dedicated P/Q Drives
 
 A natural alternative is **dedicated parity**: fix vn0=P, vn1=Q, and treat
@@ -227,6 +298,51 @@ Q = (...((data[ndata-1] * 2) ^ data[ndata-2]) * 2 ^ ...) ^ data[0]
 - If one data + P → `datap_recov` (uses Q)
 - If two data → `2data_recov` (uses P+Q)
 
+#### Single Data Column Recovery (one data disk failed, P and Q both available)
+
+Since `P = D[0] XOR D[1] XOR ... XOR D[ndata-1]`, the failed column is just
+the XOR of P with all surviving data columns:
+
+```
+D[f] = P XOR D[0] XOR ... XOR D[ndata-1]    (all terms except D[f])
+```
+
+#### Two Data Columns Recovery (`2data_recov`, columns `fa` and `fb` failed)
+
+Let `P'` = P XOR (XOR of all surviving data) = `D[fa] XOR D[fb]`
+Let `Q'` = Q XOR (GF-weighted sum of surviving data) = `g^fa * D[fa] XOR g^fb * D[fb]`
+
+where `g^i = gf_exp[i]` (powers of the generator in GF(2^8)).
+
+From these two equations, solve for `D[fb]` first:
+
+```
+D[fb] = gf_mul(gf_inv(gf_exp[fa] ^ gf_exp[fb]),
+               gf_mul(gf_exp[fa], P') ^ Q')
+D[fa] = P' ^ D[fb]
+```
+
+The divisor `gf_exp[fa] ^ gf_exp[fb]` is non-zero as long as `fa != fb`,
+which is guaranteed by the caller.
+
+#### One Data + P Recovery (`datap_recov`, data column `fd` failed, P lost)
+
+Since Q encodes the data with generator weights:
+
+```
+Q = g^0*D[0] ^ g^1*D[1] ^ ... ^ g^(ndata-1)*D[ndata-1]
+```
+
+Isolate the missing term:
+
+```
+g^fd * D[fd] = Q XOR (sum of g^i * D[i] for all surviving i)
+D[fd]        = gf_mul(gf_inv(gf_exp[fd]), Q')
+```
+
+where `Q'` is Q XOR-reduced by all surviving weighted contributions. Then
+`P_new` is recomputed as the XOR of all recovered data columns.
+
 ---
 
 ## 5. I/O Layer
@@ -282,6 +398,39 @@ buffer cache pressure during degraded-mode flush.
 - Degraded mode (inline): `bwrite` for data and P/Q (synchronous, prevents
   runningbufspace deadlock)
 
+### `old_data` Buffer Lifecycle
+
+`old_data` is a snapshot of a DIO's contents taken *before* the caller
+modifies the buffer. It is the foundation of the RMW delta parity formula
+and must be valid for the entire window from modification through parity write.
+
+```
+1. CAPTURE  — _hammer2_io_getblk, before handing buffer to caller:
+                dio->raid6_old_data = kmalloc(bytes)
+                memcpy(dio->raid6_old_data, bp->b_data, bytes)
+
+2. HOLD     — caller modifies bp->b_data freely; old_data is untouched
+
+3. CONSUME  — _hammer2_io_putblk (lastdrop):
+                healthy:  enqueue old_data with parity work item
+                          (parity thread calls hammer2_io_raid6_write
+                           with old_data, then kfrees it)
+                degraded: pass old_data directly to hammer2_io_raid6_write
+                          kfree(old_data) after parity write
+
+4. FREED    — by whichever consumer calls kfree(old_data)
+```
+
+**Invariants**:
+- `old_data` must not be NULL when `hammer2_io_raid6_write` is called — a
+  NULL `old_data` silently produces wrong parity (delta formula degenerates).
+- `old_data` must not be accessed after the parity write; it is freed by the
+  consumer, not the DIO owner.
+- In degraded mode, `old_data` is also needed for the failed-disk path: when
+  `DOP_NEW` (sub-buffer allocation, e.g., a 1 KB inode within a 64 KB DIO) is
+  directed at a failed disk, the old buffer content is zeros from the original
+  `breadnx` call on the replacement path, which is correct.
+
 **IMPORTANT**: Each `breadnx` call must be preceded by `bp = NULL`. `breadnx` checks
 `*bpp` and will reuse a stale/freed pointer if it's non-NULL. This has caused
 use-after-free GPFs in the past (see `img/FatalTrap9.png`).
@@ -312,9 +461,10 @@ and waits for it to drain the queue and exit.
 ```c
 struct hammer2_parity_work {
     TAILQ_ENTRY(hammer2_parity_work) entry;
-    hammer2_off_t   pbase;   /* logical offset */
-    int             psize;   /* size in bytes */
-    char           *data;    /* data buffer (kmalloc'd, freed by thread) */
+    hammer2_off_t   pbase;    /* logical offset */
+    int             psize;    /* size in bytes */
+    char           *data;     /* new data buffer (kmalloc'd, freed by thread) */
+    char           *old_data; /* pre-modification snapshot for RMW delta */
 };
 ```
 
@@ -505,6 +655,32 @@ Called for version-3 (RAID6) volumes. Validates:
 
 Translates logical offset → (disk index, physical offset). Adds `HAMMER2_ZONE_SEG64`
 to the physical offset to skip the volume header zone.
+
+### `hammer2_volumes_commit(hmp, voldata)`
+
+Writes the updated volume header to disk. **HAMMER2 only writes the volume
+header to `hmp->devvp` (disk 0)**; the other disks' headers are not updated
+by the normal flush path. This has two important consequences:
+
+1. **After resilver**: the replacement disk needs a manually constructed
+   volume header (Phase 1 of the resilver procedure) because it will never
+   receive an automatic header update from `volumes_commit`.
+
+2. **RAID config state**: `fail-disk` and `replace` ioctls must write the
+   updated `disk_state[]` and flags to **both** `hmp->raid_config` (runtime)
+   and `hmp->voldata.raid_config` (persisted). Only `voldata` reaches disk
+   via `volumes_commit`. If only `hmp->raid_config` is updated, the change
+   is lost on unmount and the array remounts as if no failure occurred
+   (see the disk_state persistence pitfall in Section 13).
+
+### Two-Copy Header Write
+
+`hammer2_volumes_commit` writes the volume header twice to disk 0: once at
+the primary header offset and once at the backup offset. HAMMER2's mount
+code validates both copies via `ICRC_SECT0` and `ICRC_VOLHEADER` CRCs and
+uses whichever is newer (highest `volu_icrc_volheader` sequence number).
+When writing a resilver header to a new disk (Phase 1), both copies must be
+written and both CRCs must be recomputed.
 
 ---
 
@@ -814,6 +990,60 @@ call `dev_dstrategy`, then `biowait` — the `BIO_SYNC` flag causes
 | Counting semaphore in HAMMER2 | No effect | `buf_daemon` bypasses it, generating UFS dirty blocks independently |
 | `BUF_CMD_FLUSH` bio after chain flush | **Fix** | Calls `VOP_FSYNC(MNT_WAIT)` on UFS backing file, draining all dirty blocks before sync(2) checks |
 
+### disk_state Must Be Written to Both hmp->raid_config and hmp->voldata
+
+Any ioctl that modifies disk failure/replacement state must update **two**
+separate copies of the RAID config:
+
+```c
+/* Runtime — used immediately by I/O path */
+hmp->raid_config.disk_state[i] = HAMMER2_RAID6_DISK_FAILED;
+hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+
+/* Persistent — written to disk on next flush via volumes_commit */
+hmp->voldata.raid_config.disk_state[i] = HAMMER2_RAID6_DISK_FAILED;
+hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+```
+
+At mount time, `hmp->raid_config` is restored from `hmp->voldata.raid_config`
+(the on-disk copy). If only the runtime copy is updated, the change is lost on
+unmount. On remount the disk will appear ONLINE and the kernel will submit I/O
+to it directly — bypassing the degraded read path — producing CHECK FAIL errors
+on every block that was written to the replacement disk during the degraded
+session.
+
+This affects `hammer2_ioctl_raid_fail_disk` and `hammer2_ioctl_raid_replace`.
+Any future ioctls that change per-disk state have the same requirement.
+
+### dual_recov Argument Order Must Be Normalized
+
+`hammer2_raid6_dual_recov(ndisks, bytes, faila, failb, ptrs)` dispatches to
+recovery sub-functions based on which columns failed. The dispatch logic
+assumes that when one failed column is a parity column (index `>= ndata`) and
+one is a data column (index `< ndata`), the **parity column index is in
+`faila`** and the **data column index is in `failb`**.
+
+If the caller passes them in the wrong order (`faila < ndata`, `failb >= ndata`),
+the dispatch falls through to the wrong branch — typically the "both parity"
+branch — computing incorrect output.
+
+The fix is a normalization at the top of `dual_recov`:
+
+```c
+/* Normalize: parity column (>= ndata) must be in faila */
+if (faila >= ndata && failb < ndata) {
+    int tmp = faila; faila = failb; failb = tmp;
+}
+```
+
+This is especially relevant for the resilver path, which calls
+`dual_recov(failed_col, other_failed_col)` where `failed_col` is the disk
+being rebuilt. When the disk being resilvered holds a P or Q column for a
+given stripe, `failed_col >= ndata`. If the second failure is a data column,
+the argument order produces the normalization bug. Without the swap, resilver
+writes the wrong data to the replacement disk for those stripes, which then
+fails parity verification.
+
 ### Parity Thread Must Exit Before Closing Vnodes
 
 `hammer2_parity_uninit` must be called before closing device vnodes during unmount.
@@ -857,13 +1087,15 @@ All test scripts are in `tests/mdraid/`:
 | `test_d.sh` | Online resilver: format, write, fail disk, resilver to replacement, verify data, unmount+remount | PASS |
 | `test_e_write_degraded.sh` | Write during degraded mode: 4 scenarios with single/dual failure and data integrity | 4/4 PASS |
 | `test_f_sequential_fail.sh` | Sequential disk failures: fail one, write, fail another, verify all data | 3/3 PASS |
-| `test_g_repair_no_destroy.sh` | Repair without data loss (needs h2parity_fix on VM) | Skipped |
-| `test_h_mount_missing.sh` | Mount with absent disk scenarios | 3/4 PASS |
-| `test_i_write_during_resilver.sh` | Write during active resilver | 2/3 PASS |
-| `test_j_unclean_unmount.sh` | Unclean unmount recovery | 3/4 PASS |
+| `test_g_repair_no_destroy.sh` | Repair without data loss (needs h2parity_fix on VM) | 6/6 PASS |
+| `test_h_mount_missing.sh` | Mount with absent disk: degraded mount when a disk is absent at mount time | 6/6 PASS |
+| `test_i_write_during_resilver.sh` | Write during active resilver: data integrity with concurrent writes | 3/3 PASS |
+| `test_j_unclean_unmount.sh` | Unclean unmount recovery: journal replay after hard reboot | 5/5 PASS |
 | `test_k_concurrent_io.sh` | Concurrent I/O during degraded + resilver, deadlock detection | 6/6 PASS |
 | `test_all_fail_combos.sh` | All 4 single-fail + 6 dual-fail read + 6 dual-fail write combinations | 32/32 PASS |
 | `test_l_snapshot_compression.sh` | Snapshots during degraded mode, COW with snapshots, LZ4 compression with disk failures | 18/18 PASS |
+| `test_5disk.sh` | Full 5-disk (3 data + P + Q) array: healthy, single-fail, dual-fail, degraded write, resilver | 11/11 PASS |
+| `test_6disk.sh` | Full 6-disk (4 data + P + Q) array: healthy, single-fail, dual-fail, degraded write, resilver | 11/11 PASS |
 
 ### Parity Checker (`h2parity_fix`)
 
@@ -946,5 +1178,18 @@ RAID6 — the only valid operations are `raid fail-disk` (failure path) and a fu
 | Multiple RAID6 arrays | Per-volume rather than per-mount RAID config |
 | HAMMER2 version bump | `HAMMER2_VOL_VERSION_WIP = 4` currently; bump to 3 as stable |
 | ioctl for resilver abort | Allow cancelling an in-progress resilver |
-| Progress display in resilver | `hammer2 raid replace` currently blocks; add `-n` / polling |
-| Pool alias config (`/etc/hammer2.conf`) | Map short names to full device strings so `hammer2 raid status pool0` works instead of typing `/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3@TEST`; add `hammer2 pool-set/del/list` subcommands to manage entries; resolution goes in `hammer2_ioctl_handle()` in `subs.c` as an early lookup step before existing `open()` and `getfsstat()` attempts; applies to JBOD multi-volume paths too, not RAID6-specific |
+| Progress display in resilver | `hammer2 raid replace` currently blocks; add `-n` / polling mode |
+| Resilver checkpoint persistence | Persist `resilver_dirty_lo/hi` to voldata so a crash mid-resilver can resume rather than restart from stripe 0 |
+
+### Pool Alias Config (`/etc/hammer2.conf`)
+
+Map short pool names to full device strings so commands like
+`hammer2 raid status pool0` work without typing
+`/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3@TEST` every time.
+
+Design sketch:
+- Add `hammer2 pool-set <name> <devspec>` / `pool-del` / `pool-list` subcommands
+- Store entries in `/etc/hammer2.conf` (or `~/.hammer2.conf`)
+- Resolution logic goes in `hammer2_ioctl_handle()` in `subs.c` as an early
+  lookup step, before the existing `open()` and `getfsstat()` attempts
+- Applies to JBOD multi-volume paths as well — not RAID6-specific
