@@ -11,6 +11,282 @@ index 30b0b71dc5..037d9296b2 100644
  SRCS+=	print_inode.c
  MAN=	hammer2.8
  
+diff --git a/sbin/hammer2/cmd_raid.c b/sbin/hammer2/cmd_raid.c
+new file mode 100644
+index 0000000000..d51369b0c2
+--- /dev/null
++++ b/sbin/hammer2/cmd_raid.c
+@@ -0,0 +1,270 @@
++/*
++ * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name of The DragonFly Project nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific, prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++#include "hammer2.h"
++
++static const char *
++raid_disk_state_str(uint8_t state)
++{
++	switch (state) {
++	case HAMMER2_RAID6_DISK_ONLINE:
++		return "online";
++	case HAMMER2_RAID6_DISK_FAILED:
++		return "FAILED";
++	case HAMMER2_RAID6_DISK_REBUILDING:
++		return "rebuilding";
++	case HAMMER2_RAID6_DISK_SPARE:
++		return "spare";
++	default:
++		return "unknown";
++	}
++}
++
++/*
++ * Display RAID status for a HAMMER2 filesystem.
++ * Reads the volume header directly from the device to show the
++ * RAID configuration and disk states.
++ */
++static int
++cmd_raid_status(const char *devpath)
++{
++	hammer2_volume_data_t voldata;
++	hammer2_raid_config_t *rc;
++	int fd, i;
++
++	fd = open(devpath, O_RDONLY);
++	if (fd < 0) {
++		fprintf(stderr, "Cannot open %s: %s\n",
++			devpath, strerror(errno));
++		return 1;
++	}
++	if (hammer2_read_volume_header(fd, devpath, &voldata) < 0) {
++		fprintf(stderr, "Cannot read volume header from %s\n",
++			devpath);
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	if (voldata.version < HAMMER2_VOL_VERSION_RAID6) {
++		printf("Filesystem version %d does not support RAID\n",
++		       voldata.version);
++		return 0;
++	}
++
++	rc = &voldata.raid_config;
++	if (rc->raid_type == 0) {
++		printf("RAID type:       JBOD (no RAID)\n");
++		return 0;
++	}
++
++	printf("RAID type:       RAID %d\n", rc->raid_type);
++	printf("Total disks:     %d\n", rc->ndisks);
++	printf("Data disks:      %d\n", rc->ndata);
++	printf("Parity disks:    2 (P + Q)\n");
++	printf("Stripe unit:     %s (%jd bytes)\n",
++	       sizetostr(rc->stripe_unit), (intmax_t)rc->stripe_unit);
++	printf("Array size:      %s (%jd bytes)\n",
++	       sizetostr(rc->array_size), (intmax_t)rc->array_size);
++	printf("Flags:           0x%08x", rc->flags);
++	if (rc->flags & HAMMER2_RAID6_FLAG_DEGRADED)
++		printf(" DEGRADED");
++	if (rc->flags & HAMMER2_RAID6_FLAG_REBUILDING)
++		printf(" REBUILDING");
++	printf("\n");
++
++	printf("\nDisk states:\n");
++	for (i = 0; i < rc->ndisks; i++) {
++		printf("  disk %2d: %s\n", i,
++		       raid_disk_state_str(rc->disk_state[i]));
++	}
++
++	return 0;
++}
++
++/*
++ * Explicitly mark a RAID6 disk as failed.
++ * After this call the kernel stops submitting I/O to the device, so it
++ * can be detached (e.g. vnconfig -u) without EBUSY.
++ * The filesystem continues to operate in degraded mode.
++ */
++static int
++cmd_raid_fail_disk(const char *sel_path, const char *dev)
++{
++	hammer2_ioc_raid_fail_disk_t rfd;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rfd, sizeof(rfd));
++	snprintf(rfd.dev, sizeof(rfd.dev), "%s", dev);
++
++	if (ioctl(fd, HAMMER2IOC_RAID_FAIL_DISK, &rfd) < 0) {
++		fprintf(stderr, "raid fail-disk: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	printf("Disk %s (index %d) marked as failed.\n", dev, rfd.disk_idx);
++	printf("Filesystem is operating in degraded mode.\n");
++	printf("You may now detach the device, then run:\n");
++	printf("  hammer2 -s <mountpoint> raid replace %s <new_dev>\n", dev);
++	return 0;
++}
++
++/*
++ * Online resilver: replace a failed RAID6 disk with a new one.
++ * The filesystem must be mounted.  The ioctl reconstructs all data
++ * from surviving disks and parity, then atomically swaps in the new disk.
++ */
++static int
++cmd_raid_replace(const char *sel_path, const char *old_dev,
++		 const char *new_dev)
++{
++	hammer2_ioc_raid_replace_t rr;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rr, sizeof(rr));
++	snprintf(rr.old_dev, sizeof(rr.old_dev), "%s", old_dev);
++	snprintf(rr.new_dev, sizeof(rr.new_dev), "%s", new_dev);
++
++	if (ioctl(fd, HAMMER2IOC_RAID_REPLACE, &rr) < 0) {
++		fprintf(stderr, "raid replace: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	printf("Resilver complete: disk %s replaced by %s\n",
++	       old_dev, new_dev);
++	return 0;
++}
++
++/*
++ * Query resilver progress from the running kernel.
++ * Prints a single human-readable line; also suitable for polling from
++ * a Web UI (add -j for JSON output once needed).
++ */
++static int
++cmd_raid_resilver_status(const char *sel_path)
++{
++	hammer2_ioc_resilver_status_t rs;
++	int fd;
++
++	fd = hammer2_ioctl_handle(sel_path);
++	if (fd < 0)
++		return 1;
++
++	bzero(&rs, sizeof(rs));
++	if (ioctl(fd, HAMMER2IOC_RAID_RESILVER_STATUS, &rs) < 0) {
++		fprintf(stderr, "raid resilver-status: ioctl failed: %s\n",
++			strerror(errno));
++		close(fd);
++		return 1;
++	}
++	close(fd);
++
++	if (!rs.running) {
++		printf("resilver: idle (no resilver in progress)\n");
++	} else {
++		printf("resilver: disk %d  %llu / %llu stripes  %d%%\n",
++		       rs.disk_idx,
++		       (unsigned long long)rs.stripes_done,
++		       (unsigned long long)rs.stripes_total,
++		       rs.progress);
++	}
++	return 0;
++}
++
++/*
++ * Dispatch RAID subcommands.
++ */
++int
++cmd_raid(const char *sel_path, int ac, const char **av)
++{
++	if (ac < 1) {
++		fprintf(stderr,
++			"raid: missing subcommand\n"
++			"    raid status <devpath>           "
++				"Show RAID status\n"
++			"    raid fail-disk <dev>            "
++				"Mark a disk failed (degraded mode)\n"
++			"    raid replace <old> <new>        "
++				"Replace a failed disk (online resilver)\n"
++			"    raid resilver-status            "
++				"Query resilver progress\n");
++		return 1;
++	}
++
++	if (strcmp(av[0], "status") == 0) {
++		if (ac < 2) {
++			fprintf(stderr, "raid status: requires device path\n");
++			return 1;
++		}
++		return cmd_raid_status(av[1]);
++	} else if (strcmp(av[0], "fail-disk") == 0) {
++		if (ac < 2) {
++			fprintf(stderr, "raid fail-disk: requires <dev>\n");
++			return 1;
++		}
++		return cmd_raid_fail_disk(sel_path, av[1]);
++	} else if (strcmp(av[0], "replace") == 0) {
++		if (ac < 3) {
++			fprintf(stderr,
++				"raid replace: requires <old_dev> <new_dev>\n");
++			return 1;
++		}
++		return cmd_raid_replace(sel_path, av[1], av[2]);
++	} else if (strcmp(av[0], "resilver-status") == 0) {
++		return cmd_raid_resilver_status(sel_path);
++	} else {
++		fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
++		fprintf(stderr,
++			"    raid status <devpath>           "
++				"Show RAID status\n"
++			"    raid fail-disk <dev>            "
++				"Mark a disk failed (degraded mode)\n"
++			"    raid replace <old> <new>        "
++				"Replace a failed disk (online resilver)\n"
++			"    raid resilver-status            "
++				"Query resilver progress\n");
++		return 1;
++	}
++}
 diff --git a/sbin/hammer2/hammer2.h b/sbin/hammer2/hammer2.h
 index 2567cec224..fc0a4f63cd 100644
 --- a/sbin/hammer2/hammer2.h
@@ -461,28 +737,30 @@ index 6fde079c8b..6d43d7a323 100644
  	);
  	exit(1);
  }
+diff --git a/sys/dev/disk/vn/Makefile b/sys/dev/disk/vn/Makefile
+index 3193fbe627..d7463afa3c 100644
+--- a/sys/dev/disk/vn/Makefile
++++ b/sys/dev/disk/vn/Makefile
+@@ -5,7 +5,7 @@ SRCS=   vn.c use_vn.h
+ 
+ .if !defined(KERNBUILDDIR)
+ use_vn.h:
+-	echo "#define	NVN	4" > ${.TARGET}
++	echo "#define	NVN	6" > ${.TARGET}
+ .endif
+ 
+ .include <bsd.kmod.mk>
 diff --git a/sys/dev/disk/vn/vn.c b/sys/dev/disk/vn/vn.c
-index 8972ac44ff..df54738840 100644
+index 8972ac44ff..5c5cb43ee1 100644
 --- a/sys/dev/disk/vn/vn.c
 +++ b/sys/dev/disk/vn/vn.c
-@@ -348,7 +348,19 @@ vnstrategy(struct dev_strategy_args *ap)
+@@ -348,7 +348,8 @@ vnstrategy(struct dev_strategy_args *ap)
  
  		case (BUF_CMD_WRITE):
  			vn_lock(vn->sc_vp, LK_EXCLUSIVE | LK_RETRY);
 -			error = VOP_WRITE(vn->sc_vp, &auio, IO_RECURSE,
-+			/*
-+			 * IO_SYNC: write each UFS buffer synchronously
-+			 * (bwrite rather than bdwrite).  This ensures that
-+			 * by the time vnstrategy returns, the data is committed
-+			 * to the backing file on disk — not merely sitting in
-+			 * the UFS page cache waiting for buf_daemon.  Without
-+			 * this, repeated bwrite()s to a vn device accumulate
-+			 * async UFS writes in runningbufspace; if runningbufspace
-+			 * exceeds hirunningspace, a subsequent sync(2) call
-+			 * blocks indefinitely in waitrunningbufspace().
-+			 */
 +			error = VOP_WRITE(vn->sc_vp, &auio,
-+					  IO_RECURSE | IO_SYNC,
++					  IO_RECURSE,
  					  vn->sc_cred);
  			break;
  
@@ -500,7 +778,7 @@ index 9c5abb19e3..b563bcea46 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index 3b7ae96524..9c406be955 100644
+index 3b7ae96524..63dc513e0a 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -274,10 +274,10 @@ struct hammer2_io {
@@ -562,17 +840,18 @@ index 3b7ae96524..9c406be955 100644
  };
  
  typedef struct hammer2_dev hammer2_dev_t;
-@@ -1900,6 +1932,9 @@ void hammer2_cluster_unlock(hammer2_cluster_t *cluster);
+@@ -1900,6 +1932,10 @@ void hammer2_cluster_unlock(hammer2_cluster_t *cluster);
  
  void hammer2_bulkfree_init(hammer2_dev_t *hmp);
  void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
 +void hammer2_parity_init(hammer2_dev_t *hmp);
 +void hammer2_parity_uninit(hammer2_dev_t *hmp);
 +void hammer2_parity_drain(hammer2_dev_t *hmp);
++void hammer2_flush_vn_backing(hammer2_dev_t *hmp);
  int hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
  			struct hammer2_ioc_bulkfree *bfi);
  void hammer2_dummy_xop_from_chain(hammer2_xop_head_t *xop,
-@@ -1938,6 +1973,26 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -1938,6 +1974,26 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  			struct vnode **rootvoldevvp);
  hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
  
@@ -890,7 +1169,7 @@ index d940d17012..7fe37e9877 100644
  	if (flush_error)
  		total_error = flush_error;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 68a47162fb..7796be51d8 100644
+index 68a47162fb..8fa3d86714 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,7 @@
@@ -1201,7 +1480,63 @@ index 68a47162fb..7796be51d8 100644
  	/*
  	 * Clear INPROG and WAITING, set GOOD wake up anyone waiting.
  	 */
-@@ -506,8 +731,37 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -419,6 +644,55 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+ 	return dio;
+ }
+ 
++/*
++ * Flush the UFS backing files for all vn device volumes.
++ *
++ * When HAMMER2 runs on vn devices backed by UFS files, bwrite() calls on
++ * vn device buffers go through vn_strategy → VOP_WRITE (without IO_SYNC)
++ * → UFS bdwrite.  This leaves dirty UFS blocks in the buffer cache that
++ * buf_daemon flushes asynchronously.  If enough accumulate, sync(2) blocks
++ * indefinitely in waitrunningbufspace() because the running count of async
++ * writes to the underlying disk exceeds hirunningspace.
++ *
++ * Submitting a BUF_CMD_FLUSH bio to each vn device triggers
++ * vn_strategy(BUF_CMD_FLUSH) → VOP_FSYNC(sc_vp, MNT_WAIT), which drains
++ * all dirty UFS blocks for the backing file to disk synchronously.  After
++ * this returns, sync(2)'s waitrunningbufspace() has nothing to wait for.
++ *
++ * Must be called after all dirty DIOs have been bwritten to vn devices
++ * (i.e., after hammer2_inode_chain_flush with VOLHDR completes).
++ */
++void
++hammer2_flush_vn_backing(hammer2_dev_t *hmp)
++{
++	hammer2_volume_t *vol;
++	struct buf *bp;
++	struct bio *bio;
++	int i;
++
++	for (i = 0; i < hmp->nvolumes; i++) {
++		vol = &hmp->volumes[i];
++		if (vol->dev == NULL || vol->dev->devvp == NULL)
++			continue;
++		if (vol->dev->devvp->v_rdev == NULL)
++			continue;
++
++		bp = getpbuf(NULL);
++		bio = &bp->b_bio1;
++		bp->b_cmd = BUF_CMD_FLUSH;
++		bp->b_bcount = 0;
++		bp->b_resid = 0;
++		bio->bio_offset = 0;
++		bio->bio_done = biodone_sync;
++		bio->bio_flags |= BIO_SYNC;
++
++		dev_dstrategy(vol->dev->devvp->v_rdev, bio);
++		biowait(bio, "h2vnfl");
++
++		relpbuf(bp, NULL);
++	}
++}
++
+ /*
+  * Release our ref on *diop.
+  *
+@@ -506,8 +780,37 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		 * Non-errored disposal of bp
  		 */
  		if (orefs & HAMMER2_DIO_DIRTY) {
@@ -1239,7 +1574,7 @@ index 68a47162fb..7796be51d8 100644
  			/*
  			 * Allows dirty buffers to accumulate and
  			 * possibly be canceled (e.g. by a 'rm'),
-@@ -523,22 +777,104 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -523,22 +826,96 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  			 * write.  This typically occurs in the write-behind
  			 * case when writing to large files.
  			 */
@@ -1270,14 +1605,6 @@ index 68a47162fb..7796be51d8 100644
 +				}
 +
 +				if (dio->refs & HAMMER2_DIO_FLUSH) {
-+					/*
-+					 * Degraded mode: use synchronous
-+					 * bwrite to prevent runningbufspace
-+					 * accumulation.  Async data bawrites
-+					 * can exhaust the buffer cache and
-+					 * deadlock against the vn device's
-+					 * UFS backing store.
-+					 */
 +					if (hmp->raid_nfailed > 0) {
 +						bp->b_flags &= ~B_CLUSTEROK;
 +						bwrite(bp);
@@ -1357,7 +1684,7 @@ index 68a47162fb..7796be51d8 100644
  			}
  		} else if (bp->b_flags & (B_ERROR | B_INVAL | B_RELBUF)) {
  			brelse(bp);
-@@ -552,6 +888,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -552,6 +929,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		brelse(bp);
  	}
  
@@ -1372,7 +1699,7 @@ index 68a47162fb..7796be51d8 100644
  	/*
  	 * Update iofree_count before disposing of the dio
  	 */
-@@ -646,6 +990,10 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
+@@ -646,6 +1031,10 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
  				"%016jx/%d (bp=%p)\n",
  				dio->pbase, dio->psize, dio->bp);
  		}
@@ -1383,7 +1710,7 @@ index 68a47162fb..7796be51d8 100644
  		kfree_obj(dio, hmp->mio);
  		atomic_add_int(&hammer2_dio_count, -1);
  		atomic_add_int(&hmp->iofree_count, -1);
-@@ -889,3 +1237,836 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -889,3 +1278,836 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
  	atomic_add_64(&dio->refs, 1);
  }
@@ -1593,11 +1920,11 @@ index 68a47162fb..7796be51d8 100644
 +	 * Data columns are handled by the main thread via standard
 +	 * buffer cache disposal.
 +	 *
-+	 * Use synchronous bwrite() when called inline from the
-+	 * degraded flush path.  This prevents runningbufspace
-+	 * accumulation that can deadlock against the vn device's
-+	 * UFS backing store (buffer cache exhaustion).  The
-+	 * background parity thread uses bawrite() for throughput.
++	 * Degraded mode: use synchronous bwrite() so that parity is
++	 * on-disk before the inline flush returns.  This ensures that
++	 * a subsequent degraded read can reconstruct the correct data.
++	 * Background parity thread (healthy mode) uses bawrite() for
++	 * throughput.
 +	 */
 +	di = 0;
 +	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
@@ -3056,448 +3383,6 @@ index 8e5c4bd79f..0f824f0296 100644
 +	*phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit +
 +		    (logical_off % stripe_unit);
 +}
-diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 0dfed0c4c0..250d98b09e 100644
---- a/sys/vfs/hammer2/hammer2_vfsops.c
-+++ b/sys/vfs/hammer2/hammer2_vfsops.c
-@@ -48,6 +48,7 @@
- #include <sys/file.h>
- 
- #include "hammer2.h"
-+#include "hammer2_raid6.h"
- 
- TAILQ_HEAD(hammer2_mntlist, hammer2_dev);
- static struct hammer2_mntlist hammer2_mntlist;
-@@ -349,6 +350,8 @@ hammer2_vfs_init(struct vfsconf *conf)
- 
- 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
- 
-+	hammer2_raid6_init();
-+
- 	return (error);
- }
- 
-@@ -1083,10 +1086,13 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
- 			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
- 				int devvp_found = 0;
- 				TAILQ_FOREACH(e, &devvpl, entry) {
--					KKASSERT(e->devvp);
-+					/* Skip absent devices (dummy vnodes) */
-+					if (e->devvp->v_rdev == NULL)
-+						continue;
- 					if (e_tmp->devvp == e->devvp)
- 						devvp_found = 1;
--					if (e_tmp->devvp->v_rdev &&
-+					if (e_tmp->devvp &&
-+					    e_tmp->devvp->v_rdev &&
- 					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
- 						devvp_found = 1;
- 				}
-@@ -1107,7 +1113,9 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
- 		if (hmp == NULL) {
- 			TAILQ_FOREACH(e, &devvpl, entry) {
- 				struct vnode *devvp = e->devvp;
--				KKASSERT(devvp);
-+				/* Skip absent devices (dummy vnodes) */
-+				if (devvp->v_rdev == NULL)
-+					continue;
- 				error = vfs_mountedon(devvp);
- 				if (error) {
- 					kprintf("hammer2_mount: %s mounted %d\n",
-@@ -1246,7 +1254,47 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
- 		 * Must use hmp instead of volume header for these two
- 		 * in order to handle volume versions transparently.
- 		 */
--		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
-+		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAID6) {
-+			hmp->nvolumes = hmp->voldata.nvolumes;
-+			hmp->total_size = hmp->voldata.raid_config.array_size;
-+			hmp->raid_type = hmp->voldata.raid_config.raid_type;
-+			bcopy(&hmp->voldata.raid_config, &hmp->raid_config,
-+			      sizeof(hmp->raid_config));
-+
-+			/*
-+			 * Restore failed disk state from on-disk config.
-+			 * If a disk was marked failed before unmount, keep
-+			 * it failed so we don't read stale/corrupt data
-+			 * from it.  The admin must explicitly resilver.
-+			 */
-+			hmp->raid_nfailed = 0;
-+			bzero(hmp->raid_failed, sizeof(hmp->raid_failed));
-+			for (i = 0; i < hmp->nvolumes; i++) {
-+				if (hmp->raid_config.disk_state[i] ==
-+				    HAMMER2_RAID6_DISK_FAILED) {
-+					hmp->raid_failed[i] = 1;
-+					hmp->raid_nfailed++;
-+				}
-+			}
-+
-+			/*
-+			 * Mark any absent disks (device unavailable at
-+			 * mount time) as failed.  This handles degraded
-+			 * mounts where a disk has been physically removed
-+			 * or detached.
-+			 */
-+			for (i = 0; i < hmp->nvolumes; i++) {
-+				if (hmp->volumes[i].dev == NULL ||
-+				    hmp->volumes[i].dev->devvp == NULL ||
-+				    !hmp->volumes[i].dev->open) {
-+					if (!hmp->raid_failed[i]) {
-+						hmp->raid_failed[i] = 1;
-+						hmp->raid_nfailed++;
-+					}
-+				}
-+			}
-+		} else if (hmp->voldata.version >=
-+			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
- 			hmp->nvolumes = hmp->voldata.nvolumes;
- 			hmp->total_size = hmp->voldata.total_size;
- 		} else {
-@@ -1266,6 +1314,46 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
- 		KKASSERT(TAILQ_EMPTY(&devvpl));
- 		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
- 
-+		/*
-+		 * Log RAID6 array status at mount time.  If any disks
-+		 * were previously failed, release VOP_OPEN on them so
-+		 * they can be detached/replaced.
-+		 */
-+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-+			if (hmp->raid_nfailed == 0) {
-+				kprintf("hammer2: RAID6 array mounted: "
-+					"%d disks (%d data + P + Q), "
-+					"all disks online\n",
-+					hmp->raid_config.ndisks,
-+					hmp->raid_config.ndata);
-+			} else {
-+				for (i = 0; i < hmp->nvolumes; i++) {
-+					if (!hmp->raid_failed[i])
-+						continue;
-+					kprintf("hammer2: RAID6 disk %d "
-+						"(%s) marked failed; "
-+						"operating in degraded "
-+						"mode\n", i,
-+						hmp->volumes[i].dev ?
-+						    hmp->volumes[i].dev->path :
-+						    "(absent)");
-+					if (hmp->volumes[i].dev &&
-+					    hmp->volumes[i].dev->devvp &&
-+					    hmp->volumes[i].dev->open) {
-+						vn_lock(hmp->volumes[i].dev->devvp,
-+							LK_EXCLUSIVE |
-+							LK_RETRY);
-+						VOP_CLOSE(
-+						    hmp->volumes[i].dev->devvp,
-+						    FREAD | FWRITE, NULL);
-+						vn_unlock(
-+						    hmp->volumes[i].dev->devvp);
-+						hmp->volumes[i].dev->open = 0;
-+					}
-+				}
-+			}
-+		}
-+
- 		/*
- 		 * Really important to get these right or the flush and
- 		 * teardown code will get confused.
-@@ -1362,6 +1450,7 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
- 		hammer2_update_pmps(hmp);
- 		hammer2_iocom_init(hmp);
- 		hammer2_bulkfree_init(hmp);
-+		hammer2_parity_init(hmp);
- 
- 		/*
- 		 * Ref the cluster management messaging descriptor.  The mount
-@@ -1835,6 +1924,13 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
- 
- 	hammer2_pfsfree_scan(hmp, 1);
- 
-+	/*
-+	 * Drain and stop the RAID6 parity worker thread before closing
-+	 * devices.  Any parity work queued during the final flush above
-+	 * will be completed here.
-+	 */
-+	hammer2_parity_uninit(hmp);
-+
- 	KKASSERT(hmp->spmp == NULL);
- 
- 	/*
-diff --git a/sbin/hammer2/cmd_raid.c b/sbin/hammer2/cmd_raid.c
-new file mode 100644
-index 0000000000..d51369b0c2
---- /dev/null
-+++ b/sbin/hammer2/cmd_raid.c
-@@ -0,0 +1,270 @@
-+/*
-+ * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions
-+ * are met:
-+ *
-+ * 1. Redistributions of source code must retain the above copyright
-+ *    notice, this list of conditions and the following disclaimer.
-+ * 2. Redistributions in binary form must reproduce the above copyright
-+ *    notice, this list of conditions and the following disclaimer in
-+ *    the documentation and/or other materials provided with the
-+ *    distribution.
-+ * 3. Neither the name of The DragonFly Project nor the names of its
-+ *    contributors may be used to endorse or promote products derived
-+ *    from this software without specific, prior written permission.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
-+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
-+ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
-+ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
-+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
-+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
-+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-+ * SUCH DAMAGE.
-+ */
-+
-+#include "hammer2.h"
-+
-+static const char *
-+raid_disk_state_str(uint8_t state)
-+{
-+	switch (state) {
-+	case HAMMER2_RAID6_DISK_ONLINE:
-+		return "online";
-+	case HAMMER2_RAID6_DISK_FAILED:
-+		return "FAILED";
-+	case HAMMER2_RAID6_DISK_REBUILDING:
-+		return "rebuilding";
-+	case HAMMER2_RAID6_DISK_SPARE:
-+		return "spare";
-+	default:
-+		return "unknown";
-+	}
-+}
-+
-+/*
-+ * Display RAID status for a HAMMER2 filesystem.
-+ * Reads the volume header directly from the device to show the
-+ * RAID configuration and disk states.
-+ */
-+static int
-+cmd_raid_status(const char *devpath)
-+{
-+	hammer2_volume_data_t voldata;
-+	hammer2_raid_config_t *rc;
-+	int fd, i;
-+
-+	fd = open(devpath, O_RDONLY);
-+	if (fd < 0) {
-+		fprintf(stderr, "Cannot open %s: %s\n",
-+			devpath, strerror(errno));
-+		return 1;
-+	}
-+	if (hammer2_read_volume_header(fd, devpath, &voldata) < 0) {
-+		fprintf(stderr, "Cannot read volume header from %s\n",
-+			devpath);
-+		close(fd);
-+		return 1;
-+	}
-+	close(fd);
-+
-+	if (voldata.version < HAMMER2_VOL_VERSION_RAID6) {
-+		printf("Filesystem version %d does not support RAID\n",
-+		       voldata.version);
-+		return 0;
-+	}
-+
-+	rc = &voldata.raid_config;
-+	if (rc->raid_type == 0) {
-+		printf("RAID type:       JBOD (no RAID)\n");
-+		return 0;
-+	}
-+
-+	printf("RAID type:       RAID %d\n", rc->raid_type);
-+	printf("Total disks:     %d\n", rc->ndisks);
-+	printf("Data disks:      %d\n", rc->ndata);
-+	printf("Parity disks:    2 (P + Q)\n");
-+	printf("Stripe unit:     %s (%jd bytes)\n",
-+	       sizetostr(rc->stripe_unit), (intmax_t)rc->stripe_unit);
-+	printf("Array size:      %s (%jd bytes)\n",
-+	       sizetostr(rc->array_size), (intmax_t)rc->array_size);
-+	printf("Flags:           0x%08x", rc->flags);
-+	if (rc->flags & HAMMER2_RAID6_FLAG_DEGRADED)
-+		printf(" DEGRADED");
-+	if (rc->flags & HAMMER2_RAID6_FLAG_REBUILDING)
-+		printf(" REBUILDING");
-+	printf("\n");
-+
-+	printf("\nDisk states:\n");
-+	for (i = 0; i < rc->ndisks; i++) {
-+		printf("  disk %2d: %s\n", i,
-+		       raid_disk_state_str(rc->disk_state[i]));
-+	}
-+
-+	return 0;
-+}
-+
-+/*
-+ * Explicitly mark a RAID6 disk as failed.
-+ * After this call the kernel stops submitting I/O to the device, so it
-+ * can be detached (e.g. vnconfig -u) without EBUSY.
-+ * The filesystem continues to operate in degraded mode.
-+ */
-+static int
-+cmd_raid_fail_disk(const char *sel_path, const char *dev)
-+{
-+	hammer2_ioc_raid_fail_disk_t rfd;
-+	int fd;
-+
-+	fd = hammer2_ioctl_handle(sel_path);
-+	if (fd < 0)
-+		return 1;
-+
-+	bzero(&rfd, sizeof(rfd));
-+	snprintf(rfd.dev, sizeof(rfd.dev), "%s", dev);
-+
-+	if (ioctl(fd, HAMMER2IOC_RAID_FAIL_DISK, &rfd) < 0) {
-+		fprintf(stderr, "raid fail-disk: ioctl failed: %s\n",
-+			strerror(errno));
-+		close(fd);
-+		return 1;
-+	}
-+	close(fd);
-+
-+	printf("Disk %s (index %d) marked as failed.\n", dev, rfd.disk_idx);
-+	printf("Filesystem is operating in degraded mode.\n");
-+	printf("You may now detach the device, then run:\n");
-+	printf("  hammer2 -s <mountpoint> raid replace %s <new_dev>\n", dev);
-+	return 0;
-+}
-+
-+/*
-+ * Online resilver: replace a failed RAID6 disk with a new one.
-+ * The filesystem must be mounted.  The ioctl reconstructs all data
-+ * from surviving disks and parity, then atomically swaps in the new disk.
-+ */
-+static int
-+cmd_raid_replace(const char *sel_path, const char *old_dev,
-+		 const char *new_dev)
-+{
-+	hammer2_ioc_raid_replace_t rr;
-+	int fd;
-+
-+	fd = hammer2_ioctl_handle(sel_path);
-+	if (fd < 0)
-+		return 1;
-+
-+	bzero(&rr, sizeof(rr));
-+	snprintf(rr.old_dev, sizeof(rr.old_dev), "%s", old_dev);
-+	snprintf(rr.new_dev, sizeof(rr.new_dev), "%s", new_dev);
-+
-+	if (ioctl(fd, HAMMER2IOC_RAID_REPLACE, &rr) < 0) {
-+		fprintf(stderr, "raid replace: ioctl failed: %s\n",
-+			strerror(errno));
-+		close(fd);
-+		return 1;
-+	}
-+	close(fd);
-+
-+	printf("Resilver complete: disk %s replaced by %s\n",
-+	       old_dev, new_dev);
-+	return 0;
-+}
-+
-+/*
-+ * Query resilver progress from the running kernel.
-+ * Prints a single human-readable line; also suitable for polling from
-+ * a Web UI (add -j for JSON output once needed).
-+ */
-+static int
-+cmd_raid_resilver_status(const char *sel_path)
-+{
-+	hammer2_ioc_resilver_status_t rs;
-+	int fd;
-+
-+	fd = hammer2_ioctl_handle(sel_path);
-+	if (fd < 0)
-+		return 1;
-+
-+	bzero(&rs, sizeof(rs));
-+	if (ioctl(fd, HAMMER2IOC_RAID_RESILVER_STATUS, &rs) < 0) {
-+		fprintf(stderr, "raid resilver-status: ioctl failed: %s\n",
-+			strerror(errno));
-+		close(fd);
-+		return 1;
-+	}
-+	close(fd);
-+
-+	if (!rs.running) {
-+		printf("resilver: idle (no resilver in progress)\n");
-+	} else {
-+		printf("resilver: disk %d  %llu / %llu stripes  %d%%\n",
-+		       rs.disk_idx,
-+		       (unsigned long long)rs.stripes_done,
-+		       (unsigned long long)rs.stripes_total,
-+		       rs.progress);
-+	}
-+	return 0;
-+}
-+
-+/*
-+ * Dispatch RAID subcommands.
-+ */
-+int
-+cmd_raid(const char *sel_path, int ac, const char **av)
-+{
-+	if (ac < 1) {
-+		fprintf(stderr,
-+			"raid: missing subcommand\n"
-+			"    raid status <devpath>           "
-+				"Show RAID status\n"
-+			"    raid fail-disk <dev>            "
-+				"Mark a disk failed (degraded mode)\n"
-+			"    raid replace <old> <new>        "
-+				"Replace a failed disk (online resilver)\n"
-+			"    raid resilver-status            "
-+				"Query resilver progress\n");
-+		return 1;
-+	}
-+
-+	if (strcmp(av[0], "status") == 0) {
-+		if (ac < 2) {
-+			fprintf(stderr, "raid status: requires device path\n");
-+			return 1;
-+		}
-+		return cmd_raid_status(av[1]);
-+	} else if (strcmp(av[0], "fail-disk") == 0) {
-+		if (ac < 2) {
-+			fprintf(stderr, "raid fail-disk: requires <dev>\n");
-+			return 1;
-+		}
-+		return cmd_raid_fail_disk(sel_path, av[1]);
-+	} else if (strcmp(av[0], "replace") == 0) {
-+		if (ac < 3) {
-+			fprintf(stderr,
-+				"raid replace: requires <old_dev> <new_dev>\n");
-+			return 1;
-+		}
-+		return cmd_raid_replace(sel_path, av[1], av[2]);
-+	} else if (strcmp(av[0], "resilver-status") == 0) {
-+		return cmd_raid_resilver_status(sel_path);
-+	} else {
-+		fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
-+		fprintf(stderr,
-+			"    raid status <devpath>           "
-+				"Show RAID status\n"
-+			"    raid fail-disk <dev>            "
-+				"Mark a disk failed (degraded mode)\n"
-+			"    raid replace <old> <new>        "
-+				"Replace a failed disk (online resilver)\n"
-+			"    raid resilver-status            "
-+				"Query resilver progress\n");
-+		return 1;
-+	}
-+}
 diff --git a/sys/vfs/hammer2/hammer2_raid6.c b/sys/vfs/hammer2/hammer2_raid6.c
 new file mode 100644
 index 0000000000..325a6f36ef
@@ -3975,6 +3860,208 @@ index 0000000000..5b2576b684
 + */
 +
 +#endif /* !_VFS_HAMMER2_RAID6_H_ */
+diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
+index 0dfed0c4c0..c34824a210 100644
+--- a/sys/vfs/hammer2/hammer2_vfsops.c
++++ b/sys/vfs/hammer2/hammer2_vfsops.c
+@@ -48,6 +48,7 @@
+ #include <sys/file.h>
+ 
+ #include "hammer2.h"
++#include "hammer2_raid6.h"
+ 
+ TAILQ_HEAD(hammer2_mntlist, hammer2_dev);
+ static struct hammer2_mntlist hammer2_mntlist;
+@@ -349,6 +350,8 @@ hammer2_vfs_init(struct vfsconf *conf)
+ 
+ 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
+ 
++	hammer2_raid6_init();
++
+ 	return (error);
+ }
+ 
+@@ -1083,10 +1086,13 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
+ 				int devvp_found = 0;
+ 				TAILQ_FOREACH(e, &devvpl, entry) {
+-					KKASSERT(e->devvp);
++					/* Skip absent devices (dummy vnodes) */
++					if (e->devvp->v_rdev == NULL)
++						continue;
+ 					if (e_tmp->devvp == e->devvp)
+ 						devvp_found = 1;
+-					if (e_tmp->devvp->v_rdev &&
++					if (e_tmp->devvp &&
++					    e_tmp->devvp->v_rdev &&
+ 					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
+ 						devvp_found = 1;
+ 				}
+@@ -1107,7 +1113,9 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		if (hmp == NULL) {
+ 			TAILQ_FOREACH(e, &devvpl, entry) {
+ 				struct vnode *devvp = e->devvp;
+-				KKASSERT(devvp);
++				/* Skip absent devices (dummy vnodes) */
++				if (devvp->v_rdev == NULL)
++					continue;
+ 				error = vfs_mountedon(devvp);
+ 				if (error) {
+ 					kprintf("hammer2_mount: %s mounted %d\n",
+@@ -1246,7 +1254,47 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		 * Must use hmp instead of volume header for these two
+ 		 * in order to handle volume versions transparently.
+ 		 */
+-		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
++		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAID6) {
++			hmp->nvolumes = hmp->voldata.nvolumes;
++			hmp->total_size = hmp->voldata.raid_config.array_size;
++			hmp->raid_type = hmp->voldata.raid_config.raid_type;
++			bcopy(&hmp->voldata.raid_config, &hmp->raid_config,
++			      sizeof(hmp->raid_config));
++
++			/*
++			 * Restore failed disk state from on-disk config.
++			 * If a disk was marked failed before unmount, keep
++			 * it failed so we don't read stale/corrupt data
++			 * from it.  The admin must explicitly resilver.
++			 */
++			hmp->raid_nfailed = 0;
++			bzero(hmp->raid_failed, sizeof(hmp->raid_failed));
++			for (i = 0; i < hmp->nvolumes; i++) {
++				if (hmp->raid_config.disk_state[i] ==
++				    HAMMER2_RAID6_DISK_FAILED) {
++					hmp->raid_failed[i] = 1;
++					hmp->raid_nfailed++;
++				}
++			}
++
++			/*
++			 * Mark any absent disks (device unavailable at
++			 * mount time) as failed.  This handles degraded
++			 * mounts where a disk has been physically removed
++			 * or detached.
++			 */
++			for (i = 0; i < hmp->nvolumes; i++) {
++				if (hmp->volumes[i].dev == NULL ||
++				    hmp->volumes[i].dev->devvp == NULL ||
++				    !hmp->volumes[i].dev->open) {
++					if (!hmp->raid_failed[i]) {
++						hmp->raid_failed[i] = 1;
++						hmp->raid_nfailed++;
++					}
++				}
++			}
++		} else if (hmp->voldata.version >=
++			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
+ 			hmp->nvolumes = hmp->voldata.nvolumes;
+ 			hmp->total_size = hmp->voldata.total_size;
+ 		} else {
+@@ -1266,6 +1314,46 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		KKASSERT(TAILQ_EMPTY(&devvpl));
+ 		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
+ 
++		/*
++		 * Log RAID6 array status at mount time.  If any disks
++		 * were previously failed, release VOP_OPEN on them so
++		 * they can be detached/replaced.
++		 */
++		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
++			if (hmp->raid_nfailed == 0) {
++				kprintf("hammer2: RAID6 array mounted: "
++					"%d disks (%d data + P + Q), "
++					"all disks online\n",
++					hmp->raid_config.ndisks,
++					hmp->raid_config.ndata);
++			} else {
++				for (i = 0; i < hmp->nvolumes; i++) {
++					if (!hmp->raid_failed[i])
++						continue;
++					kprintf("hammer2: RAID6 disk %d "
++						"(%s) marked failed; "
++						"operating in degraded "
++						"mode\n", i,
++						hmp->volumes[i].dev ?
++						    hmp->volumes[i].dev->path :
++						    "(absent)");
++					if (hmp->volumes[i].dev &&
++					    hmp->volumes[i].dev->devvp &&
++					    hmp->volumes[i].dev->open) {
++						vn_lock(hmp->volumes[i].dev->devvp,
++							LK_EXCLUSIVE |
++							LK_RETRY);
++						VOP_CLOSE(
++						    hmp->volumes[i].dev->devvp,
++						    FREAD | FWRITE, NULL);
++						vn_unlock(
++						    hmp->volumes[i].dev->devvp);
++						hmp->volumes[i].dev->open = 0;
++					}
++				}
++			}
++		}
++
+ 		/*
+ 		 * Really important to get these right or the flush and
+ 		 * teardown code will get confused.
+@@ -1362,6 +1450,7 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		hammer2_update_pmps(hmp);
+ 		hammer2_iocom_init(hmp);
+ 		hammer2_bulkfree_init(hmp);
++		hammer2_parity_init(hmp);
+ 
+ 		/*
+ 		 * Ref the cluster management messaging descriptor.  The mount
+@@ -1835,6 +1924,13 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+ 
+ 	hammer2_pfsfree_scan(hmp, 1);
+ 
++	/*
++	 * Drain and stop the RAID6 parity worker thread before closing
++	 * devices.  Any parity work queued during the final flush above
++	 * will be completed here.
++	 */
++	hammer2_parity_uninit(hmp);
++
+ 	KKASSERT(hmp->spmp == NULL);
+ 
+ 	/*
+@@ -2770,13 +2866,35 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor)
+ 	 * for the media making up the cluster.
+ 	 */
+ 	if ((ip = pmp->iroot) != NULL) {
++		hammer2_dev_t *hmp = NULL;
++
+ 		hammer2_inode_ref(ip);
+ 		hammer2_mtx_ex(&ip->lock);
++
++		/*
++		 * Capture hmp before the flush for vn backing file sync.
++		 * Access is safe while we hold the inode lock.
++		 */
++		if (ip->cluster.array[0].chain)
++			hmp = ip->cluster.array[0].chain->hmp;
++
+ 		hammer2_inode_chain_sync(ip);
+ 		hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP |
+ 					      HAMMER2_XOP_FSSYNC |
+ 					      HAMMER2_XOP_VOLHDR);
+ 		hammer2_inode_unlock(ip);	/* unlock+drop */
++
++		/*
++		 * Flush vn device backing files after all dirty DIOs have
++		 * been bwritten to vn devices.  This drains UFS dirty blocks
++		 * synchronously so that sync(2)'s waitrunningbufspace() does
++		 * not block on buf_daemon's async writes to the underlying
++		 * disk.  Only needed in degraded mode where heavy bwrite
++		 * activity accumulates enough UFS dirty blocks to exceed
++		 * hirunningspace.
++		 */
++		if (hmp && hmp->raid_nfailed > 0)
++			hammer2_flush_vn_backing(hmp);
+ 	}
+ #ifdef HAMMER2_DEBUG_SYNC
+ 	kprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
 diff --git a/sys/vfs/hammer2/test_raid6.c b/sys/vfs/hammer2/test_raid6.c
 new file mode 100644
 index 0000000000..6d24123f84
