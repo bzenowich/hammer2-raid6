@@ -7,13 +7,84 @@ every known difference in behavior and categorizes the work required.
 
 ---
 
-## What Goes Away
+## Current Test Infrastructure
+
+The existing test suite runs on a three-layer stack:
+
+```
+HAMMER2 RAID6
+   └── /dev/vn0..vn5        (vnconfig file-backed virtual block devices)
+         └── /var/tmp/*.img  (truncate'd files, 1 GB each)
+               └── UFS       (the actual storage medium)
+```
+
+Every `bwrite`/`bdwrite` call from HAMMER2 passes through `vn_strategy →
+VOP_WRITE → UFS bdwrite`. This UFS intermediate layer has two important
+consequences that do not exist on physical hardware:
+
+**Fix 13 (IO_SYNC in `vn.c`)** was added to force synchronous UFS writes.
+Without it, `VOP_WRITE` queued dirty pages in the UFS page cache via
+`bdwrite`. Repeated `bwrite` calls across test subtests accumulated dirty
+UFS buffers in `runningbufspace`. When that exceeded `hirunningspace` (6 MB),
+subsequent `sync(2)` calls blocked indefinitely in `waitrunningbufspace`.
+Fix 13 is a modification to `/usr/src/sys/dev/disk/vn/vn.c` on the test VM;
+it has no equivalent or relevance on physical hardware.
+
+**Fix 15 (`hammer2_flush_vn_backing`)** was added to drain the UFS page
+cache after each degraded-mode sync. It submits a `BUF_CMD_FLUSH` bio to each
+vn volume, which triggers `VOP_FSYNC` on the UFS backing file — a software
+operation that completes in microseconds. On physical hardware the same bio
+issues a real ATA `FLUSH CACHE` command (see item 5 below).
+
+### Removing the UFS Layer from Testing
+
+There are three options in order of increasing fidelity:
+
+**Option A — Swap-backed vn devices (one-line change per disk)**
+
+DragonFlyBSD's `vnconfig` supports swap-backed devices that bypass UFS
+entirely:
+
+```sh
+# Current (file-backed, UFS layer present):
+truncate -s 1073741824 /var/tmp/disk${i}.img
+vnconfig vn${i} /var/tmp/disk${i}.img
+
+# Swap-backed (no image files, no UFS layer):
+vnconfig -S 1073741824 vn${i}
+```
+
+Writes go through `vm_pager` directly. There is no UFS page cache, no
+`runningbufspace` accumulation, and Fix 13 becomes irrelevant (swap-backed
+vn's `VOP_WRITE` does not go through UFS). Fix 15 (`BUF_CMD_FLUSH`) becomes
+effectively a no-op since `VOP_FSYNC` on a swap-backed device completes
+instantly. This is the lowest-effort path to UFS-free testing.
+
+**Option B — Additional QEMU virtual disks**
+
+Add six 1 GB VirtIO disks to the VM configuration. They appear as
+`/dev/da0..da5` — real block devices with no vn layer at all. This is the
+closest in-VM approximation of physical hardware behavior. Requires VM
+reconfiguration but no code changes.
+
+**Option C — Physical SATA drives**
+
+The ultimate target. All items in this document apply.
+
+---
+
+## What Goes Away on Physical Hardware
 
 **The runningbufspace deadlock (Fix 15) disappears entirely.** There is no UFS
-intermediate layer on physical disks. A `bwrite` on a physical disk bio completes
-when the disk controller acknowledges the write — the buffer is immediately
-retired from `runningbufspace`. The `hammer2_flush_vn_backing` call becomes
-either a no-op or a real ATA `FLUSH CACHE` command (see item 5 below).
+intermediate layer on physical disks. A `bwrite` on a physical disk bio
+completes when the disk controller acknowledges the write — the buffer is
+immediately retired from `runningbufspace`. The `hammer2_flush_vn_backing`
+call becomes a real ATA `FLUSH CACHE` command (see item 5 below) rather than
+a UFS drain operation.
+
+**Fix 13 (IO_SYNC in `vn.c`) is completely irrelevant.** The `vn` driver is
+not involved on physical hardware. The modification to `vnstrategy` has no
+physical-hardware equivalent and need not be ported or carried forward.
 
 ---
 
@@ -24,49 +95,42 @@ These must be resolved before deploying on real hardware.
 ### 1. Undetected I/O Errors on Surviving Disks
 
 **Severity**: Data loss (silent wrong reconstruction)
-**Effort**: Medium
+**Status**: **Fixed** — `hammer2_raid6_auto_fail_disk` implemented.
 
 On vn devices, disk failure is always explicit — someone calls
 `hammer2 raid fail-disk`. A vn device either works or is detached; there is no
-middle ground.
+middle ground. vn never returns `EIO` for reads past a truncated backing file
+(it returns zeros), so the EIO path could not be exercised on vn.
 
 Physical disks can return `EIO` at any time on any I/O to any surviving disk,
 without prior notice. The degraded read path (`hammer2_io_raid6_read_degraded`)
 reads all surviving columns and passes them to `dual_recov`. If one of those
 surviving reads returns `EIO`, the buffer fed to the reconstruction function
-contains garbage — and `dual_recov` will produce a wrong answer silently. The
-code currently has no logic to detect "we received EIO from a disk that is not
-in `raid_failed[]`; this is now a triple failure and the result is
-unrecoverable."
+contains garbage — and `dual_recov` will produce a wrong answer silently.
 
-The resilver path has the same exposure: `breadnx` on a surviving column during
+The resilver path had the same exposure: `breadnx` on a surviving column during
 Phase 2 or 3 could silently fail. The reconstructed data written to the
 replacement disk would then be wrong, with no indication anything went wrong.
 
-**Required change**: Every `breadnx` call in the RAID6 paths
-(`hammer2_io_raid6_read_degraded`, `hammer2_io_raid6_write`,
-`hammer2_io_raid6_resilver`) must check `bp->b_error` after the call. An
-unexpected `EIO` on a non-failed disk must be treated as a new failure event:
-immediately mark that disk as failed in `hmp->raid_failed[]`, increment
-`raid_nfailed`, and return `EIO` to the caller rather than passing garbage
-buffers to reconstruction.
+**Implemented**: `hammer2_raid6_auto_fail_disk(hmp, disk_idx)` is called from
+every `breadnx` error branch in `hammer2_io_raid6_read_degraded`,
+`hammer2_io_raid6_write`, and `hammer2_io_raid6_resilver`. It atomically marks
+the disk failed in `hmp->raid_failed[]`, increments `raid_nfailed`, and
+persists the state to `hmp->voldata.raid_config` via `hammer2_voldata_modify`
+so it survives unmount/remount. Returns `ENXIO` if `raid_nfailed` would reach
+3 (triple failure — unrecoverable).
 
 ---
 
 ### 2. Drive Naming Instability Across Reboots
 
 **Severity**: Data loss (wrong disk mapped to wrong array slot)
-**Status**: Partially resolved — `volu_id`-based slot assignment already
-implemented; `volu_id < ndisks` bounds check added.
+**Status**: Largely resolved — `volu_id`-based slot assignment implemented;
+`volu_id < ndisks` bounds check added.
 
 DragonFlyBSD assigns `da0`, `da1`, etc. in CAM probe order, which is not
 guaranteed to be stable across reboots. If a disk is removed and reinserted,
 or if the bus is rescanned, what was `da2` may come back as `da3`.
-
-The current mount command is positional:
-```sh
-mount -t hammer2 /dev/da0:/dev/da1:/dev/da2:/dev/da3@LABEL /mnt
-```
 
 **Already implemented**: `hammer2_init_volumes` uses each disk's `volu_id`
 field (stored in the volume header) to assign it to the correct
@@ -74,10 +138,10 @@ field (stored in the volume header) to assign it to the correct
 irrelevant. A disk that appears as `da3` after a reboot but has `volu_id=2`
 in its header is correctly placed in slot 2.
 
-**Remaining gap (now fixed)**: `hammer2_verify_volumes_3()` previously only
-checked `volu_id < HAMMER2_MAX_VOLUMES` but not `volu_id < ndisks`. A disk
-with an out-of-range `volu_id` would have been silently assigned to a slot
-beyond the array size. This bounds check is now present.
+**Now fixed**: `hammer2_verify_volumes_3()` previously only checked
+`volu_id < HAMMER2_MAX_VOLUMES` but not `volu_id < ndisks`. A disk with an
+out-of-range `volu_id` would have been silently assigned to a slot beyond the
+array size. This bounds check is now present.
 
 **Remaining gap (deferred)**: Store a persistent array UUID in the volume
 header alongside `volu_id`. At mount time, verify both the UUID (all disks
@@ -144,9 +208,10 @@ belonging to a different array, before the resilver begins.
 
 On vn devices, `hammer2_flush_vn_backing` submits a `BUF_CMD_FLUSH` bio to
 each vn volume, which triggers `VOP_FSYNC` on the UFS backing file — a
-software operation. On a physical disk, the same bio causes the disk driver to
-issue an ATA `FLUSH CACHE` (`0xE7`) or SCSI `SYNCHRONIZE CACHE` command,
-forcing the disk's volatile write cache to commit to persistent storage.
+software operation that completes in microseconds. On a physical disk, the
+same bio causes the disk driver to issue an ATA `FLUSH CACHE` (`0xE7`) or
+SCSI `SYNCHRONIZE CACHE` command, forcing the disk's volatile write cache to
+commit to persistent storage.
 
 This is correct and desirable behavior for durability. However, `FLUSH CACHE`
 on a spinning HDD can take 50–100ms. The current implementation issues flushes
@@ -158,6 +223,10 @@ On SSDs the per-flush latency is ~1ms, making this less urgent.
 **Required change**: Issue all N `BUF_CMD_FLUSH` bios simultaneously (without
 the `BIO_SYNC` flag initially), then `biowait` on all N in a second pass. This
 reduces the stall from O(N × latency) to O(1 × latency).
+
+**Also**: Rename `hammer2_flush_vn_backing` to `hammer2_flush_dev_cache` and
+update its comment. The function works correctly on physical disks (it uses the
+generic `dev_dstrategy` interface), but the name implies vn-specific behavior.
 
 ---
 
@@ -187,11 +256,10 @@ the current two-pass resilver approach (see Section 8 of `DEVELOPER.md` for a
 detailed comparison).
 
 **Short-term mitigation**: For SSD deployments, accept the current behavior.
-For HDD deployments, consider limiting the write rate in degraded mode at the
-application layer, or issuing data/P/Q bios in parallel rather than sequentially
-(data write, then P write, then Q write; fire all three, then wait for all
-three). This does not eliminate the correctness concern but reduces wall-clock
-time by overlapping the three disk writes.
+For HDD deployments, consider issuing data/P/Q bios in parallel rather than
+sequentially (fire all three, then wait for all three). This does not eliminate
+the correctness concern but reduces wall-clock time by overlapping the three
+disk writes.
 
 **Long-term fix**: Per-stripe locking or a forward checkpoint (the md RAID
 approach). This is the largest single piece of unfinished work for HDD
@@ -205,7 +273,7 @@ deployments.
 
 In healthy mode, the background parity thread uses `bawrite` for P/Q writes.
 On vn devices, "async" meant queued to UFS page cache, written to the backing
-disk later by `buf_daemon` — still serialized through a single ad1 device.
+disk later by `buf_daemon` — still serialized through a single UFS file.
 
 On a physical multi-disk array, `bawrite` on disk N is truly parallel to reads
 and writes on disks 0..N-1. The background parity thread can overlap its P/Q
@@ -220,28 +288,16 @@ improvement.
 ### 8. Automatic Disk Failure Detection
 
 **Severity**: Operational
-**Effort**: Medium
+**Status**: Addressed by item 1.
 
 On vn devices, the kernel detects a detached device immediately (the vnode is
-invalidated, the next I/O returns `ENXIO`). On physical disks, a failing drive
-may respond slowly rather than returning immediate `EIO`. The current code has
-no path for the disk driver to notify HAMMER2 that a device is degraded —
-there is no equivalent of the device-failure callbacks that enterprise storage
-stacks receive from CAM or SMART daemons.
+invalidated, the next I/O returns `ENXIO`). The EIO auto-fail path
+implemented in item 1 covers the physical disk case: any unexpected `EIO` from
+a non-failed disk triggers the same state machine as `hammer2 raid fail-disk`.
 
-Without automatic failure detection, a disk that starts returning intermittent
-errors requires manual intervention (`hammer2 raid fail-disk`) before the
-RAID6 degraded paths engage. Until that happens, reads to the affected disk
-return wrong data (or EIO) rather than being reconstructed from parity.
-
-**Minimum viable approach**: Define an error threshold in the `breadnx` paths —
-e.g., N consecutive `EIO`s from the same disk index trigger the equivalent of
-`fail-disk` automatically, setting `hmp->raid_failed[i] = 1` and logging to
-`dmesg`. This requires a per-disk error counter in `hammer2_dev_t`.
-
-**Better approach**: Register a CAM async callback for `AC_LOST_DEVICE` to
-detect physical disk removal, and integrate with `smartd` to act on
-SMART pre-failure thresholds before data errors occur.
+A per-disk error counter for threshold-based failure (N consecutive EIOs before
+marking failed) and a CAM `AC_LOST_DEVICE` callback for hot-plug detection are
+possible refinements, but the minimum viable behavior is present.
 
 ---
 
@@ -301,11 +357,12 @@ computed by the freemap.
 
 | # | Issue | Severity | Status |
 |---|-------|----------|--------|
+| — | Fix 13 (IO_SYNC in vn.c) | vn/UFS-specific | Not applicable on physical disks |
 | 1 | EIO on surviving disk → silent wrong reconstruction | **Data loss** | **Fixed** (auto-fail) |
 | 2 | Drive naming instability across reboots | **Data loss** | **Largely resolved** (volu_id assignment + bounds check; UUID deferred) |
 | 3 | Volume header only written to disk 0 | **Data loss** | **Already implemented** |
 | 4 | Hot-swap device identity (API mismatch) | Operational | Deferred |
-| 5 | BUF_CMD_FLUSH is sequential across disks | Performance | Deferred |
+| 5 | BUF_CMD_FLUSH sequential + function rename | Performance | Deferred |
 | 6 | Synchronous degraded writes slow on HDDs | Performance | Deferred |
 | 7 | Healthy-mode bawrite is now genuinely parallel | Improvement | None needed |
 | 8 | No automatic disk failure detection | Operational | **Addressed by item 1** |
@@ -315,3 +372,8 @@ computed by the freemap.
 Items 1–3 were the data-loss prerequisites for production deployment; all three
 are now resolved or confirmed implemented. Items 6, 9, and 10 are required for
 HDD deployments. Items 4, 5, and 10 can be deferred to a follow-on release.
+
+The next recommended step before any physical hardware testing is switching the
+test suite from file-backed to swap-backed vn devices (`vnconfig -S`), which
+eliminates the UFS layer from test results and makes Fix 13 unnecessary going
+forward.
