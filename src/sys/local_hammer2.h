@@ -276,6 +276,7 @@ struct hammer2_io {
 	int		error;
 	int		disk_idx;	/* RAID6: physical disk index (-1 if N/A) */
 	char		*raid6_old_data; /* RAID6 degraded: pre-mod data for RMW */
+	char		*absent_data;	/* RAID6 absent disk: kmalloc'd reconstruction buffer */
 #ifdef HAMMER2_IO_DEBUG
 	int		debug_index;
 #endif

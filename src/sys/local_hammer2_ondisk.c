@@ -618,6 +618,21 @@ hammer2_verify_volumes_3(const hammer2_volume_t *volumes,
 		return EINVAL;
 	}
 
+	/*
+	 * Each disk's volu_id must be within the array bounds.
+	 * hammer2_init_volumes assigns disks to volumes[volu_id] slots,
+	 * so a volu_id >= ndisks would index outside the active range.
+	 */
+	for (i = 0; i < HAMMER2_MAX_VOLUMES; i++) {
+		vol = &volumes[i];
+		if (vol->id != -1 && vol->dev && vol->dev->open &&
+		    vol->id >= rc->ndisks) {
+			hprintf("disk with volu_id %d exceeds ndisks %d\n",
+				vol->id, rc->ndisks);
+			return EINVAL;
+		}
+	}
+
 	return 0;
 }
 

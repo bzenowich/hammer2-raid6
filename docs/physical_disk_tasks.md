@@ -56,7 +56,8 @@ buffers to reconstruction.
 ### 2. Drive Naming Instability Across Reboots
 
 **Severity**: Data loss (wrong disk mapped to wrong array slot)
-**Effort**: Medium
+**Status**: Partially resolved — `volu_id`-based slot assignment already
+implemented; `volu_id < ndisks` bounds check added.
 
 DragonFlyBSD assigns `da0`, `da1`, etc. in CAM probe order, which is not
 guaranteed to be stable across reboots. If a disk is removed and reinserted,
@@ -67,19 +68,18 @@ The current mount command is positional:
 mount -t hammer2 /dev/da0:/dev/da1:/dev/da2:/dev/da3@LABEL /mnt
 ```
 
-Each disk's volume header stores `volu_id` (its intended position in the
-array). If the device list order at mount time does not match the `volu_id`
-values in the headers, the kernel silently maps `disk_state[]` entries to the
-wrong physical disks. After a disk failure and reboot, the surviving disks may
-shift positions, making it easy to accidentally mark a healthy disk as failed,
-or to mount with the wrong column rotation.
+**Already implemented**: `hammer2_init_volumes` uses each disk's `volu_id`
+field (stored in the volume header) to assign it to the correct
+`hmp->volumes[]` slot — the order of devices in the mount command is
+irrelevant. A disk that appears as `da3` after a reboot but has `volu_id=2`
+in its header is correctly placed in slot 2.
 
-**Required change (short term)**: Mount-time validation that the `volu_id`
-field in each disk's volume header matches its position in the device list,
-with a clear error message if they do not match. The existing
-`hammer2_verify_volumes_3()` is the right place for this check.
+**Remaining gap (now fixed)**: `hammer2_verify_volumes_3()` previously only
+checked `volu_id < HAMMER2_MAX_VOLUMES` but not `volu_id < ndisks`. A disk
+with an out-of-range `volu_id` would have been silently assigned to a slot
+beyond the array size. This bounds check is now present.
 
-**Required change (long term)**: Store a persistent array UUID in the volume
+**Remaining gap (deferred)**: Store a persistent array UUID in the volume
 header alongside `volu_id`. At mount time, verify both the UUID (all disks
 belong to the same array) and the `volu_id` (each disk is in the right slot).
 This allows the mount code to auto-detect the correct ordering from an
@@ -90,23 +90,19 @@ unordered device list, similar to how `mdadm --assemble --scan` works.
 ### 3. Volume Header Written Only to Disk 0
 
 **Severity**: Data loss (stale config after disk 0 failure)
-**Effort**: Low
+**Status**: Already implemented — the flush path writes the volume header to
+all open devices.
 
-The kernel's `hammer2_volumes_commit()` writes the updated volume header only
-to `hmp->devvp` (disk 0). On vn devices the consequence of losing the current
-`disk_state[]` is minor — just re-run `fail-disk` after remount. On real
-hardware, disk 0 can itself be the disk that fails.
+The flush code in `hammer2_flush.c` already iterates over `hmp->devvpl`
+(all open device vnodes) with a `TAILQ_FOREACH` loop, writing the updated
+volume header to every open, non-failed disk on every sync. For each
+non-root disk, the code patches `volu_id` in the copy and recomputes both
+CRCs (`ICRC_SECT0` and `ICRC_VOLHEADER`) before calling `bwrite`.
 
-If disk 0 fails and is replaced, the header cloned from a surviving disk for
-the resilver Phase 1 may have a stale `disk_state[]`, because surviving disks'
-headers were never updated during prior fail/replace operations. After resilver
-and remount, the reconstructed config may be incorrect.
-
-**Required change**: On every flush, write the updated volume header to all
-non-failed disks, not just disk 0. This requires looping over all
-`hmp->volumes[]` entries in `hammer2_volumes_commit`, skipping entries where
-`hmp->raid_failed[i]` is set. Both the primary and backup header copies must
-be written and both CRCs recomputed for each disk.
+If disk 0 fails and is replaced, the replacement disk receives a correctly
+constructed header during resilver Phase 1, and all surviving disks already
+have up-to-date headers from the last flush. Remounting from any surviving
+disk will see the current `disk_state[]`.
 
 ---
 
@@ -303,19 +299,19 @@ computed by the freemap.
 
 ## Summary Table
 
-| # | Issue | Severity | Effort |
+| # | Issue | Severity | Status |
 |---|-------|----------|--------|
-| 1 | EIO on surviving disk → silent wrong reconstruction | **Data loss** | Medium |
-| 2 | Drive naming instability across reboots | **Data loss** | Medium |
-| 3 | Volume header only written to disk 0 | **Data loss** | Low |
-| 4 | Hot-swap device identity (API mismatch) | Operational | Low |
-| 5 | BUF_CMD_FLUSH is sequential across disks | Performance | Low |
-| 6 | Synchronous degraded writes slow on HDDs | Performance | High |
-| 7 | Healthy-mode bawrite is now genuinely parallel | Improvement | None |
-| 8 | No automatic disk failure detection | Operational | Medium |
-| 9 | I/O timeout blocks entire array | Availability | Medium |
-| 10 | No TRIM/discard support | SSD longevity | High |
+| 1 | EIO on surviving disk → silent wrong reconstruction | **Data loss** | **Fixed** (auto-fail) |
+| 2 | Drive naming instability across reboots | **Data loss** | **Largely resolved** (volu_id assignment + bounds check; UUID deferred) |
+| 3 | Volume header only written to disk 0 | **Data loss** | **Already implemented** |
+| 4 | Hot-swap device identity (API mismatch) | Operational | Deferred |
+| 5 | BUF_CMD_FLUSH is sequential across disks | Performance | Deferred |
+| 6 | Synchronous degraded writes slow on HDDs | Performance | Deferred |
+| 7 | Healthy-mode bawrite is now genuinely parallel | Improvement | None needed |
+| 8 | No automatic disk failure detection | Operational | **Addressed by item 1** |
+| 9 | I/O timeout blocks entire array | Availability | Deferred |
+| 10 | No TRIM/discard support | SSD longevity | Deferred |
 
-Items 1–3 are prerequisites for any production deployment. Items 6, 8, and 9
-are required for HDD deployments. Items 4, 5, and 10 can be deferred to a
-follow-on release.
+Items 1–3 were the data-loss prerequisites for production deployment; all three
+are now resolved or confirmed implemented. Items 6, 9, and 10 are required for
+HDD deployments. Items 4, 5, and 10 can be deferred to a follow-on release.

@@ -650,6 +650,8 @@ Called for version-3 (RAID6) volumes. Validates:
 - `ndata == ndisks - 2`
 - `stripe_unit == HAMMER2_PBUFSIZE` (64KB)
 - All disks consistent in config
+- Each disk's `volu_id` is within the range `[0, ndisks)` (guards against
+  a corrupted header causing an out-of-bounds slot assignment)
 
 ### `hammer2_raid6_map(hmp, logical_off, disk_idx_out, phys_off_out)`
 
@@ -658,25 +660,42 @@ to the physical offset to skip the volume header zone.
 
 ### `hammer2_volumes_commit(hmp, voldata)`
 
-Writes the updated volume header to disk. **HAMMER2 only writes the volume
-header to `hmp->devvp` (disk 0)**; the other disks' headers are not updated
-by the normal flush path. This has two important consequences:
+Writes the updated volume header to **all open devices** on every flush.
+The flush code in `hammer2_flush.c` iterates over `hmp->devvpl` with a
+`TAILQ_FOREACH` loop, skipping closed or failed devices. For each open
+device, it:
 
-1. **After resilver**: the replacement disk needs a manually constructed
-   volume header (Phase 1 of the resilver procedure) because it will never
-   receive an automatic header update from `volumes_commit`.
+1. Issues a `BUF_CMD_FLUSH` bio (ATA `FLUSH CACHE` on physical disks;
+   `VOP_FSYNC` on vn devices) to drain pending writes before overwriting
+   the header.
+2. Calls `getblk` + `bcopy` to write `hmp->volsync` to the header slot.
+3. For non-root disks, patches `volu_id` in the copy and recomputes both
+   `ICRC_SECT0` and `ICRC_VOLHEADER` CRCs before `bwrite`.
 
-2. **RAID config state**: `fail-disk` and `replace` ioctls must write the
-   updated `disk_state[]` and flags to **both** `hmp->raid_config` (runtime)
-   and `hmp->voldata.raid_config` (persisted). Only `voldata` reaches disk
-   via `volumes_commit`. If only `hmp->raid_config` is updated, the change
-   is lost on unmount and the array remounts as if no failure occurred
-   (see the disk_state persistence pitfall in Section 13).
+**Consequence**: All surviving disks always have a current volume header.
+After any disk failure, remounting from any surviving disk will see the
+correct `disk_state[]`.
+
+**RAID config state**: `fail-disk` and `replace` ioctls must write the
+updated `disk_state[]` and flags to **both** `hmp->raid_config` (runtime)
+and `hmp->voldata.raid_config` (persisted). Only `voldata` reaches disk
+via the flush path. If only `hmp->raid_config` is updated, the change
+is lost on unmount and the array remounts as if no failure occurred
+(see the disk_state persistence pitfall in Section 13).
+
+### `hammer2_init_volumes()`
+
+Uses each disk's `volu_id` field from the volume header to assign it to the
+correct `hmp->volumes[]` slot — the order of devices in the mount command is
+irrelevant. A disk that appears as `da3` after a reboot but has `volu_id=2`
+in its header is correctly placed in slot 2. This makes the mount command
+order-independent: any permutation of the device list produces the same
+internal layout.
 
 ### Two-Copy Header Write
 
-`hammer2_volumes_commit` writes the volume header twice to disk 0: once at
-the primary header offset and once at the backup offset. HAMMER2's mount
+The flush loop writes the volume header to one of `HAMMER2_NUM_VOLHDRS`
+alternating zones per sync cycle (rotating `hmp->volhdrno`). HAMMER2's mount
 code validates both copies via `ICRC_SECT0` and `ICRC_VOLHEADER` CRCs and
 uses whichever is newer (highest `volu_icrc_volheader` sequence number).
 When writing a resilver header to a new disk (Phase 1), both copies must be

@@ -192,7 +192,7 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
 			hammer2_raid6_map(hmp, pbase,
 					  &disk_idx, &phys_off);
 			vol = &hmp->volumes[disk_idx];
-			dio->devvp = vol->dev->devvp;
+			dio->devvp = vol->dev ? vol->dev->devvp : NULL;
 			dio->dbase = pbase - phys_off;
 			dio->disk_idx = disk_idx;
 		} else {
@@ -277,7 +277,8 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		if (orefs & HAMMER2_DIO_GOOD) {
 			if (isgood == 0)
 				cpu_mfence();
-			bkvasync(dio->bp);
+			if (dio->bp)
+				bkvasync(dio->bp);
 
 			/*
 			 * RAID6: save pre-modification data for RMW
@@ -289,10 +290,13 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			 */
 			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 			    dio->raid6_old_data == NULL) {
-				dio->raid6_old_data = kmalloc(dio->psize,
-				    M_HAMMER2, M_WAITOK);
-				bcopy(dio->bp->b_data,
-				    dio->raid6_old_data, dio->psize);
+				char *src = dio->bp ? dio->bp->b_data :
+						dio->absent_data;
+				if (src) {
+					dio->raid6_old_data = kmalloc(dio->psize,
+					    M_HAMMER2, M_WAITOK);
+					bcopy(src, dio->raid6_old_data, dio->psize);
+				}
 			}
 
 			switch(op) {
@@ -355,17 +359,33 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	    hmp->raid_nfailed > 0 &&
 	    dio->disk_idx >= 0 &&
 	    hmp->raid_failed[dio->disk_idx]) {
-		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
-				 GETBLK_KVABIO, 0);
-		if (dio->bp) {
-			bkvasync(dio->bp);
+		char *preempt_data;
+
+		if (dio->devvp) {
+			dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+					 GETBLK_KVABIO, 0);
+			preempt_data = dio->bp ? dio->bp->b_data : NULL;
+		} else {
+			/*
+			 * Absent disk (no devvp): cannot call getblk()
+			 * without a valid vnode.  Allocate a kmalloc buffer
+			 * for the reconstruction data; callers access it
+			 * via hammer2_io_data() which checks absent_data.
+			 */
+			dio->absent_data = kmalloc(dio->psize, M_HAMMER2,
+						   M_INTWAIT | M_ZERO);
+			preempt_data = dio->absent_data;
+		}
+		if (preempt_data) {
+			if (dio->bp)
+				bkvasync(dio->bp);
 			error = hammer2_io_raid6_read_degraded(
 					hmp, dio->pbase,
-					dio->bp->b_data, dio->psize);
+					preempt_data, dio->psize);
 			if (error == 0) {
 				dio->raid6_old_data = kmalloc(dio->psize,
 				    M_HAMMER2, M_WAITOK);
-				bcopy(dio->bp->b_data,
+				bcopy(preempt_data,
 				    dio->raid6_old_data, dio->psize);
 			}
 			switch(op) {
@@ -373,7 +393,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				if (dio->pbase ==
 				    (lbase & ~HAMMER2_OFF_MASK_RADIX) &&
 				    dio->psize == lsize)
-					bzero(dio->bp->b_data, dio->psize);
+					bzero(preempt_data, dio->psize);
 				else
 					bzero(hammer2_io_data(dio, lbase),
 					      lsize);
@@ -775,7 +795,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	bp = dio->bp;
 	dio->bp = NULL;
 
-	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
+	if ((orefs & HAMMER2_DIO_GOOD) && (bp || dio->absent_data)) {
 		/*
 		 * Non-errored disposal of bp
 		 */
@@ -792,10 +812,16 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * this bp.
 			 */
 			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-				bkvasync(bp);
-				raid6_data = kmalloc(psize, M_HAMMER2,
-						     M_WAITOK);
-				bcopy(bp->b_data, raid6_data, psize);
+				if (bp) {
+					bkvasync(bp);
+					raid6_data = kmalloc(psize, M_HAMMER2,
+							     M_WAITOK);
+					bcopy(bp->b_data, raid6_data, psize);
+				} else if (dio->absent_data) {
+					/* Transfer absent buffer ownership to raid6_data */
+					raid6_data = dio->absent_data;
+					dio->absent_data = NULL;
+				}
 			}
 
 			/*
@@ -807,7 +833,8 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			    hmp->raid_nfailed > 0 &&
 			    dio->disk_idx >= 0 &&
 			    hmp->raid_failed[dio->disk_idx]) {
-				brelse(bp);
+				if (bp)
+					brelse(bp);
 				bp = NULL;
 			}
 
@@ -917,10 +944,12 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				spin_unlock(&hmp->raid6_parity_spin);
 				wakeup(&hmp->raid6_parity_q);
 			}
-		} else if (bp->b_flags & (B_ERROR | B_INVAL | B_RELBUF)) {
-			brelse(bp);
-		} else {
-			bqrelse(bp);
+		} else if (bp) {
+			/* Non-dirty, non-RAID6-absent disposal of bp */
+			if (bp->b_flags & (B_ERROR | B_INVAL | B_RELBUF))
+				brelse(bp);
+			else
+				bqrelse(bp);
 		}
 	} else if (bp) {
 		/*
@@ -930,11 +959,16 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	}
 
 	/*
-	 * RAID6: free old_data if not transferred to parity work item
+	 * RAID6: free old_data and absent_data if not transferred
+	 * to parity work item.
 	 */
 	if (dio->raid6_old_data) {
 		kfree(dio->raid6_old_data, M_HAMMER2);
 		dio->raid6_old_data = NULL;
+	}
+	if (dio->absent_data) {
+		kfree(dio->absent_data, M_HAMMER2);
+		dio->absent_data = NULL;
 	}
 
 	/*
@@ -1035,6 +1069,10 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
 			kfree(dio->raid6_old_data, M_HAMMER2);
 			dio->raid6_old_data = NULL;
 		}
+		if (dio->absent_data) {
+			kfree(dio->absent_data, M_HAMMER2);
+			dio->absent_data = NULL;
+		}
 		kfree_obj(dio, hmp->mio);
 		atomic_add_int(&hammer2_dio_count, -1);
 		atomic_add_int(&hmp->iofree_count, -1);
@@ -1050,11 +1088,21 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
 	struct buf *bp;
 	int off;
 
+	lbase -= dio->dbase;
+	off = (int)((lbase & ~HAMMER2_OFF_MASK_RADIX) -
+		    (off_t)(dio->pbase - dio->dbase));
+
+	/*
+	 * Absent disk (no devvp): data is in a kmalloc buffer.
+	 */
+	if (dio->absent_data) {
+		KKASSERT(off >= 0 && off < dio->psize);
+		return (dio->absent_data + off);
+	}
+
 	bp = dio->bp;
 	KKASSERT(bp != NULL);
 	bkvasync(bp);
-	lbase -= dio->dbase;
-	off = (lbase & ~HAMMER2_OFF_MASK_RADIX) - bp->b_loffset;
 	KKASSERT(off >= 0 && off < bp->b_bufsize);
 	return(bp->b_data + off);
 }
@@ -1257,7 +1305,7 @@ static
 void
 dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
 {
-	if (bp->b_flags & B_DELWRI)
+	if (bp && (bp->b_flags & B_DELWRI))
 		return;
 	hammer2_adjwritecounter(dio->btype, dio->psize);
 }
@@ -1265,6 +1313,8 @@ dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
 void
 hammer2_io_bkvasync(hammer2_io_t *dio)
 {
+	if (dio->absent_data)
+		return;	/* kmalloc buffer is always CPU-accessible, no KVABIO needed */
 	KKASSERT(dio->bp != NULL);
 	bkvasync(dio->bp);
 }
@@ -1277,6 +1327,48 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 {
 	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
 	atomic_add_64(&dio->refs, 1);
+}
+
+/*
+ * Auto-fail a disk that returned EIO during a RAID6 I/O operation.
+ *
+ * Updates both the runtime hmp->raid_failed[] state and the on-disk
+ * voldata.raid_config, so the failed state survives unmount/remount.
+ *
+ * If raid_nfailed would reach 3 (triple failure), returns ENXIO to
+ * signal unrecoverable array state; otherwise marks the disk failed
+ * and returns 0.
+ *
+ * Called from I/O context — does NOT close the vnode.  The disk is
+ * excluded from future I/Os via raid_failed[]; the vnode is released
+ * at unmount.
+ */
+static int
+hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
+{
+	hammer2_voldata_lock(hmp);
+	if (hmp->raid_failed[disk_idx]) {
+		hammer2_voldata_unlock(hmp);
+		return 0;
+	}
+	if (hmp->raid_nfailed >= 2) {
+		hammer2_voldata_unlock(hmp);
+		kprintf("hammer2: RAID6 unrecoverable: I/O error on disk %d "
+			"but already %d disk(s) failed\n",
+			disk_idx, hmp->raid_nfailed);
+		return ENXIO;
+	}
+	kprintf("hammer2: RAID6 disk %d auto-failed due to I/O error\n",
+		disk_idx);
+	hmp->raid_failed[disk_idx] = 1;
+	atomic_add_int(&hmp->raid_nfailed, 1);
+	hmp->raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
+	hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	hmp->voldata.raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
+	hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	hammer2_voldata_modify(hmp);
+	hammer2_voldata_unlock(hmp);
+	return 0;
 }
 
 /*
@@ -1293,7 +1385,8 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  *    the failed column.  The failed disk's data cancels out in the XOR.
  *  - If old_data is NULL (healthy mode): full-stripe gen_syndrome as before.
  *
- * No HAMMER2 locks are held.  Returns 0 on success.
+ * No HAMMER2 locks are held.  Returns 0 on success, EIO if an unexpected
+ * I/O error occurs on a surviving disk and the array becomes unrecoverable.
  */
 int
 hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
@@ -1314,6 +1407,7 @@ hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	int fail_data_a = -1, fail_data_b = -1;
 	int fail_p = 0, fail_q = 0;
 	int phys_disk, di, col;
+	int error = 0;
 	int i;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
@@ -1384,7 +1478,15 @@ hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 			} else {
 				if (bp)
 					brelse(bp);
-				/* I/O error: track for recovery */
+				{
+					int aerr = hammer2_raid6_auto_fail_disk(
+							hmp, phys_disk);
+					if (aerr) {
+						error = EIO;
+						goto write_done;
+					}
+				}
+				/* I/O error: track failed column for reconstruction */
 				if (col < ndata) {
 					if (fail_data_a == -1)
 						fail_data_a = col;
@@ -1444,6 +1546,8 @@ hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 				kprintf("hammer2: RAID6 write: too many "
 					"failures (data %d,%d parity %d,%d)\n",
 					fail_data_a, fail_data_b, fail_p, fail_q);
+				error = EIO;
+				goto write_done;
 			} else {
 				if (fail_data_a > fail_data_b) {
 					int tmp = fail_data_a;
@@ -1461,6 +1565,8 @@ hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 					kprintf("hammer2: RAID6 write: too "
 						"many failures (data %d parity P,Q)\n",
 						fail_data_a);
+					error = EIO;
+					goto write_done;
 				} else {
 					hammer2_raid6_datap_recov(ndisks,
 								  stripe_unit,
@@ -1520,12 +1626,13 @@ parity_write:
 		}
 	}
 
+write_done:
 	for (i = 0; i < ndisks; i++) {
 		if (col_bufs[i])
 			kfree(col_bufs[i], M_HAMMER2);
 	}
 
-	return 0;
+	return error;
 }
 
 /*
@@ -1729,7 +1836,15 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		} else {
 			if (bp)
 				brelse(bp);
-			/* I/O error: track for recovery */
+			{
+				int aerr = hammer2_raid6_auto_fail_disk(
+						hmp, phys_disk);
+				if (aerr) {
+					error = EIO;
+					break;
+				}
+			}
+			/* I/O error: track failed column for reconstruction */
 			if (col < ndata) {
 				if (fail_data_a == -1)
 					fail_data_a = col;
@@ -1744,6 +1859,8 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	}
 
 	/* Perform recovery */
+	if (error)
+		goto read_degraded_done;
 	error = 0;
 	if (fail_data_a != -1) {
 		if (fail_data_b != -1) {
@@ -1786,6 +1903,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	if (error == 0) {
 		bcopy(ptrs[target_col], buf, stripe_unit);
 	}
+read_degraded_done:
 	/* Free temporary buffers */
 	for (col = 0; col <= ndata + 1; col++) {
 		if (col_bufs[col])
@@ -1827,6 +1945,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	hammer2_volume_t *vol;
 	struct buf *bp, *wbp;
 	int error = 0;
+	int lerror;
 	int i;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
@@ -1968,18 +2087,30 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 			vol = &hmp->volumes[phys_disk];
 			bp = NULL;
-			error = breadnx(vol->dev->devvp, phys_off,
-					stripe_unit, 0, NULL, NULL, 0, &bp);
-			if (error == 0 && bp) {
+			lerror = breadnx(vol->dev->devvp, phys_off,
+					 stripe_unit, 0, NULL, NULL, 0, &bp);
+			if (lerror == 0 && bp) {
 				bkvasync(bp);
 				bcopy(bp->b_data, col_bufs[col], stripe_unit);
 				brelse(bp);
 			} else {
 				if (bp)
 					brelse(bp);
-				/* treat as zeros */
+				{
+					int aerr = hammer2_raid6_auto_fail_disk(
+							hmp, phys_disk);
+					if (aerr) {
+						error = EIO;
+						kprintf("hammer2: resilver stripe"
+							" %llu: unrecoverable"
+							" I/O error on disk %d\n",
+							(unsigned long long)
+							stripe_num, phys_disk);
+						goto resilver_done;
+					}
+				}
+				/* disk now in raid_failed[]; treated as zeros */
 			}
-			error = 0;
 		}
 
 		/* Reconstruct the failed column */
@@ -2001,7 +2132,9 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		if (wbp) {
 			bkvasync(wbp);
 			bcopy(ptrs[failed_col], wbp->b_data, stripe_unit);
-			bwrite(wbp); /* synchronous: correctness > performance */
+			lerror = bwrite(wbp);
+			if (lerror && !error)
+				error = lerror;
 		}
 
 		/* Update progress and yield every 256 stripes */
@@ -2063,9 +2196,9 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					continue;
 				vol = &hmp->volumes[phys_disk];
 				bp = NULL;
-				error = breadnx(vol->dev->devvp, phys_off,
+				lerror = breadnx(vol->dev->devvp, phys_off,
 					stripe_unit, 0, NULL, NULL, 0, &bp);
-				if (error == 0 && bp) {
+				if (lerror == 0 && bp) {
 					bkvasync(bp);
 					bcopy(bp->b_data, col_bufs[col],
 					      stripe_unit);
@@ -2073,8 +2206,17 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				} else {
 					if (bp)
 						brelse(bp);
+					{
+						int aerr =
+						    hammer2_raid6_auto_fail_disk(
+							hmp, phys_disk);
+						if (aerr) {
+							error = EIO;
+							goto resilver_done;
+						}
+					}
+					/* disk now in raid_failed[]; zeros */
 				}
-				error = 0;
 			}
 
 			if (other_failed_col >= 0) {
@@ -2093,7 +2235,9 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				bkvasync(wbp);
 				bcopy(ptrs[failed_col], wbp->b_data,
 				      stripe_unit);
-				bwrite(wbp);
+				lerror = bwrite(wbp);
+				if (lerror && !error)
+					error = lerror;
 			}
 
 			if ((stripe_num & 255) == 255)
@@ -2101,6 +2245,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 	}
 
+resilver_done:
 	/* Free column buffers */
 	for (i = 0; i < ndisks; i++)
 		kfree(col_bufs[i], M_HAMMER2);
