@@ -126,7 +126,8 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 static __inline
 hammer2_io_t *
 hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
-		 int createit, int *isgoodp)
+		 int createit, int *isgoodp,
+		 const hammer2_blockref_t *bref)
 {
 	hammer2_io_t *dio;
 	hammer2_io_t *xio;
@@ -185,12 +186,45 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
 			 * as the sector address on the physical device.
 			 * For RAID 6, phys_off is the correct physical
 			 * sector address, so set dbase = pbase - phys_off.
+			 *
+			 * v4 (RAIDZ2-native): disk index and physical column
+			 * offset are encoded directly in the bref:
+			 *   bref->copyid     = physical disk index
+			 *   bref->data_off   = physical col offset (low 6
+			 *                      bits = radix, upper = bytes)
+			 *
+			 * v3 (RAID6): derive disk and offset via the stripe
+			 * mapping function hammer2_raid6_map().
 			 */
 			int disk_idx;
 			hammer2_off_t phys_off;
 
-			hammer2_raid6_map(hmp, pbase,
-					  &disk_idx, &phys_off);
+			if (hmp->voldata.version >=
+			    HAMMER2_VOL_VERSION_RAIDZ2 && bref != NULL &&
+			    (bref->type == HAMMER2_BREF_TYPE_DATA ||
+			     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
+				/*
+				 * v4: DATA and DIRENT blocks use physical
+				 * addressing encoded in the bref:
+				 *   bref->copyid   = physical disk index
+				 *   bref->data_off = physical col offset
+				 *                    (low bits = radix)
+				 *
+				 * All other block types (INODE, INDIRECT,
+				 * FREEMAP, etc.) are allocated via the
+				 * freemap and still use v3 logical mapping.
+				 */
+				disk_idx = (int)bref->copyid;
+				phys_off = bref->data_off &
+					   ~HAMMER2_OFF_MASK_RADIX;
+			} else {
+				/*
+				 * v3 or non-stripe block: compute via
+				 * stripe-layout mapping.
+				 */
+				hammer2_raid6_map(hmp, pbase,
+						  &disk_idx, &phys_off);
+			}
 			vol = &hmp->volumes[disk_idx];
 			dio->devvp = vol->dev ? vol->dev->devvp : NULL;
 			dio->dbase = pbase - phys_off;
@@ -241,7 +275,8 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
  */
 hammer2_io_t *
 _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
-		   int lsize, int op HAMMER2_IO_DEBUG_ARGS)
+		   int lsize, int op, const hammer2_blockref_t *bref
+		   HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_io_t *dio;
 	hammer2_off_t dev_pbase;
@@ -259,12 +294,12 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	KKASSERT((1 << (int)(lbase & HAMMER2_OFF_MASK_RADIX)) == lsize);
 
 	if (op == HAMMER2_DOP_READQ) {
-		dio = hammer2_io_alloc(hmp, lbase, btype, 0, &isgood);
+		dio = hammer2_io_alloc(hmp, lbase, btype, 0, &isgood, bref);
 		if (dio == NULL)
 			return NULL;
 		op = HAMMER2_DOP_READ;
 	} else {
-		dio = hammer2_io_alloc(hmp, lbase, btype, 1, &isgood);
+		dio = hammer2_io_alloc(hmp, lbase, btype, 1, &isgood, bref);
 	}
 
 	for (;;) {
@@ -380,7 +415,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			if (dio->bp)
 				bkvasync(dio->bp);
 			error = hammer2_io_raid6_read_degraded(
-					hmp, dio->pbase,
+					hmp, dio->pbase, dio->disk_idx,
 					preempt_data, dio->psize);
 			if (error == 0) {
 				dio->raid6_old_data = kmalloc(dio->psize,
@@ -439,7 +474,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				if (dio->bp) {
 					bkvasync(dio->bp);
 					error = hammer2_io_raid6_read_degraded(
-					    hmp, dio->pbase,
+					    hmp, dio->pbase, dio->disk_idx,
 					    dio->bp->b_data, dio->psize);
 					if (error == 0) {
 						dio->raid6_old_data = kmalloc(
@@ -623,7 +658,7 @@ io_done:
 			if (dio->bp) {
 				bkvasync(dio->bp);
 				error = hammer2_io_raid6_read_degraded(
-						hmp, dio->pbase,
+						hmp, dio->pbase, dio->disk_idx,
 						dio->bp->b_data, dio->psize);
 				dio->error = error;
 				/*
@@ -904,18 +939,42 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * so reads don't need parity reconstruction).
 			 */
 			if (raid6_data && hmp->raid_nfailed > 0) {
-				hammer2_io_raid6_write(hmp, pbase,
-				    raid6_data, dio->raid6_old_data,
-				    psize);
+				/*
+				 * Degraded mode: process parity inline
+				 * (synchronous).
+				 *
+				 * v4 (RAIDZ2-native): all other data columns
+				 * in this stripe slot are zero (freshly
+				 * allocated), so compute P/Q from scratch
+				 * without any reads.
+				 *
+				 * v3: use RMW delta path as before.
+				 */
+				if (hmp->voldata.version >=
+				    HAMMER2_VOL_VERSION_RAIDZ2) {
+					hammer2_io_raid6_write_scratch(hmp,
+					    pbase, dio->disk_idx,
+					    raid6_data, psize);
+				} else {
+					hammer2_io_raid6_write(hmp, pbase,
+					    raid6_data, dio->raid6_old_data,
+					    psize);
+				}
 				/*
 				 * Track stripes written during an active
 				 * resilver so the resilver can do a second
 				 * pass over them after a sync.
 				 */
 				if (hmp->resilver_running) {
-					uint64_t sn = pbase /
-					    ((uint64_t)hmp->raid_config.ndata *
-					     hmp->raid_config.stripe_unit);
+					uint64_t sn;
+					if (hmp->voldata.version >=
+					    HAMMER2_VOL_VERSION_RAIDZ2)
+						sn = (pbase - HAMMER2_ZONE_SEG64) /
+						    hmp->raid_config.stripe_unit;
+					else
+						sn = pbase /
+						    ((uint64_t)hmp->raid_config.ndata *
+						     hmp->raid_config.stripe_unit);
 					hammer2_spin_ex(&hmp->io_spin);
 					if (sn < hmp->resilver_dirty_lo)
 						hmp->resilver_dirty_lo = sn;
@@ -938,6 +997,13 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				pw->data = raid6_data;
 				pw->old_data = dio->raid6_old_data;
 				dio->raid6_old_data = NULL;
+				/*
+				 * v4 (RAIDZ2-native): tell the background
+				 * parity thread to compute P/Q from scratch
+				 * (no reads, no RMW delta needed).
+				 */
+				pw->scratch = (hmp->voldata.version >=
+				    HAMMER2_VOL_VERSION_RAIDZ2) ? 1 : 0;
 				spin_lock(&hmp->raid6_parity_spin);
 				TAILQ_INSERT_TAIL(&hmp->raid6_parity_q,
 				    pw, entry);
@@ -1109,30 +1175,34 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
 
 int
 hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-	       hammer2_io_t **diop)
+	       hammer2_io_t **diop, const hammer2_blockref_t *bref)
 {
-	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_NEW);
+	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_NEW,
+				  bref);
 	return ((*diop)->error);
 }
 
 int
 hammer2_io_newnz(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-		 hammer2_io_t **diop)
+		 hammer2_io_t **diop, const hammer2_blockref_t *bref)
 {
-	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_NEWNZ);
+	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_NEWNZ,
+				  bref);
 	return ((*diop)->error);
 }
 
 int
 _hammer2_io_bread(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-		hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+		hammer2_io_t **diop, const hammer2_blockref_t *bref
+		HAMMER2_IO_DEBUG_ARGS)
 {
 #ifdef HAMMER2_IO_DEBUG
 	hammer2_io_t *dio;
 #endif
 
 	*diop = _hammer2_io_getblk(hmp, btype, lbase, lsize,
-				   HAMMER2_DOP_READ HAMMER2_IO_DEBUG_CALL);
+				   HAMMER2_DOP_READ, bref
+				   HAMMER2_IO_DEBUG_CALL);
 #ifdef HAMMER2_IO_DEBUG
 	if ((dio = *diop) != NULL) {
 #if 0
@@ -1151,7 +1221,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
 	hammer2_io_t *dio;
 
 	dio = _hammer2_io_getblk(hmp, 0, lbase, lsize,
-				 HAMMER2_DOP_READQ HAMMER2_IO_DEBUG_CALL);
+				 HAMMER2_DOP_READQ, NULL
+				 HAMMER2_IO_DEBUG_CALL);
 	return dio;
 }
 
@@ -1654,8 +1725,18 @@ hammer2_parity_thread(void *arg)
 			TAILQ_REMOVE(&hmp->raid6_parity_q, pw, entry);
 			hmp->raid6_parity_processing = 1;
 			spin_unlock(&hmp->raid6_parity_spin);
-			hammer2_io_raid6_write(hmp, pw->pbase, pw->data,
-					       pw->old_data, pw->psize);
+			/*
+			 * v4 (RAIDZ2-native): compute P/Q from scratch,
+			 * no sibling reads needed.
+			 * v3: use full RMW-delta path as before.
+			 */
+			if (pw->scratch) {
+				hammer2_io_raid6_write_scratch(hmp, pw->pbase,
+				    pw->data, pw->psize);
+			} else {
+				hammer2_io_raid6_write(hmp, pw->pbase,
+				    pw->data, pw->old_data, pw->psize);
+			}
 			kfree(pw->data, M_HAMMER2);
 			if (pw->old_data)
 				kfree(pw->old_data, M_HAMMER2);
@@ -1749,7 +1830,7 @@ hammer2_parity_uninit(hammer2_dev_t *hmp)
  */
 int
 hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
-			       void *buf, size_t bytes)
+			       int data_disk_idx, void *buf, size_t bytes)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
@@ -1768,9 +1849,138 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	int fail_data_a = -1, fail_data_b = -1;
 	int fail_p = 0, fail_q = 0;
 
+	bzero(col_bufs, sizeof(col_bufs));
+
 	KKASSERT(bytes == stripe_unit);
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 
+	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+		/*
+		 * v4 (RAIDZ2-native): physical addressing.
+		 *
+		 * logical_off is the physical column offset on disk
+		 * data_disk_idx.  All columns in the same stripe slot
+		 * share the same physical offset:
+		 *   stripe_slot = (logical_off - HAMMER2_ZONE_SEG64) /
+		 *                 stripe_unit
+		 *   phys_off    = HAMMER2_ZONE_SEG64 + stripe_slot *
+		 *                 stripe_unit
+		 *
+		 * P disk = stripe_slot % ndisks
+		 * Q disk = (P disk + 1) % ndisks
+		 * Data columns: all other disks in disk-index order.
+		 *
+		 * target_col: the logical column index for data_disk_idx.
+		 *   If data_disk_idx == p_disk -> target_col = ndata (P)
+		 *   If data_disk_idx == q_disk -> target_col = ndata+1 (Q)
+		 *   Otherwise: count data disks below data_disk_idx.
+		 */
+		uint64_t stripe_slot;
+		int d_col;
+
+		stripe_slot = (logical_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+		p_disk = (int)(stripe_slot % ndisks);
+		q_disk = (p_disk + 1) % ndisks;
+		phys_off = HAMMER2_ZONE_SEG64 + stripe_slot * stripe_unit;
+
+		if (data_disk_idx == p_disk) {
+			target_col = ndata;
+		} else if (data_disk_idx == q_disk) {
+			target_col = ndata + 1;
+		} else {
+			/* Count data disks with index < data_disk_idx */
+			d_col = 0;
+			for (di = 0; di < data_disk_idx; di++) {
+				if (di != p_disk && di != q_disk)
+					d_col++;
+			}
+			target_col = d_col;
+		}
+
+		di = 0;
+		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
+			int lerror;
+			if (phys_disk == p_disk)
+				col = ndata;
+			else if (phys_disk == q_disk)
+				col = ndata + 1;
+			else
+				col = di++;
+
+			col_bufs[col] = kmalloc(stripe_unit, M_HAMMER2,
+						M_WAITOK | M_ZERO);
+			ptrs[col] = col_bufs[col];
+
+			if (phys_disk == data_disk_idx) {
+				/*
+				 * This is the column being reconstructed.
+				 * Leave the buffer zeroed and mark failed.
+				 */
+				if (col < ndata) {
+					if (fail_data_a == -1)
+						fail_data_a = col;
+					else if (fail_data_b == -1)
+						fail_data_b = col;
+				} else if (col == ndata) {
+					fail_p = 1;
+				} else {
+					fail_q = 1;
+				}
+				continue;
+			}
+
+			if (hmp->raid_failed[phys_disk]) {
+				if (col < ndata) {
+					if (fail_data_a == -1)
+						fail_data_a = col;
+					else if (fail_data_b == -1)
+						fail_data_b = col;
+				} else if (col == ndata) {
+					fail_p = 1;
+				} else {
+					fail_q = 1;
+				}
+				continue;
+			}
+
+			vol = &hmp->volumes[phys_disk];
+			bp = NULL;
+			lerror = breadnx(vol->dev->devvp, phys_off,
+					 stripe_unit, 0, NULL, NULL, 0, &bp);
+			if (lerror == 0 && bp) {
+				bkvasync(bp);
+				bcopy(bp->b_data, col_bufs[col], stripe_unit);
+				brelse(bp);
+			} else {
+				if (bp)
+					brelse(bp);
+				{
+					int aerr =
+					    hammer2_raid6_auto_fail_disk(
+						hmp, phys_disk);
+					if (aerr) {
+						error = EIO;
+						break;
+					}
+				}
+				if (col < ndata) {
+					if (fail_data_a == -1)
+						fail_data_a = col;
+					else if (fail_data_b == -1)
+						fail_data_b = col;
+				} else if (col == ndata) {
+					fail_p = 1;
+				} else {
+					fail_q = 1;
+				}
+			}
+		}
+		goto do_recovery;
+	}
+
+	/*
+	 * v3 (RAID6): logical addressing via hammer2_raid6_map().
+	 */
 	stripe_num = logical_off / ((uint64_t)ndata * stripe_unit);
 
 	/* P and Q disk positions */
@@ -1858,6 +2068,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		}
 	}
 
+do_recovery:
 	/* Perform recovery */
 	if (error)
 		goto read_degraded_done;
@@ -1953,7 +2164,16 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	KKASSERT(ndata > 0);
 	KKASSERT(failed_disk_idx >= 0 && failed_disk_idx < ndisks);
 
-	num_stripes = rc->array_size / ((uint64_t)ndata * stripe_unit);
+	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+		/*
+		 * v4 (RAIDZ2-native): iterate over all possible stripe slots
+		 * in the bitmap.  Only process allocated (bit-set) slots.
+		 */
+		num_stripes = (HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64) /
+			      stripe_unit;
+	} else {
+		num_stripes = rc->array_size / ((uint64_t)ndata * stripe_unit);
+	}
 
 	/* Publish progress so status ioctl can be polled from userspace */
 	hmp->resilver_disk_idx = failed_disk_idx;
@@ -2046,6 +2266,20 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
+		/*
+		 * v4 (RAIDZ2-native): skip unallocated stripe slots.
+		 * The bitmap lives in hmp->stripe_bitmap.
+		 */
+		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    hmp->stripe_bitmap != NULL) {
+			int byte_idx = (int)(stripe_num / 8);
+			int bit_idx  = (int)(stripe_num % 8);
+			if (byte_idx >= (int)hmp->stripe_bitmap_size ||
+			    (hmp->stripe_bitmap[byte_idx] &
+			     (1 << bit_idx)) == 0)
+				continue;
+		}
+
 		phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
 
 		/* Left-symmetric P and Q disk positions */
@@ -2162,6 +2396,17 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 			"%ju..%ju\n", (uintmax_t)lo, (uintmax_t)hi);
 
 		for (stripe_num = lo; stripe_num <= hi; stripe_num++) {
+			/* v4: skip unallocated slots */
+			if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			    hmp->stripe_bitmap != NULL) {
+				int byte_idx = (int)(stripe_num / 8);
+				int bit_idx  = (int)(stripe_num % 8);
+				if (byte_idx >= (int)hmp->stripe_bitmap_size ||
+				    (hmp->stripe_bitmap[byte_idx] &
+				     (1 << bit_idx)) == 0)
+					continue;
+			}
+
 			phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
 			p_disk = (int)(stripe_num % ndisks);
 			q_disk = (p_disk + 1) % ndisks;

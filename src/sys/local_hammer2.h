@@ -1109,6 +1109,7 @@ struct hammer2_parity_work {
 	int		psize;
 	char		*data;
 	char		*old_data;	/* pre-modification data for RMW delta */
+	int		scratch;	/* v4: compute P/Q from scratch, no RMW */
 };
 typedef struct hammer2_parity_work hammer2_parity_work_t;
 
@@ -1153,6 +1154,10 @@ struct hammer2_dev {
 	int		raid_type;		/* 0=JBOD, 6=RAID6 */
 	int		raid_failed[HAMMER2_MAX_VOLUMES]; /* failed disk tracking */
 	int		raid_nfailed;		/* count of failed disks */
+
+	/* RAIDZ2-native physical stripe bitmap (v4 format) */
+	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
+	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
 
 	/* RAID6 resilver progress (written by resilver, read by status ioctl) */
 	volatile uint64_t resilver_stripes_done;
@@ -1660,15 +1665,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
 				u_int bytes);
 int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-				hammer2_io_t **diop);
+				hammer2_io_t **diop,
+				const hammer2_blockref_t *bref);
 int hammer2_io_newnz(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-				hammer2_io_t **diop);
+				hammer2_io_t **diop,
+				const hammer2_blockref_t *bref);
 int _hammer2_io_bread(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
-				hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
+				hammer2_io_t **diop,
+				const hammer2_blockref_t *bref
+				HAMMER2_IO_DEBUG_ARGS);
 void hammer2_io_setdirty(hammer2_io_t *dio);
 
 hammer2_io_t *_hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
-				int lsize, int op HAMMER2_IO_DEBUG_ARGS);
+				int lsize, int op,
+				const hammer2_blockref_t *bref
+				HAMMER2_IO_DEBUG_ARGS);
 hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
 				int lsize HAMMER2_IO_DEBUG_ARGS);
 void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
@@ -1681,8 +1692,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
 
 #ifndef HAMMER2_IO_DEBUG
 
-#define hammer2_io_getblk(hmp, btype, lbase, lsize, op)			\
-	_hammer2_io_getblk((hmp), (btype), (lbase), (lsize), (op))
+#define hammer2_io_getblk(hmp, btype, lbase, lsize, op, bref)		\
+	_hammer2_io_getblk((hmp), (btype), (lbase), (lsize), (op), (bref))
 #define hammer2_io_getquick(hmp, lbase, lsize)				\
 	_hammer2_io_getquick((hmp), (lbase), (lsize))
 #define hammer2_io_putblk(diop)						\
@@ -1700,13 +1711,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
 #define hammer2_io_ref(dio)						\
 	_hammer2_io_ref((dio))
 
-#define hammer2_io_bread(hmp, btype, lbase, lsize, diop)		\
-	_hammer2_io_bread((hmp), (btype), (lbase), (lsize), (diop))
+#define hammer2_io_bread(hmp, btype, lbase, lsize, diop, bref)		\
+	_hammer2_io_bread((hmp), (btype), (lbase), (lsize), (diop), (bref))
 
 #else
 
-#define hammer2_io_getblk(hmp, btype, lbase, lsize, op)			\
-	_hammer2_io_getblk((hmp), (btype), (lbase), (lsize), (op),	\
+#define hammer2_io_getblk(hmp, btype, lbase, lsize, op, bref)		\
+	_hammer2_io_getblk((hmp), (btype), (lbase), (lsize), (op), (bref), \
 	__FILE__, __LINE__)
 
 #define hammer2_io_getquick(hmp, lbase, lsize)				\
@@ -1728,8 +1739,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
 #define hammer2_io_ref(dio)						\
 	_hammer2_io_ref((dio), __FILE__, __LINE__)
 
-#define hammer2_io_bread(hmp, btype, lbase, lsize, diop)		\
-	_hammer2_io_bread((hmp), (btype), (lbase), (lsize), (diop),	\
+#define hammer2_io_bread(hmp, btype, lbase, lsize, diop, bref)		\
+	_hammer2_io_bread((hmp), (btype), (lbase), (lsize), (diop), (bref), \
 			  __FILE__, __LINE__)
 
 #endif
@@ -1974,6 +1985,12 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 			int *rootvolzone,
 			struct vnode **rootvoldevvp);
 hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
+void hammer2_raid6_bitmap_init(hammer2_dev_t *hmp);
+void hammer2_raid6_bitmap_read(hammer2_dev_t *hmp);
+void hammer2_raid6_bitmap_write(hammer2_dev_t *hmp);
+int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
+void hammer2_raid6_stripe_free(hammer2_dev_t *hmp,
+				const hammer2_blockref_t *bref);
 
 /*
  * hammer2_raid6.c
@@ -1990,8 +2007,12 @@ void hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		int *disk_idx, hammer2_off_t *phys_off);
 int hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		void *data, void *old_data, size_t bytes);
+int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
+		hammer2_off_t pbase, int data_disk_idx,
+		void *data, size_t bytes);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
-		hammer2_off_t logical_off, void *buf, size_t bytes);
+		hammer2_off_t logical_off, int data_disk_idx,
+		void *buf, size_t bytes);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 

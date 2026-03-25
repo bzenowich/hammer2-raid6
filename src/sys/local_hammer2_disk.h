@@ -286,6 +286,7 @@
 #define HAMMER2_ZONE_FREEMAP_06		31	/* normal freemap rotation */
 #define HAMMER2_ZONE_FREEMAP_07		36	/* normal freemap rotation */
 #define HAMMER2_ZONE_FREEMAP_END	41	/* (non-inclusive) */
+#define HAMMER2_ZONE_RAID6_BITMAP	41	/* RAIDZ2-native: physical stripe bitmap (zone slots 41-42) */
 
 #define HAMMER2_ZONE_UNUSED41		41
 #define HAMMER2_ZONE_UNUSED42		42
@@ -1162,6 +1163,7 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_RAID6_DISK_FAILED	1
 #define HAMMER2_RAID6_DISK_REBUILDING	2
 #define HAMMER2_RAID6_DISK_SPARE	3
+#define HAMMER2_RAID6_DISK_ABSENT	4	/* RAIDZ2-native: disk absent at mount (degraded boot) */
 
 /* hammer2_raid_config flags */
 #define HAMMER2_RAID6_FLAG_DEGRADED	0x0001
@@ -1350,10 +1352,11 @@ typedef struct hammer2_volume_data hammer2_volume_data_t;
 
 #define HAMMER2_VOL_VERSION_MULTI_VOLUMES	2
 #define HAMMER2_VOL_VERSION_RAID6		3
+#define HAMMER2_VOL_VERSION_RAIDZ2		4	/* RAIDZ2-native: bref.data_off=physical col, bref.copyid=disk index */
 
 #define HAMMER2_VOL_VERSION_MIN		1
 #define HAMMER2_VOL_VERSION_DEFAULT	HAMMER2_VOL_VERSION_MULTI_VOLUMES
-#define HAMMER2_VOL_VERSION_WIP		(HAMMER2_VOL_VERSION_RAID6 + 1)
+#define HAMMER2_VOL_VERSION_WIP		HAMMER2_VOL_VERSION_RAIDZ2
 
 #define HAMMER2_NUM_VOLHDRS		4
 

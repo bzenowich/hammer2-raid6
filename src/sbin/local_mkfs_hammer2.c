@@ -779,6 +779,24 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	fsync(vol->fd);
 
 	/*
+	 * RAIDZ2-native (v4): write an empty stripe bitmap to zone slot 41
+	 * on disk 0 (the root volume).  All bits zero = no stripes allocated.
+	 * The kernel reads this zone at mount to restore the in-memory bitmap.
+	 */
+	if (opt->RaidType == 6 &&
+	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    vol->id == HAMMER2_ROOT_VOLUME) {
+		bzero(buf, HAMMER2_PBUFSIZE);
+		n = pwrite(vol->fd, buf, HAMMER2_PBUFSIZE,
+			   (hammer2_off_t)HAMMER2_ZONE_RAID6_BITMAP *
+			   HAMMER2_ZONE_SEG);
+		if (n != HAMMER2_PBUFSIZE) {
+			perror("write (stripe bitmap zone)");
+			exit(1);
+		}
+	}
+
+	/*
 	 * Cleanup
 	 */
 	free(buf);
@@ -873,6 +891,14 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 				min_size = fso.volumes[i].size;
 		}
 		fso.total_size = (hammer2_off_t)(fso.nvolumes - 2) * min_size;
+
+		/*
+		 * RAIDZ2-native (v4): upgrade the filesystem version so the
+		 * kernel uses physical stripe addressing (bref.copyid = disk,
+		 * bref.data_off = physical column offset).
+		 */
+		if (opt->Hammer2Version < HAMMER2_VOL_VERSION_RAIDZ2)
+			opt->Hammer2Version = HAMMER2_VOL_VERSION_RAIDZ2;
 	}
 
 	/*

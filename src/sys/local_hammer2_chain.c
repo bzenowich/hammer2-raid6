@@ -1201,11 +1201,11 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 	if (chain->flags & HAMMER2_CHAIN_INITIAL) {
 		error = hammer2_io_new(hmp, bref->type,
 				       bref->data_off, chain->bytes,
-				       &chain->dio);
+				       &chain->dio, bref);
 	} else {
 		error = hammer2_io_bread(hmp, bref->type,
 					 bref->data_off, chain->bytes,
-					 &chain->dio);
+					 &chain->dio, bref);
 		hammer2_adjreadcounter(chain->bref.type, chain->bytes);
 	}
 	if (error) {
@@ -1593,7 +1593,14 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 	 *	 to resize data blocks in-place, or directory entry blocks
 	 *	 which are about to be modified in some manner.
 	 */
-	error = hammer2_freemap_alloc(chain, nbytes);
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+		error = hammer2_raid6_stripe_alloc(hmp, chain);
+	} else {
+		error = hammer2_freemap_alloc(chain, nbytes);
+	}
 	if (error)
 		return error;
 
@@ -1744,6 +1751,14 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			 */
 			newmod = 1;
 		}
+		/*
+		 * RAIDZ2-native (v4): always allocate a fresh stripe slot.
+		 * The scratch P/Q path in _hammer2_io_putblk assumes all
+		 * columns of a new stripe slot are zero; in-place overwrite
+		 * violates that invariant and would require RMW delta parity.
+		 */
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
+			newmod = 1;
 	} else if (chain->flags & HAMMER2_CHAIN_DEDUPABLE) {
 		/*
 		 * If the modified chain was registered for dedup we need
@@ -1832,13 +1847,36 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 					hammer2_pfs_memory_wakeup(
 						chain->pmp, -1);
 				}
-				hammer2_freemap_adjust(hmp, &chain->bref,
-						HAMMER2_FREEMAP_DORECOVER);
+				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+				    hmp->voldata.version >=
+				    HAMMER2_VOL_VERSION_RAIDZ2 &&
+				    (chain->bref.type ==
+				     HAMMER2_BREF_TYPE_DATA ||
+				     chain->bref.type ==
+				     HAMMER2_BREF_TYPE_DIRENT)) {
+					hammer2_raid6_stripe_free(hmp,
+					    &chain->bref);
+				} else {
+					hammer2_freemap_adjust(hmp,
+					    &chain->bref,
+					    HAMMER2_FREEMAP_DORECOVER);
+				}
 				atomic_set_int(&chain->flags,
 						HAMMER2_CHAIN_DEDUPABLE);
 			} else {
-				error = hammer2_freemap_alloc(chain,
-							      chain->bytes);
+				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+				    hmp->voldata.version >=
+				    HAMMER2_VOL_VERSION_RAIDZ2 &&
+				    (chain->bref.type ==
+				     HAMMER2_BREF_TYPE_DATA ||
+				     chain->bref.type ==
+				     HAMMER2_BREF_TYPE_DIRENT)) {
+					error = hammer2_raid6_stripe_alloc(
+					    hmp, chain);
+				} else {
+					error = hammer2_freemap_alloc(chain,
+					    chain->bytes);
+				}
 				atomic_clear_int(&chain->flags,
 						HAMMER2_CHAIN_DEDUPABLE);
 
@@ -2000,11 +2038,13 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		if (wasinitial && dedup_off == 0) {
 			error = hammer2_io_new(hmp, chain->bref.type,
 					       chain->bref.data_off,
-					       chain->bytes, &dio);
+					       chain->bytes, &dio,
+					       &chain->bref);
 		} else {
 			error = hammer2_io_bread(hmp, chain->bref.type,
 						 chain->bref.data_off,
-						 chain->bytes, &dio);
+						 chain->bytes, &dio,
+						 &chain->bref);
 		}
 		hammer2_adjreadcounter(chain->bref.type, chain->bytes);
 

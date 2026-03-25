@@ -347,3 +347,138 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		hammer2_raid6_2data_recov(ndisks, bytes, faila, failb, ptrs);
 	}
 }
+
+/*
+ * RAIDZ2-native (v4) parity write: compute P and Q from scratch.
+ *
+ * Under v4, every data write goes to a freshly-allocated stripe slot where
+ * all other data columns are zero.  Therefore:
+ *
+ *   P = data_col XOR 0 XOR ... XOR 0 = data_col
+ *   Q = gf_mul(2^my_col, data_col) XOR 0 XOR ... XOR 0
+ *
+ * No reads of old P/Q are needed.  No RMW.  The raid6_old_data field is
+ * not used and must be NULL on entry.
+ *
+ * logical_off is the HAMMER2 logical base of the column that was written
+ * (same value as pbase from _hammer2_io_putblk).  data contains the bytes
+ * written to that column (stripe_unit bytes).
+ *
+ * Writes P and Q synchronously when degraded (raid_nfailed > 0), or
+ * asynchronously (bawrite) otherwise.
+ *
+ * Returns 0 on success, EIO on I/O error.
+ */
+int
+hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
+			       int data_disk_idx, void *data, size_t bytes)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	int ndisks = rc->ndisks;
+	int ndata __unused = rc->ndata;
+	uint64_t stripe_unit = rc->stripe_unit;
+	uint64_t stripe_slot;
+	int my_col;
+	int p_disk, q_disk;
+	hammer2_off_t phys_off;
+	hammer2_volume_t *vol;
+	struct buf *pbp, *qbp;
+	uint8_t coeff;
+	uint8_t *src;
+	uint8_t *dst;
+	size_t i;
+	int error = 0;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(bytes == (size_t)stripe_unit);
+
+	/*
+	 * v4 (RAIDZ2-native) stripe geometry.
+	 *
+	 * pbase encodes the physical column offset:
+	 *   pbase = HAMMER2_ZONE_SEG64 + stripe_slot * stripe_unit
+	 *
+	 * All columns in the same stripe slot share this physical offset
+	 * on their respective disks.
+	 *
+	 * P disk = stripe_slot % ndisks
+	 * Q disk = (P disk + 1) % ndisks
+	 *
+	 * my_col: logical data column index for data_disk_idx.  Count
+	 * disk indices < data_disk_idx that are neither p_disk nor q_disk.
+	 */
+	stripe_slot = (pbase - HAMMER2_ZONE_SEG64) / stripe_unit;
+	p_disk      = (int)(stripe_slot % ndisks);
+	q_disk      = (p_disk + 1) % ndisks;
+	phys_off    = pbase;
+
+	{
+		int d;
+		my_col = 0;
+		for (d = 0; d < data_disk_idx; d++) {
+			if (d != p_disk && d != q_disk)
+				my_col++;
+		}
+	}
+
+	/*
+	 * Write P column.
+	 * P = data_col (all other columns in this fresh slot are zero).
+	 */
+	pbp = NULL;
+	if (!hmp->raid_failed[p_disk]) {
+		vol = &hmp->volumes[p_disk];
+		pbp = getblk(vol->dev->devvp, phys_off,
+			     stripe_unit, GETBLK_KVABIO, 0);
+		if (pbp) {
+			bkvasync(pbp);
+			bcopy(data, pbp->b_data, stripe_unit);
+		}
+	}
+
+	/*
+	 * Write Q column.
+	 * Q = gf_mul(2^my_col, data_col) byte-by-byte.
+	 */
+	qbp = NULL;
+	if (!hmp->raid_failed[q_disk]) {
+		vol = &hmp->volumes[q_disk];
+		qbp = getblk(vol->dev->devvp, phys_off,
+			     stripe_unit, GETBLK_KVABIO, 0);
+		if (qbp) {
+			bkvasync(qbp);
+			coeff = hammer2_gf_exp[my_col % 255];
+			src = (uint8_t *)data;
+			dst = (uint8_t *)qbp->b_data;
+			for (i = 0; i < stripe_unit; i++)
+				dst[i] = hammer2_gf_mul(coeff, src[i]);
+		}
+	}
+
+	/*
+	 * Issue P and Q writes.  In degraded mode use synchronous bwrite()
+	 * so that parity is on-disk before the inline flush returns.
+	 * Background parity thread (healthy mode) uses bawrite() for
+	 * throughput.
+	 */
+	if (pbp) {
+		if (hmp->raid_nfailed > 0) {
+			int e = bwrite(pbp);
+			if (e && !error)
+				error = e;
+		} else {
+			bawrite(pbp);
+		}
+	}
+	if (qbp) {
+		if (hmp->raid_nfailed > 0) {
+			int e = bwrite(qbp);
+			if (e && !error)
+				error = e;
+		} else {
+			bawrite(qbp);
+		}
+	}
+
+	return error;
+}

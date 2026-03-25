@@ -1293,6 +1293,14 @@ next_hmp:
 					}
 				}
 			}
+
+			/*
+			 * Allocate and load the physical stripe bitmap.
+			 * Tracks which stripe slots are allocated so the
+			 * allocator never re-uses an in-use slot.
+			 */
+			hammer2_raid6_bitmap_init(hmp);
+			hammer2_raid6_bitmap_read(hmp);
 		} else if (hmp->voldata.version >=
 			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
 			hmp->nvolumes = hmp->voldata.nvolumes;
@@ -1995,6 +2003,12 @@ again:
 	kmalloc_destroy_obj(&hmp->mchain);
 	kmalloc_destroy_obj(&hmp->mio);
 	kmalloc_destroy(&hmp->mmsg);
+
+	if (hmp->stripe_bitmap) {
+		kfree(hmp->stripe_bitmap, M_HAMMER2);
+		hmp->stripe_bitmap = NULL;
+	}
+
 	kfree(hmp, M_HAMMER2);
 }
 

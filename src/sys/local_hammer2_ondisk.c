@@ -1057,3 +1057,186 @@ hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	*phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit +
 		    (logical_off % stripe_unit);
 }
+
+/*
+ * Allocate the in-memory stripe bitmap for a RAID6 array.
+ * One bit per stripe slot; all bits start as 0 (free).
+ * Called during mount after hmp->raid_config is populated.
+ */
+void
+hammer2_raid6_bitmap_init(hammer2_dev_t *hmp)
+{
+	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
+	uint64_t usable = HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64;
+	uint64_t max_stripes = usable / stripe_unit;
+	size_t bsize = (size_t)((max_stripes + 7) / 8);
+
+	hmp->stripe_bitmap = kmalloc(bsize, M_HAMMER2, M_WAITOK | M_ZERO);
+	hmp->stripe_bitmap_size = bsize;
+}
+
+/*
+ * Read the on-disk stripe bitmap from zone slot HAMMER2_ZONE_RAID6_BITMAP
+ * on disk 0.  If the read fails (new array, zone never written), the bitmap
+ * remains all-zeros (all stripes free), which is correct for a fresh array.
+ * Called during mount after hammer2_raid6_bitmap_init().
+ */
+void
+hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
+{
+	struct vnode *devvp;
+	struct buf *bp;
+	off_t pbase;
+	int error;
+
+	devvp = hmp->volumes[0].dev->devvp;
+	if (devvp == NULL || !hmp->volumes[0].dev->open)
+		return;
+
+	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
+
+	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
+	if (error) {
+		/* Not an error for a new array; bitmap stays all-zeros. */
+		if (bp)
+			brelse(bp);
+		return;
+	}
+
+	bcopy(bp->b_data, hmp->stripe_bitmap, hmp->stripe_bitmap_size);
+	brelse(bp);
+}
+
+/*
+ * Write the in-memory stripe bitmap to disk zone slot
+ * HAMMER2_ZONE_RAID6_BITMAP on disk 0, synchronously.
+ * Called from the TXG commit path before the volume header write
+ * so the bitmap is durable before the header that references it.
+ */
+void
+hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
+{
+	struct vnode *devvp;
+	struct buf *bp;
+	off_t pbase;
+
+	devvp = hmp->volumes[0].dev->devvp;
+	if (devvp == NULL || !hmp->volumes[0].dev->open)
+		return;
+
+	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
+
+	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+	if (bp == NULL) {
+		kprintf("hammer2_raid6_bitmap_write: getblk failed\n");
+		return;
+	}
+	bkvasync(bp);
+	bzero(bp->b_data, HAMMER2_PBUFSIZE);
+	bcopy(hmp->stripe_bitmap, bp->b_data, hmp->stripe_bitmap_size);
+	bwrite(bp);
+}
+
+/*
+ * Allocate a physical stripe slot for a RAIDZ2-native (v4) data column.
+ * Sets chain->bref.data_off to the physical column offset on the chosen disk
+ * and chain->bref.copyid to the disk index (0..ndisks-1).
+ *
+ * Returns 0 on success, ENOSPC if no free stripe slot is available.
+ *
+ * The caller holds the chain in the appropriate state for modification.
+ * The stripe bitmap spinlock protects concurrent alloc/free.
+ */
+int
+hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	uint64_t stripe_unit = rc->stripe_unit;
+	uint64_t max_stripes = (HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64) /
+	    stripe_unit;
+	uint64_t slot;
+	int byte_idx, bit_idx;
+	int disk_idx;
+	hammer2_off_t phys_off;
+	int radix;
+	int n;
+	static int next_disk = 0;  /* round-robin data column selection */
+
+	/* Find first free slot (simple linear scan) */
+	for (slot = 0; slot < max_stripes; slot++) {
+		byte_idx = (int)(slot / 8);
+		bit_idx  = (int)(slot % 8);
+		if (byte_idx >= (int)hmp->stripe_bitmap_size)
+			break;
+		if ((hmp->stripe_bitmap[byte_idx] & (1 << bit_idx)) == 0) {
+			hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+			goto found;
+		}
+	}
+	return ENOSPC;
+
+found:
+	/*
+	 * Choose data disk (round-robin, skipping the P and Q disks for
+	 * this stripe).  P = slot % ndisks, Q = (slot + 1) % ndisks.
+	 */
+	{
+		int ndisks = rc->ndisks;
+		int p_disk = (int)(slot % ndisks);
+		int q_disk = (p_disk + 1) % ndisks;
+		int candidate;
+		int tries;
+
+		/* Pick a data disk round-robin, skipping P and Q */
+		for (tries = 0; tries < ndisks; tries++) {
+			candidate = next_disk % ndisks;
+			next_disk++;
+			if (candidate != p_disk && candidate != q_disk) {
+				disk_idx = candidate;
+				goto have_disk;
+			}
+		}
+		/* All disks are P or Q — can't happen for ndisks >= 4 */
+		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+		return ENOSPC;
+	}
+have_disk:
+	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
+
+	/* Compute radix (log2 of chain->bytes) */
+	radix = 0;
+	n = chain->bytes;
+	while (n > 1) { n >>= 1; radix++; }
+
+	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
+	chain->bref.copyid   = (uint8_t)disk_idx;
+
+	return 0;
+}
+
+/*
+ * Free a physical stripe slot for a RAIDZ2-native (v4) data column.
+ * Clears the stripe bitmap bit for the slot encoded in bref->data_off.
+ */
+void
+hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	uint64_t stripe_unit = rc->stripe_unit;
+	hammer2_off_t phys_off;
+	uint64_t slot;
+	int byte_idx, bit_idx;
+
+	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
+	if (phys_off < HAMMER2_ZONE_SEG64)
+		return; /* metadata block, not a stripe slot */
+
+	slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+	byte_idx = (int)(slot / 8);
+	bit_idx  = (int)(slot % 8);
+
+	if (byte_idx >= (int)hmp->stripe_bitmap_size)
+		return; /* out of range */
+
+	hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+}

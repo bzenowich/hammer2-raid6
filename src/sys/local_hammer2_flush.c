@@ -1529,6 +1529,15 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 				 HAMMER2_CHAIN_VOLUMESYNC);
 
 		/*
+		 * Persist the physical stripe bitmap before the volume
+		 * header so the bitmap is durable before the header
+		 * that references the array state is written.
+		 */
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    hmp->stripe_bitmap)
+			hammer2_raid6_bitmap_write(hmp);
+
+		/*
 		 * Write the volume header to ALL open devices.
 		 * This ensures RAID config changes (DEGRADED flag,
 		 * disk_state) propagate to all surviving disks on
