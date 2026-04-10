@@ -364,8 +364,7 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  * (same value as pbase from _hammer2_io_putblk).  data contains the bytes
  * written to that column (stripe_unit bytes).
  *
- * Writes P and Q synchronously when degraded (raid_nfailed > 0), or
- * asynchronously (bawrite) otherwise.
+ * Writes P and Q synchronously (bwrite) in all modes.
  *
  * Returns 0 on success, EIO on I/O error.
  */
@@ -407,10 +406,18 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 	 * my_col: logical data column index for data_disk_idx.  Count
 	 * disk indices < data_disk_idx that are neither p_disk nor q_disk.
 	 */
-	stripe_slot = (pbase - HAMMER2_ZONE_SEG64) / stripe_unit;
+	/*
+	 * pbase is the GLOBAL address (vol->offset + per_disk_phys_off).
+	 * Convert to per-disk physical offset for stripe geometry.
+	 * All columns (data, P, Q) share this per-disk physical offset.
+	 */
+	{
+		hammer2_volume_t *dvol = &hmp->volumes[data_disk_idx];
+		phys_off = pbase - dvol->offset;
+	}
+	stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
 	p_disk      = (int)(stripe_slot % ndisks);
 	q_disk      = (p_disk + 1) % ndisks;
-	phys_off    = pbase;
 
 	{
 		int d;
@@ -456,28 +463,20 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 	}
 
 	/*
-	 * Issue P and Q writes.  In degraded mode use synchronous bwrite()
-	 * so that parity is on-disk before the inline flush returns.
-	 * Background parity thread (healthy mode) uses bawrite() for
-	 * throughput.
+	 * Issue P and Q writes synchronously.  Using bwrite() prevents
+	 * async parity bawrite() calls from accumulating in runningbufspace
+	 * faster than vtbd completions drain them, which caused a buffer
+	 * cache deadlock on physical virtio-blk devices.
 	 */
 	if (pbp) {
-		if (hmp->raid_nfailed > 0) {
-			int e = bwrite(pbp);
-			if (e && !error)
-				error = e;
-		} else {
-			bawrite(pbp);
-		}
+		int e = bwrite(pbp);
+		if (e && !error)
+			error = e;
 	}
 	if (qbp) {
-		if (hmp->raid_nfailed > 0) {
-			int e = bwrite(qbp);
-			if (e && !error)
-				error = e;
-		} else {
-			bawrite(qbp);
-		}
+		int e = bwrite(qbp);
+		if (e && !error)
+			error = e;
 	}
 
 	return error;

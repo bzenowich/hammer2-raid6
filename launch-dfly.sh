@@ -11,6 +11,11 @@ BRIDGE="br0"
 HOST_IF="enp0s25"
 TAP_IF="tap0"
 
+# Number of RAID6 test disks to attach (4-6)
+NDISKS="${NDISKS:-4}"
+RAID_DISK_SIZE="4G"
+RAID_DISK_PREFIX="dfly-raid"
+
 # Create disk image if it doesn't exist
 if [ ! -f "$DISK" ]; then
     echo "Creating disk image ($DISK_SIZE)..."
@@ -22,6 +27,15 @@ if [ ! -f "$ROOT_DISK" ]; then
     echo "Creating UFS root disk image ($ROOT_DISK_SIZE)..."
     qemu-img create -f qcow2 "$ROOT_DISK" "$ROOT_DISK_SIZE"
 fi
+
+# Create RAID6 test disk images if they don't exist
+for i in $(seq 0 $((NDISKS - 1))); do
+    img="${RAID_DISK_PREFIX}${i}.qcow2"
+    if [ ! -f "$img" ]; then
+        echo "Creating RAID6 disk image $img ($RAID_DISK_SIZE)..."
+        qemu-img create -f qcow2 "$img" "$RAID_DISK_SIZE"
+    fi
+done
 
 # Set up bridge networking if not already configured
 if ! ip link show "$BRIDGE" &>/dev/null; then
@@ -46,6 +60,16 @@ if ! ip link show "$TAP_IF" &>/dev/null; then
     sudo ip link set "$TAP_IF" up
 fi
 
+# Build RAID6 disk arguments (virtio-blk, appear as vtbd0..vtbd(N-1) in DragonFly)
+RAID_ARGS=()
+for i in $(seq 0 $((NDISKS - 1))); do
+    img="${RAID_DISK_PREFIX}${i}.qcow2"
+    RAID_ARGS+=(
+        -drive "if=none,id=raid${i},format=qcow2,file=${img},cache=writethrough"
+        -device "virtio-blk-pci,drive=raid${i},serial=RAID${i}"
+    )
+done
+
 exec qemu-system-x86_64 \
     -m "$RAM" \
     -smp "$CPUS" \
@@ -58,4 +82,5 @@ exec qemu-system-x86_64 \
     -device VGA,edid=on,xres=1024,yres=768 \
     -display gtk,window-close=off \
     -netdev tap,id=net0,ifname="$TAP_IF",script=no,downscript=no \
-    -device virtio-net-pci,netdev=net0
+    -device virtio-net-pci,netdev=net0 \
+    "${RAID_ARGS[@]}"

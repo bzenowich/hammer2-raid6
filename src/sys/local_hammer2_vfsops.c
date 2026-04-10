@@ -1578,6 +1578,18 @@ next_hmp:
 
 	pmp->hflags = info.hflags;
 	mp->mnt_flag |= MNT_LOCAL;
+	/*
+	 * RAID6: disable VFS cluster_write() in VOP_WRITE to prevent
+	 * mnt_pbuf_count exhaustion.  cluster_write() acquires one pbuf
+	 * per write and holds it until XOP completes.  With chain-lock
+	 * contention on sequential writes, many in-flight writes pile up,
+	 * exhausting mnt_pbuf_count (nswbuf_kva/10 ~50) before the
+	 * hammer2_flush_pipe (100) throttle kicks in, deadlocking dd
+	 * in wswbuf2 (getpbuf_kva).  With MNT_NOCLUSTERW, VOP_WRITE
+	 * uses bdwrite(bp); bufdaemon flushes via bawrite (no pbuf).
+	 */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
+		mp->mnt_flag |= MNT_NOCLUSTERW;
 	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;   /* all entry pts are SMP */
 	mp->mnt_kern_flag |= MNTK_THR_SYNC;     /* new vsyncscan semantics */
 
@@ -1755,9 +1767,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
 	else
 		flags = 0;
 	if (pmp->iroot) {
+		/*
+		 * Pre-flush sync: clean all dirty page cache buffers before
+		 * vflush calls vinvalbuf.  Without this, async XOP strategy
+		 * writes may not have called biodone by the time vinvalbuf
+		 * inspects buffer state, causing "busy buffer problem" for
+		 * large files (e.g. 100 MB write then immediate umount).
+		 */
+		hammer2_vfs_sync(mp, MNT_WAIT);
 		error = vflush(mp, 0, flags);
 		if (error)
 			goto failed;
+		/*
+		 * Three syncs are required to fully flush the filesystem
+		 * (freemap updates lag by one flush, and one extra for
+		 * safety).  Run these after vflush so any dirty chains
+		 * created by VOP_FSYNC during vflush are also captured.
+		 */
 		hammer2_vfs_sync(mp, MNT_WAIT);
 		hammer2_vfs_sync(mp, MNT_WAIT);
 		hammer2_vfs_sync(mp, MNT_WAIT);
@@ -2005,6 +2031,7 @@ again:
 	kmalloc_destroy(&hmp->mmsg);
 
 	if (hmp->stripe_bitmap) {
+		spin_uninit(&hmp->stripe_bitmap_spin);
 		kfree(hmp->stripe_bitmap, M_HAMMER2);
 		hmp->stripe_bitmap = NULL;
 	}
@@ -2899,15 +2926,16 @@ restart:
 		hammer2_inode_unlock(ip);	/* unlock+drop */
 
 		/*
-		 * Flush vn device backing files after all dirty DIOs have
-		 * been bwritten to vn devices.  This drains UFS dirty blocks
-		 * synchronously so that sync(2)'s waitrunningbufspace() does
-		 * not block on buf_daemon's async writes to the underlying
-		 * disk.  Only needed in degraded mode where heavy bwrite
-		 * activity accumulates enough UFS dirty blocks to exceed
-		 * hirunningspace.
+		 * Flush device write caches after all dirty DIOs have been
+		 * submitted (bawrite/bwrite).  For vn devices this drains UFS
+		 * dirty blocks; for vtbd (virtio-blk) this issues
+		 * VIRTIO_BLK_T_FLUSH so all prior writes are committed before
+		 * unmount.  Without this, bawrite on vtbd is genuinely async
+		 * and data may not reach disk before umount → CHECK FAIL on
+		 * remount.  Also needed in degraded mode to prevent UFS dirty-
+		 * block accumulation beyond hirunningspace.
 		 */
-		if (hmp && hmp->raid_nfailed > 0)
+		if (hmp && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
 			hammer2_flush_vn_backing(hmp);
 	}
 #ifdef HAMMER2_DEBUG_SYNC

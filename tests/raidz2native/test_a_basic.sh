@@ -51,20 +51,20 @@ else
 fi
 teardown "A2"
 
-# A3: Blockref encoding — copyid in [0..5], data_off 64KB-aligned
+# A3: Blockref encoding — copyid in [0..NDISKS-1], data_off 64KB-aligned
 setup_fresh
 check_v4
 dd if=/dev/urandom of=$MNTPT/probe bs=65536 count=4 2>/dev/null
 sync; sync
 hammer2 -s $MNTPT show > /var/tmp/a3_show.txt 2>&1
-# Check: no DATA blockref with copyid outside [0,5]
+# Check: no DATA blockref with copyid outside [0, NDISKS-1]
 if grep -q "type=DATA" /var/tmp/a3_show.txt 2>/dev/null; then
     bad_copyid=$(grep "type=DATA" /var/tmp/a3_show.txt |
         awk '{ for(i=1;i<=NF;i++) if($i~/^copyid=/) print $i }' |
         sed 's/copyid=//' |
-        awk '$1 < 0 || $1 > 5 { print $1 }')
+        awk -v n="$NDISKS" '$1 < 0 || $1 >= n { print $1 }')
     if [ -z "$bad_copyid" ]; then
-        result PASS "A3: all DATA blockrefs have copyid in [0..5]"
+        result PASS "A3: all DATA blockrefs have copyid in [0...$((NDISKS-1))]"
     else
         result FAIL "A3: DATA blockref copyid out of range: $bad_copyid"
     fi

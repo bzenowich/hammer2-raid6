@@ -1073,6 +1073,8 @@ hammer2_raid6_bitmap_init(hammer2_dev_t *hmp)
 
 	hmp->stripe_bitmap = kmalloc(bsize, M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->stripe_bitmap_size = bsize;
+	spin_init(&hmp->stripe_bitmap_spin, "h2smap");
+	hmp->stripe_next_disk = 0;
 }
 
 /*
@@ -1160,10 +1162,59 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	hammer2_off_t phys_off;
 	int radix;
 	int n;
-	static int next_disk = 0;  /* round-robin data column selection */
 
-	/* Find first free slot (simple linear scan) */
-	for (slot = 0; slot < max_stripes; slot++) {
+	/*
+	 * Reserve the first HAMMER2_STRIPE_V4_START slots for v3 freemap /
+	 * metadata blocks (INODE, INDIRECT).  The v3 stripe map allocates
+	 * metadata at low physical offsets (ZONE_SEG64 + slot * stripe_unit
+	 * for small slot numbers).  v4 DATA blocks must not reuse those
+	 * physical locations or both sets of blocks would collide on-disk.
+	 *
+	 * HAMMER2_STRIPE_V4_START = 1024 reserves 64 MB per disk for v3
+	 * metadata, which is far more than any test in the suite requires.
+	 *
+	 * Additionally, any slot whose per-disk physical offset falls inside
+	 * a HAMMER2 reserved zone must be skipped:
+	 *
+	 *   phys = ZONE_SEG64 + slot * stripe_unit
+	 *   zone = phys / ZONE_SEG
+	 *
+	 * Reserved zones:
+	 *   Freemap rotation zones: Z ≡ 1 (mod 5), 1 ≤ Z ≤ 36
+	 *     (ZONE_FREEMAP_00=1 through ZONE_FREEMAP_07=36, step 5)
+	 *     → slot ranges [0,64), [320,384), [640,704), [960,1024),
+	 *                    [1280,1344), [1600,1664), [1920,1984), [2240,2304)
+	 *   Stripe bitmap zone: Z == 41
+	 *     → slot range [2560, 2624)
+	 *
+	 * The STRIPE_V4_START=1024 already covers the first four freemap
+	 * groups (zones 1,6,11,16).  The zone check below handles zones
+	 * 21,26,31,36 and 41 which fall within the v4 DATA range.
+	 */
+#define HAMMER2_STRIPE_V4_START 1024
+
+	/*
+	 * The stripe bitmap and next_disk counter are shared across
+	 * concurrent xop threads.  Hold the spinlock for the entire
+	 * scan+allocate+disk-select sequence to prevent two threads from
+	 * racing into the same slot.
+	 */
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+
+	/* Find first free slot, skipping v3 range and all reserved zones */
+	for (slot = HAMMER2_STRIPE_V4_START; slot < max_stripes; slot++) {
+		uint64_t zone;
+
+		/* Skip slots whose physical offset is in a reserved zone */
+		zone = (HAMMER2_ZONE_SEG64 + slot * stripe_unit) /
+		    HAMMER2_ZONE_SEG64;
+		if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
+		    zone <= HAMMER2_ZONE_FREEMAP_07 &&
+		    (zone % HAMMER2_ZONE_FREEMAP_INC) == HAMMER2_ZONE_FREEMAP_00)
+			continue;
+		if (zone == HAMMER2_ZONE_RAID6_BITMAP)
+			continue;
+
 		byte_idx = (int)(slot / 8);
 		bit_idx  = (int)(slot % 8);
 		if (byte_idx >= (int)hmp->stripe_bitmap_size)
@@ -1173,6 +1224,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			goto found;
 		}
 	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	return ENOSPC;
 
 found:
@@ -1189,8 +1241,8 @@ found:
 
 		/* Pick a data disk round-robin, skipping P and Q */
 		for (tries = 0; tries < ndisks; tries++) {
-			candidate = next_disk % ndisks;
-			next_disk++;
+			candidate = hmp->stripe_next_disk % ndisks;
+			hmp->stripe_next_disk++;
 			if (candidate != p_disk && candidate != q_disk) {
 				disk_idx = candidate;
 				goto have_disk;
@@ -1198,9 +1250,11 @@ found:
 		}
 		/* All disks are P or Q — can't happen for ndisks >= 4 */
 		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 		return ENOSPC;
 	}
 have_disk:
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
 
 	/* Compute radix (log2 of chain->bytes) */
@@ -1208,7 +1262,25 @@ have_disk:
 	n = chain->bytes;
 	while (n > 1) { n >>= 1; radix++; }
 
-	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
+	/*
+	 * Store the GLOBAL (concatenated) address in bref.data_off so the
+	 * DIO tree key (pbase = bref.data_off & ~radix) is unique across
+	 * all disks.  Without this, two v4 DATA blocks on different disks
+	 * that share the same per-disk physical offset (e.g. disk 0 at
+	 * 0x0a800000 and disk 2 at 0x0a800000) would collide in the DIO
+	 * cache, causing silent data corruption.
+	 *
+	 * global_pbase = vol->offset + per_disk_phys_off
+	 *             = vol->offset + (ZONE_SEG64 + slot * stripe_unit)
+	 *
+	 * The io_alloc v4 path reconstructs per_disk_phys_off as:
+	 *   dev_pbase = pbase - vol->offset = global_pbase - vol->offset
+	 */
+	{
+		hammer2_volume_t *vol = &hmp->volumes[disk_idx];
+		hammer2_off_t global_pbase = vol->offset + phys_off;
+		chain->bref.data_off = global_pbase | (hammer2_off_t)radix;
+	}
 	chain->bref.copyid   = (uint8_t)disk_idx;
 
 	return 0;
@@ -1227,7 +1299,18 @@ hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	uint64_t slot;
 	int byte_idx, bit_idx;
 
+	/*
+	 * bref->data_off encodes the GLOBAL address (vol->offset +
+	 * per_disk_phys_off).  Convert to per-disk physical offset before
+	 * computing the stripe slot.
+	 */
 	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
+	{
+		hammer2_volume_t *vol = &hmp->volumes[(int)bref->copyid];
+		if (phys_off < vol->offset)
+			return; /* sanity: should not happen */
+		phys_off -= vol->offset; /* now per-disk */
+	}
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return; /* metadata block, not a stripe slot */
 
@@ -1238,5 +1321,7 @@ hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	if (byte_idx >= (int)hmp->stripe_bitmap_size)
 		return; /* out of range */
 
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }

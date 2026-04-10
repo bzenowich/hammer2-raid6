@@ -7,7 +7,7 @@ SCRIPTDIR=$(dirname "$0")
 
 kldstat -q -m hammer2 || kldload hammer2
 
-echo "=== Group I: Unclean Unmount ==="
+echo "=== Group I: Unclean Unmount (NDISKS=$NDISKS) ==="
 
 # I1: Write data, simulate crash (forced unmount without sync), remount, verify
 setup_fresh
@@ -44,12 +44,14 @@ fi
 teardown "I1"
 
 # I2: Unclean unmount while degraded
+# Fail disk 3 (valid for NDISKS >= 4)
+I2_DISK=3
 setup_fresh
 check_v4
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk /dev/vn3 > /dev/null 2>&1
-vnconfig -u vn3 2>/dev/null || true
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $I2_DISK)" > /dev/null 2>&1
+detach_disk "$I2_DISK"
 
 dd if=/dev/urandom of=$MNTPT/degraded_write bs=65536 count=64 2>/dev/null
 sync; sync
@@ -57,15 +59,20 @@ sync; sync
 # Simulate crash
 umount -f $MNTPT 2>/dev/null || umount $MNTPT 2>/dev/null || true
 
-# Remount degraded (without vn3)
-DEGRADED_SPEC="/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn4:/dev/vn5"
-if mount -t hammer2 "${DEGRADED_SPEC}@RZ2TEST" $MNTPT 2>/dev/null; then
+# Remount degraded (without I2_DISK)
+DEGRADED="$(degraded_spec $I2_DISK)@RZ2TEST"
+if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     verify_ref "I2: pre-crash reference intact after degraded unclean unmount" "ref"
     check_no_checkfail "I2"
     umount $MNTPT
 else
     result FAIL "I2: degraded remount failed after unclean unmount"
 fi
-for i in 0 1 2 3 4 5; do vnconfig -u vn$i 2>/dev/null || true; done
+# Cleanup all disks
+i=0
+while [ "$i" -lt "$NDISKS" ]; do
+    detach_disk "$i"
+    i=$((i + 1))
+done
 
 summary

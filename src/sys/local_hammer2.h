@@ -1110,6 +1110,7 @@ struct hammer2_parity_work {
 	char		*data;
 	char		*old_data;	/* pre-modification data for RMW delta */
 	int		scratch;	/* v4: compute P/Q from scratch, no RMW */
+	int		disk_idx;	/* v4: data column index for write_scratch */
 };
 typedef struct hammer2_parity_work hammer2_parity_work_t;
 
@@ -1158,6 +1159,8 @@ struct hammer2_dev {
 	/* RAIDZ2-native physical stripe bitmap (v4 format) */
 	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
 	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
+	hammer2_spin_t	stripe_bitmap_spin;	/* protects stripe_bitmap + next_disk */
+	int		stripe_next_disk;	/* round-robin data disk counter */
 
 	/* RAID6 resilver progress (written by resilver, read by status ioctl) */
 	volatile uint64_t resilver_stripes_done;
@@ -2012,7 +2015,7 @@ int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 		void *data, size_t bytes);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
-		void *buf, size_t bytes);
+		void *buf, size_t bytes, int is_physical);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 

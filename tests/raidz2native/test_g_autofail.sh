@@ -1,31 +1,31 @@
 #!/bin/sh
 # Group G: Auto-fail — verify that explicit fail-disk and degraded mount work.
-# (True EIO injection requires physical hardware or fault-injection; tested manually.)
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
 
 kldstat -q -m hammer2 || kldload hammer2
 
-echo "=== Group G: Auto-fail and Degraded Mount ==="
+echo "=== Group G: Auto-fail and Degraded Mount (NDISKS=$NDISKS) ==="
 
 # G1: Explicit fail-disk + unmount + remount in degraded mode, verify data
+G1_DISK=2
 setup_fresh
 check_v4
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk /dev/vn2 > /dev/null 2>&1
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G1_DISK)" > /dev/null 2>&1
 sync; sync
 umount $MNTPT
 
-# Remount without vn2 — should succeed in degraded mode
-vnconfig -u vn2 2>/dev/null || true
-DEGRADED_SPEC="/dev/vn0:/dev/vn1:/dev/vn3:/dev/vn4:/dev/vn5"
-if mount -t hammer2 "${DEGRADED_SPEC}@RZ2TEST" $MNTPT 2>/dev/null; then
+# Remount without disk G1_DISK — should succeed in degraded mode
+detach_disk "$G1_DISK"
+DEGRADED="$(degraded_spec $G1_DISK)@RZ2TEST"
+if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     sha256 $MNTPT/ref_a > /var/tmp/g1_check.txt 2>&1
     sha256 $MNTPT/ref_b >> /var/tmp/g1_check.txt 2>&1
     if diff -q /var/tmp/rz2_ref.txt /var/tmp/g1_check.txt > /dev/null 2>&1; then
-        result PASS "G1: degraded remount (absent disk) — data correct"
+        result PASS "G1: degraded remount (absent disk${G1_DISK}) — data correct"
     else
         result FAIL "G1: degraded remount — data mismatch"
     fi
@@ -33,24 +33,30 @@ if mount -t hammer2 "${DEGRADED_SPEC}@RZ2TEST" $MNTPT 2>/dev/null; then
 else
     result FAIL "G1: degraded remount failed"
 fi
-for i in 0 1 2 3 4 5; do vnconfig -u vn$i 2>/dev/null || true; done
+# Cleanup all disks
+i=0
+while [ "$i" -lt "$NDISKS" ]; do
+    detach_disk "$i"
+    i=$((i + 1))
+done
 
 # G2: fail-disk state persists across unmount/remount (voldata persisted)
+# Fail second-to-last disk so the index is always valid
+G2_DISK=$((NDISKS - 2))
 setup_fresh
 check_v4
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk /dev/vn4 > /dev/null 2>&1
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G2_DISK)" > /dev/null 2>&1
 sync; sync
 
-# Check that disk 4 shows as failed before unmount
-status_before=$(hammer2 -s $MNTPT raid status 2>/dev/null || echo "")
 umount $MNTPT
 
-# Remount with all devices present (including vn4 still configured)
+# Remount with all devices present (including G2_DISK still configured)
 mount -t hammer2 $PFSPATH $MNTPT
-# After remount, disk 4 should still be FAILED
-status_after=$(hammer2 -s $MNTPT raid status 2>/dev/null || echo "")
+# After remount, disk G2_DISK should still be FAILED.
+# "raid status" reads voldata from disk directly (requires devpath).
+status_after=$(hammer2 raid status "$(disk_dev 0)" 2>/dev/null || echo "")
 if echo "$status_after" | grep -q "FAILED"; then
     result PASS "G2: fail state persisted across unmount/remount"
 else
@@ -59,18 +65,20 @@ fi
 teardown "G2"
 
 # G3: Degraded write while one disk is absent, verify correctness
+G3_DISK=1
 setup_fresh
 check_v4
 write_ref_data "before"
 
-hammer2 -s $MNTPT raid fail-disk /dev/vn1 > /dev/null 2>&1
-vnconfig -u vn1 2>/dev/null || true
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G3_DISK)" > /dev/null 2>&1
+detach_disk "$G3_DISK"
 write_ref_data "during"
 sync; sync
 
-# Bring vn1 back, resilver, then verify both datasets
-vnconfig -S 1073741824 vn1
-hammer2 -s $MNTPT raid replace /dev/vn1 /dev/vn1 > /dev/null 2>&1
+# Bring disk back (fresh), resilver, then verify both datasets
+fresh_disk "$G3_DISK"
+hammer2 -s $MNTPT raid replace \
+    "$(disk_dev $G3_DISK)" "$(disk_dev $G3_DISK)" > /dev/null 2>&1
 
 verify_ref "G3: pre-failure data still correct" "before"
 verify_ref "G3: degraded-written data correct" "during"

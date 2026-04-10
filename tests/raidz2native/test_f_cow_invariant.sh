@@ -64,9 +64,9 @@ if [ -n "$H2CHECK" ]; then
     sync; sync
     umount $MNTPT
 
-    # Run h2stripe_check on the raw devices
-    if $H2CHECK /dev/vn0 /dev/vn1 /dev/vn2 /dev/vn3 /dev/vn4 /dev/vn5 \
-            > /var/tmp/f2_check.txt 2>&1; then
+    # Run h2stripe_check on all raw devices
+    # shellcheck disable=SC2086
+    if $H2CHECK $DEVS > /var/tmp/f2_check.txt 2>&1; then
         result PASS "F2: h2stripe_check: all P/Q parity correct"
     else
         result FAIL "F2: h2stripe_check: parity errors detected"

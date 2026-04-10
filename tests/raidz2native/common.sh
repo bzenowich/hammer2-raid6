@@ -1,13 +1,80 @@
 #!/bin/sh
 # common.sh — shared helpers for raidz2native (v4) integration tests
 #
-# Uses swap-backed vn devices (vnconfig -S): no image files, no UFS layer.
+# DISK_MODE=vtbd  (default): use physical /dev/vtbd* QEMU block devices
+# DISK_MODE=vn             : use swap-backed vnconfig -S devices (in-memory)
+#
+# NDISKS: number of disks to use (default 4, supports 4-6)
 
+DISK_MODE="${DISK_MODE:-vtbd}"
+NDISKS="${NDISKS:-4}"
 MNTPT=/mnt/rz2test
-NDISKS=6
-DEVSPEC="/dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3:/dev/vn4:/dev/vn5"
-PFSPATH="${DEVSPEC}@RZ2TEST"
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
+
+# Build device list and colon-separated DEVSPEC
+DEVS=""
+DEVSPEC=""
+i=0
+while [ "$i" -lt "$NDISKS" ]; do
+    if [ "$DISK_MODE" = "vtbd" ]; then
+        dev="/dev/vbd${i}"
+    else
+        dev="/dev/vn${i}"
+    fi
+    DEVS="${DEVS} ${dev}"
+    if [ -z "$DEVSPEC" ]; then
+        DEVSPEC="${dev}"
+    else
+        DEVSPEC="${DEVSPEC}:${dev}"
+    fi
+    i=$((i + 1))
+done
+PFSPATH="${DEVSPEC}@RZ2TEST"
+
+# Return the device path for disk index $1
+disk_dev() {
+    if [ "$DISK_MODE" = "vtbd" ]; then
+        echo "/dev/vbd${1}"
+    else
+        echo "/dev/vn${1}"
+    fi
+}
+
+# Build a DEVSPEC with disk index $1 excluded (for degraded mount)
+degraded_spec() {
+    local skip="$1"
+    local spec=""
+    local j=0
+    while [ "$j" -lt "$NDISKS" ]; do
+        if [ "$j" != "$skip" ]; then
+            dev=$(disk_dev "$j")
+            spec="${spec:+${spec}:}${dev}"
+        fi
+        j=$((j + 1))
+    done
+    echo "$spec"
+}
+
+# Detach disk $1 (index).  vn mode: unconfigure; vtbd mode: disk stays present.
+detach_disk() {
+    local idx="$1"
+    if [ "$DISK_MODE" = "vn" ]; then
+        vnconfig -u vn${idx} 2>/dev/null || true
+    fi
+}
+
+# Prepare disk $1 as a fresh replacement for resilver.
+# vn mode: unconfigure then re-configure with fresh swap backing.
+# vtbd mode: zero the first 64 MB (one HAMMER2 zone) to clear metadata.
+fresh_disk() {
+    local idx="$1"
+    if [ "$DISK_MODE" = "vn" ]; then
+        vnconfig -u vn${idx} 2>/dev/null || true
+        vnconfig -S 1073741824 vn${idx}
+    else
+        dd if=/dev/zero of=/dev/vbd${idx} bs=65536 count=1024 2>/dev/null || true
+    fi
+}
 
 result() {
     TOTAL=$((TOTAL + 1))
@@ -25,7 +92,11 @@ result() {
 check_no_checkfail() {
     local label="$1"
     local cfails
-    cfails=$(dmesg | grep -c "CHECK FAIL" 2>/dev/null || echo 0)
+    # grep -c exits 1 (no matches) or 0 (matches); always outputs a count.
+    # Do NOT use "|| echo 0" — that appends a second zero when grep exits 1,
+    # corrupting cfails into "0\n0" which makes result() print two lines.
+    cfails=$(dmesg | grep -c "CHECK FAIL" 2>/dev/null)
+    cfails="${cfails:-0}"
     if [ "$cfails" != "0" ]; then
         result FAIL "$label: $cfails CHECK FAIL(s) in dmesg"
         return 1
@@ -35,13 +106,32 @@ check_no_checkfail() {
 
 setup_fresh() {
     umount $MNTPT 2>/dev/null || true
-    for i in 0 1 2 3 4 5; do
-        vnconfig -u vn$i 2>/dev/null || true
-        vnconfig -S 1073741824 vn$i
+    if [ "$DISK_MODE" = "vn" ]; then
+        i=0
+        while [ "$i" -lt "$NDISKS" ]; do
+            vnconfig -u vn${i} 2>/dev/null || true
+            vnconfig -S 1073741824 vn${i}
+            i=$((i + 1))
+        done
+    fi
+    # Retry newfs up to 5 times: devices may be briefly busy after umount
+    local newfs_ok=0
+    local attempt=0
+    while [ "$attempt" -lt 5 ]; do
+        # shellcheck disable=SC2086
+        if newfs_hammer2 -R 6 -L RZ2TEST $DEVS > /dev/null 2>&1; then
+            newfs_ok=1
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
     done
-    newfs_hammer2 -R 6 -L RZ2TEST \
-        /dev/vn0 /dev/vn1 /dev/vn2 /dev/vn3 /dev/vn4 /dev/vn5 \
-        > /dev/null 2>&1
+    if [ "$newfs_ok" = "0" ]; then
+        echo "  FATAL: newfs_hammer2 failed after 5 attempts in setup_fresh"
+        # shellcheck disable=SC2086
+        newfs_hammer2 -R 6 -L RZ2TEST $DEVS 2>&1 | head -5
+        exit 1
+    fi
     mkdir -p $MNTPT
     if ! mount -t hammer2 $PFSPATH $MNTPT; then
         echo "  FATAL: mount failed in setup_fresh"
@@ -53,10 +143,15 @@ setup_fresh() {
 teardown() {
     local label="$1"
     check_no_checkfail "$label"
-    umount $MNTPT 2>/dev/null || true
-    for i in 0 1 2 3 4 5; do
-        vnconfig -u vn$i 2>/dev/null || true
-    done
+    sync
+    umount $MNTPT 2>/dev/null || umount -f $MNTPT 2>/dev/null || true
+    if [ "$DISK_MODE" = "vn" ]; then
+        i=0
+        while [ "$i" -lt "$NDISKS" ]; do
+            vnconfig -u vn${i} 2>/dev/null || true
+            i=$((i + 1))
+        done
+    fi
 }
 
 write_ref_data() {
@@ -93,7 +188,7 @@ summary() {
 
 # Version guard: check that the mounted filesystem is v4 (RAIDZ2-native)
 check_v4() {
-    if hammer2 -s $MNTPT volconf 2>/dev/null | grep -q "version.*4"; then
+    if hammer2 -s $MNTPT volume-list 2>/dev/null | grep -q "^version 4"; then
         return 0
     fi
     echo "SKIP: v4 (RAIDZ2-native) format not detected; skipping test suite"

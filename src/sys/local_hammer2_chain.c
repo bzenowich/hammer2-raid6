@@ -1871,6 +1871,11 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				     HAMMER2_BREF_TYPE_DATA ||
 				     chain->bref.type ==
 				     HAMMER2_BREF_TYPE_DIRENT)) {
+					/* COW: free old stripe slot before allocating new */
+					if ((chain->bref.data_off &
+					     ~HAMMER2_OFF_MASK_RADIX) != 0)
+						hammer2_raid6_stripe_free(hmp,
+						    &chain->bref);
 					error = hammer2_raid6_stripe_alloc(
 					    hmp, chain);
 				} else {
@@ -5624,7 +5629,16 @@ hammer2_base_insert(hammer2_chain_t *parent,
 			goto validate;
 		}
 	}
-	panic("hammer2_base_insert: no room!");
+	panic("hammer2_base_insert: no room! "
+	    "pt=%d pk=%016jx cnt=%d "
+	    "et=%d ek=%016jx "
+	    "b0t=%d b1t=%d b2t=%d b3t=%d",
+	    (int)parent->bref.type, (intmax_t)parent->bref.key, count,
+	    (int)elm->type, (intmax_t)elm->key,
+	    count > 0 ? (int)base[0].type : -1,
+	    count > 1 ? (int)base[1].type : -1,
+	    count > 2 ? (int)base[2].type : -1,
+	    count > 3 ? (int)base[3].type : -1);
 
 	/*
 	 * Debugging
