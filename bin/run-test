@@ -1,0 +1,131 @@
+#!/bin/sh
+# run-test — orchestrate one test run end to end.
+#
+# Usage:
+#   run-test <test-script-path-in-guest>
+#
+# Example:
+#   run-test tests/v4/test_a_basic.sh
+#
+# Steps:
+#   1. Stop any running VM and watcher
+#   2. Reset system overlay from locked base
+#   3. Regenerate RAID disks
+#   4. Launch VM
+#   5. Wait for SSH
+#   6. push source to guest
+#   7. Start watcher
+#   8. Run the test script via ssh, with a timeout
+#   9. Stop watcher
+#  10. Pull dumps + artifacts
+#  11. Bundle logs into logs/runs/<timestamp>/
+#  12. Echo PASS/FAIL and exit with test rc
+
+set -u
+
+if [ $# -lt 1 ]; then
+    echo "usage: $0 <test-script>" >&2
+    exit 2
+fi
+
+TEST="$1"
+TIMEOUT="${TIMEOUT:-600}"        # seconds
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_DIR="logs/runs/${TS}"
+mkdir -p "$RUN_DIR"
+
+log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN_DIR/orchestrator.log" ; }
+
+# -- 1. tear down --------------------------------------------------------
+log "tearing down any existing VM/watcher"
+bin/watcher stop >/dev/null 2>&1 || true
+bin/qmp quit >/dev/null 2>&1 || true
+sleep 1
+# qemu's -daemonize cleans up its pidfile only on graceful exit; if a
+# previous run crashed, the pidfile may linger.
+[ -f run/qemu.pid ] && ! kill -0 "$(cat run/qemu.pid)" 2>/dev/null && rm -f run/qemu.pid
+
+# -- 2. reset overlay ----------------------------------------------------
+log "resetting system overlay from base"
+./launch-dfly.sh reset >> "$RUN_DIR/orchestrator.log" 2>&1
+
+# -- 3. fresh RAID disks -------------------------------------------------
+log "recreating RAID disks"
+NDISKS="${NDISKS:-4}"
+for i in $(seq 0 $((NDISKS - 1))); do
+    rm -f "images/raid${i}.qcow2"
+done
+
+# -- 4. launch ------------------------------------------------------------
+log "launching VM"
+./launch-dfly.sh run >> "$RUN_DIR/orchestrator.log" 2>&1
+
+# -- 5. wait for SSH -----------------------------------------------------
+log "waiting for SSH"
+deadline=$(($(date +%s) + 120))
+while ! ssh -o ConnectTimeout=3 -o BatchMode=yes h2dev true 2>/dev/null; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        log "SSH did not come up in 120s; aborting"
+        cp logs/console.log "$RUN_DIR/console.log" 2>/dev/null || true
+        bin/qmp quit >/dev/null 2>&1 || true
+        echo "FAIL: ssh timeout" > "$RUN_DIR/result.txt"
+        exit 1
+    fi
+    sleep 2
+done
+log "SSH up"
+
+# -- 6. push -------------------------------------------------------------
+log "rsync push"
+bin/push >> "$RUN_DIR/orchestrator.log" 2>&1
+
+# -- 7. start watcher ----------------------------------------------------
+log "starting watcher"
+bin/watcher start >> "$RUN_DIR/orchestrator.log" 2>&1
+
+# -- 8. run test ---------------------------------------------------------
+log "running test: $TEST (timeout ${TIMEOUT}s)"
+set +e
+timeout "$TIMEOUT" ssh h2dev "cd /root/h2 && sh $TEST" \
+    > "$RUN_DIR/test.stdout" 2> "$RUN_DIR/test.stderr"
+RC=$?
+set -e
+log "test exit=$RC"
+
+# -- 9. stop watcher -----------------------------------------------------
+bin/watcher stop >/dev/null 2>&1 || true
+
+# -- 10. pull ------------------------------------------------------------
+log "rsync pull"
+bin/pull >> "$RUN_DIR/orchestrator.log" 2>&1 || true
+
+# -- 11. bundle ----------------------------------------------------------
+cp logs/console.log "$RUN_DIR/console.log" 2>/dev/null || true
+if [ -d logs/dumps ]; then
+    cp -r logs/dumps "$RUN_DIR/dumps" 2>/dev/null || true
+fi
+if [ -f logs/watcher_event.json ]; then
+    cp logs/watcher_event.json "$RUN_DIR/watcher_event.json"
+fi
+
+if [ "$RC" -eq 0 ]; then
+    result=PASS
+elif [ "$RC" -eq 124 ]; then
+    result=TIMEOUT
+else
+    result=FAIL
+fi
+{
+    echo "result=$result"
+    echo "rc=$RC"
+    echo "test=$TEST"
+    echo "ts=$TS"
+} > "$RUN_DIR/result.txt"
+
+log "$result rc=$RC bundle=$RUN_DIR"
+echo "$result $RUN_DIR"
+exit "$RC"

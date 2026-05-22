@@ -1,0 +1,22 @@
+#!/bin/sh
+# push — rsync working tree to the guest at /root/h2/.
+# Excludes VCS, build artifacts, harness state, and ISO/disk images.
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="${PUSH_DEST:-h2dev:/root/h2/}"
+
+exec rsync -a --delete \
+    --exclude='.git/' \
+    --exclude='*.o' \
+    --exclude='*.ko' \
+    --exclude='*.qcow2' \
+    --exclude='*.iso' \
+    --exclude='*.iso.bz2' \
+    --exclude='images/' \
+    --exclude='iso/' \
+    --exclude='logs/' \
+    --exclude='run/' \
+    --exclude='mnt/' \
+    "$ROOT"/ "$DEST"

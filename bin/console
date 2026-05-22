@@ -1,0 +1,49 @@
+#!/bin/sh
+# console — read the guest's serial console log or interact with the live socket.
+#
+# Usage:
+#   console tail [N]       last N lines of logs/console.log (default 80)
+#   console grep <pat>     grep entire logs/console.log
+#   console clear          truncate logs/console.log (start a clean run)
+#   console interact       socat to run/serial.sock (Ctrl-] to exit)
+#   console follow         tail -F logs/console.log
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LOG="$ROOT/logs/console.log"
+SOCK="$ROOT/run/serial.sock"
+
+cmd="${1:-tail}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    tail)
+        n="${1:-80}"
+        [ -f "$LOG" ] || { echo "console: no log at $LOG" >&2; exit 1; }
+        tail -n "$n" "$LOG"
+        ;;
+    grep)
+        [ -n "$1" ] || { echo "usage: console grep <pat>" >&2; exit 2; }
+        [ -f "$LOG" ] || { echo "console: no log at $LOG" >&2; exit 1; }
+        grep -nE "$1" "$LOG" || true
+        ;;
+    clear)
+        : > "$LOG"
+        echo "console: cleared $LOG"
+        ;;
+    interact)
+        [ -S "$SOCK" ] || { echo "console: no socket at $SOCK (is the VM running?)" >&2; exit 1; }
+        command -v socat >/dev/null || { echo "console: socat not installed" >&2; exit 1; }
+        echo "console: connecting to $SOCK — escape with Ctrl-]"
+        exec socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:$SOCK"
+        ;;
+    follow)
+        [ -f "$LOG" ] || { echo "console: no log at $LOG" >&2; exit 1; }
+        exec tail -F "$LOG"
+        ;;
+    *)
+        echo "usage: console {tail [N]|grep <pat>|clear|interact|follow}" >&2
+        exit 2
+        ;;
+esac

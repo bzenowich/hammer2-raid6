@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Harness watcher: detect kernel panics and lockups, capture state, recover.
+
+Poll loop:
+  - every POLL_INTERVAL: ssh h2dev true
+  - on N consecutive ssh failures (FAIL_THRESHOLD):
+      - tail logs/console.log, scan for panic markers
+      - classify state:
+          * panic_reboot   : panic seen, kernel auto-rebooting
+          * panic_ddb      : panic seen, ddb prompt active (interactive)
+          * lockup         : no panic, no progress, no ssh
+          * qemu_gone      : qemu pidfile stale
+      - capture diagnostics to logs/panics/<ts>/
+      - write logs/watcher_event.json for the agent
+      - recovery:
+          * panic_reboot : wait for ssh to come back; then bin/pull
+          * panic_ddb    : leave it; agent will drive via console interact
+          * lockup       : qmp system_reset
+          * qemu_gone    : nothing to do, exit
+
+The watcher itself is a daemon. Start: bin/watcher start. Stop: bin/watcher stop.
+Status: bin/watcher status.
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(ROOT, "logs")
+CONSOLE_LOG = os.path.join(LOG_DIR, "console.log")
+PANICS_DIR = os.path.join(LOG_DIR, "panics")
+EVENT_FILE = os.path.join(LOG_DIR, "watcher_event.json")
+WATCHER_LOG = os.path.join(LOG_DIR, "watcher.log")
+WATCHER_PID = os.path.join(ROOT, "run", "watcher.pid")
+QEMU_PID = os.path.join(ROOT, "run", "qemu.pid")
+QMP = os.path.join(ROOT, "bin", "qmp")
+PULL = os.path.join(ROOT, "bin", "pull")
+
+POLL_INTERVAL = 10        # seconds between SSH probes
+FAIL_THRESHOLD = 3        # consecutive failures before classifying
+SSH_TIMEOUT = 3           # ssh ConnectTimeout
+REBOOT_WAIT = 180         # seconds; DragonFly loader has 10s countdown + 30-60s boot
+
+PANIC_PATTERNS = [
+    r"\bpanic:",
+    r"Fatal trap",
+    r"^KDB:",
+    r"Debugger\(",
+    r"^db>",
+    r"trap number =",
+]
+REBOOT_MARKERS = [
+    r"Uptime:",
+    r"Rebooting",
+    r"Automatic reboot",
+]
+
+
+def log(msg):
+    # When daemonized, stdout is redirected to WATCHER_LOG; write only there.
+    # When run with `watcher foreground`, stdout is the terminal.
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"{ts} {msg}\n"
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def ssh_alive():
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}",
+             "-o", "BatchMode=yes", "h2dev", "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=SSH_TIMEOUT + 2,
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def qemu_running():
+    if not os.path.exists(QEMU_PID):
+        return False
+    try:
+        with open(QEMU_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def tail_console(lines=400):
+    try:
+        with open(CONSOLE_LOG, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, 65536)
+            f.seek(size - chunk)
+            data = f.read().decode(errors="replace")
+        return "\n".join(data.splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def classify(console_tail):
+    saw_panic = any(re.search(p, console_tail, re.MULTILINE) for p in PANIC_PATTERNS)
+    saw_reboot = any(re.search(p, console_tail, re.MULTILINE) for p in REBOOT_MARKERS)
+    saw_ddb = bool(re.search(r"^db>", console_tail, re.MULTILINE))
+
+    if not qemu_running():
+        return "qemu_gone"
+    if saw_panic and saw_ddb:
+        return "panic_ddb"
+    if saw_panic:
+        return "panic_reboot"
+    return "lockup"
+
+
+def capture(state, console_tail):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(PANICS_DIR, f"{ts}_{state}")
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, "console.tail"), "w") as f:
+        f.write(console_tail)
+    event = {
+        "timestamp": ts,
+        "state": state,
+        "dir": dest,
+    }
+    with open(EVENT_FILE, "w") as f:
+        json.dump(event, f, indent=2)
+    log(f"captured {state} to {dest}")
+    return dest
+
+
+def qmp_reset():
+    try:
+        subprocess.run([QMP, "system_reset"], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("qmp system_reset sent")
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"qmp system_reset failed: {e}")
+
+
+def do_pull():
+    try:
+        subprocess.run([PULL], timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def wait_for_ssh(deadline):
+    while time.time() < deadline:
+        if ssh_alive():
+            return True
+        time.sleep(2)
+    return False
+
+
+def run_loop():
+    os.makedirs(PANICS_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(WATCHER_PID), exist_ok=True)
+    with open(WATCHER_PID, "w") as f:
+        f.write(str(os.getpid()))
+
+    fails = 0
+    log(f"watcher started (pid {os.getpid()})")
+
+    try:
+        while True:
+            if not qemu_running():
+                log("qemu not running — watcher exiting")
+                return
+
+            if ssh_alive():
+                if fails:
+                    log(f"ssh back after {fails} failure(s)")
+                fails = 0
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            fails += 1
+            if fails < FAIL_THRESHOLD:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            tail = tail_console()
+            state = classify(tail)
+            dest = capture(state, tail)
+            log(f"state={state}")
+
+            if state == "panic_reboot":
+                if wait_for_ssh(time.time() + REBOOT_WAIT):
+                    log("guest back after panic reboot; pulling dumps")
+                    do_pull()
+                    fails = 0
+                else:
+                    log("guest did not return after panic reboot; treating as lockup")
+                    qmp_reset()
+                    fails = 0
+            elif state == "panic_ddb":
+                log("ddb prompt detected; leaving guest for interactive debug")
+                # Park: stop probing until human/agent intervenes.
+                while qemu_running():
+                    time.sleep(POLL_INTERVAL)
+                    if ssh_alive():
+                        log("ssh returned from ddb state")
+                        fails = 0
+                        break
+            elif state == "lockup":
+                log("hard lockup; resetting via qmp")
+                qmp_reset()
+                if wait_for_ssh(time.time() + REBOOT_WAIT):
+                    log("guest back after reset")
+                    fails = 0
+                else:
+                    log("guest did not return after reset; will keep trying")
+                    fails = 0  # restart probing
+            elif state == "qemu_gone":
+                log("qemu process gone — watcher exiting")
+                return
+    finally:
+        try:
+            os.remove(WATCHER_PID)
+        except OSError:
+            pass
+
+
+def cmd_start():
+    if os.path.exists(WATCHER_PID):
+        try:
+            with open(WATCHER_PID) as f:
+                pid = int(f.read())
+            os.kill(pid, 0)
+            print(f"watcher already running (pid {pid})")
+            return 1
+        except (OSError, ValueError):
+            os.remove(WATCHER_PID)
+
+    pid = os.fork()
+    if pid > 0:
+        time.sleep(0.3)
+        if os.path.exists(WATCHER_PID):
+            print(f"watcher started (pid {pid})")
+            return 0
+        print("watcher failed to start; check logs/watcher.log")
+        return 1
+
+    os.setsid()
+    sys.stdin = open(os.devnull, "r")
+    sys.stdout = open(WATCHER_LOG, "a", buffering=1)
+    sys.stderr = sys.stdout
+    run_loop()
+    sys.exit(0)
+
+
+def cmd_stop():
+    if not os.path.exists(WATCHER_PID):
+        print("watcher not running")
+        return 0
+    with open(WATCHER_PID) as f:
+        pid = int(f.read())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"watcher stopped (pid {pid})")
+    except OSError as e:
+        print(f"kill {pid}: {e}")
+        return 1
+    return 0
+
+
+def cmd_status():
+    if not os.path.exists(WATCHER_PID):
+        print("watcher not running")
+        return 1
+    with open(WATCHER_PID) as f:
+        pid = int(f.read())
+    try:
+        os.kill(pid, 0)
+        print(f"watcher running (pid {pid})")
+        return 0
+    except OSError:
+        print(f"watcher pidfile stale (pid {pid} dead)")
+        return 1
+
+
+def cmd_foreground():
+    run_loop()
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["start", "stop", "status", "foreground"])
+    args = ap.parse_args()
+    return {
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "status": cmd_status,
+        "foreground": cmd_foreground,
+    }[args.cmd]()
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

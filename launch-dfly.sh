@@ -1,86 +1,181 @@
 #!/bin/bash
+# launch-dfly.sh — start the harness VM.
+#
+# Modes (first positional arg):
+#   run      (default) boot from images/overlay-system.qcow2
+#   install  boot from CDROM (iso/dfly-*_REL.iso) to install DragonFly
+#   reset    delete the overlay and recreate it from the locked base image
+#
+# Environment overrides:
+#   NDISKS=4                number of RAID6 test disks (default 4, max ~10)
+#   RAM=4G                  guest memory
+#   CPUS=4                  vCPUs
+#   FOREGROUND=1            do not daemonize (block until QEMU exits)
+#   ISO=path/to.iso         override CDROM image for install mode
+#   SSH_PORT=2322           host forwarding port for guest SSH
 
-ISO="dfly-x86_64-6.4.2_REL.iso"
-DISK="dfly-disk.qcow2"
-ROOT_DISK="dfly-root.qcow2"
-DISK_SIZE="20G"
-ROOT_DISK_SIZE="8G"
-RAM="2G"
-CPUS="2"
-BRIDGE="br0"
-HOST_IF="enp0s25"
-TAP_IF="tap0"
+set -e
 
-# Number of RAID6 test disks to attach (4-6)
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+mkdir -p run logs images iso
+
+MODE="${1:-run}"
 NDISKS="${NDISKS:-4}"
-RAID_DISK_SIZE="4G"
-RAID_DISK_PREFIX="dfly-raid"
+RAM="${RAM:-4G}"
+CPUS="${CPUS:-4}"
+SSH_PORT="${SSH_PORT:-2322}"
 
-# Create disk image if it doesn't exist
-if [ ! -f "$DISK" ]; then
-    echo "Creating disk image ($DISK_SIZE)..."
-    qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
+BASE="images/base-dfly-6.4.2.qcow2"
+SYS="images/overlay-system.qcow2"
+SYS_SIZE="${SYS_SIZE:-20G}"
+RAID_SIZE="${RAID_SIZE:-4G}"
+
+PIDFILE="run/qemu.pid"
+SERIAL_SOCK="run/serial.sock"
+QMP_SOCK="run/qmp.sock"
+CONSOLE_LOG="logs/console.log"
+
+# -------------------------------------------------------------------
+# Sanity: do not start a second VM on top of a running one.
+# -------------------------------------------------------------------
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "launch-dfly: VM already running (pid $(cat "$PIDFILE"))" >&2
+    echo "             stop it first: bin/qmp quit" >&2
+    exit 1
 fi
 
-# Create root disk image if it doesn't exist
-if [ ! -f "$ROOT_DISK" ]; then
-    echo "Creating UFS root disk image ($ROOT_DISK_SIZE)..."
-    qemu-img create -f qcow2 "$ROOT_DISK" "$ROOT_DISK_SIZE"
-fi
+# Stale sockets / pid
+rm -f "$PIDFILE" "$SERIAL_SOCK" "$QMP_SOCK"
 
-# Create RAID6 test disk images if they don't exist
-for i in $(seq 0 $((NDISKS - 1))); do
-    img="${RAID_DISK_PREFIX}${i}.qcow2"
-    if [ ! -f "$img" ]; then
-        echo "Creating RAID6 disk image $img ($RAID_DISK_SIZE)..."
-        qemu-img create -f qcow2 "$img" "$RAID_DISK_SIZE"
-    fi
-done
+# -------------------------------------------------------------------
+# Resolve mode-specific args
+# -------------------------------------------------------------------
+CDROM_ARGS=()
+BOOT_ARGS=()
 
-# Set up bridge networking if not already configured
-if ! ip link show "$BRIDGE" &>/dev/null; then
-    echo "Setting up bridge $BRIDGE..."
-    sudo ip link add name "$BRIDGE" type bridge
-    sudo ip link set "$HOST_IF" master "$BRIDGE"
-    # Move IP from host interface to bridge
-    HOST_IP=$(ip -4 addr show "$HOST_IF" | grep -oP 'inet \K[0-9./]+')
-    HOST_GW=$(ip route | grep "default.*$HOST_IF" | awk '{print $3}')
-    sudo ip addr flush dev "$HOST_IF"
-    sudo ip addr add "$HOST_IP" dev "$BRIDGE"
-    sudo ip link set "$BRIDGE" up
-    if [ -n "$HOST_GW" ]; then
-        sudo ip route add default via "$HOST_GW" dev "$BRIDGE"
-    fi
-fi
+case "$MODE" in
+    reset)
+        if [ ! -f "$BASE" ]; then
+            echo "launch-dfly: no base image at $BASE — run install first" >&2
+            exit 1
+        fi
+        rm -f "$SYS"
+        qemu-img create -f qcow2 -F qcow2 -b "$(realpath "$BASE")" "$SYS"
+        echo "launch-dfly: overlay reset from base"
+        exit 0
+        ;;
+    install)
+        ISO="${ISO:-$(ls iso/dfly-*REL*.iso 2>/dev/null | head -1)}"
+        if [ -z "$ISO" ] || [ ! -f "$ISO" ]; then
+            echo "launch-dfly: no installer ISO found in iso/ (set ISO=...)" >&2
+            exit 1
+        fi
+        # Use a plain (no-backing) system disk for the install.
+        if [ ! -f "$SYS" ]; then
+            qemu-img create -f qcow2 "$SYS" "$SYS_SIZE"
+        fi
+        CDROM_ARGS=(-cdrom "$ISO")
+        BOOT_ARGS=(-boot d)
+        echo "launch-dfly: install mode, CDROM=$ISO"
+        ;;
+    run)
+        if [ ! -f "$SYS" ]; then
+            if [ -f "$BASE" ]; then
+                qemu-img create -f qcow2 -F qcow2 -b "$(realpath "$BASE")" "$SYS"
+                echo "launch-dfly: created overlay from base"
+            else
+                echo "launch-dfly: no system disk at $SYS and no base at $BASE" >&2
+                echo "             run: ./launch-dfly.sh install" >&2
+                exit 1
+            fi
+        fi
+        BOOT_ARGS=(-boot c)
+        ;;
+    *)
+        echo "usage: $0 {run|install|reset}" >&2
+        exit 2
+        ;;
+esac
 
-# Create tap interface for QEMU
-if ! ip link show "$TAP_IF" &>/dev/null; then
-    sudo ip tuntap add dev "$TAP_IF" mode tap user "$(whoami)"
-    sudo ip link set "$TAP_IF" master "$BRIDGE"
-    sudo ip link set "$TAP_IF" up
-fi
-
-# Build RAID6 disk arguments (virtio-blk, appear as vtbd0..vtbd(N-1) in DragonFly)
+# -------------------------------------------------------------------
+# RAID test disks
+# -------------------------------------------------------------------
 RAID_ARGS=()
 for i in $(seq 0 $((NDISKS - 1))); do
-    img="${RAID_DISK_PREFIX}${i}.qcow2"
+    img="images/raid${i}.qcow2"
+    if [ ! -f "$img" ]; then
+        qemu-img create -f qcow2 "$img" "$RAID_SIZE" >/dev/null
+        echo "launch-dfly: created $img ($RAID_SIZE)"
+    fi
     RAID_ARGS+=(
-        -drive "if=none,id=raid${i},format=qcow2,file=${img},cache=writethrough"
+        -drive "if=none,id=raid${i},format=qcow2,file=${img},cache=writeback"
         -device "virtio-blk-pci,drive=raid${i},serial=RAID${i}"
     )
 done
 
-exec qemu-system-x86_64 \
-    -m "$RAM" \
-    -smp "$CPUS" \
-    -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-    -hda "$DISK" \
-    -hdb "$ROOT_DISK" \
-    -boot c \
-    -enable-kvm \
-    -cpu host \
-    -device VGA,edid=on,xres=1024,yres=768 \
-    -display gtk,window-close=off \
-    -netdev tap,id=net0,ifname="$TAP_IF",script=no,downscript=no \
-    -device virtio-net-pci,netdev=net0 \
+# -------------------------------------------------------------------
+# Truncate console log per launch (panic forensics belong to the run
+# that produced them; older runs are preserved in logs/runs/).
+# -------------------------------------------------------------------
+: > "$CONSOLE_LOG"
+
+# -------------------------------------------------------------------
+# Build the QEMU command
+# -------------------------------------------------------------------
+# Install mode needs VGA + GTK because DragonFly's dfuiinstaller spawns
+# dfuife_curses on a separate VT — there is no such VT on a serial-only
+# guest, so the backend stalls forever waiting for a frontend. The
+# graphical window only appears during install; the installed system
+# uses serial via /boot/loader.conf (see harness/guest-config/apply.sh).
+DISPLAY_ARGS=(-nographic)
+if [ "$MODE" = "install" ]; then
+    DISPLAY_ARGS=(-vga std -display gtk,window-close=off)
+fi
+
+QEMU_ARGS=(
+    -name h2dev
+    -enable-kvm
+    -cpu host
+    -smp "$CPUS"
+    -m "$RAM"
+    "${DISPLAY_ARGS[@]}"
+    -nodefaults
+
+    # System disk (virtio-blk for vtbd0)
+    -drive "if=none,id=sys,format=qcow2,file=${SYS},cache=writeback"
+    -device "virtio-blk-pci,drive=sys,serial=SYS,bootindex=1"
+
     "${RAID_ARGS[@]}"
+
+    # User-mode net with SSH port forward
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+    -device "virtio-net-pci,netdev=net0"
+
+    # Serial console → Unix socket + logfile
+    -chardev "socket,id=ser,path=${SERIAL_SOCK},server=on,wait=off,logfile=${CONSOLE_LOG},logappend=on"
+    -serial "chardev:ser"
+
+    # QMP control socket
+    -chardev "socket,id=mon,path=${QMP_SOCK},server=on,wait=off"
+    -mon "chardev=mon,mode=control"
+
+    -pidfile "$PIDFILE"
+
+    "${CDROM_ARGS[@]}"
+    "${BOOT_ARGS[@]}"
+)
+
+if [ "${FOREGROUND:-0}" = "1" ]; then
+    echo "launch-dfly: starting QEMU in foreground (FOREGROUND=1)"
+    exec qemu-system-x86_64 "${QEMU_ARGS[@]}"
+else
+    QEMU_ARGS+=(-daemonize)
+    qemu-system-x86_64 "${QEMU_ARGS[@]}"
+    echo "launch-dfly: VM started, pid $(cat "$PIDFILE")"
+    echo "             console:  bin/console follow"
+    echo "             monitor:  bin/qmp query-status"
+    echo "             shell:    ssh h2dev"
+    echo "             stop:     bin/qmp quit"
+fi

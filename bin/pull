@@ -1,0 +1,13 @@
+#!/bin/sh
+# pull — rsync crash dumps + test artifacts back to the host.
+# Never fails the caller; missing paths on guest are not errors.
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="${PULL_SRC:-h2dev}"
+
+mkdir -p "$ROOT/logs/dumps" "$ROOT/logs/artifacts"
+
+rsync -a "$SRC:/var/crash/"   "$ROOT/logs/dumps/"     2>/dev/null || true
+rsync -a "$SRC:/root/h2-out/" "$ROOT/logs/artifacts/" 2>/dev/null || true
+
+exit 0

@@ -1,0 +1,8 @@
+# Harness additions for /etc/rc.conf.
+# Note: the installer already sets dumpdev to the swap partition; we
+# do NOT override it with "AUTO" because DragonFly's rc.d/dumpon does
+# not interpret AUTO and the kernel rejects it (savecore disabled).
+hostname="h2dev"
+sshd_enable="YES"
+# dumpdev is left as the installer-provided value (e.g. /dev/vbd0s1b).
+# ifconfig_vtnet0 same — installer sets DHCP by default.

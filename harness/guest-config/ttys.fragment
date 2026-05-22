@@ -1,0 +1,2 @@
+# Add or replace the ttyu0 line in /etc/ttys with this:
+ttyu0   "/usr/libexec/getty std.115200"   xterm   on  secure

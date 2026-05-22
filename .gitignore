@@ -6,3 +6,10 @@ session-*.json
 mnt/
 src/diag/diag_map
 src/diag/h2raid6_test
+
+# Harness runtime state and downloaded artifacts
+images/
+iso/
+logs/
+run/
+.claude/scheduled_tasks.lock
