@@ -2907,36 +2907,13 @@ restart:
 	 * for the media making up the cluster.
 	 */
 	if ((ip = pmp->iroot) != NULL) {
-		hammer2_dev_t *hmp = NULL;
-
 		hammer2_inode_ref(ip);
 		hammer2_mtx_ex(&ip->lock);
-
-		/*
-		 * Capture hmp before the flush for vn backing file sync.
-		 * Access is safe while we hold the inode lock.
-		 */
-		if (ip->cluster.array[0].chain)
-			hmp = ip->cluster.array[0].chain->hmp;
-
 		hammer2_inode_chain_sync(ip);
 		hammer2_inode_chain_flush(ip, HAMMER2_XOP_INODE_STOP |
 					      HAMMER2_XOP_FSSYNC |
 					      HAMMER2_XOP_VOLHDR);
 		hammer2_inode_unlock(ip);	/* unlock+drop */
-
-		/*
-		 * Flush device write caches after all dirty DIOs have been
-		 * submitted (bawrite/bwrite).  For vn devices this drains UFS
-		 * dirty blocks; for vtbd (virtio-blk) this issues
-		 * VIRTIO_BLK_T_FLUSH so all prior writes are committed before
-		 * unmount.  Without this, bawrite on vtbd is genuinely async
-		 * and data may not reach disk before umount → CHECK FAIL on
-		 * remount.  Also needed in degraded mode to prevent UFS dirty-
-		 * block accumulation beyond hirunningspace.
-		 */
-		if (hmp && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
-			hammer2_flush_vn_backing(hmp);
 	}
 #ifdef HAMMER2_DEBUG_SYNC
 	kprintf("FILESYSTEM SYNC STAGE 2 DONE\n");

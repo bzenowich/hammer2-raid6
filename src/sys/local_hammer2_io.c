@@ -754,55 +754,6 @@ io_done:
 }
 
 /*
- * Flush the UFS backing files for all vn device volumes.
- *
- * When HAMMER2 runs on vn devices backed by UFS files, bwrite() calls on
- * vn device buffers go through vn_strategy → VOP_WRITE (without IO_SYNC)
- * → UFS bdwrite.  This leaves dirty UFS blocks in the buffer cache that
- * buf_daemon flushes asynchronously.  If enough accumulate, sync(2) blocks
- * indefinitely in waitrunningbufspace() because the running count of async
- * writes to the underlying disk exceeds hirunningspace.
- *
- * Submitting a BUF_CMD_FLUSH bio to each vn device triggers
- * vn_strategy(BUF_CMD_FLUSH) → VOP_FSYNC(sc_vp, MNT_WAIT), which drains
- * all dirty UFS blocks for the backing file to disk synchronously.  After
- * this returns, sync(2)'s waitrunningbufspace() has nothing to wait for.
- *
- * Must be called after all dirty DIOs have been bwritten to vn devices
- * (i.e., after hammer2_inode_chain_flush with VOLHDR completes).
- */
-void
-hammer2_flush_vn_backing(hammer2_dev_t *hmp)
-{
-	hammer2_volume_t *vol;
-	struct buf *bp;
-	struct bio *bio;
-	int i;
-
-	for (i = 0; i < hmp->nvolumes; i++) {
-		vol = &hmp->volumes[i];
-		if (vol->dev == NULL || vol->dev->devvp == NULL)
-			continue;
-		if (vol->dev->devvp->v_rdev == NULL)
-			continue;
-
-		bp = getpbuf(NULL);
-		bio = &bp->b_bio1;
-		bp->b_cmd = BUF_CMD_FLUSH;
-		bp->b_bcount = 0;
-		bp->b_resid = 0;
-		bio->bio_offset = 0;
-		bio->bio_done = biodone_sync;
-		bio->bio_flags |= BIO_SYNC;
-
-		dev_dstrategy(vol->dev->devvp->v_rdev, bio);
-		biowait(bio, "h2vnfl");
-
-		relpbuf(bp, NULL);
-	}
-}
-
-/*
  * Release our ref on *diop.
  *
  * On the 1->0 transition we clear DIO_GOOD, set DIO_INPROG, and dispose

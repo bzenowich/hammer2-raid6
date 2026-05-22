@@ -1950,7 +1950,6 @@ void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
 void hammer2_parity_init(hammer2_dev_t *hmp);
 void hammer2_parity_uninit(hammer2_dev_t *hmp);
 void hammer2_parity_drain(hammer2_dev_t *hmp);
-void hammer2_flush_vn_backing(hammer2_dev_t *hmp);
 int hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 			struct hammer2_ioc_bulkfree *bfi);
 void hammer2_dummy_xop_from_chain(hammer2_xop_head_t *xop,

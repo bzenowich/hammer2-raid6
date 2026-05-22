@@ -29,11 +29,7 @@ do_sync() {
         [ -f "$f" ] || continue
         base="$(basename "$f")"
         name="${base#local_}"
-        if [ "$base" = "local_vn.c" ]; then
-            scp_as "$f" "/usr/src/sys/dev/disk/vn/vn.c"
-        else
-            scp_as "$f" "/usr/src/sys/vfs/hammer2/$name"
-        fi
+        scp_as "$f" "/usr/src/sys/vfs/hammer2/$name"
     done
 
     echo "==> Syncing additional VFS sources -> /usr/src/sys/vfs/hammer2/"
