@@ -1458,7 +1458,6 @@ next_hmp:
 		hammer2_update_pmps(hmp);
 		hammer2_iocom_init(hmp);
 		hammer2_bulkfree_init(hmp);
-		hammer2_parity_init(hmp);
 
 		/*
 		 * Ref the cluster management messaging descriptor.  The mount
@@ -1957,13 +1956,6 @@ again:
 	}
 
 	hammer2_pfsfree_scan(hmp, 1);
-
-	/*
-	 * Drain and stop the RAID6 parity worker thread before closing
-	 * devices.  Any parity work queued during the final flush above
-	 * will be completed here.
-	 */
-	hammer2_parity_uninit(hmp);
 
 	KKASSERT(hmp->spmp == NULL);
 

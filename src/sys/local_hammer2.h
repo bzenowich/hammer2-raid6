@@ -275,7 +275,6 @@ struct hammer2_io {
 	int		ticks;
 	int		error;
 	int		disk_idx;	/* RAID6: physical disk index (-1 if N/A) */
-	char		*raid6_old_data; /* RAID6 degraded: pre-mod data for RMW */
 	char		*absent_data;	/* RAID6 absent disk: kmalloc'd reconstruction buffer */
 #ifdef HAMMER2_IO_DEBUG
 	int		debug_index;
@@ -1102,18 +1101,6 @@ typedef struct hammer2_volume hammer2_volume_t;
  * many PFSs and those PFSs might combine together in various ways to form
  * the set of available clusters.
  */
-/* RAID6 parity worker queue entry */
-struct hammer2_parity_work {
-	TAILQ_ENTRY(hammer2_parity_work) entry;
-	hammer2_off_t	pbase;
-	int		psize;
-	char		*data;
-	char		*old_data;	/* pre-modification data for RMW delta */
-	int		scratch;	/* v4: compute P/Q from scratch, no RMW */
-	int		disk_idx;	/* v4: data column index for write_scratch */
-};
-typedef struct hammer2_parity_work hammer2_parity_work_t;
-
 struct hammer2_dev {
 	struct vnode	*devvp;		/* device vnode for root volume */
 	int		ronly;		/* read-only mount */
@@ -1170,13 +1157,6 @@ struct hammer2_dev {
 	/* Stripes written during active resilver — need second pass */
 	uint64_t	resilver_dirty_lo;	/* min stripe written during pass */
 	uint64_t	resilver_dirty_hi;	/* max stripe written during pass */
-
-	/* RAID6 parity worker thread */
-	struct spinlock	raid6_parity_spin;
-	TAILQ_HEAD(, hammer2_parity_work) raid6_parity_q;
-	thread_t	raid6_parity_td;
-	int		raid6_parity_exiting;
-	int		raid6_parity_processing; /* 1 while processing a work item */
 };
 
 typedef struct hammer2_dev hammer2_dev_t;
@@ -1947,9 +1927,6 @@ void hammer2_cluster_unlock(hammer2_cluster_t *cluster);
 
 void hammer2_bulkfree_init(hammer2_dev_t *hmp);
 void hammer2_bulkfree_uninit(hammer2_dev_t *hmp);
-void hammer2_parity_init(hammer2_dev_t *hmp);
-void hammer2_parity_uninit(hammer2_dev_t *hmp);
-void hammer2_parity_drain(hammer2_dev_t *hmp);
 int hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 			struct hammer2_ioc_bulkfree *bfi);
 void hammer2_dummy_xop_from_chain(hammer2_xop_head_t *xop,
@@ -2005,8 +1982,6 @@ void hammer2_raid6_datap_recov(int ndisks, size_t bytes,
 		int faila, void **ptrs);
 void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
-int hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
-		void *data, void *old_data, size_t bytes);
 int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 		hammer2_off_t pbase, int data_disk_idx,
 		void *data, size_t bytes);

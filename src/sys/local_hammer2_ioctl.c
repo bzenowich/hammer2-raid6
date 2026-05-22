@@ -1646,11 +1646,10 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 
 		if (!hmp->raid_failed[i]) {
 			/*
-			 * Ensure all pending parity writes complete before
+			 * Ensure all pending writes complete before
 			 * marking the disk failed.
 			 */
 			hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
-			hammer2_parity_drain(hmp);
 			hmp->raid_failed[i] = 1;
 			atomic_add_int(&hmp->raid_nfailed, 1);
 			/* Update on-disk disk_state (both runtime and persisted) */

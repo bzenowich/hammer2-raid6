@@ -357,8 +357,7 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  *   P = data_col XOR 0 XOR ... XOR 0 = data_col
  *   Q = gf_mul(2^my_col, data_col) XOR 0 XOR ... XOR 0
  *
- * No reads of old P/Q are needed.  No RMW.  The raid6_old_data field is
- * not used and must be NULL on entry.
+ * No reads of old P/Q are needed.  No RMW.
  *
  * logical_off is the HAMMER2 logical base of the column that was written
  * (same value as pbase from _hammer2_io_putblk).  data contains the bytes

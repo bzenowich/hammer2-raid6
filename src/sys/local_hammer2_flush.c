@@ -1529,18 +1529,6 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 				 HAMMER2_CHAIN_VOLUMESYNC);
 
 		/*
-		 * Drain the parity work queue before writing the volume
-		 * header.  The parity thread writes P/Q synchronously but
-		 * runs concurrently with the flush.  If parity writes are
-		 * still in-flight when we try to getblk() the volume header,
-		 * the temporarily elevated runningbufspace can stall getnewbuf
-		 * in waitrunningbufspace.  Draining here ensures the virtio
-		 * ring is idle before we touch the volume header.
-		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
-			hammer2_parity_drain(hmp);
-
-		/*
 		 * Persist the physical stripe bitmap before the volume
 		 * header so the bitmap is durable before the header
 		 * that references the array state is written.

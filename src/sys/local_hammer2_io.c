@@ -327,25 +327,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			if (dio->bp)
 				bkvasync(dio->bp);
 
-			/*
-			 * RAID6: save pre-modification data for RMW
-			 * delta parity computation.  Always saved (not
-			 * just degraded) to handle the case where both
-			 * data columns in a stripe are modified — the
-			 * sibling's bdwrite may not have flushed when
-			 * the parity thread reads it from disk.
-			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    dio->raid6_old_data == NULL) {
-				char *src = dio->bp ? dio->bp->b_data :
-						dio->absent_data;
-				if (src) {
-					dio->raid6_old_data = kmalloc(dio->psize,
-					    M_HAMMER2, M_WAITOK);
-					bcopy(src, dio->raid6_old_data, dio->psize);
-				}
-			}
-
 			switch(op) {
 			case HAMMER2_DOP_NEW:
 				bzero(hammer2_io_data(dio, lbase), lsize);
@@ -433,12 +414,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 					    HAMMER2_BREF_TYPE_DATA ||
 					 dio->btype ==
 					    HAMMER2_BREF_TYPE_DIRENT) ? 1 : 0);
-			if (error == 0) {
-				dio->raid6_old_data = kmalloc(dio->psize,
-				    M_HAMMER2, M_WAITOK);
-				bcopy(preempt_data,
-				    dio->raid6_old_data, dio->psize);
-			}
 			switch(op) {
 			case HAMMER2_DOP_NEW:
 				if (dio->pbase ==
@@ -468,23 +443,20 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		case HAMMER2_DOP_NEW:
 		case HAMMER2_DOP_NEWNZ:
 			/*
-			 * RAID6: read old data before clearing so we
-			 * can compute RMW delta parity later.  Always
-			 * done (not just degraded) to avoid parity race
-			 * when both data columns in a stripe are modified.
+			 * COW writes go to fresh stripe slots whose other
+			 * data columns are guaranteed zero (newplan.md
+			 * §5.4), so no pre-read is needed for any RAID6
+			 * write path.  Just getblk() and zero the buffer
+			 * for DOP_NEW.
 			 *
-			 * Failed disk: reconstruct from parity.
-			 * Healthy disk: read directly via breadnx.
-			 * Non-RAID6: original getblk (no I/O needed).
+			 * Failed disk on RAID6: reconstruct from parity
+			 * so the dirty buffer reflects the live content
+			 * before the caller overwrites it.
 			 */
 			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 			    hmp->raid_nfailed > 0 &&
 			    dio->disk_idx >= 0 &&
 			    hmp->raid_failed[dio->disk_idx]) {
-				/*
-				 * DIO is on the failed disk: reconstruct
-				 * old content from parity.
-				 */
 				dio->bp = getblk(dio->devvp, dev_pbase,
 				    dio->psize, GETBLK_KVABIO, 0);
 				if (dio->bp) {
@@ -497,73 +469,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 					     dio->btype ==
 						HAMMER2_BREF_TYPE_DIRENT)
 					    ? 1 : 0);
-					if (error == 0) {
-						dio->raid6_old_data = kmalloc(
-						    dio->psize, M_HAMMER2,
-						    M_WAITOK);
-						bcopy(dio->bp->b_data,
-						    dio->raid6_old_data,
-						    dio->psize);
-					}
 					if (op == HAMMER2_DOP_NEW)
 						bzero(dio->bp->b_data,
 						    dio->psize);
-				}
-			} else if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-				/*
-				 * v4 DATA/DIRENT: parity is computed from scratch
-				 * by write_scratch() which ignores raid6_old_data.
-				 * Skip breadnx to avoid a wasted read I/O per
-				 * write; just getblk() and zero the buffer.
-				 *
-				 * v3 or non-stripe types (INODE, INDIRECT, FREEMAP):
-				 * read old data via breadnx for RMW delta parity.
-				 */
-				if (hmp->voldata.version >=
-				    HAMMER2_VOL_VERSION_RAIDZ2 &&
-				    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
-				     dio->btype == HAMMER2_BREF_TYPE_DIRENT) &&
-				    (op == HAMMER2_DOP_NEW ||
-				     op == HAMMER2_DOP_NEWNZ)) {
-					/*
-					 * v4 DATA/DIRENT write: write_scratch()
-					 * computes parity from scratch so
-					 * raid6_old_data is not needed.
-					 * Skip breadnx to avoid a wasted read.
-					 */
-					dio->bp = getblk(dio->devvp, dev_pbase,
-					    dio->psize, GETBLK_KVABIO, 0);
-					if (dio->bp) {
-						bkvasync(dio->bp);
-						bzero(dio->bp->b_data, dio->psize);
-					}
-				} else {
-					/*
-					 * Healthy disk: read old data directly.
-					 */
-					error = breadnx(dio->devvp, dev_pbase,
-					    dio->psize, bflags,
-					    NULL, NULL, 0, &dio->bp);
-					if (dio->bp && error == 0) {
-						bkvasync(dio->bp);
-						dio->raid6_old_data = kmalloc(
-						    dio->psize, M_HAMMER2, M_WAITOK);
-						bcopy(dio->bp->b_data,
-						    dio->raid6_old_data, dio->psize);
-						if (op == HAMMER2_DOP_NEW)
-							bzero(dio->bp->b_data,
-							    dio->psize);
-					} else {
-						if (dio->bp == NULL)
-							dio->bp = getblk(dio->devvp,
-							    dev_pbase, dio->psize,
-							    GETBLK_KVABIO, 0);
-						if (dio->bp && op == HAMMER2_DOP_NEW) {
-							bkvasync(dio->bp);
-							bzero(dio->bp->b_data,
-							    dio->psize);
-						}
-					}
 				}
 			} else {
 				dio->bp = getblk(dio->devvp,
@@ -597,19 +505,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 						dio->psize, bflags,
 					        NULL, NULL, 0, &dio->bp);
 			}
-			/*
-			 * RAID6: save data just read for RMW delta
-			 * parity computation.
-			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    error == 0 && dio->bp &&
-			    dio->raid6_old_data == NULL) {
-				bkvasync(dio->bp);
-				dio->raid6_old_data = kmalloc(dio->psize,
-				    M_HAMMER2, M_WAITOK);
-				bcopy(dio->bp->b_data,
-				    dio->raid6_old_data, dio->psize);
-			}
 			break;
 		}
 	} else {
@@ -631,20 +526,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 					NULL, NULL, 0, &dio->bp);
 		}
 		if (dio->bp) {
-			/*
-			 * RAID6: save data just read for RMW delta
-			 * parity computation (before NEW zeroing).
-			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    error == 0 &&
-			    dio->raid6_old_data == NULL) {
-				bkvasync(dio->bp);
-				dio->raid6_old_data = kmalloc(dio->psize,
-				    M_HAMMER2, M_WAITOK);
-				bcopy(dio->bp->b_data,
-				    dio->raid6_old_data, dio->psize);
-			}
-
 			/*
 			 * Handle NEW flags
 			 */
@@ -715,17 +596,6 @@ io_done:
 						 dio->btype ==
 						    HAMMER2_BREF_TYPE_DIRENT) ? 1 : 0);
 				dio->error = error;
-				/*
-				 * Save reconstructed data as old_data
-				 * for RMW delta parity computation.
-				 */
-				if (error == 0 &&
-				    dio->raid6_old_data == NULL) {
-					dio->raid6_old_data = kmalloc(
-					    dio->psize, M_HAMMER2, M_WAITOK);
-					bcopy(dio->bp->b_data,
-					    dio->raid6_old_data, dio->psize);
-				}
 			}
 		}
 	}
@@ -845,13 +715,18 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			dio_write_stats_update(dio, bp);
 
 			/*
-			 * RAID6: save the data column to a local buffer
-			 * before releasing bp.  Parity is computed after
-			 * bp is released so that sibling reads can use
-			 * blocking breadnx without deadlocking against
-			 * this bp.
+			 * v4 RAIDZ2-native: capture the data column for
+			 * parity-protected btypes (DATA/DIRENT) before
+			 * releasing bp.  Parity is computed after bp is
+			 * released so write_scratch's P/Q writes do not
+			 * contend with this bp.  INODE/INDIRECT/FREEMAP_*
+			 * are not parity-protected pre-Group I and don't
+			 * need a copy.
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+			     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
 				if (bp) {
 					bkvasync(bp);
 					raid6_data = kmalloc(psize, M_HAMMER2,
@@ -942,81 +817,33 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				}
 			}
 			/*
-			 * RAID6 parity update.
+			 * v4 RAIDZ2-native parity update.
 			 *
-			 * Degraded mode: process parity inline (synchronous)
-			 * so that subsequent degraded reads reconstruct the
-			 * correct data.  The buffer has been released above
-			 * (brelse for failed disk, bdwrite for healthy), so
-			 * no vn device locks are held — blocking sibling
-			 * reads are safe here.
+			 * COW invariant: the stripe slot is freshly
+			 * allocated, so all other data columns are zero
+			 * — write_scratch computes P/Q without any reads.
+			 * Always synchronous; no background parity thread.
 			 *
-			 * Healthy mode: enqueue to background parity thread
-			 * as before (data stays in buffer cache via bdwrite,
-			 * so reads don't need parity reconstruction).
+			 * The data bp has been disposed above (bdwrite /
+			 * bwrite / brelse for failed disk) before we
+			 * compute parity, so write_scratch's P/Q getblk
+			 * calls do not contend with it.
 			 */
-			if (raid6_data && hmp->raid_nfailed > 0) {
-				/*
-				 * Degraded mode: process parity inline
-				 * (synchronous).
-				 *
-				 * v4 (RAIDZ2-native): all other data columns
-				 * in this stripe slot are zero (freshly
-				 * allocated), so compute P/Q from scratch
-				 * without any reads.
-				 *
-				 * v3: use RMW delta path as before.
-				 */
-				if (hmp->voldata.version >=
-				    HAMMER2_VOL_VERSION_RAIDZ2 &&
-				    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
-				     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
-					/* v4 DATA/DIRENT: fresh slot, other cols zero */
-					hammer2_io_raid6_write_scratch(hmp,
-					    pbase, dio->disk_idx,
-					    raid6_data, psize);
-				} else {
-					/* v3-style or INODE/INDIRECT: RMW delta */
-					hammer2_io_raid6_write(hmp, pbase,
-					    raid6_data, dio->raid6_old_data,
-					    psize);
-				}
+			if (raid6_data) {
+				hammer2_io_raid6_write_scratch(hmp, pbase,
+				    dio->disk_idx, raid6_data, psize);
 				/*
 				 * Track stripes written during an active
 				 * resilver so the resilver can do a second
 				 * pass over them after a sync.
 				 */
 				if (hmp->resilver_running) {
-					uint64_t sn;
-					int track = 1;
-					if (hmp->voldata.version >=
-					    HAMMER2_VOL_VERSION_RAIDZ2) {
-						/*
-						 * v4: data stripes start at
-						 * ZONE_SEG64.  Writes to zone
-						 * 0 (pbase < ZONE_SEG64) don't
-						 * belong to any stripe; skip to
-						 * avoid uint64 underflow giving
-						 * a bogus sn.
-						 */
-						{
-							/* pbase is global; get per-disk offset */
-							hammer2_off_t _pdp = pbase -
-							    hmp->volumes[dio->disk_idx].offset;
-							if (_pdp < HAMMER2_ZONE_SEG64) {
-								track = 0;
-							} else {
-								sn = (_pdp -
-								    HAMMER2_ZONE_SEG64) /
-								    hmp->raid_config.stripe_unit;
-							}
-						}
-					} else {
-						sn = pbase /
-						    ((uint64_t)hmp->raid_config.ndata *
-						     hmp->raid_config.stripe_unit);
-					}
-					if (track) {
+					hammer2_off_t _pdp = pbase -
+					    hmp->volumes[dio->disk_idx].offset;
+					if (_pdp >= HAMMER2_ZONE_SEG64) {
+						uint64_t sn = (_pdp -
+						    HAMMER2_ZONE_SEG64) /
+						    hmp->raid_config.stripe_unit;
 						hammer2_spin_ex(&hmp->io_spin);
 						if (sn < hmp->resilver_dirty_lo)
 							hmp->resilver_dirty_lo = sn;
@@ -1026,37 +853,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					}
 				}
 				kfree(raid6_data, M_HAMMER2);
-				if (dio->raid6_old_data) {
-					kfree(dio->raid6_old_data, M_HAMMER2);
-					dio->raid6_old_data = NULL;
-				}
 				raid6_data = NULL;
-			} else if (raid6_data) {
-				hammer2_parity_work_t *pw;
-
-				pw = kmalloc(sizeof(*pw), M_HAMMER2, M_WAITOK);
-				pw->pbase = pbase;
-				pw->psize = psize;
-				pw->data = raid6_data;
-				pw->old_data = dio->raid6_old_data;
-				dio->raid6_old_data = NULL;
-				/*
-				 * v4 DATA/DIRENT: fresh stripe slot, other
-				 * columns zero — compute P/Q from scratch.
-				 * INODE/INDIRECT/FREEMAP use v3 stripe with
-				 * two data cols: use RMW delta instead.
-				 */
-				pw->scratch = (hmp->voldata.version >=
-				    HAMMER2_VOL_VERSION_RAIDZ2 &&
-				    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
-				     dio->btype == HAMMER2_BREF_TYPE_DIRENT))
-				    ? 1 : 0;
-				pw->disk_idx = dio->disk_idx;
-				spin_lock(&hmp->raid6_parity_spin);
-				TAILQ_INSERT_TAIL(&hmp->raid6_parity_q,
-				    pw, entry);
-				spin_unlock(&hmp->raid6_parity_spin);
-				wakeup(&hmp->raid6_parity_q);
 			}
 		} else if (bp) {
 			/* Non-dirty, non-RAID6-absent disposal of bp */
@@ -1072,14 +869,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		brelse(bp);
 	}
 
-	/*
-	 * RAID6: free old_data and absent_data if not transferred
-	 * to parity work item.
-	 */
-	if (dio->raid6_old_data) {
-		kfree(dio->raid6_old_data, M_HAMMER2);
-		dio->raid6_old_data = NULL;
-	}
 	if (dio->absent_data) {
 		kfree(dio->absent_data, M_HAMMER2);
 		dio->absent_data = NULL;
@@ -1178,10 +967,6 @@ hammer2_io_cleanup(hammer2_dev_t *hmp, struct hammer2_io_tree *tree)
 			kprintf("hammer2_io_cleanup: Dirty buffer "
 				"%016jx/%d (bp=%p)\n",
 				dio->pbase, dio->psize, dio->bp);
-		}
-		if (dio->raid6_old_data) {
-			kfree(dio->raid6_old_data, M_HAMMER2);
-			dio->raid6_old_data = NULL;
 		}
 		if (dio->absent_data) {
 			kfree(dio->absent_data, M_HAMMER2);
@@ -1488,386 +1273,6 @@ hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 	hammer2_voldata_modify(hmp);
 	hammer2_voldata_unlock(hmp);
 	return 0;
-}
-
-/*
- * RAID6 parity write.
- *
- * Called from the parity background thread.  logical_off is the HAMMER2
- * logical base of the stripe unit that was just written; data contains
- * the bytes written to that column (stripe_unit bytes).
- *
- * Reads all sibling data columns from their physical devices:
- *  - If the sibling disk is healthy: blocking breadnx read.
- *  - If the sibling disk is failed and old_data is available: use RMW
- *    delta (P_new = P_old XOR D_old XOR D_new) instead of reconstructing
- *    the failed column.  The failed disk's data cancels out in the XOR.
- *  - If old_data is NULL (healthy mode): full-stripe gen_syndrome as before.
- *
- * No HAMMER2 locks are held.  Returns 0 on success, EIO if an unexpected
- * I/O error occurs on a surviving disk and the array becomes unrecoverable.
- */
-int
-hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
-		       void *data, void *old_data, size_t bytes)
-{
-	hammer2_raid_config_t *rc = &hmp->raid_config;
-	int ndisks = rc->ndisks;
-	int ndata = rc->ndata;
-	uint64_t stripe_unit = rc->stripe_unit;
-	uint64_t stripe_num;
-	int my_col;
-	int p_disk, q_disk;
-	hammer2_off_t phys_off;
-	void *col_bufs[HAMMER2_MAX_VOLUMES];
-	void *ptrs[HAMMER2_MAX_VOLUMES];
-	hammer2_volume_t *vol;
-	struct buf *bp;
-	int fail_data_a = -1, fail_data_b = -1;
-	int fail_p = 0, fail_q = 0;
-	int phys_disk, di, col;
-	int error = 0;
-	int i;
-
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(bytes == (size_t)stripe_unit);
-
-	stripe_num = logical_off / ((uint64_t)ndata * stripe_unit);
-	my_col     = (int)((logical_off / stripe_unit) % (uint64_t)ndata);
-	p_disk     = (int)(stripe_num % ndisks);
-	q_disk     = (p_disk + 1) % ndisks;
-	phys_off   = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
-	for (i = 0; i < ndisks; i++)
-		col_bufs[i] = NULL;
-
-	di = 0;
-	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-		if (phys_disk == p_disk)
-			col = ndata;
-		else if (phys_disk == q_disk)
-			col = ndata + 1;
-		else
-			col = di++;
-
-		col_bufs[col] = kmalloc(stripe_unit, M_HAMMER2,
-					M_WAITOK | M_ZERO);
-		ptrs[col] = col_bufs[col];
-
-		if (col == my_col) {
-			/*
-			 * This is the column we are updating.  Use the
-			 * data supplied by the caller directly.
-			 */
-			bcopy(data, col_bufs[col], stripe_unit);
-		} else if (hmp->raid_failed[phys_disk]) {
-			/* Already failed: track for recovery */
-			if (col < ndata) {
-				if (fail_data_a == -1)
-					fail_data_a = col;
-				else if (fail_data_b == -1)
-					fail_data_b = col;
-			} else if (col == ndata) {
-				fail_p = 1;
-			} else {
-				fail_q = 1;
-			}
-		} else {
-			/*
-			 * Healthy sibling.
-			 *
-			 * Healthy mode: skip reading P/Q — gen_syndrome
-			 * completely overwrites them.  Always read data
-			 * columns (needed for gen_syndrome).
-			 *
-			 * Degraded mode: always read everything that is
-			 * reachable (P, Q, and sibling data columns).
-			 * - If a data column is failed (fail_data_a != -1):
-			 *   RMW delta is used; P_old and Q_old from disk are
-			 *   needed.  Sibling data is also read (harmless).
-			 * - If only P or Q disk failed: gen_syndrome is used
-			 *   since all data columns are available; P/Q from
-			 *   disk are not needed but are reachable here (they
-			 *   are overwritten by gen_syndrome anyway).
-			 *
-			 * RMW delta requires P_old == XOR(all data), which
-			 * may not hold for stripes left over from a previous
-			 * filesystem on vtbd disks.  gen_syndrome uses only
-			 * the current data columns so it is always correct.
-			 */
-			if (hmp->raid_nfailed == 0 &&
-			    (col == ndata || col == ndata + 1)) {
-				/* Healthy gen_syndrome: skip reading P/Q */
-				continue;
-			}
-			vol = &hmp->volumes[phys_disk];
-			bp = NULL;
-			if (breadnx(vol->dev->devvp, phys_off,
-				    stripe_unit, 0, NULL, NULL, 0, &bp) == 0 &&
-			    bp != NULL) {
-				bkvasync(bp);
-				bcopy(bp->b_data, col_bufs[col], stripe_unit);
-				brelse(bp);
-			} else {
-				if (bp)
-					brelse(bp);
-				{
-					int aerr = hammer2_raid6_auto_fail_disk(
-							hmp, phys_disk);
-					if (aerr) {
-						error = EIO;
-						goto write_done;
-					}
-				}
-				/* I/O error: track failed column for reconstruction */
-				if (col < ndata) {
-					if (fail_data_a == -1)
-						fail_data_a = col;
-					else if (fail_data_b == -1)
-						fail_data_b = col;
-				} else if (col == ndata) {
-					fail_p = 1;
-				} else {
-					fail_q = 1;
-				}
-			}
-		}
-	}
-
-	/*
-	 * RMW delta path: used in degraded mode (raid_nfailed > 0) when
-	 * a DATA column is failed (fail_data_a != -1) so we cannot read
-	 * that column.  Applies the delta to P_old/Q_old without needing
-	 * the failed sibling's data:
-	 *
-	 * P_new = P_old XOR D_old XOR D_new
-	 * Q_new = Q_old XOR gf_mul(2^my_col, D_old XOR D_new)
-	 *
-	 * When only a parity disk (P or Q) is failed, ALL data columns
-	 * are readable, so fall through to gen_syndrome instead.
-	 * gen_syndrome is always correct regardless of P_old consistency.
-	 */
-	if (old_data != NULL && hmp->raid_nfailed > 0 && fail_data_a != -1) {
-		uint8_t *od = (uint8_t *)old_data;
-		uint8_t *nd = (uint8_t *)data;
-		uint8_t coeff = hammer2_gf_exp[my_col];
-		uint8_t *p;
-		uint8_t *q;
-		size_t si;
-
-		p = col_bufs[ndata];
-		if (!fail_p && p != NULL) {
-			for (si = 0; si < stripe_unit; si++)
-				p[si] ^= od[si] ^ nd[si];
-		}
-		q = col_bufs[ndata + 1];
-		if (!fail_q && q != NULL) {
-			for (si = 0; si < stripe_unit; si++)
-				q[si] ^= hammer2_gf_mul(coeff,
-						od[si] ^ nd[si]);
-		}
-		goto parity_write;
-	}
-
-	/*
-	 * If we have failed data columns but no old_data (shouldn't
-	 * happen in practice), fall back to reconstruction.
-	 */
-	if (fail_data_a != -1) {
-		if (fail_data_b != -1) {
-			/* Two data disks failed - requires BOTH P and Q */
-			if (fail_p || fail_q) {
-				kprintf("hammer2: RAID6 write: too many "
-					"failures (data %d,%d parity %d,%d)\n",
-					fail_data_a, fail_data_b, fail_p, fail_q);
-				error = EIO;
-				goto write_done;
-			} else {
-				if (fail_data_a > fail_data_b) {
-					int tmp = fail_data_a;
-					fail_data_a = fail_data_b;
-					fail_data_b = tmp;
-				}
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 fail_data_a,
-							 fail_data_b, ptrs);
-			}
-		} else {
-			/* One data disk failed - requires either P or Q */
-			if (fail_p) {
-				if (fail_q) {
-					kprintf("hammer2: RAID6 write: too "
-						"many failures (data %d parity P,Q)\n",
-						fail_data_a);
-					error = EIO;
-					goto write_done;
-				} else {
-					hammer2_raid6_datap_recov(ndisks,
-								  stripe_unit,
-								  fail_data_a,
-								  ptrs);
-				}
-			} else {
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 fail_data_a,
-							 ndisks - 1, ptrs);
-			}
-		}
-	}
-
-	/* Compute NEW P and Q in-place in col_bufs[ndata] and col_bufs[ndata+1] */
-	hammer2_raid6_gen_syndrome(ndisks, stripe_unit, ptrs);
-
-parity_write:
-	/*
-	 * Write out parity columns (P and Q) to healthy disks only.
-	 * Data columns are handled by the main thread via standard
-	 * buffer cache disposal.
-	 *
-	 * Always use synchronous bwrite(): async bawrite() accumulates
-	 * runningbufspace faster than vtbd completions drain it, causing
-	 * a buffer cache deadlock on physical virtio-blk devices.
-	 */
-	di = 0;
-	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-		if (phys_disk == p_disk)
-			col = ndata;
-		else if (phys_disk == q_disk)
-			col = ndata + 1;
-		else
-			col = di++;
-
-		/* Only write parity columns here */
-		if (col < ndata)
-			continue;
-
-		/* Skip write if disk is failed */
-		if (hmp->raid_failed[phys_disk])
-			continue;
-
-		vol = &hmp->volumes[phys_disk];
-		bp = getblk(vol->dev->devvp, phys_off,
-			    stripe_unit, GETBLK_KVABIO, 0);
-		if (bp) {
-			bkvasync(bp);
-			bcopy(col_bufs[col], bp->b_data, stripe_unit);
-			bwrite(bp);
-		}
-	}
-
-write_done:
-	for (i = 0; i < ndisks; i++) {
-		if (col_bufs[i])
-			kfree(col_bufs[i], M_HAMMER2);
-	}
-
-	return error;
-}
-
-/*
- * RAID6 parity background thread.
- *
- * Processes queued parity work items.  Runs with no HAMMER2 locks
- * held, so blocking breadnx reads for sibling columns are safe.
- */
-static void
-hammer2_parity_thread(void *arg)
-{
-	hammer2_dev_t *hmp = arg;
-	hammer2_parity_work_t *pw;
-
-	for (;;) {
-		spin_lock(&hmp->raid6_parity_spin);
-		pw = TAILQ_FIRST(&hmp->raid6_parity_q);
-		if (pw != NULL) {
-			TAILQ_REMOVE(&hmp->raid6_parity_q, pw, entry);
-			hmp->raid6_parity_processing = 1;
-			spin_unlock(&hmp->raid6_parity_spin);
-			if (pw->scratch) {
-				hammer2_io_raid6_write_scratch(hmp, pw->pbase,
-				    pw->disk_idx, pw->data, pw->psize);
-			} else {
-				hammer2_io_raid6_write(hmp, pw->pbase,
-				    pw->data, pw->old_data, pw->psize);
-			}
-			kfree(pw->data, M_HAMMER2);
-			if (pw->old_data)
-				kfree(pw->old_data, M_HAMMER2);
-			kfree(pw, M_HAMMER2);
-			spin_lock(&hmp->raid6_parity_spin);
-			hmp->raid6_parity_processing = 0;
-			wakeup(&hmp->raid6_parity_q);
-			spin_unlock(&hmp->raid6_parity_spin);
-			continue;
-		}
-		if (hmp->raid6_parity_exiting) {
-			spin_unlock(&hmp->raid6_parity_spin);
-			hmp->raid6_parity_td = NULL;
-			wakeup(&hmp->raid6_parity_td);
-			lwkt_exit();
-			/* NOTREACHED */
-		}
-		tsleep_interlock(&hmp->raid6_parity_q, 0);
-		spin_unlock(&hmp->raid6_parity_spin);
-		tsleep(&hmp->raid6_parity_q, PINTERLOCKED, "h2par", hz);
-	}
-}
-
-/*
- * Drain the parity work queue.
- *
- * Waits until the queue is empty AND the parity thread is not processing
- * any work item.  Called from hammer2_ioctl_raid_fail_disk before marking
- * a disk as failed, to ensure all pending parity writes complete using
- * the still-healthy disk layout before the failed flag is visible.
- */
-void
-hammer2_parity_drain(hammer2_dev_t *hmp)
-{
-	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
-	    hmp->raid6_parity_td == NULL)
-		return;
-
-	for (;;) {
-		spin_lock(&hmp->raid6_parity_spin);
-		if (TAILQ_EMPTY(&hmp->raid6_parity_q) &&
-		    !hmp->raid6_parity_processing) {
-			spin_unlock(&hmp->raid6_parity_spin);
-			break;
-		}
-		tsleep_interlock(&hmp->raid6_parity_q, 0);
-		spin_unlock(&hmp->raid6_parity_spin);
-		tsleep(&hmp->raid6_parity_q, PINTERLOCKED, "h2pdr", hz);
-	}
-}
-
-void
-hammer2_parity_init(hammer2_dev_t *hmp)
-{
-	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
-		return;
-	spin_init(&hmp->raid6_parity_spin, "h2par");
-	TAILQ_INIT(&hmp->raid6_parity_q);
-	hmp->raid6_parity_exiting = 0;
-	hmp->raid6_parity_td = NULL;
-	lwkt_create(hammer2_parity_thread, hmp, &hmp->raid6_parity_td,
-		    NULL, 0, -1, "h2par-%s", hmp->devrepname);
-}
-
-void
-hammer2_parity_uninit(hammer2_dev_t *hmp)
-{
-	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
-	    hmp->raid6_parity_td == NULL)
-		return;
-	/* Signal exit, wake thread */
-	spin_lock(&hmp->raid6_parity_spin);
-	hmp->raid6_parity_exiting = 1;
-	spin_unlock(&hmp->raid6_parity_spin);
-	wakeup(&hmp->raid6_parity_q);
-	/* Wait for thread to drain queue and exit */
-	while (hmp->raid6_parity_td != NULL)
-		tsleep(&hmp->raid6_parity_td, 0, "h2parx", hz);
-	spin_uninit(&hmp->raid6_parity_spin);
 }
 
 /*
