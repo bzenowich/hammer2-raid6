@@ -787,20 +787,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 
 				if (dio->refs & HAMMER2_DIO_FLUSH) {
 					bp->b_flags &= ~B_CLUSTEROK;
-					if (hmp->raid_type ==
-					    HAMMER2_RAID_TYPE_RAID6) {
-						/*
-						 * RAID6 (healthy or degraded):
-						 * always synchronous bwrite().
-						 * Async bawrite() accumulates
-						 * runningbufspace faster than
-						 * vtblk can drain it, filling
-						 * the virtio ring and deadlocking
-						 * the interrupt handler against
-						 * the submission path.
-						 */
-						bwrite(bp);
-					} else if ((hce = hammer2_cluster_write)
+					if ((hce = hammer2_cluster_write)
 					    != 0) {
 						peof = (pbase + HAMMER2_SEGMASK64)
 						    & ~HAMMER2_SEGMASK64;
