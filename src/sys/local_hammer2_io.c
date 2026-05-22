@@ -819,26 +819,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			if (raid6_data) {
 				hammer2_io_raid6_write_scratch(hmp, pbase,
 				    dio->disk_idx, raid6_data, psize);
-				/*
-				 * Track stripes written during an active
-				 * resilver so the resilver can do a second
-				 * pass over them after a sync.
-				 */
-				if (hmp->resilver_running) {
-					hammer2_off_t _pdp = pbase -
-					    hmp->volumes[dio->disk_idx].offset;
-					if (_pdp >= HAMMER2_ZONE_SEG64) {
-						uint64_t sn = (_pdp -
-						    HAMMER2_ZONE_SEG64) /
-						    hmp->raid_config.stripe_unit;
-						hammer2_spin_ex(&hmp->io_spin);
-						if (sn < hmp->resilver_dirty_lo)
-							hmp->resilver_dirty_lo = sn;
-						if (sn > hmp->resilver_dirty_hi)
-							hmp->resilver_dirty_hi = sn;
-						hammer2_spin_unex(&hmp->io_spin);
-					}
-				}
 				kfree(raid6_data, M_HAMMER2);
 				raid6_data = NULL;
 			}
@@ -1628,12 +1608,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	 * Phase 3: Rebuild each stripe.
 	 *
 	 * Flush all pending writes first so that parity on surviving disks
-	 * is up-to-date before we read it.  Concurrent degraded writes that
-	 * happen AFTER this sync go to new stripes; we track them in
-	 * resilver_dirty_lo/hi for a second pass below.
+	 * is up-to-date before we read it.  Under v4 COW, concurrent writes
+	 * land in freshly-allocated stripe slots whose data column may or
+	 * may not be on the replacement disk — if it is, the write itself
+	 * goes there directly; if not, the resilver doesn't care.  No
+	 * second-pass tracking is needed (newplan.md §5.9).
 	 */
-	hmp->resilver_dirty_lo = UINT64_MAX;
-	hmp->resilver_dirty_hi = 0;
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
@@ -1746,122 +1726,6 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		if ((stripe_num & 255) == 255) {
 			hmp->resilver_stripes_done = stripe_num + 1;
 			lwkt_yield();
-		}
-	}
-
-	/*
-	 * Phase 4: Second pass over stripes written during Phase 3.
-	 *
-	 * A concurrent degraded write (bwrite P, bwrite Q) may have raced
-	 * with Phase 3 reading P/Q: the resilver read old parity (zeros for
-	 * new stripes) and wrote zeros to the replacement disk.  After a
-	 * full sync the parity is correct; re-resilver the dirty range.
-	 */
-	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
-
-	if (hmp->resilver_dirty_lo <= hmp->resilver_dirty_hi) {
-		uint64_t lo = hmp->resilver_dirty_lo;
-		uint64_t hi = hmp->resilver_dirty_hi;
-
-		/* Safety clamp: dirty range must not exceed the stripe space. */
-		if (hi >= num_stripes)
-			hi = num_stripes - 1;
-
-		kprintf("hammer2: resilver phase 4: re-processing stripes "
-			"%ju..%ju\n", (uintmax_t)lo, (uintmax_t)hi);
-
-		for (stripe_num = lo; stripe_num <= hi; stripe_num++) {
-			/* v4: skip unallocated slots */
-			if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-			    hmp->stripe_bitmap != NULL) {
-				uint64_t byte_idx = stripe_num / 8;
-				int bit_idx  = (int)(stripe_num % 8);
-				if (byte_idx >= hmp->stripe_bitmap_size ||
-				    (hmp->stripe_bitmap[byte_idx] &
-				     (1 << bit_idx)) == 0)
-					continue;
-			}
-
-			phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
-			p_disk = (int)(stripe_num % ndisks);
-			q_disk = (p_disk + 1) % ndisks;
-
-			di = 0;
-			for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-				if (phys_disk == p_disk)
-					phys_to_lcol[phys_disk] = ndata;
-				else if (phys_disk == q_disk)
-					phys_to_lcol[phys_disk] = ndata + 1;
-				else
-					phys_to_lcol[phys_disk] = di++;
-			}
-
-			failed_col = phys_to_lcol[failed_disk_idx];
-
-			other_failed_col = -1;
-			for (i = 0; i < ndisks; i++) {
-				if (i != failed_disk_idx && hmp->raid_failed[i]) {
-					other_failed_col = phys_to_lcol[i];
-					break;
-				}
-			}
-
-			for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-				col = phys_to_lcol[phys_disk];
-				bzero(col_bufs[col], stripe_unit);
-				ptrs[col] = col_bufs[col];
-				if (phys_disk == failed_disk_idx)
-					continue;
-				if (hmp->raid_failed[phys_disk])
-					continue;
-				vol = &hmp->volumes[phys_disk];
-				bp = NULL;
-				lerror = breadnx(vol->dev->devvp, phys_off,
-					stripe_unit, 0, NULL, NULL, 0, &bp);
-				if (lerror == 0 && bp) {
-					bkvasync(bp);
-					bcopy(bp->b_data, col_bufs[col],
-					      stripe_unit);
-					brelse(bp);
-				} else {
-					if (bp)
-						brelse(bp);
-					{
-						int aerr =
-						    hammer2_raid6_auto_fail_disk(
-							hmp, phys_disk);
-						if (aerr) {
-							error = EIO;
-							goto resilver_done;
-						}
-					}
-					/* disk now in raid_failed[]; zeros */
-				}
-			}
-
-			if (other_failed_col >= 0) {
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 failed_col,
-							 other_failed_col, ptrs);
-			} else {
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 failed_col,
-							 ndisks - 1, ptrs);
-			}
-
-			wbp = getblk(new_devvp, phys_off, stripe_unit,
-				     GETBLK_KVABIO, 0);
-			if (wbp) {
-				bkvasync(wbp);
-				bcopy(ptrs[failed_col], wbp->b_data,
-				      stripe_unit);
-				lerror = bwrite(wbp);
-				if (lerror && !error)
-					error = lerror;
-			}
-
-			if ((stripe_num & 255) == 255)
-				lwkt_yield();
 		}
 	}
 

@@ -1154,9 +1154,6 @@ struct hammer2_dev {
 	volatile uint64_t resilver_stripes_total;
 	volatile int	resilver_running;	/* 1 while resilver active */
 	int		resilver_disk_idx;	/* disk being resilvered (-1=none) */
-	/* Stripes written during active resilver — need second pass */
-	uint64_t	resilver_dirty_lo;	/* min stripe written during pass */
-	uint64_t	resilver_dirty_hi;	/* max stripe written during pass */
 };
 
 typedef struct hammer2_dev hammer2_dev_t;
