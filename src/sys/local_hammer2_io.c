@@ -118,6 +118,83 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 #endif
 
 /*
+ * Compute the DIO tree key for a logical I/O target.
+ *
+ * Single dispatch point for the three encoding paths.  Downstream cache
+ * and strategy code consume (pbase, dbase, devvp, disk_idx) and stays
+ * encoding-blind.
+ *
+ * Path A — v4 RAIDZ2-native DATA/DIRENT:
+ *   bref->copyid   = physical disk index (0..ndisks-1)
+ *   bref->data_off = (vol[disk].offset + per_disk_phys_off) | radix
+ *   pbase = data_off & pmask           (= vol->offset + per_disk_phys)
+ *   dbase = vol->offset                 (so dev_pbase = per_disk_phys)
+ *
+ * Path B — v3 RAID6 fallback (and v4 metadata until Group I lands):
+ *   pbase = data_off & pmask            (logical offset)
+ *   hammer2_raid6_map(pbase) → (disk_idx, phys_off)
+ *   dbase = pbase - phys_off            (so dev_pbase = phys_off)
+ *
+ * Path C — JBOD / non-RAID:
+ *   pbase = data_off & pmask
+ *   vol   = hammer2_get_volume(pbase)
+ *   dbase = vol->offset                 (so dev_pbase = pbase - vol->offset)
+ *
+ * KNOWN LIMITATION (resolved by Group B + G-final):
+ *   Path A's pbase lives in the v3 logical keyspace [0, total_size), so a
+ *   v4 DATA pbase can alias a v3 logical pbase.  This is the bug WIP commit
+ *   `9d537be` (devel) patched by adding total_size + disk*size to the v4
+ *   pbase.  We intentionally do NOT replicate that patch here: Group B
+ *   deletes v3 entirely, after which v4 owns the keyspace alone and the
+ *   patch becomes unnecessary.  Until Group B lands, v3 and v4 must not
+ *   be mounted on the same array (already true: format version gates the
+ *   dispatch).
+ */
+static __inline void
+hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
+		const hammer2_blockref_t *bref,
+		hammer2_key_t *pbase_out, hammer2_off_t *dbase_out,
+		struct vnode **devvp_out, int *disk_idx_out)
+{
+	hammer2_off_t pmask = ~(hammer2_off_t)(HAMMER2_PBUFSIZE - 1);
+	hammer2_off_t lbase = data_off & ~HAMMER2_OFF_MASK_RADIX;
+	hammer2_off_t pbase = lbase & pmask;
+	hammer2_off_t dbase;
+	hammer2_volume_t *vol;
+	int disk_idx = -1;
+
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    bref != NULL &&
+	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
+	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
+		/* Path A: v4 RAIDZ2-native DATA/DIRENT. */
+		disk_idx = (int)bref->copyid;
+		KKASSERT(disk_idx >= 0 && disk_idx < hmp->nvolumes);
+		vol = &hmp->volumes[disk_idx];
+		dbase = vol->offset;
+		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
+	} else if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+		/* Path B: v3 RAID6 fallback / v4 metadata (pre-Group I). */
+		hammer2_off_t phys_off;
+
+		hammer2_raid6_map(hmp, pbase, &disk_idx, &phys_off);
+		vol = &hmp->volumes[disk_idx];
+		dbase = pbase - phys_off;
+		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
+	} else {
+		/* Path C: JBOD / non-RAID. */
+		vol = hammer2_get_volume(hmp, pbase);
+		dbase = vol->offset;
+		*devvp_out = vol->dev->devvp;
+	}
+
+	*pbase_out = pbase;
+	*dbase_out = dbase;
+	*disk_idx_out = disk_idx;
+}
+
+/*
  * Returns the DIO corresponding to the data|radix, creating it if necessary.
  *
  * If createit is 0, NULL can be returned indicating that the DIO does not
@@ -133,26 +210,36 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
 	hammer2_io_t *xio;
 	hammer2_key_t lbase;
 	hammer2_key_t pbase;
-	hammer2_key_t pmask;
-	hammer2_volume_t *vol;
+	hammer2_off_t dbase;
+	struct vnode *devvp;
 	uint64_t refs;
 	int lsize;
 	int psize;
+	int disk_idx;
 
 	psize = HAMMER2_PBUFSIZE;
-	pmask = ~(hammer2_off_t)(psize - 1);
 	if ((int)(data_off & HAMMER2_OFF_MASK_RADIX))
 		lsize = 1 << (int)(data_off & HAMMER2_OFF_MASK_RADIX);
 	else
 		lsize = 0;
 	lbase = data_off & ~HAMMER2_OFF_MASK_RADIX;
-	pbase = lbase & pmask;
 
-	if (pbase == 0 || ((lbase + lsize - 1) & pmask) != pbase) {
-		kprintf("Illegal: %016jx %016jx+%08x / %016jx\n",
-			pbase, lbase, lsize, pmask);
+	{
+		hammer2_off_t pmask = ~(hammer2_off_t)(psize - 1);
+
+		pbase = lbase & pmask;
+		if (pbase == 0 ||
+		    ((lbase + lsize - 1) & pmask) != pbase) {
+			kprintf("Illegal: %016jx %016jx+%08x / %016jx\n",
+				(uintmax_t)pbase, (uintmax_t)lbase,
+				lsize, (uintmax_t)pmask);
+		}
+		KKASSERT(pbase != 0 &&
+			 ((lbase + lsize - 1) & pmask) == pbase);
 	}
-	KKASSERT(pbase != 0 && ((lbase + lsize - 1) & pmask) == pbase);
+
+	hammer2_dio_key(hmp, data_off, bref, &pbase, &dbase, &devvp,
+			&disk_idx);
 	*isgoodp = 0;
 
 	/*
@@ -177,73 +264,9 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_key_t data_off, uint8_t btype,
 		hammer2_spin_unsh(&hmp->io_spin);
 		dio = kmalloc_obj(sizeof(*dio), hmp->mio, M_INTWAIT | M_ZERO);
 		dio->hmp = hmp;
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-			/*
-			 * RAID 6: map logical offset to physical disk
-			 * and physical offset.
-			 *
-			 * The DIO layer computes dev_pbase = pbase - dbase
-			 * as the sector address on the physical device.
-			 * For RAID 6, phys_off is the correct physical
-			 * sector address, so set dbase = pbase - phys_off.
-			 *
-			 * v4 (RAIDZ2-native): disk index and physical column
-			 * offset are encoded directly in the bref:
-			 *   bref->copyid     = physical disk index
-			 *   bref->data_off   = physical col offset (low 6
-			 *                      bits = radix, upper = bytes)
-			 *
-			 * v3 (RAID6): derive disk and offset via the stripe
-			 * mapping function hammer2_raid6_map().
-			 */
-			int disk_idx;
-			hammer2_off_t phys_off;
-
-			if (hmp->voldata.version >=
-			    HAMMER2_VOL_VERSION_RAIDZ2 && bref != NULL &&
-			    (bref->type == HAMMER2_BREF_TYPE_DATA ||
-			     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
-				/*
-				 * v4: DATA and DIRENT blocks encode a GLOBAL
-				 * (concatenated) address in bref->data_off:
-				 *   global_pbase = vol->offset + per_disk_phys
-				 *
-				 * DIO tree key = pbase = global_pbase (unique).
-				 * dev_pbase = pbase - vol->offset = per_disk.
-				 * So dbase = vol->offset (not pbase - phys_off).
-				 *
-				 * All other block types (INODE, INDIRECT,
-				 * FREEMAP, etc.) use the freemap/v3 mapping.
-				 */
-				disk_idx = (int)bref->copyid;
-				vol = &hmp->volumes[disk_idx];
-				dio->devvp = vol->dev ? vol->dev->devvp : NULL;
-				/*
-				 * dbase = vol->offset so that:
-				 *   dev_pbase = pbase - dbase
-				 *             = global_pbase - vol->offset
-				 *             = per_disk_phys_off
-				 */
-				dio->dbase = vol->offset;
-				dio->disk_idx = disk_idx;
-			} else {
-				/*
-				 * v3 or non-stripe block: compute via
-				 * stripe-layout mapping.
-				 */
-				hammer2_raid6_map(hmp, pbase,
-						  &disk_idx, &phys_off);
-				vol = &hmp->volumes[disk_idx];
-				dio->devvp = vol->dev ? vol->dev->devvp : NULL;
-				dio->dbase = pbase - phys_off;
-				dio->disk_idx = disk_idx;
-			}
-		} else {
-			vol = hammer2_get_volume(hmp, pbase);
-			dio->devvp = vol->dev->devvp;
-			dio->dbase = vol->offset;
-			dio->disk_idx = -1;
-		}
+		dio->devvp = devvp;
+		dio->dbase = dbase;
+		dio->disk_idx = disk_idx;
 		/* dbase must be 1GB-aligned for JBOD; RAID6 uses stripe offsets */
 		KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 ||
 			 (dio->dbase & HAMMER2_FREEMAP_LEVEL1_MASK) == 0);
