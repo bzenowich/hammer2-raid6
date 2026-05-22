@@ -1067,6 +1067,18 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
 	int i;
 
 	pmp = ip->pmp;
+	/*
+	 * v4 RAIDZ2-native arrays cannot honor emergency in-place
+	 * overwrite without breaking the no-RMW invariant. Refuse.
+	 */
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp == NULL)
+			continue;
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+			return (EOPNOTSUPP);
+	}
 	if (mode) {
 		kprintf("hammer2: WARNING: Emergency mode enabled\n");
 		atomic_set_int(&pmp->flags, HAMMER2_PMPF_EMERG);

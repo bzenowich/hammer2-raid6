@@ -201,6 +201,20 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 		return 0;
 	}
 
+	/*
+	 * v4 RAIDZ2-native: DATA/DIRENT blocks are allocated from the
+	 * stripe bitmap, not the freemap. Centralizing the dispatch here
+	 * covers every caller, not just hammer2_chain_modify.
+	 * INODE/INDIRECT/FREEMAP_* still flow through the freemap radix
+	 * (restricted to the metadata zone per metadata_zone.md).
+	 */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
+	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
+		return hammer2_raid6_stripe_alloc(hmp, chain);
+	}
+
 	KKASSERT(hmp->spmp);
 	mtid = hammer2_trans_sub(hmp->spmp);
 

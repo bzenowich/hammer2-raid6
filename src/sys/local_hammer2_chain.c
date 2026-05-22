@@ -1757,7 +1757,8 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		 * columns of a new stripe slot are zero; in-place overwrite
 		 * violates that invariant and would require RMW delta parity.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
 			newmod = 1;
 	} else if (chain->flags & HAMMER2_CHAIN_DEDUPABLE) {
 		/*
@@ -1864,24 +1865,27 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				atomic_set_int(&chain->flags,
 						HAMMER2_CHAIN_DEDUPABLE);
 			} else {
+				/*
+				 * v4 COW: free prior stripe slot before
+				 * allocating a new one. hammer2_freemap_alloc
+				 * internally dispatches DATA/DIRENT on v4 to
+				 * hammer2_raid6_stripe_alloc; all other types
+				 * fall through to the freemap radix.
+				 */
 				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 				    hmp->voldata.version >=
 				    HAMMER2_VOL_VERSION_RAIDZ2 &&
 				    (chain->bref.type ==
 				     HAMMER2_BREF_TYPE_DATA ||
 				     chain->bref.type ==
-				     HAMMER2_BREF_TYPE_DIRENT)) {
-					/* COW: free old stripe slot before allocating new */
-					if ((chain->bref.data_off &
-					     ~HAMMER2_OFF_MASK_RADIX) != 0)
-						hammer2_raid6_stripe_free(hmp,
-						    &chain->bref);
-					error = hammer2_raid6_stripe_alloc(
-					    hmp, chain);
-				} else {
-					error = hammer2_freemap_alloc(chain,
-					    chain->bytes);
+				     HAMMER2_BREF_TYPE_DIRENT) &&
+				    (chain->bref.data_off &
+				     ~HAMMER2_OFF_MASK_RADIX) != 0) {
+					hammer2_raid6_stripe_free(hmp,
+					    &chain->bref);
 				}
+				error = hammer2_freemap_alloc(chain,
+				    chain->bytes);
 				atomic_clear_int(&chain->flags,
 						HAMMER2_CHAIN_DEDUPABLE);
 
@@ -1897,8 +1901,16 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				 * THIS IS IMPORTANT: These modifications
 				 * are virtually guaranteed to corrupt any
 				 * snapshots related to this filesystem.
+				 *
+				 * v4 RAIDZ2-native: in-place reuse violates
+				 * the no-RMW invariant. Refuse the fallback
+				 * and surface the original allocation error.
 				 */
-				if (error && (hmp->hflags & HMNT2_EMERG)) {
+				if (error && (hmp->hflags & HMNT2_EMERG) &&
+				    !(hmp->raid_type ==
+					HAMMER2_RAID_TYPE_RAID6 &&
+				      hmp->voldata.version >=
+					HAMMER2_VOL_VERSION_RAIDZ2)) {
 					error = 0;
 					chain->bref.flags |=
 						HAMMER2_BREF_FLAG_EMERG_MIP;
