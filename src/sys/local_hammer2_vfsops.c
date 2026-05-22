@@ -1303,12 +1303,21 @@ next_hmp:
 			hammer2_raid6_bitmap_read(hmp);
 
 			/*
-			 * Compute the metadata-zone extent table deterministically
-			 * from per-disk size.  Persisting the table to the volume
-			 * header lands with Group J; until then every mount derives
-			 * the same defaults, so the layout is stable.
+			 * Load the metadata-zone extent table from voldata.
+			 * mkfs (--raid6) writes md_extents[0] at format time.
+			 * If older media has md_nextents == 0 we fall back to
+			 * the same deterministic default; this keeps in-place
+			 * upgrades from a pre-Group-J binary working.
 			 */
-			{
+			if (hmp->voldata.raid_config.md_nextents > 0 &&
+			    hmp->voldata.raid_config.md_nextents <=
+			     HAMMER2_MD_MAX_EXTENTS) {
+				hmp->md_nextents =
+				    hmp->voldata.raid_config.md_nextents;
+				bcopy(hmp->voldata.raid_config.md_extents,
+				      hmp->md_extents,
+				      sizeof(hmp->md_extents));
+			} else {
 				hammer2_off_t per_disk =
 				    hmp->volumes[0].size;
 				hammer2_off_t size =

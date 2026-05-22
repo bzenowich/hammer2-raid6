@@ -730,6 +730,33 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 		rc->flags = 0;
 		for (i = 0; i < fso->nvolumes; ++i)
 			rc->disk_state[i] = 0; /* ONLINE */
+
+		/*
+		 * v4 RAIDZ2-native addendum (volhdr_quorum.md).  Array UUID is
+		 * shared by all disks (reuse VolFSID, which mkfs already
+		 * generates once and writes identically into every disk's
+		 * voldata.fsid).  v4_disk_id is the per-disk volu_id, so
+		 * mount can identify a disk even if device names reshuffle.
+		 * Initial seqno = 1; flush bumps it per TXG.
+		 */
+		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+			hammer2_off_t md_size;
+
+			rc->v4_txg_seq = 1;
+			bcopy(&opt->Hammer2_VolFSID, rc->v4_array_uuid,
+			    sizeof(rc->v4_array_uuid));
+			rc->v4_disk_id = (uint8_t)vol->id;
+			rc->v4_ndisks = (uint8_t)fso->nvolumes;
+
+			md_size = min_size * HAMMER2_MD_EXTENT0_PCT / 100;
+			if (md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
+				md_size = HAMMER2_MD_EXTENT0_MIN_SIZE;
+			if (md_size > min_size - HAMMER2_MD_EXTENT0_OFF)
+				md_size = min_size - HAMMER2_MD_EXTENT0_OFF;
+			rc->md_nextents = 1;
+			rc->md_extents[0].md_off = HAMMER2_MD_EXTENT0_OFF;
+			rc->md_extents[0].md_size = md_size;
+		}
 	}
 
 	voldata->fsid = opt->Hammer2_VolFSID;

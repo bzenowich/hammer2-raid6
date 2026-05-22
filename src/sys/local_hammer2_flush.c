@@ -821,6 +821,17 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			}
 
 			/*
+			 * v4 RAIDZ2-native: bump per-TXG sequence number on
+			 * every commit so mount-time discovery can find the
+			 * most-recent durable volhdr by max(seqno) across
+			 * disks (docs/volhdr_quorum.md).
+			 */
+			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+				hmp->voldata.raid_config.v4_txg_seq++;
+			}
+
+			/*
 			 * The volume header is flushed manually by the
 			 * syncer, not here.  All we do here is adjust the
 			 * crc's.

@@ -891,6 +891,50 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 			error = EINVAL;
 			goto done;
 		}
+
+		/*
+		 * v4 RAIDZ2-native: every disk carries the same array UUID
+		 * (mkfs writes voldata.fsid identically into every disk).
+		 * Per-disk v4_array_uuid is generated at format time and
+		 * must match what we already verified via voldata.fsid above.
+		 * v4_disk_id must match volu_id; v4_ndisks must agree with
+		 * raid_config.ndisks.
+		 *
+		 * Full majority-quorum + multi-TXG rollback (volhdr_quorum.md)
+		 * is deferred; today we log per-disk v4_txg_seq and any
+		 * mismatched UUIDs.  Mount-time selection of the
+		 * highest-seqno root voldata is a follow-up.
+		 */
+		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    voldata->raid_config.raid_type ==
+		     HAMMER2_RAID_TYPE_RAID6) {
+			const hammer2_raid_config_t *vrc =
+			    &voldata->raid_config;
+			if (bcmp(vrc->v4_array_uuid, &voldata->fsid,
+				 sizeof(vrc->v4_array_uuid)) != 0) {
+				hprintf("%s: v4_array_uuid does not match "
+					"voldata.fsid; refusing\n", path);
+				error = ENXIO;
+				goto done;
+			}
+			if (vrc->v4_disk_id != voldata->volu_id) {
+				hprintf("%s: v4_disk_id %u != volu_id %u\n",
+					path, vrc->v4_disk_id,
+					voldata->volu_id);
+				error = EINVAL;
+				goto done;
+			}
+			if (vrc->v4_ndisks != vrc->ndisks) {
+				hprintf("%s: v4_ndisks %u != ndisks %u\n",
+					path, vrc->v4_ndisks, vrc->ndisks);
+				error = EINVAL;
+				goto done;
+			}
+			hprintf("%s: v4 RAID6 disk %u/%u txg_seq %ju\n",
+				path, vrc->v4_disk_id, vrc->v4_ndisks,
+				(uintmax_t)vrc->v4_txg_seq);
+		}
+
 		/* all per-volume tests passed */
 		vol->dev = e;
 		vol->id = voldata->volu_id;

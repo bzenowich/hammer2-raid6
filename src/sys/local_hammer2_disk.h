@@ -1271,7 +1271,21 @@ struct hammer2_raid_config {
 	uint64_t	stripe_unit;	/* stripe unit in bytes (def 64KB) */
 	uint64_t	array_size;	/* usable data size after parity */
 	uint8_t		disk_state[HAMMER2_MAX_VOLUMES]; /* per-disk state */
-	uint8_t		reserved[424];	/* pad to 512 bytes total */
+
+	/*
+	 * v4 RAIDZ2-native addendum (volhdr_quorum.md, metadata_zone.md).
+	 * Present on HAMMER2_VOL_VERSION_RAIDZ2 volumes; zero on older.
+	 */
+	uint64_t	v4_txg_seq;	/* monotonic per-TXG sequence number */
+	uint8_t		v4_array_uuid[16]; /* identifies this RAID6 array */
+	uint8_t		v4_disk_id;	/* this disk's slot (0..N-1) */
+	uint8_t		v4_ndisks;	/* total disks (cross-check) */
+	uint8_t		v4_pad[6];
+	uint32_t	md_nextents;	/* number of metadata-zone extents */
+	uint32_t	md_reserved;
+	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];
+
+	uint8_t		reserved[256];	/* pad to 512 bytes total */
 } __packed;
 
 typedef struct hammer2_raid_config hammer2_raid_config_t;
