@@ -1202,24 +1202,12 @@ have_disk:
 	while (n > 1) { n >>= 1; radix++; }
 
 	/*
-	 * Store the GLOBAL (concatenated) address in bref.data_off so the
-	 * DIO tree key (pbase = bref.data_off & ~radix) is unique across
-	 * all disks.  Without this, two v4 DATA blocks on different disks
-	 * that share the same per-disk physical offset (e.g. disk 0 at
-	 * 0x0a800000 and disk 2 at 0x0a800000) would collide in the DIO
-	 * cache, causing silent data corruption.
-	 *
-	 * global_pbase = vol->offset + per_disk_phys_off
-	 *             = vol->offset + (ZONE_SEG64 + slot * stripe_unit)
-	 *
-	 * The io_alloc v4 path reconstructs per_disk_phys_off as:
-	 *   dev_pbase = pbase - vol->offset = global_pbase - vol->offset
+	 * Encode (disk_idx, phys_off) into bref.data_off so the DIO tree
+	 * key is unique by construction across all disks.  Layout is
+	 * documented at HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h.
 	 */
-	{
-		hammer2_volume_t *vol = &hmp->volumes[disk_idx];
-		hammer2_off_t global_pbase = vol->offset + phys_off;
-		chain->bref.data_off = global_pbase | (hammer2_off_t)radix;
-	}
+	chain->bref.data_off = ((hammer2_off_t)disk_idx <<
+	    HAMMER2_RAID6_DISK_SHIFT) | phys_off | (hammer2_off_t)radix;
 	chain->bref.copyid   = (uint8_t)disk_idx;
 
 	return 0;
@@ -1239,17 +1227,10 @@ hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	int byte_idx, bit_idx;
 
 	/*
-	 * bref->data_off encodes the GLOBAL address (vol->offset +
-	 * per_disk_phys_off).  Convert to per-disk physical offset before
-	 * computing the stripe slot.
+	 * Decode per-disk physical offset from bref->data_off (top byte
+	 * holds disk_idx; see HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).
 	 */
-	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
-	{
-		hammer2_volume_t *vol = &hmp->volumes[(int)bref->copyid];
-		if (phys_off < vol->offset)
-			return; /* sanity: should not happen */
-		phys_off -= vol->offset; /* now per-disk */
-	}
+	phys_off = bref->data_off & HAMMER2_RAID6_PHYS_MASK;
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return; /* metadata block, not a stripe slot */
 

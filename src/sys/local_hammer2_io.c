@@ -125,18 +125,18 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  *
  * Path A — v4 RAIDZ2-native DATA/DIRENT:
  *   bref->copyid   = physical disk index (0..ndisks-1)
- *   bref->data_off = (vol[disk].offset + per_disk_phys_off) | radix
- *   pbase = data_off & pmask           (= vol->offset + per_disk_phys)
- *   dbase = vol->offset                 (so dev_pbase = per_disk_phys)
+ *   bref->data_off = (disk_idx<<56) | per_disk_phys_off | radix
+ *                    (HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h)
+ *   pbase = data_off & pmask           (top byte = disk_idx)
+ *   dbase = disk_idx << 56              (so dev_pbase = per_disk_phys)
+ *
+ *   Collision-avoidance is structural: different disks → different
+ *   top bytes → different pbase. No vol->offset arithmetic involved.
  *
  * Path C — JBOD / non-RAID, and v4 metadata pre-Group I:
  *   pbase = data_off & pmask
  *   vol   = hammer2_get_volume(pbase)
  *   dbase = vol->offset                 (so dev_pbase = pbase - vol->offset)
- *
- * v3 logical→physical mapping (hammer2_raid6_map) is gone: Group B
- * deleted v3. Multi-disk RAID6 INODE/INDIRECT temporarily route via
- * Path C until Group I lands the metadata-zone mirror.
  */
 static __inline void
 hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
@@ -159,8 +159,9 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 		/* Path A: v4 RAIDZ2-native DATA/DIRENT. */
 		disk_idx = (int)bref->copyid;
 		KKASSERT(disk_idx >= 0 && disk_idx < hmp->nvolumes);
+		KKASSERT((int)(pbase >> HAMMER2_RAID6_DISK_SHIFT) == disk_idx);
 		vol = &hmp->volumes[disk_idx];
-		dbase = vol->offset;
+		dbase = (hammer2_off_t)disk_idx << HAMMER2_RAID6_DISK_SHIFT;
 		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
 	} else {
 		/* Path C: JBOD / non-RAID, or v4 metadata pre-Group I. */
@@ -1282,13 +1283,11 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		/*
 		 * v4 RAIDZ2-native physical addressing for DATA/DIRENT.
 		 *
-		 * logical_off is the GLOBAL address (vol->offset +
-		 * per_disk_phys_off) on disk data_disk_idx.  All columns
-		 * in the same stripe slot share the same per-disk
-		 * physical offset:
-		 *   stripe_slot = (per_disk_phys - HAMMER2_ZONE_SEG64) /
-		 *                 stripe_unit
-		 *   phys_off    = per_disk_phys
+		 * logical_off is the encoded key (top byte = disk_idx,
+		 * middle bits = per-disk physical offset; see
+		 * HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).  All
+		 * columns in the same stripe slot share the same
+		 * per-disk physical offset.
 		 *
 		 * P disk = stripe_slot % ndisks
 		 * Q disk = (P disk + 1) % ndisks
@@ -1302,18 +1301,10 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		uint64_t stripe_slot;
 		int d_col;
 
-		/*
-		 * logical_off is the GLOBAL address (vol->offset +
-		 * per_disk_phys_off).  Convert to per-disk offset.
-		 */
-		{
-			hammer2_off_t _pdp = logical_off -
-			    hmp->volumes[data_disk_idx].offset;
-			stripe_slot = (_pdp - HAMMER2_ZONE_SEG64) / stripe_unit;
-			phys_off = _pdp;
-		}
-		p_disk = (int)(stripe_slot % ndisks);
-		q_disk = (p_disk + 1) % ndisks;
+		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK;
+		stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+		p_disk      = (int)(stripe_slot % ndisks);
+		q_disk      = (p_disk + 1) % ndisks;
 
 		if (data_disk_idx == p_disk) {
 			target_col = ndata;

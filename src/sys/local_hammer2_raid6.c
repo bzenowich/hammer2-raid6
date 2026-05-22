@@ -406,14 +406,11 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 	 * disk indices < data_disk_idx that are neither p_disk nor q_disk.
 	 */
 	/*
-	 * pbase is the GLOBAL address (vol->offset + per_disk_phys_off).
-	 * Convert to per-disk physical offset for stripe geometry.
+	 * Decode per-disk physical offset from pbase (top byte holds
+	 * disk_idx; see HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).
 	 * All columns (data, P, Q) share this per-disk physical offset.
 	 */
-	{
-		hammer2_volume_t *dvol = &hmp->volumes[data_disk_idx];
-		phys_off = pbase - dvol->offset;
-	}
+	phys_off    = pbase & HAMMER2_RAID6_PHYS_MASK;
 	stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
 	p_disk      = (int)(stripe_slot % ndisks);
 	q_disk      = (p_disk + 1) % ndisks;

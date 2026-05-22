@@ -1148,9 +1148,22 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
  *   stripe_slot = (per_disk_phys - HAMMER2_ZONE_SEG64) / stripe_unit
  *   P disk      = stripe_slot % ndisks
  *   Q disk      = (stripe_slot + 1) % ndisks
+ *
+ * The bref->data_off layout for v4 DATA/DIRENT is:
+ *   [63:56] disk_idx (0..ndisks-1)   — also redundantly in bref->copyid
+ *   [55:6]  per-disk physical byte offset (50 bits = 1 PB / disk max)
+ *   [5:0]   radix (= log2(chain->bytes))
+ *
+ * Putting disk_idx in the top byte means two (disk, phys) pairs that
+ * differ in disk produce different keys structurally; the DIO cache
+ * cannot alias. No vol->offset arithmetic is involved.
  */
 #define HAMMER2_RAID_TYPE_JBOD		0
 #define HAMMER2_RAID_TYPE_RAID6		6
+
+#define HAMMER2_RAID6_DISK_SHIFT	56
+#define HAMMER2_RAID6_DISK_MASK		((hammer2_off_t)0xFFULL << HAMMER2_RAID6_DISK_SHIFT)
+#define HAMMER2_RAID6_PHYS_MASK		(~HAMMER2_RAID6_DISK_MASK & ~HAMMER2_OFF_MASK_RADIX)
 
 /*
  * Maximum number of volumes in a HAMMER2 filesystem (defined early
