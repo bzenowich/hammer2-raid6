@@ -779,14 +779,60 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	fsync(vol->fd);
 
 	/*
-	 * RAIDZ2-native (v4): write an empty stripe bitmap to zone slot 41
-	 * on disk 0 (the root volume).  All bits zero = no stripes allocated.
-	 * The kernel reads this zone at mount to restore the in-memory bitmap.
+	 * RAIDZ2-native (v4): write an empty but valid stripe bitmap to
+	 * zone slot 41 on disk 0.  Header+footer with generation 1 + CRC;
+	 * bitmap region all-zero (no stripes allocated).  The kernel reads
+	 * this at mount; without the header it would mark bitmap_invalid.
 	 */
 	if (opt->RaidType == 6 &&
 	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    vol->id == HAMMER2_ROOT_VOLUME) {
+		hammer2_stripe_bitmap_header_t *hdr;
+		hammer2_stripe_bitmap_footer_t *ftr;
+		uint8_t *bitmap;
+		uint64_t stripe_unit = HAMMER2_PBUFSIZE;
+		uint64_t max_stripes = (HAMMER2_ZONE_BYTES64 -
+		    HAMMER2_ZONE_SEG64) / stripe_unit;
+		size_t bitmap_pages = (size_t)(((max_stripes + 7) / 8 +
+		    HAMMER2_STRIPE_BITMAP_PAGE - 1) /
+		    HAMMER2_STRIPE_BITMAP_PAGE);
+		uint32_t crc;
+		hammer2_stripe_bitmap_header_t htmp;
+		hammer2_stripe_bitmap_footer_t ftmp;
+
+		if (bitmap_pages == 0)
+			bitmap_pages = 1;
+
 		bzero(buf, HAMMER2_PBUFSIZE);
+		hdr = (hammer2_stripe_bitmap_header_t *)buf;
+		bitmap = (uint8_t *)buf + HAMMER2_STRIPE_BITMAP_PAGE;
+		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)buf +
+		    HAMMER2_STRIPE_BITMAP_PAGE +
+		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
+
+		hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
+		hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
+		hdr->ndisks = (uint32_t)fso->nvolumes;
+		hdr->stripe_unit = stripe_unit;
+		hdr->num_slots = max_stripes;
+		hdr->slot_origin = HAMMER2_ZONE_SEG64;
+		hdr->cursor = HAMMER2_STRIPE_V4_START;
+		hdr->generation = 1;
+
+		ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
+		ftr->generation = 1;
+
+		htmp = *hdr;
+		ftmp = *ftr;
+		bzero(htmp.crc, sizeof(htmp.crc));
+		bzero(ftmp.crc, sizeof(ftmp.crc));
+		crc = hammer2_icrc32(&htmp, sizeof(htmp));
+		crc = hammer2_icrc32c(bitmap,
+		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE, crc);
+		crc = hammer2_icrc32c(&ftmp, sizeof(ftmp), crc);
+		bcopy(&crc, hdr->crc, sizeof(crc));
+		bcopy(&crc, ftr->crc, sizeof(crc));
+
 		n = pwrite(vol->fd, buf, HAMMER2_PBUFSIZE,
 			   (hammer2_off_t)HAMMER2_ZONE_RAID6_BITMAP *
 			   HAMMER2_ZONE_SEG);

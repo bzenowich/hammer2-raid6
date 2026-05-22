@@ -998,8 +998,44 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
 }
 
 /*
+ * Stripe bitmap on-disk layout (see docs/stripe_bitmap.md):
+ *
+ *   page 0:                 header
+ *   pages 1..bitmap_pages:  bitmap data
+ *   final page:             footer
+ *
+ * The whole structure fits within one HAMMER2_PBUFSIZE (64 KB) block on
+ * disk 0 at zone HAMMER2_ZONE_RAID6_BITMAP, since num_slots * 1 bit / 8
+ * stays well under 56 KB for any practical zone size.
+ */
+#define HAMMER2_STRIPE_BITMAP_PAGES_MAX	\
+	((HAMMER2_PBUFSIZE - 2 * HAMMER2_STRIPE_BITMAP_PAGE) / \
+	 HAMMER2_STRIPE_BITMAP_PAGE)
+
+static __inline uint32_t
+hammer2_stripe_bitmap_crc(const hammer2_stripe_bitmap_header_t *hdr,
+			  const uint8_t *bitmap, size_t bitmap_pages,
+			  const hammer2_stripe_bitmap_footer_t *ftr)
+{
+	hammer2_stripe_bitmap_header_t h = *hdr;
+	hammer2_stripe_bitmap_footer_t f = *ftr;
+	uint32_t c;
+
+	bzero(h.crc, sizeof(h.crc));
+	bzero(f.crc, sizeof(f.crc));
+	c = hammer2_icrc32(&h, sizeof(h));
+	c = hammer2_icrc32c(bitmap, bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE,
+			    c);
+	c = hammer2_icrc32c(&f, sizeof(f), c);
+	return c;
+}
+
+/*
  * Allocate the in-memory stripe bitmap for a RAID6 array.
- * One bit per stripe slot; all bits start as 0 (free).
+ * Sizing assumes one zone slot per disk and the legacy
+ * slot_origin = HAMMER2_ZONE_SEG64.  Bits start zero (all slots free);
+ * hammer2_raid6_bitmap_read() overwrites them with the persisted copy.
+ *
  * Called during mount after hmp->raid_config is populated.
  */
 void
@@ -1008,19 +1044,34 @@ hammer2_raid6_bitmap_init(hammer2_dev_t *hmp)
 	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
 	uint64_t usable = HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64;
 	uint64_t max_stripes = usable / stripe_unit;
-	size_t bsize = (size_t)((max_stripes + 7) / 8);
+	size_t bitmap_pages = (size_t)(((max_stripes + 7) / 8 +
+	    HAMMER2_STRIPE_BITMAP_PAGE - 1) / HAMMER2_STRIPE_BITMAP_PAGE);
+	size_t bsize;
+
+	if (bitmap_pages == 0)
+		bitmap_pages = 1;
+	KKASSERT(bitmap_pages <= HAMMER2_STRIPE_BITMAP_PAGES_MAX);
+	bsize = bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE;
 
 	hmp->stripe_bitmap = kmalloc(bsize, M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->stripe_bitmap_size = bsize;
+	hmp->stripe_num_slots = max_stripes;
+	hmp->stripe_cursor = HAMMER2_STRIPE_V4_START;
+	hmp->stripe_generation = 0;
+	hmp->stripe_bitmap_invalid = 0;
 	spin_init(&hmp->stripe_bitmap_spin, "h2smap");
 	hmp->stripe_next_disk = 0;
 }
 
 /*
- * Read the on-disk stripe bitmap from zone slot HAMMER2_ZONE_RAID6_BITMAP
- * on disk 0.  If the read fails (new array, zone never written), the bitmap
- * remains all-zeros (all stripes free), which is correct for a fresh array.
- * Called during mount after hammer2_raid6_bitmap_init().
+ * Read and verify the on-disk stripe bitmap from zone slot
+ * HAMMER2_ZONE_RAID6_BITMAP on disk 0.  On any header/footer/CRC
+ * mismatch (or read failure), mark the bitmap invalid; the caller
+ * keeps the in-memory zero bitmap and logs a warning.  A blockref-walk
+ * reconstruction (newplan.md §5.9, stripe_bitmap.md "mount-time
+ * verify") is a Phase 2 TODO; until it lands a torn bitmap risks
+ * re-allocating live slots, so the mount path treats invalid as
+ * fatal for RW mounts.
  */
 void
 hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
@@ -1028,31 +1079,76 @@ hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
 	struct vnode *devvp;
 	struct buf *bp;
 	off_t pbase;
+	hammer2_stripe_bitmap_header_t *hdr;
+	hammer2_stripe_bitmap_footer_t *ftr;
+	uint8_t *bitmap;
+	size_t bitmap_pages = hmp->stripe_bitmap_size /
+	    HAMMER2_STRIPE_BITMAP_PAGE;
+	uint32_t hdr_crc, ftr_crc, want_crc;
 	int error;
 
 	devvp = hmp->volumes[0].dev->devvp;
-	if (devvp == NULL || !hmp->volumes[0].dev->open)
+	if (devvp == NULL || !hmp->volumes[0].dev->open) {
+		hmp->stripe_bitmap_invalid = 1;
 		return;
+	}
 
 	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
 
 	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
-	if (error) {
-		/* Not an error for a new array; bitmap stays all-zeros. */
+	if (error || bp == NULL) {
 		if (bp)
 			brelse(bp);
+		kprintf("hammer2: stripe bitmap read I/O error %d; "
+			"bitmap invalid\n", error);
+		hmp->stripe_bitmap_invalid = 1;
 		return;
 	}
 
-	bcopy(bp->b_data, hmp->stripe_bitmap, hmp->stripe_bitmap_size);
+	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
+	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
+	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
+	    HAMMER2_STRIPE_BITMAP_PAGE +
+	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
+
+	if (hdr->magic != HAMMER2_STRIPE_BITMAP_MAGIC ||
+	    hdr->version != HAMMER2_STRIPE_BITMAP_VERSION ||
+	    hdr->ndisks != hmp->raid_config.ndisks ||
+	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
+	    ftr->magic_end != HAMMER2_STRIPE_BITMAP_MAGIC_END ||
+	    ftr->generation != hdr->generation) {
+		kprintf("hammer2: stripe bitmap header/footer mismatch; "
+			"bitmap invalid\n");
+		hmp->stripe_bitmap_invalid = 1;
+		brelse(bp);
+		return;
+	}
+
+	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
+	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
+	want_crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
+	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
+		kprintf("hammer2: stripe bitmap CRC mismatch "
+			"(hdr %08x ftr %08x want %08x); bitmap invalid\n",
+			hdr_crc, ftr_crc, want_crc);
+		hmp->stripe_bitmap_invalid = 1;
+		brelse(bp);
+		return;
+	}
+
+	bcopy(bitmap, hmp->stripe_bitmap, hmp->stripe_bitmap_size);
+	hmp->stripe_cursor = hdr->cursor;
+	hmp->stripe_generation = hdr->generation;
 	brelse(bp);
 }
 
 /*
  * Write the in-memory stripe bitmap to disk zone slot
  * HAMMER2_ZONE_RAID6_BITMAP on disk 0, synchronously.
- * Called from the TXG commit path before the volume header write
- * so the bitmap is durable before the header that references it.
+ * Bumps the generation, computes a fresh CRC, and writes
+ * header + bitmap + footer as one buffer.  Called from the TXG commit
+ * path before the volume header write so the bitmap is durable before
+ * the header that references it.
  */
 void
 hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
@@ -1060,6 +1156,12 @@ hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
 	struct vnode *devvp;
 	struct buf *bp;
 	off_t pbase;
+	hammer2_stripe_bitmap_header_t *hdr;
+	hammer2_stripe_bitmap_footer_t *ftr;
+	uint8_t *bitmap;
+	size_t bitmap_pages = hmp->stripe_bitmap_size /
+	    HAMMER2_STRIPE_BITMAP_PAGE;
+	uint32_t crc;
 
 	devvp = hmp->volumes[0].dev->devvp;
 	if (devvp == NULL || !hmp->volumes[0].dev->open)
@@ -1074,7 +1176,32 @@ hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
 	}
 	bkvasync(bp);
 	bzero(bp->b_data, HAMMER2_PBUFSIZE);
-	bcopy(hmp->stripe_bitmap, bp->b_data, hmp->stripe_bitmap_size);
+
+	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
+	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
+	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
+	    HAMMER2_STRIPE_BITMAP_PAGE +
+	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
+
+	hmp->stripe_generation++;
+	hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
+	hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
+	hdr->ndisks = hmp->raid_config.ndisks;
+	hdr->stripe_unit = hmp->raid_config.stripe_unit;
+	hdr->num_slots = hmp->stripe_num_slots;
+	hdr->slot_origin = HAMMER2_ZONE_SEG64;
+	hdr->cursor = hmp->stripe_cursor;
+	hdr->generation = hmp->stripe_generation;
+
+	ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
+	ftr->generation = hmp->stripe_generation;
+
+	bcopy(hmp->stripe_bitmap, bitmap, hmp->stripe_bitmap_size);
+
+	crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
+	bcopy(&crc, hdr->crc, sizeof(crc));
+	bcopy(&crc, ftr->crc, sizeof(crc));
+
 	bwrite(bp);
 }
 
@@ -1093,9 +1220,10 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	uint64_t stripe_unit = rc->stripe_unit;
-	uint64_t max_stripes = (HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64) /
-	    stripe_unit;
+	uint64_t max_stripes = hmp->stripe_num_slots;
 	uint64_t slot;
+	uint64_t start;
+	int wrapped = 0;
 	int byte_idx, bit_idx;
 	int disk_idx;
 	hammer2_off_t phys_off;
@@ -1103,56 +1231,49 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	int n;
 
 	/*
-	 * Reserve the first HAMMER2_STRIPE_V4_START slots for v3 freemap /
-	 * metadata blocks (INODE, INDIRECT).  The v3 stripe map allocates
-	 * metadata at low physical offsets (ZONE_SEG64 + slot * stripe_unit
-	 * for small slot numbers).  v4 DATA blocks must not reuse those
-	 * physical locations or both sets of blocks would collide on-disk.
+	 * Sequential-cursor allocator (docs/stripe_bitmap.md §Allocator):
+	 * start from hmp->stripe_cursor, scan forward for the first 0 bit,
+	 * wrap once on miss.  Cursor never moves backwards; on free, slots
+	 * become reachable again only after the cursor wraps.
 	 *
-	 * HAMMER2_STRIPE_V4_START = 1024 reserves 64 MB per disk for v3
-	 * metadata, which is far more than any test in the suite requires.
-	 *
-	 * Additionally, any slot whose per-disk physical offset falls inside
-	 * a HAMMER2 reserved zone must be skipped:
-	 *
-	 *   phys = ZONE_SEG64 + slot * stripe_unit
-	 *   zone = phys / ZONE_SEG
-	 *
-	 * Reserved zones:
-	 *   Freemap rotation zones: Z ≡ 1 (mod 5), 1 ≤ Z ≤ 36
-	 *     (ZONE_FREEMAP_00=1 through ZONE_FREEMAP_07=36, step 5)
-	 *     → slot ranges [0,64), [320,384), [640,704), [960,1024),
-	 *                    [1280,1344), [1600,1664), [1920,1984), [2240,2304)
-	 *   Stripe bitmap zone: Z == 41
-	 *     → slot range [2560, 2624)
-	 *
-	 * The STRIPE_V4_START=1024 already covers the first four freemap
-	 * groups (zones 1,6,11,16).  The zone check below handles zones
-	 * 21,26,31,36 and 41 which fall within the v4 DATA range.
-	 */
-#define HAMMER2_STRIPE_V4_START 1024
-
-	/*
-	 * The stripe bitmap and next_disk counter are shared across
-	 * concurrent xop threads.  Hold the spinlock for the entire
-	 * scan+allocate+disk-select sequence to prevent two threads from
-	 * racing into the same slot.
+	 * Reserved-zone slots (freemap rotations at zones 21/26/31/36 and
+	 * the bitmap zone 41) are skipped in line.
 	 */
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 
-	/* Find first free slot, skipping v3 range and all reserved zones */
-	for (slot = HAMMER2_STRIPE_V4_START; slot < max_stripes; slot++) {
+	start = hmp->stripe_cursor;
+	if (start < HAMMER2_STRIPE_V4_START || start >= max_stripes)
+		start = HAMMER2_STRIPE_V4_START;
+	slot = start;
+
+	for (;;) {
 		uint64_t zone;
 
-		/* Skip slots whose physical offset is in a reserved zone */
+		if (slot >= max_stripes) {
+			if (wrapped)
+				break;
+			wrapped = 1;
+			slot = HAMMER2_STRIPE_V4_START;
+			if (slot >= start)
+				break;
+			continue;
+		}
+		if (wrapped && slot >= start)
+			break;
+
 		zone = (HAMMER2_ZONE_SEG64 + slot * stripe_unit) /
 		    HAMMER2_ZONE_SEG64;
 		if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
 		    zone <= HAMMER2_ZONE_FREEMAP_07 &&
-		    (zone % HAMMER2_ZONE_FREEMAP_INC) == HAMMER2_ZONE_FREEMAP_00)
+		    (zone % HAMMER2_ZONE_FREEMAP_INC) ==
+		     HAMMER2_ZONE_FREEMAP_00) {
+			slot++;
 			continue;
-		if (zone == HAMMER2_ZONE_RAID6_BITMAP)
+		}
+		if (zone == HAMMER2_ZONE_RAID6_BITMAP) {
+			slot++;
 			continue;
+		}
 
 		byte_idx = (int)(slot / 8);
 		bit_idx  = (int)(slot % 8);
@@ -1160,8 +1281,10 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			break;
 		if ((hmp->stripe_bitmap[byte_idx] & (1 << bit_idx)) == 0) {
 			hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+			hmp->stripe_cursor = slot + 1;
 			goto found;
 		}
+		slot++;
 	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	return ENOSPC;

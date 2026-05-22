@@ -1146,7 +1146,11 @@ struct hammer2_dev {
 	/* RAIDZ2-native physical stripe bitmap (v4 format) */
 	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
 	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
-	hammer2_spin_t	stripe_bitmap_spin;	/* protects stripe_bitmap + next_disk */
+	uint64_t	stripe_num_slots;	/* total slots covered */
+	uint64_t	stripe_cursor;		/* sequential allocator cursor */
+	uint64_t	stripe_generation;	/* bumped on every TXG flush */
+	int		stripe_bitmap_invalid;	/* 1 if on-disk header was bad */
+	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + next_disk */
 	int		stripe_next_disk;	/* round-robin data disk counter */
 
 	/* RAID6 resilver progress (written by resilver, read by status ioctl) */

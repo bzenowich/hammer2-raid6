@@ -1182,6 +1182,56 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_RAID6_FLAG_DEGRADED	0x0001
 #define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
 
+/*
+ * v4 RAIDZ2-native stripe bitmap zone (zone 41 on disk 0).
+ * Per docs/stripe_bitmap.md:
+ *
+ *   [page 0]       header  (4 KB)
+ *   [page 1..N]    bitmap data (one bit per stripe slot)
+ *   [page N+1]     footer  (4 KB)
+ *
+ * header.generation == footer.generation + matching CRC detects torn
+ * writes.  CRC stored as a single icrc32 in the low 4 bytes of crc[16];
+ * remaining bytes are zero-padded reserve.
+ */
+#define HAMMER2_STRIPE_BITMAP_PAGE	4096
+#define HAMMER2_STRIPE_BITMAP_VERSION	1
+#define HAMMER2_STRIPE_BITMAP_MAGIC	0x484D32535452424DULL /* "MBRTS2H\0" */
+#define HAMMER2_STRIPE_BITMAP_MAGIC_END	0x00484D32535452ULL   /* reversed */
+
+/*
+ * Lowest stripe slot eligible for v4 DATA/DIRENT allocation.  Slots
+ * below this reserve physical space at the start of every disk's data
+ * area for HAMMER2 reserved zones (freemap rotations) that v3-era
+ * metadata-via-freemap can still consume; v4 DATA must not collide
+ * with those.
+ */
+#define HAMMER2_STRIPE_V4_START		1024
+
+struct hammer2_stripe_bitmap_header {
+	uint64_t magic;			/* HAMMER2_STRIPE_BITMAP_MAGIC */
+	uint32_t version;		/* HAMMER2_STRIPE_BITMAP_VERSION */
+	uint32_t ndisks;		/* must match volhdr raid_config.ndisks */
+	uint64_t stripe_unit;		/* HAMMER2_PBUFSIZE */
+	uint64_t num_slots;		/* total slots covered by bitmap */
+	uint64_t slot_origin;		/* per-disk byte offset of slot 0 */
+	uint64_t cursor;		/* sequential allocator cursor */
+	uint64_t generation;		/* bumped on every TXG flush */
+	uint8_t  crc[16];		/* icrc32 of header+bitmap+footer */
+	uint8_t  pad[4040];
+} __packed;
+
+typedef struct hammer2_stripe_bitmap_header hammer2_stripe_bitmap_header_t;
+
+struct hammer2_stripe_bitmap_footer {
+	uint64_t magic_end;		/* HAMMER2_STRIPE_BITMAP_MAGIC_END */
+	uint64_t generation;		/* must match header.generation */
+	uint8_t  crc[16];		/* mirrors header.crc */
+	uint8_t  pad[4072];
+} __packed;
+
+typedef struct hammer2_stripe_bitmap_footer hammer2_stripe_bitmap_footer_t;
+
 struct hammer2_raid_config {
 	uint8_t		raid_type;	/* 0=JBOD, 6=RAID6 */
 	uint8_t		ndisks;		/* total disks in array */
