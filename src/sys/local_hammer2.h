@@ -1153,6 +1153,10 @@ struct hammer2_dev {
 	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + next_disk */
 	int		stripe_next_disk;	/* round-robin data disk counter */
 
+	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
+	uint32_t	md_nextents;
+	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];
+
 	/* RAID6 resilver progress (written by resilver, read by status ioctl) */
 	volatile uint64_t resilver_stripes_done;
 	volatile uint64_t resilver_stripes_total;

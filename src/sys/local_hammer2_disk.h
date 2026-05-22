@@ -1232,6 +1232,36 @@ struct hammer2_stripe_bitmap_footer {
 
 typedef struct hammer2_stripe_bitmap_footer hammer2_stripe_bitmap_footer_t;
 
+/*
+ * v4 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
+ *
+ * INODE / INDIRECT / FREEMAP_NODE / FREEMAP_LEAF blocks live in a
+ * dedicated per-disk LBA range that is N-way mirrored across every
+ * disk in the array.  The same content lands at the same per-disk
+ * byte offset on all N disks; no parity is required.
+ *
+ * Each `hammer2_md_extent` describes one contiguous LBA range on a
+ * disk.  Extent 0 is laid down by `newfs_hammer2 --raid6` immediately
+ * after the stripe bitmap zone (byte HAMMER2_ZONE_SEG64 * 42).
+ * Additional extents can be added by an offline tool as the zone fills.
+ *
+ * The on-disk persistence of the extent table is the volume-header
+ * addendum landing with Group J (docs/volhdr_quorum.md); until then
+ * the table is computed deterministically at mount time.
+ */
+struct hammer2_md_extent {
+	uint64_t md_off;		/* per-disk byte offset of extent */
+	uint64_t md_size;		/* extent size in bytes */
+} __packed;
+
+typedef struct hammer2_md_extent hammer2_md_extent_t;
+
+#define HAMMER2_MD_MAX_EXTENTS		8
+#define HAMMER2_MD_EXTENT0_OFF		\
+	((hammer2_off_t)(HAMMER2_ZONE_RAID6_BITMAP + 1) * HAMMER2_ZONE_SEG64)
+#define HAMMER2_MD_EXTENT0_MIN_SIZE	((hammer2_off_t)64 * 1024 * 1024)
+#define HAMMER2_MD_EXTENT0_PCT		5	/* 5% of per-disk LBA */
+
 struct hammer2_raid_config {
 	uint8_t		raid_type;	/* 0=JBOD, 6=RAID6 */
 	uint8_t		ndisks;		/* total disks in array */

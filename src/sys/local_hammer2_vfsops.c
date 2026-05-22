@@ -1301,6 +1301,27 @@ next_hmp:
 			 */
 			hammer2_raid6_bitmap_init(hmp);
 			hammer2_raid6_bitmap_read(hmp);
+
+			/*
+			 * Compute the metadata-zone extent table deterministically
+			 * from per-disk size.  Persisting the table to the volume
+			 * header lands with Group J; until then every mount derives
+			 * the same defaults, so the layout is stable.
+			 */
+			{
+				hammer2_off_t per_disk =
+				    hmp->volumes[0].size;
+				hammer2_off_t size =
+				    per_disk * HAMMER2_MD_EXTENT0_PCT / 100;
+				if (size < HAMMER2_MD_EXTENT0_MIN_SIZE)
+					size = HAMMER2_MD_EXTENT0_MIN_SIZE;
+				if (size > per_disk - HAMMER2_MD_EXTENT0_OFF)
+					size = per_disk - HAMMER2_MD_EXTENT0_OFF;
+				hmp->md_nextents = 1;
+				hmp->md_extents[0].md_off =
+				    HAMMER2_MD_EXTENT0_OFF;
+				hmp->md_extents[0].md_size = size;
+			}
 		} else if (hmp->voldata.version >=
 			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
 			hmp->nvolumes = hmp->voldata.nvolumes;

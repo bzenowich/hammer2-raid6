@@ -1022,6 +1022,19 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	printf("free-size:        %s (%jd bytes)\n",
 	       sizetostr(fso.free_size),
 	       (intmax_t)fso.free_size);
+	if (opt->RaidType == 6 &&
+	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+		hammer2_off_t per_disk = fso.volumes[0].size;
+		hammer2_off_t md_size = per_disk *
+		    HAMMER2_MD_EXTENT0_PCT / 100;
+		if (md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
+			md_size = HAMMER2_MD_EXTENT0_MIN_SIZE;
+		if (md_size > per_disk - HAMMER2_MD_EXTENT0_OFF)
+			md_size = per_disk - HAMMER2_MD_EXTENT0_OFF;
+		printf("md-extent0:       %s (%jd bytes) @ %jd\n",
+		       sizetostr(md_size), (intmax_t)md_size,
+		       (intmax_t)HAMMER2_MD_EXTENT0_OFF);
+	}
 	printf("vol-fsid:         %s\n", vol_fsid);
 	printf("sup-clid:         %s\n", sup_clid_name);
 	printf("sup-fsid:         %s\n", sup_fsid_name);
