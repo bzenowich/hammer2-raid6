@@ -1,5 +1,14 @@
 # HAMMER2 RAID6 — Snapshots and RAIDZ2-Native Integration
 
+> **STATUS (2026-05-21)**: Foundational design input. The core finding —
+> `hammer2_chain_modify` in-place overwrite contradicts the no-RMW
+> invariant, and must be COW-only under RAID6 — is adopted as the
+> architectural rule in `newplan.md` §5.3 ("in-place overwrite is
+> forbidden in RAID6 mode") and §5.7. The exact set of in-place sites
+> is being catalogued in `docs/inplace_audit.md` as a Phase 0 task;
+> the Phase 1 punch list (`docs/tracker.md`) carries the one-line
+> guard insertion.
+
 This document analyzes how HAMMER2's snapshot and atomic-restore features
 interact with the RAIDZ2-native design from `raidz2_in_hammer2.md`. The
 central finding is that snapshots do not merely coexist with the RAIDZ2-native

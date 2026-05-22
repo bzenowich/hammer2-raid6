@@ -327,11 +327,18 @@ Goal: lock the design before any more code.
   reachability traversal order.
 - Catalog all in-place-overwrite paths in HAMMER2 (`hammer2_chain_modify`,
   `HMNT2_EMERG`, dedup, growfile). Document the RAID6 guard at each.
-- Identify the **target physical machine** (model, disks, controller).
-  Order disks if necessary so they arrive in time for Phase 3.
+- **Target physical machine — LOCKED:**
+  - Motherboard: ASRock B450M Pro4 (AM4)
+  - CPU: AMD Ryzen 7 2700 (8C/16T, Zen+)
+  - RAM: 32 GB DDR4 ECC
+  - HBA: Supermicro AOC-USAS-L8i, 8-port SAS, PCIe x16, IT mode
+  - Disks: 4× WD Red WD10JFCX, 1 TB, 2.5" SATA (5400 RPM HDD)
 
-Exit: a single design doc with no open questions, plus a hardware
-purchase order if needed.
+  HDD substrate validates §9.1 metadata-zone locality choice. SAS HBA in
+  IT mode gives clean per-disk EIO and SMART pass-through.
+
+Exit: a single design doc with no open questions; per-topic specs
+landed (§13); Phase 1 punch list (`docs/tracker.md`) populated.
 
 ### Phase 1 — Clean rebase (1–2 weeks)
 
@@ -447,60 +454,94 @@ folded back into earlier phases:
 - No half-finished resilver state machines. If resilver fails partway,
   restart from blockref traversal — idempotent, no per-stripe checkpoint.
 
-## 9. Open Questions to Resolve in Phase 0
+## 9. Phase 0 Decisions
 
-1. **Metadata mirror layout — DECIDED: hybrid (C).** Dedicated metadata
-   zone, freemap-allocated within it, N-way mirror at zone offsets.
-   Rationale below; two alternatives considered and rejected for v1.
+All five questions from the prior draft are resolved here. Full per-topic
+specs land in dedicated docs (referenced in §13).
 
-   **Hybrid (chosen)**: reserved metadata zone, allocator = existing
-   freemap radix restricted to that zone, every block written at the
-   same byte offset on all N disks.
-   - HDD wins: metadata reads/writes clustered in narrow LBA band;
-     cold `find` / mount / metadata resilver run sequential.
-   - SSD neutral: scattering doesn't help, locality doesn't hurt.
-   - No capacity cliff: zone grows on demand (initial sizing ~5% of
-     per-disk LBA; extend into unused adjacent space if it fills).
-   - Code reuse: freemap radix unchanged. Snapshot reachability,
-     bulkfree, dedup all work as today; only physical location
-     differs.
-   - Resilver: sequential read of metadata zone from a surviving
-     disk → sequential write to replacement. Order-of-magnitude
-     faster than blockref-walk on HDD.
+### 9.1 Metadata layout — hybrid (dedicated zone + freemap + N-way mirror)
 
-   **Alternative A — reserved region with bitmap/bump allocator**
-   (rejected): same locality wins as hybrid, but adds a new allocator
-   and a fixed capacity ceiling. Hybrid keeps the locality without
-   either downside.
+Dedicated metadata zone on each disk; allocator = existing freemap radix
+restricted to that zone; every metadata block written at the same byte
+offset on all N disks (no per-disk slot lookup).
 
-   **Alternative B — freemap + N-replica flag, no dedicated zone**
-   (rejected): cleanest composability and best capacity flexibility,
-   but metadata scatters across the platter. Cold metadata reads and
-   resilver become random I/O, costing minutes-to-hours on HDD. The
-   user's target is real server hardware that may include spinning
-   disks; this is the regret path. Reconsider if the deployment turns
-   out to be SSD-only.
+- **Initial sizing**: ~5% of per-disk LBA range, with room to extend.
+- **HDD wins**: metadata I/O clustered in narrow LBA band; cold `find` /
+  mount / metadata resilver sequential.
+- **No capacity cliff**: zone extends into adjacent unused space if it
+  fills; offline tool grows the zone.
+- **Per-disk zone-full**: array goes read-only with a clear error;
+  admin extends via offline tool. Can only happen after replace-with-
+  larger-disk asymmetry; normal mirrored writes keep all N disks
+  in lockstep.
+- **Code reuse**: freemap radix unchanged. Snapshot reachability,
+  bulkfree, dedup work as today; only physical location differs.
+- **Resilver**: sequential read from surviving disk → sequential write
+  to replacement. Order-of-magnitude faster than blockref-walk on HDD.
 
-   Per-disk metadata-zone-full handling: if one disk's zone fills
-   before others (should not happen since writes are mirrored at the
-   same offset on all disks, but possible after replace-with-larger
-   disk), array goes read-only with a clear error; admin extends the
-   zone via offline tool.
-2. **Volume header quorum**: do we accept the array if only ⌈N/2⌉
-   disks present a matching latest sequence number, or do we require
-   all? ZFS uses majority. Match ZFS.
-3. **Free-stripe selection**: first-fit, best-fit, sequential cursor?
-   Sequential cursor is what ZFS uses for sequential-write performance.
-   Match ZFS.
-4. **Stripe bitmap durability**: is it written every TXG, or
-   reconstructed by scanning blockrefs at mount? ZFS reconstructs space
-   maps lazily. Match ZFS: persist the bitmap as a TXG-flushed structure,
-   but verify it against blockref reachability at mount.
-5. **DIO key encoding under physical addressing**: v4's recent fix
-   ("Fix v4 RAIDZ2-native addressing, races, and stability issues")
-   touched this. Audit it carefully in Phase 1 — make sure the
-   collision-avoidance is a property of the design, not a patch
-   stacked on a confused encoding.
+Alternatives considered and rejected for v1:
+- **Alternative A — reserved region with bitmap/bump allocator**: same
+  locality, but adds a new allocator and a fixed capacity ceiling.
+  Hybrid wins without either downside.
+- **Alternative B — freemap + N-replica flag, no dedicated zone**:
+  cleanest composability, best capacity flexibility, but metadata
+  scatters across the platter. Cold metadata reads and resilver become
+  random I/O, costing minutes-to-hours on HDD. Target hardware (§7
+  Phase 3) is HDD; this is the regret path. Reconsider if a future
+  deployment is SSD-only.
+
+Full spec: `docs/metadata_zone.md`.
+
+### 9.2 Volume-header quorum — ZFS-style majority
+
+On mount, scan all N disks for the highest sequence number presented
+by a *majority* (⌈N/2⌉+1) of disks. That seqno is the live volume
+header. If no majority, fall back to the highest seqno present on a
+majority for the *prior* generation.
+
+- Per-disk seqno is monotonically increasing; written as part of the
+  TXG-commit volume-header copy.
+- Partial-write detection: per-disk seqno + CRC mismatch invalidates
+  that disk's copy.
+- Majority threshold matches ZFS uberblock discovery.
+
+Full spec: `docs/volhdr_quorum.md`.
+
+### 9.3 Free-stripe selection — sequential cursor
+
+Allocator maintains a per-pool cursor; each new stripe slot is taken
+at the cursor and the cursor advances. On wrap, restart from the
+first free slot. Matches ZFS metaslab allocator behavior for
+sequential-write throughput on HDD.
+
+- No first-fit or best-fit scanning.
+- Cursor persists across TXG via stripe bitmap zone footer.
+
+### 9.4 Stripe bitmap durability — persist + mount-time verify
+
+The stripe bitmap is a TXG-flushed structure (written at zone 41 as
+part of TXG commit). At mount, the bitmap is *verified* against
+blockref reachability — any divergence (stripes marked live with no
+referencing blockref) is reconciled in favor of the blockref walk,
+and bulkfree reclaims the orphans.
+
+- Persistence avoids full-traversal cost on every mount.
+- Mount-time verify catches corruption and torn TXG commits.
+- Matches ZFS space-map lazy-reconstruction policy.
+
+Full spec: `docs/stripe_bitmap.md`.
+
+### 9.5 DIO key encoding under physical addressing — moved to Phase 1 punch list
+
+v4's recent fix ("Fix v4 RAIDZ2-native addressing, races, and stability
+issues", commit `53cc7cd`, expanded in `9d537be`) placed v4 DATA/DIRENT
+DIO tree keys above `total_size` to avoid aliasing v3 logical keys.
+This must be re-derived from the design in Phase 1, not stacked on the
+WIP patch.
+
+- Move to Phase 1 punch list (§7 Phase 1, `docs/tracker.md`).
+- Acceptance criterion: collision-avoidance falls out of the address
+  encoding by construction, not by post-hoc offset arithmetic.
 
 ## 10. Risk Register
 
@@ -548,3 +589,24 @@ and the early v4 stumbles applied.
 
 Estimated time to upstreamable patch series: **3–4 months** from Phase 0
 start. Less than the time already spent; more than wishful thinking.
+
+## 13. Phase 0 Design Docs (per-topic specs)
+
+Detail bodies live in their own files so this document stays the index:
+
+- `docs/metadata_zone.md` — hybrid metadata zone layout (§9.1).
+- `docs/stripe_bitmap.md` — zone-41 stripe bitmap on-disk format (§9.4).
+- `docs/volhdr_quorum.md` — volume-header seqno + majority quorum (§9.2).
+- `docs/resilver_v4.md` — blockref-reachability resilver order (§5.9).
+- `docs/inplace_audit.md` — catalog of in-place-overwrite paths and the
+  RAID6 guard at each (§5.3, §11.4).
+- `docs/tracker.md` — Phase 1 deletion punch list (§11.5).
+
+Superseded v3-era docs that need reconciliation in Phase 0:
+
+- `docs/raidz2_in_hammer2.md` — original v4 design proposal. Reconcile
+  against this plan; flag any divergence as superseded.
+- `docs/raidz2_snapshot_interaction.md` — snapshot interaction analysis.
+  Folded into §5.7; verify no contradictions remain.
+- `docs/write_hole.md` — v3 WIB design. Reframe as "v3-era; not
+  applicable under COW + TXG-commit closure (§5.6)."

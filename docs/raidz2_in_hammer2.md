@@ -1,5 +1,18 @@
 # HAMMER2 RAID6 — Integrating RAIDZ2 Into HAMMER2's COW Layer
 
+> **STATUS (2026-05-21)**: Foundational design input. Folded into
+> `newplan.md` §5 (Clean Design v4) and §9.1 (metadata layout). Where
+> this document and `newplan.md` disagree, `newplan.md` wins. Specific
+> divergences:
+> - §5.2/5.3 here predate the **hybrid metadata zone** decision in
+>   `newplan.md` §9.1. Metadata is **not** parity-protected — it lives
+>   in a dedicated zone, freemap-allocated, N-way mirrored at zone
+>   offsets across all disks. See `docs/metadata_zone.md`.
+> - "Three-bwrite window" / vn-backing analysis (Fixes 13, 15) is
+>   test-infrastructure history; **deleted** in Phase 1.
+> - DIO key encoding discussion is superseded by the Phase 1 audit
+>   item in `newplan.md` §9.5.
+
 This document analyzes what it would take to bring RAID6 parity into HAMMER2's
 existing chain/COW machinery — making HAMMER2 "RAID-native" the way ZFS is,
 rather than layering a separate RAID translation below the filesystem.
