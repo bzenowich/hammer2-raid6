@@ -998,67 +998,6 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
 }
 
 /*
- * Map a logical offset to a physical (disk_index, physical_offset) for
- * RAID 6 configurations.
- *
- * Left-symmetric layout:
- *   For stripe S, P is on disk (S % ndisks), Q is on disk ((S+1) % ndisks).
- *   Data columns fill the remaining disk slots in order.
- *
- * logical_off is the byte offset in the RAID logical address space.
- * On return, *disk_idx is the volume index (0..ndisks-1) and *phys_off
- * is the byte offset on that physical disk.
- */
-void
-hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
-		  int *disk_idx, hammer2_off_t *phys_off)
-{
-	hammer2_raid_config_t *rc = &hmp->raid_config;
-	uint64_t stripe_unit = rc->stripe_unit;
-	int ndata = rc->ndata;
-	int ndisks = rc->ndisks;
-	uint64_t stripe_num;
-	int column;
-	int p_disk, q_disk;
-	int phys_disk;
-	int di;
-
-	/*
-	 * Determine which stripe and column within the stripe.
-	 * Mask logical_off to be relative to the start of the 2GB zone.
-	 */
-	logical_off &= HAMMER2_ZONE_MASK64;
-	stripe_num = logical_off / ((uint64_t)ndata * stripe_unit);
-	column = (int)((logical_off / stripe_unit) % ndata);
-
-	/* P and Q disk positions (left-symmetric rotation) */
-	p_disk = (int)(stripe_num % ndisks);
-	q_disk = (p_disk + 1) % ndisks;
-
-	/*
-	 * Map data column to physical disk.
-	 * Data columns fill disks that are not P or Q, in order.
-	 */
-	di = 0;
-	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-		if (phys_disk == p_disk || phys_disk == q_disk)
-			continue;
-		if (di == column)
-			break;
-		di++;
-	}
-
-	*disk_idx = phys_disk;
-	/*
-	 * Add HAMMER2_ZONE_SEG64 so RAID6 physical I/O starts after the
-	 * zone reserved area (volume headers + freemap) on each disk.
-	 * This prevents overwriting volume headers at physical offset 0.
-	 */
-	*phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit +
-		    (logical_off % stripe_unit);
-}
-
-/*
  * Allocate the in-memory stripe bitmap for a RAID6 array.
  * One bit per stripe slot; all bits start as 0 (free).
  * Called during mount after hmp->raid_config is populated.

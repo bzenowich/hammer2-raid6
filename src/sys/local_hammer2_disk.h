@@ -1142,12 +1142,12 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
  * The stripe_unit is the size of each column in a stripe and defaults
  * to HAMMER2_PBUFSIZE (64KB), aligning naturally with HAMMER2's DIO size.
  *
- * Address space mapping (left-symmetric):
- *   stripe_number = logical_offset / (ndata * stripe_unit)
- *   column        = (logical_offset / stripe_unit) % ndata
- *   P disk        = stripe_number % ndisks
- *   Q disk        = (stripe_number + 1) % ndisks
- *   Data columns fill remaining disk slots in order
+ * v4 RAIDZ2-native (HAMMER2_VOL_VERSION_RAIDZ2): DATA/DIRENT blockrefs
+ * encode disk index in bref->copyid and per-disk physical byte offset in
+ * bref->data_off; no logical→physical mapping. P+Q rotate left-symmetric:
+ *   stripe_slot = (per_disk_phys - HAMMER2_ZONE_SEG64) / stripe_unit
+ *   P disk      = stripe_slot % ndisks
+ *   Q disk      = (stripe_slot + 1) % ndisks
  */
 #define HAMMER2_RAID_TYPE_JBOD		0
 #define HAMMER2_RAID_TYPE_RAID6		6

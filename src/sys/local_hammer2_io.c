@@ -120,9 +120,8 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 /*
  * Compute the DIO tree key for a logical I/O target.
  *
- * Single dispatch point for the three encoding paths.  Downstream cache
- * and strategy code consume (pbase, dbase, devvp, disk_idx) and stays
- * encoding-blind.
+ * Two dispatch paths; downstream cache and strategy code consumes
+ * (pbase, dbase, devvp, disk_idx) and stays encoding-blind.
  *
  * Path A — v4 RAIDZ2-native DATA/DIRENT:
  *   bref->copyid   = physical disk index (0..ndisks-1)
@@ -130,25 +129,14 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  *   pbase = data_off & pmask           (= vol->offset + per_disk_phys)
  *   dbase = vol->offset                 (so dev_pbase = per_disk_phys)
  *
- * Path B — v3 RAID6 fallback (and v4 metadata until Group I lands):
- *   pbase = data_off & pmask            (logical offset)
- *   hammer2_raid6_map(pbase) → (disk_idx, phys_off)
- *   dbase = pbase - phys_off            (so dev_pbase = phys_off)
- *
- * Path C — JBOD / non-RAID:
+ * Path C — JBOD / non-RAID, and v4 metadata pre-Group I:
  *   pbase = data_off & pmask
  *   vol   = hammer2_get_volume(pbase)
  *   dbase = vol->offset                 (so dev_pbase = pbase - vol->offset)
  *
- * KNOWN LIMITATION (resolved by Group B + G-final):
- *   Path A's pbase lives in the v3 logical keyspace [0, total_size), so a
- *   v4 DATA pbase can alias a v3 logical pbase.  This is the bug WIP commit
- *   `9d537be` (devel) patched by adding total_size + disk*size to the v4
- *   pbase.  We intentionally do NOT replicate that patch here: Group B
- *   deletes v3 entirely, after which v4 owns the keyspace alone and the
- *   patch becomes unnecessary.  Until Group B lands, v3 and v4 must not
- *   be mounted on the same array (already true: format version gates the
- *   dispatch).
+ * v3 logical→physical mapping (hammer2_raid6_map) is gone: Group B
+ * deleted v3. Multi-disk RAID6 INODE/INDIRECT temporarily route via
+ * Path C until Group I lands the metadata-zone mirror.
  */
 static __inline void
 hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
@@ -174,16 +162,8 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 		vol = &hmp->volumes[disk_idx];
 		dbase = vol->offset;
 		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
-	} else if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-		/* Path B: v3 RAID6 fallback / v4 metadata (pre-Group I). */
-		hammer2_off_t phys_off;
-
-		hammer2_raid6_map(hmp, pbase, &disk_idx, &phys_off);
-		vol = &hmp->volumes[disk_idx];
-		dbase = pbase - phys_off;
-		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
 	} else {
-		/* Path C: JBOD / non-RAID. */
+		/* Path C: JBOD / non-RAID, or v4 metadata pre-Group I. */
 		vol = hammer2_get_volume(hmp, pbase);
 		dbase = vol->offset;
 		*devvp_out = vol->dev->devvp;
@@ -1958,7 +1938,6 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	int ndisks = rc->ndisks;
 	int ndata = rc->ndata;
 	uint64_t stripe_unit = rc->stripe_unit;
-	uint64_t stripe_num;
 	int p_disk, q_disk;
 	int target_col;
 	int phys_disk, di, col;
@@ -1975,31 +1954,27 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 
 	KKASSERT(bytes == stripe_unit);
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-
-	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 && is_physical) {
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	if (is_physical) {
 		/*
-		 * v4 (RAIDZ2-native): physical addressing.
-		 * Only DATA and DIRENT blocks use physical addressing.
-		 * INODE/INDIRECT/FREEMAP use v3 logical addressing even
-		 * in v4 format (they are allocated via the freemap, not
-		 * the v4 stripe bitmap).
+		 * v4 RAIDZ2-native physical addressing for DATA/DIRENT.
 		 *
-		 * logical_off is the physical column offset on disk
-		 * data_disk_idx.  All columns in the same stripe slot
-		 * share the same physical offset:
-		 *   stripe_slot = (logical_off - HAMMER2_ZONE_SEG64) /
+		 * logical_off is the GLOBAL address (vol->offset +
+		 * per_disk_phys_off) on disk data_disk_idx.  All columns
+		 * in the same stripe slot share the same per-disk
+		 * physical offset:
+		 *   stripe_slot = (per_disk_phys - HAMMER2_ZONE_SEG64) /
 		 *                 stripe_unit
-		 *   phys_off    = HAMMER2_ZONE_SEG64 + stripe_slot *
-		 *                 stripe_unit
+		 *   phys_off    = per_disk_phys
 		 *
 		 * P disk = stripe_slot % ndisks
 		 * Q disk = (P disk + 1) % ndisks
 		 * Data columns: all other disks in disk-index order.
 		 *
 		 * target_col: the logical column index for data_disk_idx.
-		 *   If data_disk_idx == p_disk -> target_col = ndata (P)
-		 *   If data_disk_idx == q_disk -> target_col = ndata+1 (Q)
-		 *   Otherwise: count data disks below data_disk_idx.
+		 *   data_disk_idx == p_disk -> target_col = ndata (P)
+		 *   data_disk_idx == q_disk -> target_col = ndata+1 (Q)
+		 *   otherwise count data disks below data_disk_idx.
 		 */
 		uint64_t stripe_slot;
 		int d_col;
@@ -2113,94 +2088,13 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	}
 
 	/*
-	 * v3 (RAID6): logical addressing via hammer2_raid6_map().
+	 * Non-physical call: INODE/INDIRECT/FREEMAP on a failed disk.
+	 * Pre-Group I there is no metadata mirror to read from, and v3
+	 * logical reconstruction is gone. Return EIO; Group I lands the
+	 * metadata-zone mirror.
 	 */
-	stripe_num = logical_off / ((uint64_t)ndata * stripe_unit);
-
-	/* P and Q disk positions */
-	p_disk = (int)(stripe_num % ndisks);
-	q_disk = (p_disk + 1) % ndisks;
-
-	/* Logical column index of the block we're reconstructing */
-	target_col = (int)((logical_off / stripe_unit) % ndata);
-
-	/*
-	 * Read all columns in the stripe (data + P + Q) in one loop.
-	 */
-	phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
-	di = 0;
-	for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-		int lerror;
-		if (phys_disk == p_disk)
-			col = ndata;
-		else if (phys_disk == q_disk)
-			col = ndata + 1;
-		else
-			col = di++;
-
-		col_bufs[col] = kmalloc(stripe_unit, M_HAMMER2,
-					M_WAITOK | M_ZERO);
-		ptrs[col] = col_bufs[col];
-
-		if (col == target_col) {
-			/*
-			 * Target column being reconstructed is already
-			 * locked by caller. Mark failed to reconstruct.
-			 */
-			if (fail_data_a == -1)
-				fail_data_a = col;
-			else if (fail_data_b == -1)
-				fail_data_b = col;
-			continue;
-		}
-
-		if (hmp->raid_failed[phys_disk]) {
-			/* Already failed: track for recovery */
-			if (col < ndata) {
-				if (fail_data_a == -1)
-					fail_data_a = col;
-				else if (fail_data_b == -1)
-					fail_data_b = col;
-			} else if (col == ndata) {
-				fail_p = 1;
-			} else {
-				fail_q = 1;
-			}
-			continue;
-		}
-
-		vol = &hmp->volumes[phys_disk];
-		bp = NULL;
-		lerror = breadnx(vol->dev->devvp, phys_off,
-				 stripe_unit, 0, NULL, NULL, 0, &bp);
-		if (lerror == 0 && bp) {
-			bkvasync(bp);
-			bcopy(bp->b_data, col_bufs[col], stripe_unit);
-			brelse(bp);
-		} else {
-			if (bp)
-				brelse(bp);
-			{
-				int aerr = hammer2_raid6_auto_fail_disk(
-						hmp, phys_disk);
-				if (aerr) {
-					error = EIO;
-					break;
-				}
-			}
-			/* I/O error: track failed column for reconstruction */
-			if (col < ndata) {
-				if (fail_data_a == -1)
-					fail_data_a = col;
-				else if (fail_data_b == -1)
-					fail_data_b = col;
-			} else if (col == ndata) {
-				fail_p = 1;
-			} else {
-				fail_q = 1;
-			}
-		}
-	}
+	error = EIO;
+	goto read_degraded_done;
 
 do_recovery:
 	/* Perform recovery */

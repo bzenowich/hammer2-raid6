@@ -2006,8 +2006,6 @@ void hammer2_raid6_datap_recov(int ndisks, size_t bytes,
 		int faila, void **ptrs);
 void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
-void hammer2_raid6_map(hammer2_dev_t *hmp, hammer2_off_t logical_off,
-		int *disk_idx, hammer2_off_t *phys_off);
 int hammer2_io_raid6_write(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 		void *data, void *old_data, size_t bytes);
 int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
