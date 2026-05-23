@@ -38,14 +38,27 @@ are from the prior LAN-bridged VM and no longer reach anything.
 ## Deploy Cycle
 
 ```bash
-./deploy.sh           # sync + build + install + tests (all)
+./deploy.sh fast      # sync + build + install + reload + tests
+                      # — NO reboot; requires no hammer2 fs mounted.
+                      # Use this for the inner loop.
+./deploy.sh all       # sync + build + install + tests (reboot after)
 ./deploy.sh sync      # scp local_* to /usr/src/sys/vfs/hammer2/...
                       # + idempotently patch /usr/src/sys/conf/files
-./deploy.sh build     # make in /usr/src/sys/vfs/hammer2 + newfs_hammer2 + hammer2
+./deploy.sh build     # incrementally rebuild hammer2.ko in the
+                      # /usr/obj kernel-tree obj dir (loader-compatible)
+                      # + newfs_hammer2 + hammer2 userspace tools
 ./deploy.sh install   # cp hammer2.ko /boot/kernel/ + install binaries
+./deploy.sh reload    # kldunload + kldload hammer2 (no reboot)
 ./deploy.sh tests     # tar-pipe tests/ -> /root/hammer2-tests/
                       # + src/diag/ -> /root/h2diag/
 ```
+
+The `fast` action is the inner-loop workhorse: source edit → tested
+behaviour in ~20 seconds (vs ~20 min for a full kernel rebuild + reboot).
+The first build still needs a one-time `make nativekernel KERNCONF=H2DEV`
+on the VM to populate `/usr/obj/usr/src/sys/H2DEV/` — without it,
+`deploy.sh build` falls back to the KMOD .ko which the DragonFly loader
+rejects with `file has no contents`.
 
 Env: `DFLY_HOST` (default `h2dev`).
 

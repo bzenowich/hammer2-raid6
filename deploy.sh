@@ -78,22 +78,48 @@ do_build() {
     echo "==> Building on VM (${DFLY_HOST})..."
     ssh "$VM" sh <<'ENDSSH'
 set -e
-echo "--- hammer2 kernel module ---"
+# Fast KMOD build: produces /usr/src/sys/vfs/hammer2/hammer2.ko in
+# seconds.  This .ko loads fine via kldload at runtime; it just isn't
+# loadable via /boot/loader at boot (that needs the kernel-tree
+# variant from `make installkernel`, which deploy.sh install copies).
+# For the inner edit-test loop, KMOD + kldload is the right path.
+echo "--- hammer2.ko (KMOD, runtime-loadable) ---"
 cd /usr/src/sys/vfs/hammer2
-make clean > /dev/null 2>&1 || true
 make
 
 echo "--- newfs_hammer2 ---"
 cd /usr/src/sbin/newfs_hammer2
-make clean > /dev/null 2>&1 || true
 make
 
 echo "--- hammer2 utility ---"
 cd /usr/src/sbin/hammer2
-make clean > /dev/null 2>&1 || true
 make
 
 echo "--- Build complete ---"
+ENDSSH
+}
+
+do_reload() {
+    echo "==> Live-reloading hammer2.ko on ${DFLY_HOST}..."
+    ssh "$VM" sh <<'ENDSSH'
+set -e
+# Drop the running hammer2 and load the freshly-built KMOD .ko in
+# place.  Requires no hammer2 filesystem to be mounted; `mount` is
+# checked first and a hammer2 mount aborts the reload.
+if mount | grep -q hammer2; then
+    echo "    ERROR: a hammer2 filesystem is mounted — unmount first or reboot."
+    mount | grep hammer2
+    exit 1
+fi
+# Drop any hammer2 .ko by id (handles modules loaded under non-standard
+# names — e.g. /tmp/kmod_hammer2.ko shows up in kldstat as kmod_hammer2).
+kldstat | awk '/hammer2/ { print $1 }' | while read id; do
+    [ -n "$id" ] && kldunload -i "$id" 2>/dev/null || true
+done
+kldload /usr/src/sys/vfs/hammer2/hammer2.ko
+kldstat | grep hammer2
+echo "    sysctl probe:"
+sysctl vfs.hammer2.inject_eio_disk_mask 2>/dev/null || echo "      (sysctl absent)"
 ENDSSH
 }
 
@@ -154,7 +180,14 @@ case "$ACTION" in
     sync)    do_sync ;;
     build)   do_build ;;
     install) do_install ;;
+    reload)  do_reload ;;
     tests)   do_tests ;;
+    fast)
+        do_sync
+        do_build
+        do_reload
+        do_tests
+        ;;
     all)
         do_sync
         do_build
@@ -162,7 +195,15 @@ case "$ACTION" in
         do_tests
         ;;
     *)
-        echo "Usage: $0 [sync|build|install|tests|all]"
+        echo "Usage: $0 [sync|build|install|reload|tests|fast|all]"
+        echo ""
+        echo "  fast = sync + build + reload + tests"
+        echo "         (no reboot — KMOD .ko + kldload; requires no"
+        echo "         hammer2 fs mounted)"
+        echo "  all  = sync + build + install + tests"
+        echo "         (install needs a prior `make installkernel` to"
+        echo "         have produced a loader-compatible .ko; reboot"
+        echo "         to activate it)"
         exit 1
         ;;
 esac
