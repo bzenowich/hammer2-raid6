@@ -164,10 +164,18 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 		dbase = (hammer2_off_t)disk_idx << HAMMER2_RAID6_DISK_SHIFT;
 		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
 	} else {
-		/* Path C: JBOD / non-RAID, or v4 metadata pre-Group I. */
+		/* Path C: JBOD / non-RAID, or v4 metadata. */
 		vol = hammer2_get_volume(hmp, pbase);
 		dbase = vol->offset;
 		*devvp_out = vol->dev->devvp;
+		/*
+		 * v4 RAIDZ2-native metadata: identify the primary disk so
+		 * putblk can mirror the write to surviving siblings, and
+		 * getblk can read from a sibling if this disk is failed.
+		 */
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+			disk_idx = vol->id;
 	}
 
 	*pbase_out = pbase;
@@ -406,15 +414,37 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			preempt_data = dio->absent_data;
 		}
 		if (preempt_data) {
+			int is_meta = (dio->btype ==
+				    HAMMER2_BREF_TYPE_INODE ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_INDIRECT ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_FREEMAP_NODE ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 			if (dio->bp)
 				bkvasync(dio->bp);
-			error = hammer2_io_raid6_read_degraded(
+			if (is_meta &&
+			    hmp->voldata.version >=
+			     HAMMER2_VOL_VERSION_RAIDZ2) {
+				/*
+				 * I5: metadata is N-way-mirrored, so a
+				 * failed primary disk falls back to any
+				 * surviving sibling at the same per-disk
+				 * byte offset — no parity reconstruction.
+				 */
+				error = hammer2_io_metadata_mirror_read(hmp,
+				    dio->disk_idx, dev_pbase,
+				    preempt_data, dio->psize);
+			} else {
+				error = hammer2_io_raid6_read_degraded(
 					hmp, dio->pbase, dio->disk_idx,
 					preempt_data, dio->psize,
 					(dio->btype ==
 					    HAMMER2_BREF_TYPE_DATA ||
 					 dio->btype ==
 					    HAMMER2_BREF_TYPE_DIRENT) ? 1 : 0);
+			}
 			switch(op) {
 			case HAMMER2_DOP_NEW:
 				if (dio->pbase ==
@@ -581,6 +611,14 @@ io_done:
 				dio->disk_idx);
 		}
 		if (hmp->raid_nfailed <= 2) {
+			int is_meta = (dio->btype ==
+				    HAMMER2_BREF_TYPE_INODE ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_INDIRECT ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_FREEMAP_NODE ||
+				   dio->btype ==
+				    HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 			if (dio->bp) {
 				brelse(dio->bp);
 				dio->bp = NULL;
@@ -589,13 +627,24 @@ io_done:
 					 GETBLK_KVABIO, 0);
 			if (dio->bp) {
 				bkvasync(dio->bp);
-				error = hammer2_io_raid6_read_degraded(
-						hmp, dio->pbase, dio->disk_idx,
-						dio->bp->b_data, dio->psize,
-						(dio->btype ==
-						    HAMMER2_BREF_TYPE_DATA ||
-						 dio->btype ==
-						    HAMMER2_BREF_TYPE_DIRENT) ? 1 : 0);
+				if (is_meta &&
+				    hmp->voldata.version >=
+				     HAMMER2_VOL_VERSION_RAIDZ2) {
+					error =
+					    hammer2_io_metadata_mirror_read(
+					    hmp, dio->disk_idx, dev_pbase,
+					    dio->bp->b_data, dio->psize);
+				} else {
+					error =
+					    hammer2_io_raid6_read_degraded(
+					    hmp, dio->pbase, dio->disk_idx,
+					    dio->bp->b_data, dio->psize,
+					    (dio->btype ==
+						HAMMER2_BREF_TYPE_DATA ||
+					     dio->btype ==
+						HAMMER2_BREF_TYPE_DIRENT)
+					    ? 1 : 0);
+				}
 				dio->error = error;
 			}
 		}
@@ -712,6 +761,8 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		 */
 		if (orefs & HAMMER2_DIO_DIRTY) {
 			char *raid6_data = NULL;
+			char *md_mirror_data = NULL;
+			int v4_meta = 0;
 
 			dio_write_stats_update(dio, bp);
 
@@ -720,23 +771,46 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * parity-protected btypes (DATA/DIRENT) before
 			 * releasing bp.  Parity is computed after bp is
 			 * released so write_scratch's P/Q writes do not
-			 * contend with this bp.  INODE/INDIRECT/FREEMAP_*
-			 * are not parity-protected pre-Group I and don't
-			 * need a copy.
+			 * contend with this bp.
+			 *
+			 * For metadata btypes (INODE/INDIRECT/FREEMAP_*)
+			 * we capture for the N-way mirror write to sibling
+			 * disks (I5).
 			 */
 			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-			    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
-			     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
-				if (bp) {
-					bkvasync(bp);
-					raid6_data = kmalloc(psize, M_HAMMER2,
-							     M_WAITOK);
-					bcopy(bp->b_data, raid6_data, psize);
-				} else if (dio->absent_data) {
-					/* Transfer absent buffer ownership to raid6_data */
-					raid6_data = dio->absent_data;
-					dio->absent_data = NULL;
+			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+				if (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+				    dio->btype == HAMMER2_BREF_TYPE_DIRENT) {
+					if (bp) {
+						bkvasync(bp);
+						raid6_data = kmalloc(psize,
+						    M_HAMMER2, M_WAITOK);
+						bcopy(bp->b_data, raid6_data,
+						    psize);
+					} else if (dio->absent_data) {
+						raid6_data = dio->absent_data;
+						dio->absent_data = NULL;
+					}
+				} else if (dio->btype ==
+					    HAMMER2_BREF_TYPE_INODE ||
+					   dio->btype ==
+					    HAMMER2_BREF_TYPE_INDIRECT ||
+					   dio->btype ==
+					    HAMMER2_BREF_TYPE_FREEMAP_NODE ||
+					   dio->btype ==
+					    HAMMER2_BREF_TYPE_FREEMAP_LEAF) {
+					v4_meta = 1;
+					if (bp) {
+						bkvasync(bp);
+						md_mirror_data = kmalloc(psize,
+						    M_HAMMER2, M_WAITOK);
+						bcopy(bp->b_data,
+						    md_mirror_data, psize);
+					} else if (dio->absent_data) {
+						md_mirror_data =
+						    dio->absent_data;
+						dio->absent_data = NULL;
+					}
 				}
 			}
 
@@ -822,6 +896,23 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				    dio->disk_idx, raid6_data, psize);
 				kfree(raid6_data, M_HAMMER2);
 				raid6_data = NULL;
+			}
+
+			/*
+			 * v4 RAIDZ2-native metadata mirror (I5).  After the
+			 * primary bp has been disposed above (bdwrite /
+			 * cluster_write / bawrite to dio->devvp), replicate
+			 * the same payload synchronously to every surviving
+			 * sibling disk at the same per-disk byte offset.
+			 * skip_disk_idx avoids re-writing to the primary.
+			 */
+			if (v4_meta && md_mirror_data) {
+				hammer2_off_t per_disk_off = pbase - dio->dbase;
+				hammer2_io_metadata_mirror_write(hmp,
+				    dio->disk_idx, per_disk_off,
+				    md_mirror_data, psize);
+				kfree(md_mirror_data, M_HAMMER2);
+				md_mirror_data = NULL;
 			}
 		} else if (bp) {
 			/* Non-dirty, non-RAID6-absent disposal of bp */
