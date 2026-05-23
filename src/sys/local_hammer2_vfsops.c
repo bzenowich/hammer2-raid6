@@ -79,6 +79,7 @@ int hammer2_spread_workers;
 int hammer2_limit_saved_depth;
 int hammer2_j2_allow_rollback = 0;	/* v4 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v4 quorum: max TXG rollback */
+uint32_t hammer2_inject_eio_disk_mask = 0; /* v4 EIO injection bitmask */
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -145,6 +146,10 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, j2_rollback_max, CTLFLAG_RW,
 	   &hammer2_j2_rollback_max, 0,
 	   "v4 RAID6: maximum TXGs to search backwards for a "
 	   "majority-supported seqno before giving up");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_eio_disk_mask, CTLFLAG_RW,
+	   &hammer2_inject_eio_disk_mask, 0,
+	   "v4 RAID6 fault injection: bitmask of disk indices to force "
+	   "EIO on (no auto-fail).  Default 0 (disabled).");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
 	   &hammer2_chain_allocs, 0, "");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,

@@ -539,7 +539,10 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			break;
 		}
 	} else {
-		if (hce > 0) {
+		error = hammer2_inject_eio(dio->disk_idx);
+		if (error) {
+			/* fault injection: skip primary I/O, error cascades */
+		} else if (hce > 0) {
 			/*
 			 * Synchronous cluster I/O for now.
 			 */
@@ -603,8 +606,15 @@ io_done:
 	 * reconstruction from surviving disks + parity.
 	 */
 	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-		/* Mark this disk as failed (auto-detect from I/O error) */
-		if (dio->disk_idx >= 0 && !hmp->raid_failed[dio->disk_idx]) {
+		int injected = (dio->disk_idx >= 0 &&
+				hammer2_inject_eio(dio->disk_idx) != 0);
+		/*
+		 * Mark this disk as failed (auto-detect from I/O error).
+		 * Skip the auto-fail when the EIO came from the test
+		 * injection sysctl so the test stays repeatable.
+		 */
+		if (!injected && dio->disk_idx >= 0 &&
+		    !hmp->raid_failed[dio->disk_idx]) {
 			hmp->raid_failed[dio->disk_idx] = 1;
 			atomic_add_int(&hmp->raid_nfailed, 1);
 			kprintf("hammer2: RAID6 disk %d failed (I/O error)\n",
@@ -1459,16 +1469,20 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 
 			vol = &hmp->volumes[phys_disk];
 			bp = NULL;
-			lerror = breadnx(vol->dev->devvp, phys_off,
-					 stripe_unit, 0, NULL, NULL, 0, &bp);
+			lerror = hammer2_inject_eio(phys_disk);
+			if (lerror == 0)
+				lerror = breadnx(vol->dev->devvp, phys_off,
+						 stripe_unit, 0, NULL, NULL,
+						 0, &bp);
 			if (lerror == 0 && bp) {
 				bkvasync(bp);
 				bcopy(bp->b_data, col_bufs[col], stripe_unit);
 				brelse(bp);
 			} else {
+				int injected = hammer2_inject_eio(phys_disk);
 				if (bp)
 					brelse(bp);
-				{
+				if (!injected) {
 					int aerr =
 					    hammer2_raid6_auto_fail_disk(
 						hmp, phys_disk);
@@ -1729,14 +1743,19 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					     MD_CHUNK : (ms - off));
 
 				bp = NULL;
-				lerror = bread(vol->dev->devvp,
-				    (off_t)(mo + off), (int)this_chunk, &bp);
+				lerror = hammer2_inject_eio(surv);
+				if (lerror == 0)
+					lerror = bread(vol->dev->devvp,
+					    (off_t)(mo + off),
+					    (int)this_chunk, &bp);
 				if (lerror || bp == NULL) {
 					if (bp)
 						brelse(bp);
 					kprintf("hammer2: resilver Phase A: "
-						"read err %d at off %jx\n",
-						lerror, (intmax_t)(mo + off));
+						"read err %d at off %jx "
+						"(disk %d)\n",
+						lerror, (intmax_t)(mo + off),
+						surv);
 					kfree(md_buf, M_HAMMER2);
 					hmp->resilver_running = 0;
 					return EIO;
@@ -1838,15 +1857,28 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 			vol = &hmp->volumes[phys_disk];
 			bp = NULL;
-			lerror = breadnx(vol->dev->devvp, phys_off,
-					 stripe_unit, 0, NULL, NULL, 0, &bp);
+			lerror = hammer2_inject_eio(phys_disk);
+			if (lerror == 0)
+				lerror = breadnx(vol->dev->devvp, phys_off,
+						 stripe_unit, 0, NULL, NULL,
+						 0, &bp);
 			if (lerror == 0 && bp) {
 				bkvasync(bp);
 				bcopy(bp->b_data, col_bufs[col], stripe_unit);
 				brelse(bp);
 			} else {
+				int injected = hammer2_inject_eio(phys_disk);
 				if (bp)
 					brelse(bp);
+				if (injected) {
+					/* injection: surface as clean EIO, no auto-fail */
+					error = EIO;
+					kprintf("hammer2: resilver stripe %llu: "
+						"injected EIO on disk %d\n",
+						(unsigned long long)stripe_num,
+						phys_disk);
+					goto resilver_done;
+				}
 				{
 					int aerr = hammer2_raid6_auto_fail_disk(
 							hmp, phys_disk);

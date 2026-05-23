@@ -578,8 +578,10 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 			continue;
 
 		bp = NULL;
-		last_err = bread(vol->dev->devvp, per_disk_off,
-				 (int)bytes, &bp);
+		last_err = hammer2_inject_eio(i);
+		if (last_err == 0)
+			last_err = bread(vol->dev->devvp, per_disk_off,
+					 (int)bytes, &bp);
 		if (last_err == 0 && bp) {
 			bkvasync(bp);
 			bcopy(bp->b_data, buf, bytes);
