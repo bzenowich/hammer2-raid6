@@ -101,7 +101,33 @@ do_install() {
     echo "==> Installing on VM..."
     ssh "$VM" sh <<'ENDSSH'
 set -e
-cp /usr/src/sys/vfs/hammer2/hammer2.ko /boot/kernel/hammer2.ko
+# Pick the right hammer2.ko.  The KMOD-style /usr/src/sys/vfs/hammer2/
+# hammer2.ko (produced by `make` inside the VFS dir) is a valid ELF
+# relocatable but the DragonFly loader rejects it with "file has no
+# contents" — it lacks the linker_set metadata the kernel-tree build
+# emits.  Prefer the kernel-tree-built .ko (lives under /usr/obj for
+# whichever KERNCONF was last built); fall back to the KMOD .ko with
+# a warning.
+KO_KMOD=/usr/src/sys/vfs/hammer2/hammer2.ko
+KO_OBJ=""
+for cfg in H2DEV X86_64_GENERIC; do
+    candidate=/usr/obj/usr/src/sys/${cfg}/usr/src/sys/vfs/hammer2/hammer2.ko
+    if [ -f "$candidate" ]; then
+        KO_OBJ="$candidate"
+        break
+    fi
+done
+if [ -n "$KO_OBJ" ]; then
+    cp "$KO_OBJ" /boot/kernel/hammer2.ko
+    echo "    installed kernel-tree hammer2.ko ($(stat -f %z "$KO_OBJ") bytes)"
+    echo "    from $KO_OBJ"
+else
+    echo "    WARNING: no kernel-tree hammer2.ko found under /usr/obj."
+    echo "             The KMOD .ko at $KO_KMOD is NOT loader-compatible."
+    echo "             Run 'cd /usr/src && make nativekernel KERNCONF=H2DEV"
+    echo "             && make reinstallkernel KERNCONF=H2DEV' first."
+    exit 1
+fi
 install -m 755 /usr/src/sbin/newfs_hammer2/newfs_hammer2 /sbin/newfs_hammer2
 install -m 755 /usr/src/sbin/hammer2/hammer2 /sbin/hammer2
 echo "--- Install complete ---"
