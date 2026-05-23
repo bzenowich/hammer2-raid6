@@ -1298,9 +1298,26 @@ next_hmp:
 			 * Allocate and load the physical stripe bitmap.
 			 * Tracks which stripe slots are allocated so the
 			 * allocator never re-uses an in-use slot.
+			 *
+			 * H4: bitmap_invalid (torn write, missing/corrupt
+			 * header, disk 0 absent) means we can't safely
+			 * allocate without risking reissue of live slots.
+			 * Refuse RW mount until a blockref-walk rebuild lands;
+			 * RO mount stays allowed for inspection/recovery.
 			 */
 			hammer2_raid6_bitmap_init(hmp);
 			hammer2_raid6_bitmap_read(hmp);
+			if (hmp->stripe_bitmap_invalid && !ronly) {
+				kprintf("hammer2: stripe bitmap invalid; "
+					"refusing RW mount. Mount read-only "
+					"to inspect, or re-run "
+					"`hammer2 raid scrub` once the "
+					"bitmap walker lands.\n");
+				hammer2_unmount_helper(mp, NULL, hmp);
+				lockmgr(&hammer2_mntlk, LK_RELEASE);
+				hammer2_vfs_unmount(mp, MNT_FORCE);
+				return EROFS;
+			}
 
 			/*
 			 * Load the metadata-zone extent table from voldata.
