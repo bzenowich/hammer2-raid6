@@ -44,7 +44,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D F G I}"
+GROUPS="${*:-A B C D E F G H I}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -52,10 +52,12 @@ for GROUP in $GROUPS; do
     B) run_group "Group B" "$SCRIPTDIR/test_b_single_fail.sh"  ;;
     C) run_group "Group C" "$SCRIPTDIR/test_c_dual_fail.sh"    ;;
     D) run_group "Group D" "$SCRIPTDIR/test_d_resilver.sh"     ;;
+    E) run_group "Group E" "$SCRIPTDIR/test_e_eio_inject.sh"   ;;
     F) run_group "Group F" "$SCRIPTDIR/test_f_cow_invariant.sh" ;;
     G) run_group "Group G" "$SCRIPTDIR/test_g_autofail.sh"     ;;
+    H) run_group "Group H" "$SCRIPTDIR/test_h_snap_degraded.sh" ;;
     I) run_group "Group I" "$SCRIPTDIR/test_i_unclean.sh"      ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D F G I)" ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I)" ;;
     esac
 done
 
