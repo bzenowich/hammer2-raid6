@@ -48,6 +48,9 @@
 #include "hammer2.h"
 #include "hammer2_raid6.h"
 
+extern int hammer2_j2_allow_rollback;
+extern int hammer2_j2_rollback_max;
+
 #define hprintf(X, ...)	kprintf("hammer2_ondisk: " X, ## __VA_ARGS__)
 
 static int
@@ -1020,7 +1023,9 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		uint32_t at_target;
 		uint64_t lowest = (uint64_t)-1;
 		uint32_t seen_count = 0;
-		uint32_t rollback_max = 8; /* TBD: tunable */
+		uint32_t rollback_max = (uint32_t)
+		    (hammer2_j2_rollback_max > 0 ?
+		     hammer2_j2_rollback_max : 8);
 		int j;
 
 		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
@@ -1056,20 +1061,48 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		}
 
 		if (fallback != target) {
+			if (!hammer2_j2_allow_rollback) {
+				hprintf("v4 quorum: would roll back "
+					"%ju -> %ju (%u/%u disks at "
+					"fallback seq); refusing.  Set "
+					"vfs.hammer2.j2_allow_rollback=1 to "
+					"authorize and accept the loss of "
+					"writes between those TXGs.\n",
+					(uintmax_t)target,
+					(uintmax_t)fallback,
+					at_target, ndisks);
+				error = ENXIO;
+				goto done;
+			}
 			hprintf("v4 quorum: rolling back %ju -> %ju "
-				"(%u/%u disks at fallback seq)\n",
+				"(%u/%u disks at fallback seq) "
+				"per j2_allow_rollback=1\n",
 				(uintmax_t)target, (uintmax_t)fallback,
 				at_target, ndisks);
 			/*
-			 * NB: rootvoldata still reflects the (no-longer-
-			 * committed) higher seqno.  A full rollback would
-			 * re-read voldata from a fallback-seqno disk; for
-			 * now we log and surface ENXIO unless the admin
-			 * forces with `hammer2 raid mount --rollback`
-			 * (TBD).  Force-mount path isn't wired here yet.
+			 * Re-read voldata from a fallback-seqno disk so
+			 * rootvoldata reflects the seqno we'll actually
+			 * mount at.  The first matching disk wins; the
+			 * extent table / disk_state / etc. all come from
+			 * that disk's copy.
 			 */
-			error = ENXIO;
-			goto done;
+			TAILQ_FOREACH(e, devvpl, entry) {
+				if (e->devvp == NULL || !e->open)
+					continue;
+				if (hammer2_read_volume_header(e->devvp,
+				    e->path, voldata) < 0)
+					continue;
+				if (voldata->version <
+				    HAMMER2_VOL_VERSION_RAIDZ2)
+					continue;
+				if (voldata->raid_config.v4_txg_seq ==
+				    fallback) {
+					bcopy(voldata, rootvoldata,
+					      sizeof(*rootvoldata));
+					*rootvoldevvp = e->devvp;
+					break;
+				}
+			}
 		}
 
 		/*

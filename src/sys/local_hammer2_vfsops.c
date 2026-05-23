@@ -77,6 +77,8 @@ int hammer2_dio_limit = 256;
 int hammer2_bulkfree_tps = 5000;
 int hammer2_spread_workers;
 int hammer2_limit_saved_depth;
+int hammer2_j2_allow_rollback = 0;	/* v4 quorum: allow rollback mount */
+int hammer2_j2_rollback_max = 8;	/* v4 quorum: max TXG rollback */
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -135,6 +137,14 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
 	   &hammer2_flush_pipe, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, bulkfree_tps, CTLFLAG_RW,
 	   &hammer2_bulkfree_tps, 0, "");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, j2_allow_rollback, CTLFLAG_RW,
+	   &hammer2_j2_allow_rollback, 0,
+	   "v4 RAID6: allow mount to roll back when no majority at "
+	   "the latest TXG (data between latest and majority is lost)");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, j2_rollback_max, CTLFLAG_RW,
+	   &hammer2_j2_rollback_max, 0,
+	   "v4 RAID6: maximum TXGs to search backwards for a "
+	   "majority-supported seqno before giving up");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
 	   &hammer2_chain_allocs, 0, "");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,

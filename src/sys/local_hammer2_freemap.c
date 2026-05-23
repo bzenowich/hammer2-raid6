@@ -45,6 +45,8 @@
 struct hammer2_fiterate {
 	hammer2_off_t	bpref;
 	hammer2_off_t	bnext;
+	hammer2_off_t	bmin;	/* hard floor (0 = unbounded) */
+	hammer2_off_t	bmax;	/* hard ceiling (0 = use total_size) */
 	int		loops;
 	int		relaxed;
 };
@@ -276,14 +278,17 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	KKASSERT(hindex < HAMMER2_FREEMAP_HEUR_SIZE);
 
 	iter.bpref = hmp->heur_freemap[hindex];
+	iter.bmin = 0;
+	iter.bmax = 0;
 	iter.relaxed = hmp->freemap_relaxed;
 
 	/*
-	 * v4 RAIDZ2-native: bias non-DATA/DIRENT allocations toward the
-	 * metadata zone (metadata_zone.md) so INODE/INDIRECT/FREEMAP_*
-	 * cluster in a narrow LBA band for HDD locality.  Hard restriction
-	 * to the extent range is a follow-up; here we only set the hint and
-	 * rely on the freemap iterator to honor it under normal pressure.
+	 * v4 RAIDZ2-native: hard-restrict non-DATA/DIRENT allocations to
+	 * the metadata zone (metadata_zone.md).  Setting bmin/bmax causes
+	 * hammer2_freemap_iterate to wrap inside the zone instead of into
+	 * the data area, and to return ENOSPC if the entire zone is full.
+	 * This prevents metadata from leaking into the stripe data range,
+	 * which would break the mirror-write invariant in I5.
 	 */
 	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
@@ -292,6 +297,8 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	    bref->type != HAMMER2_BREF_TYPE_DIRENT) {
 		hammer2_off_t mo = hmp->md_extents[0].md_off;
 		hammer2_off_t ms = hmp->md_extents[0].md_size;
+		iter.bmin = mo;
+		iter.bmax = mo + ms;
 		if (iter.bpref < mo || iter.bpref >= mo + ms)
 			iter.bpref = mo;
 	}
@@ -950,11 +957,12 @@ hammer2_freemap_iterate(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
 			hammer2_fiterate_t *iter)
 {
 	hammer2_dev_t *hmp = (*parentp)->hmp;
+	hammer2_off_t ceiling = iter->bmax ? iter->bmax : hmp->total_size;
 
 	iter->bnext &= ~HAMMER2_FREEMAP_LEVEL1_MASK;
 	iter->bnext += HAMMER2_FREEMAP_LEVEL1_SIZE;
-	if (iter->bnext >= hmp->total_size) {
-		iter->bnext = 0;
+	if (iter->bnext >= ceiling) {
+		iter->bnext = iter->bmin;
 		if (++iter->loops >= 2) {
 			if (iter->relaxed == 0)
 				iter->relaxed = 1;
