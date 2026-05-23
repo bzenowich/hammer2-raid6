@@ -1199,6 +1199,101 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
 }
 
 /*
+ * H4-deep: blockref-walk reconstruction of the v4 stripe bitmap.
+ *
+ * Called from vfs_mount when hammer2_raid6_bitmap_read flagged
+ * stripe_bitmap_invalid (torn write, missing/corrupt header, or
+ * disk 0 absent).  Walks the on-disk chain tree from hmp->vchain,
+ * sets a bitmap bit for every reachable DATA/DIRENT blockref's
+ * stripe slot, and on success clears stripe_bitmap_invalid so the
+ * mount can proceed RW.  The new bitmap is persisted at the next
+ * TXG flush via the existing hammer2_raid6_bitmap_write path.
+ */
+static int
+hammer2_v4_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+{
+	hammer2_off_t phys_off;
+	uint64_t slot;
+	int byte_idx, bit_idx;
+
+	if (bref->type != HAMMER2_BREF_TYPE_DATA &&
+	    bref->type != HAMMER2_BREF_TYPE_DIRENT)
+		return 0;
+	if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0)
+		return 0;
+
+	phys_off = bref->data_off & HAMMER2_RAID6_PHYS_MASK;
+	if (phys_off < HAMMER2_ZONE_SEG64)
+		return 0;
+	slot = (phys_off - HAMMER2_ZONE_SEG64) /
+	    hmp->raid_config.stripe_unit;
+	if (slot >= hmp->stripe_num_slots)
+		return 0;
+	byte_idx = (int)(slot / 8);
+	bit_idx  = (int)(slot % 8);
+	if (byte_idx >= (int)hmp->stripe_bitmap_size)
+		return 0;
+
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+	if (slot >= hmp->stripe_cursor)
+		hmp->stripe_cursor = slot + 1;
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	return 0;
+}
+
+static int
+hammer2_v4_walk_chain(hammer2_dev_t *hmp, hammer2_chain_t *parent)
+{
+	hammer2_chain_t *chain = NULL;
+	hammer2_blockref_t bref;
+	int first = 1;
+	int error;
+
+	for (;;) {
+		error = hammer2_chain_scan(parent, &chain, &bref, &first,
+					   HAMMER2_LOOKUP_ALWAYS);
+		if (error & HAMMER2_ERROR_EOF) {
+			error = 0;
+			break;
+		}
+		if (error)
+			break;
+
+		(void)hammer2_v4_record_bref(hmp, &bref);
+
+		if (chain) {
+			error = hammer2_v4_walk_chain(hmp, chain);
+			if (error)
+				break;
+		}
+	}
+	if (chain) {
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+	}
+	return error;
+}
+
+int
+hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
+{
+	int error;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hmp->stripe_bitmap != NULL);
+
+	bzero(hmp->stripe_bitmap, hmp->stripe_bitmap_size);
+	hmp->stripe_cursor = HAMMER2_STRIPE_V4_START;
+
+	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
+	error = hammer2_v4_walk_chain(hmp, &hmp->vchain);
+	hammer2_chain_unlock(&hmp->vchain);
+	return error;
+}
+
+/*
  * Stripe bitmap on-disk layout (see docs/stripe_bitmap.md):
  *
  *   page 0:                 header

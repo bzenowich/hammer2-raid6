@@ -1317,16 +1317,26 @@ next_hmp:
 			 */
 			hammer2_raid6_bitmap_init(hmp);
 			hammer2_raid6_bitmap_read(hmp);
-			if (hmp->stripe_bitmap_invalid && !ronly) {
+			if (hmp->stripe_bitmap_invalid) {
+				int rerr;
+
 				kprintf("hammer2: stripe bitmap invalid; "
-					"refusing RW mount. Mount read-only "
-					"to inspect, or re-run "
-					"`hammer2 raid scrub` once the "
-					"bitmap walker lands.\n");
-				hammer2_unmount_helper(mp, NULL, hmp);
-				lockmgr(&hammer2_mntlk, LK_RELEASE);
-				hammer2_vfs_unmount(mp, MNT_FORCE);
-				return EROFS;
+					"walking blockref tree to rebuild...\n");
+				rerr = hammer2_v4_rebuild_stripe_bitmap(hmp);
+				if (rerr == 0) {
+					kprintf("hammer2: stripe bitmap "
+						"reconstructed from blockref "
+						"walk\n");
+					hmp->stripe_bitmap_invalid = 0;
+				} else if (!ronly) {
+					kprintf("hammer2: stripe bitmap "
+						"rebuild failed (err %d); "
+						"refusing RW mount\n", rerr);
+					hammer2_unmount_helper(mp, NULL, hmp);
+					lockmgr(&hammer2_mntlk, LK_RELEASE);
+					hammer2_vfs_unmount(mp, MNT_FORCE);
+					return EROFS;
+				}
 			}
 
 			/*
