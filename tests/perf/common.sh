@@ -1,7 +1,12 @@
 #!/bin/sh
 # common.sh — shared helpers for tests/perf.  Runs on the VM.
+#
+# The harness VM puts the SYSTEM disk at /dev/vbd0 and RAID test disks
+# at /dev/vbd1..vbd${NDISKS}.  All formatting must skip vbd0.  See
+# tests/v4/common.sh for the same DISK_BASE convention.
 
 NDISKS="${NDISKS:-4}"
+DISK_BASE="${DISK_BASE:-1}"
 MNTPT="${MNTPT:-/mnt/perf}"
 LABEL="${LABEL:-PERF}"
 RESULTS="${RESULTS:-/var/tmp/perf_results}"
@@ -10,13 +15,14 @@ DEVS=""
 DEVSPEC=""
 i=0
 while [ "$i" -lt "$NDISKS" ]; do
-    dev="/dev/vbd${i}"
+    dev="/dev/vbd$((DISK_BASE + i))"
     DEVS="${DEVS} ${dev}"
     DEVSPEC="${DEVSPEC:+${DEVSPEC}:}${dev}"
     i=$((i + 1))
 done
 PFSPATH_V4="${DEVSPEC}@${LABEL}"
-PFSPATH_1D="/dev/vbd0@${LABEL}"
+# h2-1disk baseline uses the first test disk (NOT vbd0 which is root).
+PFSPATH_1D="/dev/vbd${DISK_BASE}@${LABEL}"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
@@ -29,10 +35,10 @@ unmount_quiet() {
 }
 
 zap_disks() {
-    # Wipe HAMMER2 reserved zone on every disk so newfs is clean.
+    # Wipe HAMMER2 reserved zone on every test disk (skip vbd0=root).
     local j=0
     while [ "$j" -lt "$NDISKS" ]; do
-        dd if=/dev/zero of=/dev/vbd${j} bs=65536 count=1024 \
+        dd if=/dev/zero of=/dev/vbd$((DISK_BASE + j)) bs=65536 count=1024 \
             >/dev/null 2>&1 || true
         j=$((j + 1))
     done
@@ -41,7 +47,8 @@ zap_disks() {
 setup_h2_1disk() {
     unmount_quiet
     zap_disks
-    newfs_hammer2 -L "$LABEL" /dev/vbd0 >/dev/null || die "newfs 1disk failed"
+    newfs_hammer2 -L "$LABEL" /dev/vbd${DISK_BASE} >/dev/null \
+        || die "newfs 1disk failed"
     mkdir -p "$MNTPT"
     mount -t hammer2 "$PFSPATH_1D" "$MNTPT" || die "mount 1disk failed"
 }
@@ -59,8 +66,8 @@ setup_v4_degraded() {
     setup_v4_healthy
     # Fail one data column (index 2).  Index 0 and N-1 are typically
     # P/Q for stripe 0; idx 2 is a stable data column for NDISKS>=4.
-    hammer2 -s "$MNTPT" raid fail-disk /dev/vbd2 >/dev/null 2>&1 \
-        || die "raid fail-disk failed"
+    hammer2 -s "$MNTPT" raid fail-disk /dev/vbd$((DISK_BASE + 2)) \
+        >/dev/null 2>&1 || die "raid fail-disk failed"
 }
 
 teardown_config() {

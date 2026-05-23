@@ -3,9 +3,17 @@
 # Authoritative test substrate is virtio-blk (/dev/vbd*); per
 # newplan.md §8, vn-backed runs are no longer supported.
 #
+# The harness VM (launch-dfly.sh) places the SYSTEM disk at /dev/vbd0
+# and the RAID test disks at /dev/vbd1..vbd${NDISKS}.  Test disks must
+# never include vbd0 or the next setup_fresh will newfs the root
+# filesystem and panic the box.  $DISK_BASE is the offset into vbd*
+# (default 1 = skip system); override with DISK_BASE=0 only if your
+# harness puts test disks at vbd0 (no current launch-dfly config does).
+#
 # NDISKS: number of disks to use (default 4, supports 4-6).
 
 NDISKS="${NDISKS:-4}"
+DISK_BASE="${DISK_BASE:-1}"
 MNTPT=/mnt/v4test
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
 
@@ -14,7 +22,7 @@ DEVS=""
 DEVSPEC=""
 i=0
 while [ "$i" -lt "$NDISKS" ]; do
-    dev="/dev/vbd${i}"
+    dev="/dev/vbd$((DISK_BASE + i))"
     DEVS="${DEVS} ${dev}"
     if [ -z "$DEVSPEC" ]; then
         DEVSPEC="${dev}"
@@ -25,9 +33,9 @@ while [ "$i" -lt "$NDISKS" ]; do
 done
 PFSPATH="${DEVSPEC}@V4TEST"
 
-# Return the device path for disk index $1
+# Return the device path for disk index $1 (logical 0..NDISKS-1)
 disk_dev() {
-    echo "/dev/vbd${1}"
+    echo "/dev/vbd$((DISK_BASE + $1))"
 }
 
 # Build a DEVSPEC with disk index $1 excluded (for degraded mount)
@@ -56,7 +64,8 @@ detach_disk() {
 # header copies the kernel scans on attach.
 fresh_disk() {
     local idx="$1"
-    dd if=/dev/zero of=/dev/vbd${idx} bs=65536 count=1024 2>/dev/null || true
+    dd if=/dev/zero of=/dev/vbd$((DISK_BASE + idx)) bs=65536 count=1024 \
+        2>/dev/null || true
 }
 
 result() {

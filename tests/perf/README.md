@@ -5,9 +5,13 @@ DragonFly harness VM:
 
 | config        | layout                                       |
 |---------------|----------------------------------------------|
-| `h2-1disk`    | vanilla HAMMER2 on `/dev/vbd0` (baseline)    |
-| `v4-healthy`  | v4 RAID6 across `/dev/vbd0..vbdN-1`          |
-| `v4-degraded` | v4 RAID6 with `/dev/vbd2` failed at runtime  |
+| `h2-1disk`    | vanilla HAMMER2 on `/dev/vbd1` (baseline)    |
+| `v4-healthy`  | v4 RAID6 across `/dev/vbd1..vbdN`            |
+| `v4-degraded` | v4 RAID6 with `/dev/vbd3` failed at runtime  |
+
+`vbd0` is the system disk on the harness VM (see `tests/v4/common.sh`
+header note); test disks start at `vbd1`.  `DISK_BASE=0` overrides the
+offset if your substrate places the FS root elsewhere.
 
 Workloads (`jobs/*.fio`):
 
