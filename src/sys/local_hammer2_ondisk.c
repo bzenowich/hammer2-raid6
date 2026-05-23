@@ -1308,21 +1308,37 @@ hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
 	((HAMMER2_PBUFSIZE - 2 * HAMMER2_STRIPE_BITMAP_PAGE) / \
 	 HAMMER2_STRIPE_BITMAP_PAGE)
 
-static __inline uint32_t
+static uint32_t
 hammer2_stripe_bitmap_crc(const hammer2_stripe_bitmap_header_t *hdr,
 			  const uint8_t *bitmap, size_t bitmap_pages,
 			  const hammer2_stripe_bitmap_footer_t *ftr)
 {
-	hammer2_stripe_bitmap_header_t h = *hdr;
-	hammer2_stripe_bitmap_footer_t f = *ftr;
+	static const uint8_t zero_crc[sizeof(hdr->crc)] = { 0 };
+	const size_t hdr_crc_off = offsetof(hammer2_stripe_bitmap_header_t, crc);
+	const size_t ftr_crc_off = offsetof(hammer2_stripe_bitmap_footer_t, crc);
 	uint32_t c;
 
-	bzero(h.crc, sizeof(h.crc));
-	bzero(f.crc, sizeof(f.crc));
-	c = hammer2_icrc32(&h, sizeof(h));
+	/*
+	 * Compute the CRC over header + bitmap + footer with the crc[]
+	 * field zeroed in each.  Earlier code did this by copying the
+	 * 4 KB header and footer onto the stack, zeroing the crc field
+	 * in the copies, and feeding them whole — that blew the kernel
+	 * stack guard page on the first mount (DragonFly per-thread
+	 * stack is ~16 KB; two 4 KB local structs plus caller frames =
+	 * double fault).  Feed the live buffers in three pieces each,
+	 * substituting a 16-byte zero buffer where crc[] lives, with no
+	 * stack copy.
+	 */
+	c = hammer2_icrc32(hdr, hdr_crc_off);
+	c = hammer2_icrc32c(zero_crc, sizeof(zero_crc), c);
+	c = hammer2_icrc32c((const uint8_t *)hdr + hdr_crc_off + sizeof(hdr->crc),
+			    sizeof(*hdr) - hdr_crc_off - sizeof(hdr->crc), c);
 	c = hammer2_icrc32c(bitmap, bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE,
 			    c);
-	c = hammer2_icrc32c(&f, sizeof(f), c);
+	c = hammer2_icrc32c(ftr, ftr_crc_off, c);
+	c = hammer2_icrc32c(zero_crc, sizeof(zero_crc), c);
+	c = hammer2_icrc32c((const uint8_t *)ftr + ftr_crc_off + sizeof(ftr->crc),
+			    sizeof(*ftr) - ftr_crc_off - sizeof(ftr->crc), c);
 	return c;
 }
 
