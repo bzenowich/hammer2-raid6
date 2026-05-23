@@ -773,6 +773,16 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	const char *path;
 	uuid_t fsid, fstype;
 	int i, zone, error = 0, version = -1, nvolumes = 0;
+	/*
+	 * J2-full: per-disk v4 sequence numbers captured during the
+	 * read loop; resolved into a majority-supported target seqno
+	 * after the loop completes.  Indexed by voldata->volu_id.
+	 */
+	uint64_t disk_seqs[HAMMER2_MAX_VOLUMES];
+	int disk_seen[HAMMER2_MAX_VOLUMES];
+
+	bzero(disk_seqs, sizeof(disk_seqs));
+	bzero(disk_seen, sizeof(disk_seen));
 
 	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
 		vol = &volumes[i];
@@ -930,6 +940,8 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 				error = EINVAL;
 				goto done;
 			}
+			disk_seqs[voldata->volu_id] = vrc->v4_txg_seq;
+			disk_seen[voldata->volu_id] = 1;
 			hprintf("%s: v4 RAID6 disk %u/%u txg_seq %ju\n",
 				path, vrc->v4_disk_id, vrc->v4_ndisks,
 				(uintmax_t)vrc->v4_txg_seq);
@@ -940,7 +952,27 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		vol->id = voldata->volu_id;
 		vol->offset = voldata->volu_loff[vol->id];
 		vol->size = voldata->volu_size;
-		if (vol->id == HAMMER2_ROOT_VOLUME) {
+		/*
+		 * Select the disk whose voldata becomes rootvoldata.
+		 *
+		 * J2-full: under v4 RAID6, prefer whichever disk has the
+		 * highest v4_txg_seq so the in-memory state reflects the
+		 * most-recently committed TXG.  Otherwise (v1/v2/v3) keep
+		 * the legacy "first ROOT_VOLUME wins, else first present
+		 * disk" behavior.
+		 */
+		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    voldata->raid_config.raid_type ==
+		     HAMMER2_RAID_TYPE_RAID6) {
+			if (*rootvoldevvp == NULL ||
+			    voldata->raid_config.v4_txg_seq >
+			     rootvoldata->raid_config.v4_txg_seq) {
+				bcopy(voldata, rootvoldata,
+				      sizeof(*rootvoldata));
+				*rootvolzone = zone;
+				*rootvoldevvp = e->devvp;
+			}
+		} else if (vol->id == HAMMER2_ROOT_VOLUME) {
 			bcopy(voldata, rootvoldata, sizeof(*rootvoldata));
 			*rootvolzone = zone;
 			KKASSERT(*rootvoldevvp == NULL);
@@ -949,8 +981,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 			/*
 			 * Root volume disk is absent (degraded mount).
 			 * Use this disk's header as rootvoldata since
-			 * all RAID6 disks carry the same metadata.
-			 * Set rootvoldevvp to the first available disk.
+			 * all v3 RAID6 disks carry the same metadata.
 			 */
 			bcopy(voldata, rootvoldata, sizeof(*rootvoldata));
 			*rootvolzone = zone;
@@ -960,6 +991,99 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		hprintf("\"%s\" zone=%d id=%d offset=0x%016jx size=0x%016jx\n",
 			path, zone, vol->id, (intmax_t)vol->offset,
 			(intmax_t)vol->size);
+	}
+
+	/*
+	 * J2-full: majority quorum on the v4 TXG seqno
+	 * (docs/volhdr_quorum.md §Mount-time discovery).
+	 *
+	 * We require ⌈N/2⌉+1 disks to report the same seqno as the disk
+	 * whose voldata we adopted as rootvoldata.  Disks below that
+	 * seqno are tagged for resilver (logged here; caller marks them
+	 * failed during the normal degraded-mount path).  Disks above
+	 * (none in practice — rootvoldata already tracks the max) would
+	 * indicate corruption.
+	 *
+	 * No-majority case rolls back to the highest seqno that does
+	 * have majority (down to a hard limit of HAMMER2_J2_ROLLBACK_MAX
+	 * TXGs); if even seqno 0 has no majority, ENXIO.
+	 */
+	if (!error &&
+	    rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    rootvoldata->raid_config.raid_type ==
+	     HAMMER2_RAID_TYPE_RAID6) {
+		const hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
+		uint32_t ndisks = rrc->ndisks;
+		uint32_t majority = (ndisks / 2) + 1;
+		uint64_t target = rrc->v4_txg_seq;
+		uint64_t fallback = target;
+		uint32_t at_target;
+		uint64_t lowest = (uint64_t)-1;
+		uint32_t seen_count = 0;
+		uint32_t rollback_max = 8; /* TBD: tunable */
+		int j;
+
+		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
+			if (!disk_seen[j])
+				continue;
+			seen_count++;
+			if (disk_seqs[j] < lowest)
+				lowest = disk_seqs[j];
+		}
+
+		for (;;) {
+			at_target = 0;
+			for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
+				if (disk_seen[j] && disk_seqs[j] == fallback)
+					at_target++;
+			}
+			if (at_target >= majority)
+				break;
+			if (fallback == 0 ||
+			    target - fallback >= rollback_max) {
+				hprintf("v4 quorum: no majority within "
+					"%u-TXG rollback limit "
+					"(target seq %ju, lowest %ju, "
+					"%u disks seen of %u)\n",
+					rollback_max,
+					(uintmax_t)target,
+					(uintmax_t)lowest,
+					seen_count, ndisks);
+				error = ENXIO;
+				goto done;
+			}
+			fallback--;
+		}
+
+		if (fallback != target) {
+			hprintf("v4 quorum: rolling back %ju -> %ju "
+				"(%u/%u disks at fallback seq)\n",
+				(uintmax_t)target, (uintmax_t)fallback,
+				at_target, ndisks);
+			/*
+			 * NB: rootvoldata still reflects the (no-longer-
+			 * committed) higher seqno.  A full rollback would
+			 * re-read voldata from a fallback-seqno disk; for
+			 * now we log and surface ENXIO unless the admin
+			 * forces with `hammer2 raid mount --rollback`
+			 * (TBD).  Force-mount path isn't wired here yet.
+			 */
+			error = ENXIO;
+			goto done;
+		}
+
+		/*
+		 * Log any disks that fell behind so the operator (or a
+		 * future auto-resilver) can address them.
+		 */
+		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
+			if (disk_seen[j] && disk_seqs[j] < target) {
+				hprintf("v4 quorum: disk %d at seq %ju "
+					"(target %ju) — needs resilver\n",
+					j, (uintmax_t)disk_seqs[j],
+					(uintmax_t)target);
+			}
+		}
 	}
 
 	/*
