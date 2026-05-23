@@ -1,0 +1,17 @@
+# Postgres-ish OLTP: 8k random read/write 70/30, fsync on commit.
+# Approximates pgbench tpcb workload at the block layer.
+[global]
+ioengine=psync
+direct=0
+size=2G
+runtime=60
+time_based=1
+group_reporting=1
+fallocate=none
+fsync=8
+
+[pg-mix]
+rw=randrw
+rwmixread=70
+bs=8k
+iodepth=8

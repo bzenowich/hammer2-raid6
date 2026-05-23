@@ -1,0 +1,15 @@
+[global]
+ioengine=psync
+direct=0
+size=4G
+runtime=60
+time_based=1
+group_reporting=1
+fallocate=none
+file_service_type=random
+randrepeat=0
+norandommap=1
+
+[seq-read]
+rw=read
+bs=1M

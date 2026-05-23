@@ -1,0 +1,13 @@
+[global]
+ioengine=psync
+direct=0
+size=2G
+runtime=60
+time_based=1
+group_reporting=1
+fallocate=none
+
+[rand-read]
+rw=randread
+bs=4k
+iodepth=32

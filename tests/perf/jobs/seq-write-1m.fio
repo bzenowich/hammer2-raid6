@@ -1,0 +1,13 @@
+[global]
+ioengine=psync
+direct=0
+size=4G
+runtime=60
+time_based=1
+group_reporting=1
+fallocate=none
+end_fsync=1
+
+[seq-write]
+rw=write
+bs=1M
