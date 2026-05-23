@@ -20,11 +20,11 @@ umount $MNTPT
 
 # Remount without disk G1_DISK — should succeed in degraded mode
 detach_disk "$G1_DISK"
-DEGRADED="$(degraded_spec $G1_DISK)@RZ2TEST"
+DEGRADED="$(degraded_spec $G1_DISK)@V4TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     sha256 $MNTPT/ref_a > /var/tmp/g1_check.txt 2>&1
     sha256 $MNTPT/ref_b >> /var/tmp/g1_check.txt 2>&1
-    if diff -q /var/tmp/rz2_ref.txt /var/tmp/g1_check.txt > /dev/null 2>&1; then
+    if diff -q /var/tmp/v4_ref.txt /var/tmp/g1_check.txt > /dev/null 2>&1; then
         result PASS "G1: degraded remount (absent disk${G1_DISK}) — data correct"
     else
         result FAIL "G1: degraded remount — data mismatch"

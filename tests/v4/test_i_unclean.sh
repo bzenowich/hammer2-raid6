@@ -60,7 +60,7 @@ sync; sync
 umount -f $MNTPT 2>/dev/null || umount $MNTPT 2>/dev/null || true
 
 # Remount degraded (without I2_DISK)
-DEGRADED="$(degraded_spec $I2_DISK)@RZ2TEST"
+DEGRADED="$(degraded_spec $I2_DISK)@V4TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     verify_ref "I2: pre-crash reference intact after degraded unclean unmount" "ref"
     check_no_checkfail "I2"

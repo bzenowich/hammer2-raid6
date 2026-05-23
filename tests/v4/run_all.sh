@@ -1,22 +1,21 @@
 #!/bin/sh
-# run_all.sh — run the full RAIDZ2-native (v4) integration test suite.
+# run_all.sh — run the v4 (RAIDZ2-native) integration test suite
+# against virtio-blk (/dev/vbd*).  vn-backed runs are no longer
+# supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
 #   If no groups are specified, runs all groups (A B C D F G I).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #
 # Environment:
-#   DISK_MODE=vtbd   (default) use physical /dev/vtbd* QEMU block devices
-#   DISK_MODE=vn              use swap-backed vnconfig -S devices
 #   NDISKS=4         (default) number of disks; supports 4-6
 
-DISK_MODE="${DISK_MODE:-vtbd}"
 NDISKS="${NDISKS:-4}"
-export DISK_MODE NDISKS
+export NDISKS
 
 SCRIPTDIR=$(dirname "$0")
 
-echo "RAIDZ2-native test suite: DISK_MODE=$DISK_MODE  NDISKS=$NDISKS"
+echo "v4 RAIDZ2-native test suite: NDISKS=$NDISKS (vbd substrate)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -25,7 +24,7 @@ SUITE_ERRORS=""
 run_group() {
     local name="$1"
     local script="$2"
-    local tmpout="/var/tmp/rz2_group_out.txt"
+    local tmpout="/var/tmp/v4_group_out.txt"
     echo ""
     echo "########## $name ##########"
     # Run script once, capture output, then display and parse from the file.
@@ -62,8 +61,8 @@ done
 
 echo ""
 echo "========================================="
-echo "  RAIDZ2-native Integration Test Suite"
-echo "  DISK_MODE=$DISK_MODE  NDISKS=$NDISKS"
+echo "  v4 RAIDZ2-native Integration Test Suite"
+echo "  NDISKS=$NDISKS (vbd substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
 echo "========================================="
 if [ -n "$SUITE_ERRORS" ]; then
