@@ -5,79 +5,97 @@
 ### Launch the VM
 
 ```bash
-# 4-disk physical test (default)
-NDISKS=4 ./launch-dfly.sh
+# 4-disk default
+./launch-dfly.sh
 
-# 6-disk physical test
+# 6-disk
 NDISKS=6 ./launch-dfly.sh
 ```
 
-QEMU attaches `dfly-raid{0..N-1}.qcow2` (4 GB each) as virtio-blk devices.
-Inside DragonFlyBSD these appear as `/dev/vbd0` … `/dev/vbd{N-1}`.
+QEMU attaches `images/dfly-raid{0..N-1}.qcow2` (4 GB each, `RAID_SIZE=`
+overrides) as virtio-blk devices.  Inside DragonFlyBSD these appear as
+`/dev/vbd0` … `/dev/vbd{N-1}`.  The system disk
+(`images/overlay-system.qcow2`) is UFS — a kernel-module crash will not
+brick the VM.
 
 ### VM access
 
+User-mode networking forwards host `127.0.0.1:2322` → guest `:22`.  An
+SSH alias `h2dev` is preconfigured.
+
 ```bash
-./dfly-exec.sh <command>        # run a command on the VM
-./mount-dfly.sh                 # sshfs-mount VM root at mnt/dfly/
-ssh root@192.168.25.66          # direct SSH
+ssh h2dev <command>             # run a command on the VM
+scp src.c h2dev:/path           # copy file
+bin/console follow              # attach to serial console (kprintf log)
+bin/qmp query-status            # QEMU monitor command
 ```
+
+Do **not** use IP literals.  The old `192.168.25.66` / `.102` addresses
+are from the prior LAN-bridged VM and no longer reach anything.
 
 ---
 
 ## Deploy Cycle
 
-Run after any source change:
-
 ```bash
-./deploy.sh           # sync sources + build + install + sync tests (all)
-./deploy.sh sync      # scp src/sys/local_*.{c,h} and src/sbin/ to VM only
-./deploy.sh build     # make clean && make on VM (hammer2.ko + newfs_hammer2 + hammer2)
+./deploy.sh           # sync + build + install + tests (all)
+./deploy.sh sync      # scp local_* to /usr/src/sys/vfs/hammer2/...
+                      # + idempotently patch /usr/src/sys/conf/files
+./deploy.sh build     # make in /usr/src/sys/vfs/hammer2 + newfs_hammer2 + hammer2
 ./deploy.sh install   # cp hammer2.ko /boot/kernel/ + install binaries
-./deploy.sh tests     # tar-pipe tests/ -> /root/hammer2-tests/ and src/diag/ -> /root/h2diag/
+./deploy.sh tests     # tar-pipe tests/ -> /root/hammer2-tests/
+                      # + src/diag/ -> /root/h2diag/
 ```
+
+Env: `DFLY_HOST` (default `h2dev`).
 
 ### File mapping (local → VM)
 
 | Local path | VM path |
 |---|---|
 | `src/sys/local_hammer2*.{c,h}` | `/usr/src/sys/vfs/hammer2/hammer2*.{c,h}` |
-| `src/sys/local_vn.c` | `/usr/src/sys/dev/disk/vn/vn.c` |
-| `src/sbin/local_mkfs_hammer2.c` | `/usr/src/sbin/newfs_hammer2/mkfs_hammer2.c` |
+| `src/sys/local_Makefile` | `/usr/src/sys/vfs/hammer2/Makefile` |
+| `src/sbin/local_mkfs_hammer2.{c,h}` | `/usr/src/sbin/newfs_hammer2/mkfs_hammer2.{c,h}` |
+| `src/sbin/local_newfs_hammer2.c` | `/usr/src/sbin/newfs_hammer2/newfs_hammer2.c` |
 | `src/sbin/local_cmd_debug.c` | `/usr/src/sbin/hammer2/cmd_debug.c` |
 | `src/sbin/local_hammer2_userspace.h` | `/usr/src/sbin/hammer2/hammer2_userspace.h` |
 | `tests/` | `/root/hammer2-tests/` |
 | `src/diag/` | `/root/h2diag/` |
 
+`deploy.sh sync` also appends `vfs/hammer2/hammer2_raid6.c optional
+hammer2` to `/usr/src/sys/conf/files` if not already there (idempotent).
+Both the kernel Makefile and the static-kernel build path need this
+file listed.
+
 ### Reboot after install
 
-`hammer2.ko` cannot be unloaded while the root filesystem uses it.
-After `./deploy.sh install`, reboot to activate:
+`hammer2.ko` cannot be unloaded while a hammer2 filesystem is mounted.
+After `./deploy.sh install`, reboot:
 
 ```bash
-./dfly-exec.sh reboot
+ssh h2dev shutdown -r now
+until ssh -o ConnectTimeout=3 h2dev 'echo up' 2>/dev/null; do sleep 3; done
 ```
+
+`make clean && make` is required when struct layouts change — old
+forwarder objects link silently against stale layouts otherwise.
 
 ---
 
 ## Running Tests
 
-Tests live at `/root/hammer2-tests/` on the VM.
+Tests live at `/root/hammer2-tests/` on the VM after `./deploy.sh tests`.
 
-### v4 RAIDZ2-native tests (`tests/raidz2native/`)
+### v4 RAIDZ2-native tests (`tests/v4/`)
 
 ```bash
-# Default: DISK_MODE=vbd (physical /dev/vbd*), NDISKS=4
-./dfly-exec.sh "cd /root/hammer2-tests && sh run_all.sh"
+ssh h2dev 'cd /root/hammer2-tests/v4 && sh run_all.sh'
 
 # Specific groups only
-./dfly-exec.sh "cd /root/hammer2-tests && sh run_all.sh A B C"
+ssh h2dev 'cd /root/hammer2-tests/v4 && sh run_all.sh A B C'
 
 # 6-disk run
-./dfly-exec.sh "NDISKS=6 sh /root/hammer2-tests/run_all.sh"
-
-# Fallback: in-memory swap-backed vn devices
-./dfly-exec.sh "DISK_MODE=vn NDISKS=6 sh /root/hammer2-tests/run_all.sh"
+ssh h2dev 'cd /root/hammer2-tests/v4 && NDISKS=6 sh run_all.sh'
 ```
 
 Test groups:
@@ -88,31 +106,86 @@ Test groups:
 | B | Single disk failure for each disk position + degraded write |
 | C | All C(NDISKS,2) dual-disk failure pairs |
 | D | Resilver: basic, sequential, write-during-resilver |
-| F | COW slot uniqueness + h2stripe_check parity |
+| F | COW slot uniqueness + parity check |
 | G | Auto-fail, degraded remount, fail-state persistence |
 | I | Unclean unmount (healthy and degraded) |
 
-### v3 md-RAID tests (`tests/mdraid/`)
+### Perf harness (`tests/perf/`)
+
+See `tests/perf/README.md`.  Requires fio installed on the VM.
 
 ```bash
-./dfly-exec.sh "cd /root/hammer2-tests/mdraid && sh run_all_tests.sh"
+ssh h2dev 'cd /root/hammer2-tests/perf && sh run_perf.sh'
 ```
+
+Substrate is virtio-blk only.  The vn-backed substrate was removed in
+Group K (commit `37d3808`); any reference to `DISK_MODE=vn`,
+`vnconfig`, or `/dev/vn*` is from an older era.
 
 ---
 
-## Disk Mode Reference
+## Gotchas
 
-| Variable | Values | Default |
-|---|---|---|
-| `DISK_MODE` | `vbd` (physical QEMU), `vn` (swap-backed) | `vbd` |
-| `NDISKS` | 4–6 | 4 |
+### "Ambiguous output redirect" from tcsh
 
-When `DISK_MODE=vbd`:
-- `setup_fresh` calls `newfs_hammer2` directly on `/dev/vbd*` — no vnconfig
-- `detach_disk(idx)` is a no-op (disk stays physically present, only software-failed)
-- `fresh_disk(idx)` zeros the first 64 MB of the vbd to clear HAMMER2 zone headers
+Root's shell on DragonFly is **tcsh**, which is csh-family.  Bash-style
+redirection in `ssh h2dev '<cmd>'` is silently invalid:
 
-When `DISK_MODE=vn`:
-- `setup_fresh` calls `vnconfig -S 1073741824 vn$i` before `newfs_hammer2`
-- `detach_disk(idx)` calls `vnconfig -u vn$idx`
-- `fresh_disk(idx)` unconfigures and re-configures with a fresh swap backing
+```bash
+ssh h2dev 'ls /a 2>&1 | head'        # FAILS: Ambiguous output redirect
+ssh h2dev 'cmd > /tmp/out 2>&1'      # FAILS same way
+```
+
+tcsh wants `>&` for combined redirect; mixing `>` and `2>&1` breaks it.
+Always wrap remote commands with `sh -c` so bash syntax is parsed by
+a bash-family shell on the VM:
+
+```bash
+ssh h2dev sh -c 'ls /a 2>&1 | head'                  # OK
+ssh h2dev "sh -c 'cd /usr/src && make 2>&1 | tail'"  # OK (nested quoting)
+```
+
+Or do the redirection on the *host* side, where it's bash:
+
+```bash
+ssh h2dev ls /a 2>&1 | head                          # OK — host bash sees 2>&1
+```
+
+Symptom: `ssh` exits non-zero with `Ambiguous output redirect.` on stderr
+and the command never ran.  The error comes from tcsh on the VM, not ssh
+itself.
+
+### dmesg checks after a test run
+
+```bash
+ssh h2dev sh -c 'dmesg | grep "CHECK FAIL"'       # data corruption
+ssh h2dev sh -c 'dmesg | grep -i "sync error"'    # flush I/O failures
+ssh h2dev sh -c 'dmesg | grep -i panic'           # kernel panics
+ssh h2dev sh -c 'dmesg -c > /dev/null'            # clear before test
+```
+
+All wrapped in `sh -c` per the redirect rule above.
+
+### QEMU-level recovery (when ssh is unreachable)
+
+If hammer2 deadlocks badly enough that ssh hangs:
+
+```bash
+bin/qmp quit                     # graceful via QMP socket
+pkill -9 qemu-system-x86_64      # nuclear option
+./launch-dfly.sh                 # restart
+```
+
+System root is UFS, so a hard kill triggers fsck on next boot — watch
+via `bin/console follow`.
+
+### Loading hammer2 inside test scripts
+
+Test scripts must self-load the module; UFS root doesn't pull it in:
+
+```sh
+kldstat -q -m hammer2 || kldload hammer2
+```
+
+This is already in every `tests/v4/test_*.sh` — copy the pattern for
+new scripts.
