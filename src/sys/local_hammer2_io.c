@@ -1590,6 +1590,90 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	}
 
 	/*
+	 * Phase A: Metadata-zone sequential copy (metadata_zone.md §Resilver).
+	 *
+	 * Metadata blocks (INODE/INDIRECT/FREEMAP_*) are an N-way mirror at
+	 * the same per-disk byte offset on every disk; reconstructing the
+	 * failed disk's copy is a straight sequential bulk read from any
+	 * surviving disk followed by a bulk write to new_devvp at the same
+	 * offset.  No parity, no GF math.  Order of magnitude minutes vs the
+	 * hours a blockref walk of metadata used to take.
+	 *
+	 * Done before Phase 3 so the stripe loop has up-to-date freemap and
+	 * inode topology to read against.
+	 */
+	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    hmp->md_nextents > 0) {
+		const size_t MD_CHUNK = 4 * 1024 * 1024; /* 4 MB */
+		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
+		uint32_t ex;
+		int surv = -1;
+
+		for (i = 0; i < ndisks; i++) {
+			if (i != failed_disk_idx && !hmp->raid_failed[i] &&
+			    hmp->volumes[i].dev != NULL &&
+			    hmp->volumes[i].dev->devvp != NULL &&
+			    hmp->volumes[i].dev->open) {
+				surv = i;
+				break;
+			}
+		}
+		if (surv < 0) {
+			kprintf("hammer2: resilver Phase A: no surviving "
+				"disk to read metadata from\n");
+			kfree(md_buf, M_HAMMER2);
+			hmp->resilver_running = 0;
+			return ENXIO;
+		}
+		vol = &hmp->volumes[surv];
+
+		for (ex = 0; ex < hmp->md_nextents; ex++) {
+			hammer2_off_t mo = hmp->md_extents[ex].md_off;
+			hammer2_off_t ms = hmp->md_extents[ex].md_size;
+			hammer2_off_t off;
+
+			for (off = 0; off < ms; off += MD_CHUNK) {
+				size_t this_chunk =
+				    (size_t)((ms - off > MD_CHUNK) ?
+					     MD_CHUNK : (ms - off));
+
+				bp = NULL;
+				lerror = bread(vol->dev->devvp,
+				    (off_t)(mo + off), (int)this_chunk, &bp);
+				if (lerror || bp == NULL) {
+					if (bp)
+						brelse(bp);
+					kprintf("hammer2: resilver Phase A: "
+						"read err %d at off %jx\n",
+						lerror, (intmax_t)(mo + off));
+					kfree(md_buf, M_HAMMER2);
+					hmp->resilver_running = 0;
+					return EIO;
+				}
+				bkvasync(bp);
+				bcopy(bp->b_data, md_buf, this_chunk);
+				brelse(bp);
+
+				wbp = getblk(new_devvp, (off_t)(mo + off),
+				    (int)this_chunk, GETBLK_KVABIO, 0);
+				if (wbp) {
+					bkvasync(wbp);
+					bcopy(md_buf, wbp->b_data, this_chunk);
+					lerror = bwrite(wbp);
+					if (lerror) {
+						kfree(md_buf, M_HAMMER2);
+						hmp->resilver_running = 0;
+						return lerror;
+					}
+				}
+				if ((off >> 22) % 16 == 0)
+					lwkt_yield();
+			}
+		}
+		kfree(md_buf, M_HAMMER2);
+	}
+
+	/*
 	 * Phase 2: Allocate per-column buffers.
 	 */
 	for (i = 0; i < ndisks; i++)

@@ -1292,6 +1292,9 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 
 	for (;;) {
 		uint64_t zone;
+		hammer2_off_t cand_off;
+		uint32_t ex;
+		int in_md_zone = 0;
 
 		if (slot >= max_stripes) {
 			if (wrapped)
@@ -1305,8 +1308,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		if (wrapped && slot >= start)
 			break;
 
-		zone = (HAMMER2_ZONE_SEG64 + slot * stripe_unit) /
-		    HAMMER2_ZONE_SEG64;
+		cand_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
+		zone = cand_off / HAMMER2_ZONE_SEG64;
 		if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
 		    zone <= HAMMER2_ZONE_FREEMAP_07 &&
 		    (zone % HAMMER2_ZONE_FREEMAP_INC) ==
@@ -1315,6 +1318,24 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			continue;
 		}
 		if (zone == HAMMER2_ZONE_RAID6_BITMAP) {
+			slot++;
+			continue;
+		}
+		/*
+		 * Skip slots whose per-disk physical offset falls inside any
+		 * metadata-zone extent (metadata_zone.md).  Without this,
+		 * stripe data would overlap the mirrored metadata area.
+		 */
+		for (ex = 0; ex < hmp->md_nextents; ex++) {
+			hammer2_off_t mo = hmp->md_extents[ex].md_off;
+			hammer2_off_t ms = hmp->md_extents[ex].md_size;
+			if (cand_off + stripe_unit > mo &&
+			    cand_off < mo + ms) {
+				in_md_zone = 1;
+				break;
+			}
+		}
+		if (in_md_zone) {
 			slot++;
 			continue;
 		}

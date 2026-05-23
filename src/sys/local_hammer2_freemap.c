@@ -279,6 +279,24 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	iter.relaxed = hmp->freemap_relaxed;
 
 	/*
+	 * v4 RAIDZ2-native: bias non-DATA/DIRENT allocations toward the
+	 * metadata zone (metadata_zone.md) so INODE/INDIRECT/FREEMAP_*
+	 * cluster in a narrow LBA band for HDD locality.  Hard restriction
+	 * to the extent range is a follow-up; here we only set the hint and
+	 * rely on the freemap iterator to honor it under normal pressure.
+	 */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	    hmp->md_nextents > 0 &&
+	    bref->type != HAMMER2_BREF_TYPE_DATA &&
+	    bref->type != HAMMER2_BREF_TYPE_DIRENT) {
+		hammer2_off_t mo = hmp->md_extents[0].md_off;
+		hammer2_off_t ms = hmp->md_extents[0].md_size;
+		if (iter.bpref < mo || iter.bpref >= mo + ms)
+			iter.bpref = mo;
+	}
+
+	/*
 	 * Make sure bpref is in-bounds.  It's ok if bpref covers a zone's
 	 * reserved area, the try code will iterate past it.
 	 */

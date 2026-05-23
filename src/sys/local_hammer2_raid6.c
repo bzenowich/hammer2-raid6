@@ -477,3 +477,66 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 
 	return error;
 }
+
+/*
+ * v4 RAIDZ2-native: synchronously mirror a metadata block to every
+ * surviving disk at the same per-disk byte offset.  No parity (the
+ * mirror is its own redundancy).  Used by I5 callers once the metadata
+ * DIO key encoding decision (newplan.md §9.5) is wired through the
+ * chain layer.
+ *
+ * Returns 0 if at least one disk write succeeded; EIO if every disk
+ * was either failed or had an I/O error.
+ *
+ * XXX I5-wire: not yet called from _hammer2_io_putblk.  The caller
+ * site needs the metadata DIO key encoding to identify metadata DIOs
+ * unambiguously and to derive per_disk_off from bref->data_off.
+ */
+int
+hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp,
+				 hammer2_off_t per_disk_off,
+				 void *data, size_t bytes)
+{
+	hammer2_volume_t *vol;
+	struct buf *bp;
+	int i;
+	int ok = 0;
+	int last_err = 0;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+
+	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+		if (hmp->raid_failed[i])
+			continue;
+		vol = &hmp->volumes[i];
+		if (vol->dev == NULL || vol->dev->devvp == NULL ||
+		    !vol->dev->open)
+			continue;
+
+		bp = getblk(vol->dev->devvp, per_disk_off, bytes,
+			    GETBLK_KVABIO, 0);
+		if (bp == NULL) {
+			last_err = ENOMEM;
+			continue;
+		}
+		bkvasync(bp);
+		bcopy(data, bp->b_data, bytes);
+		{
+			int e = bwrite(bp);
+			if (e) {
+				int aerr;
+				last_err = e;
+				aerr = hammer2_raid6_auto_fail_disk(hmp, i);
+				if (aerr) {
+					/* triple-failure or already-fatal */
+					return aerr;
+				}
+				continue;
+			}
+		}
+		ok++;
+	}
+
+	return ok ? 0 : (last_err ? last_err : EIO);
+}

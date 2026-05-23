@@ -1987,6 +1987,8 @@ void hammer2_raid6_datap_recov(int ndisks, size_t bytes,
 		int faila, void **ptrs);
 void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
+int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp,
+		hammer2_off_t per_disk_off, void *data, size_t bytes);
 int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 		hammer2_off_t pbase, int data_disk_idx,
 		void *data, size_t bytes);
