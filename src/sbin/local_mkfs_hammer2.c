@@ -60,18 +60,8 @@ static void alloc_direct(hammer2_off_t *basep, hammer2_blockref_t *bref,
 				size_t bytes);
 
 /*
- * GF(2^8) multiplication by the generator 2.
- * Primitive polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x11d), reduction 0x1d.
- */
-static inline uint8_t
-gf_mul2(uint8_t x)
-{
-	return (x << 1) ^ ((x & 0x80) ? 0x1d : 0);
-}
-
-/*
- * Write one HAMMER2_PBUFSIZE block at logical_off to the correct RAID 6
- * physical disk, and update the P and Q parity blocks for that stripe.
+ * Write one HAMMER2_PBUFSIZE block at logical_off to every disk for the
+ * v4 RAIDZ2-native metadata mirror layout.
  *
  * Uses the same left-symmetric layout as the kernel's hammer2_raid6_map().
  * For a fresh filesystem all disks are zero, so incremental XOR from zero
@@ -81,86 +71,36 @@ static void
 format_raid6_pwrite(hammer2_ondisk_t *fso, hammer2_off_t logical_off,
 		    const void *buf)
 {
-	int ndisks = fso->nvolumes;
-	int ndata = ndisks - 2;
-	uint64_t stripe_unit = HAMMER2_PBUFSIZE;
-	uint64_t stripe_num = logical_off / ((uint64_t)ndata * stripe_unit);
-	int column = (int)((logical_off / stripe_unit) % ndata);
-	int p_disk = (int)(stripe_num % ndisks);
-	int q_disk = (p_disk + 1) % ndisks;
-	/* Add ZONE_SEG so RAID6 data/parity never lands at physical offset 0 */
-	hammer2_off_t phys_off = HAMMER2_ZONE_SEG + stripe_num * stripe_unit;
-	const uint8_t *data = buf;
-	uint8_t sibbuf[HAMMER2_PBUFSIZE];	/* temp for sibling column reads */
-	uint8_t pbuf[HAMMER2_PBUFSIZE];
-	uint8_t qbuf[HAMMER2_PBUFSIZE];
-	int data_disks[HAMMER2_MAX_VOLUMES];/* data_disks[col] = disk index */
-	int col, di, i, z;
+	int v;
 	size_t n;
 
-	/* Map column indices to physical disk indices */
-	di = 0;
-	for (i = 0; i < ndisks; i++) {
-		if (i != p_disk && i != q_disk)
-			data_disks[di++] = i;
-	}
-
 	/*
-	 * Compute P and Q from scratch by reading sibling data columns.
-	 * This is correct even when disk images are reused (stale parity
-	 * from previous mounts is ignored; only current data on disk is used).
+	 * v4 RAID6 (RAIDZ2-native): the kernel mount path (Path C in
+	 * hammer2_dio_key) resolves INODE/INDIRECT/FREEMAP bref->data_off
+	 * via hammer2_get_volume(pbase), which picks one volume (disk 0
+	 * for any offset inside vol[0].size) and reads dev_pbase = pbase -
+	 * vol->offset directly.  v4 DATA/DIRENT goes through the runtime
+	 * kernel stripe allocator (Path A), never written by mkfs at
+	 * format time.  So everything mkfs emits — the boot/aux clear and
+	 * the super-root/root inode page — is metadata: mirror the same
+	 * bytes to every disk at the same logical offset.  This also seeds
+	 * the I5 metadata-mirror sibling copies so a primary-disk read
+	 * failure at runtime can fall through cleanly.
 	 *
-	 * For each column c in [0, ndata):
-	 *   P ^= col_data[c]
-	 *   Q ^= g^c * col_data[c]
-	 *
-	 * For column == `column` (the one we are writing), use `buf`.
-	 * For all other columns, read current data from their disk.
-	 * Process sibling columns first so that when we write the data disk
-	 * the updated value is reflected in further reads (though for
-	 * correctness here the order does not matter: each stripe column
-	 * maps to a unique disk, and we only read the sibling, not the one
-	 * we are about to write).
+	 * A previous v3-era implementation here used a left-symmetric
+	 * stripe layout with rotating P/Q.  That landed the super-root on
+	 * the wrong disk at the wrong offset under v4 (e.g. disk 2 + 6 MiB
+	 * vs kernel reading disk 0 + 4 MiB) and produced a CHECK FAIL on
+	 * every first mount — silently masked while the harness booted the
+	 * upstream baked-in HAMMER2 instead of the local sources.
 	 */
-	bzero(pbuf, HAMMER2_PBUFSIZE);
-	bzero(qbuf, HAMMER2_PBUFSIZE);
-	for (col = 0; col < ndata; col++) {
-		const uint8_t *coldata;
-
-		if (col == column) {
-			coldata = data;
-		} else {
-			n = pread(fso->volumes[data_disks[col]].fd,
-				  sibbuf, HAMMER2_PBUFSIZE, phys_off);
-			if (n != HAMMER2_PBUFSIZE)
-				bzero(sibbuf, HAMMER2_PBUFSIZE);
-			coldata = sibbuf;
+	for (v = 0; v < fso->nvolumes; v++) {
+		n = pwrite(fso->volumes[v].fd, buf, HAMMER2_PBUFSIZE,
+			   logical_off);
+		if (n != HAMMER2_PBUFSIZE) {
+			perror("write (raid6 v4 mirror)");
+			exit(1);
 		}
-		for (i = 0; i < HAMMER2_PBUFSIZE; i++) {
-			uint8_t qc = coldata[i];
-			for (z = 0; z < col; z++)
-				qc = gf_mul2(qc);
-			pbuf[i] ^= coldata[i];
-			qbuf[i] ^= qc;
-		}
-	}
-
-	/* Write data, P, Q */
-	n = pwrite(fso->volumes[data_disks[column]].fd, buf,
-		   HAMMER2_PBUFSIZE, phys_off);
-	if (n != HAMMER2_PBUFSIZE) {
-		perror("write (raid6 data)");
-		exit(1);
-	}
-	n = pwrite(fso->volumes[p_disk].fd, pbuf, HAMMER2_PBUFSIZE, phys_off);
-	if (n != HAMMER2_PBUFSIZE) {
-		perror("write (raid6 P parity)");
-		exit(1);
-	}
-	n = pwrite(fso->volumes[q_disk].fd, qbuf, HAMMER2_PBUFSIZE, phys_off);
-	if (n != HAMMER2_PBUFSIZE) {
-		perror("write (raid6 Q parity)");
-		exit(1);
 	}
 }
 

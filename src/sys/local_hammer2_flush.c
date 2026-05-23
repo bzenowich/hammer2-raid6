@@ -1590,10 +1590,20 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			bcopy(&hmp->volsync, bp->b_data,
 			      HAMMER2_PBUFSIZE);
 			/*
-			 * Each disk must retain its own volu_id.
-			 * volsync has the root volume's id (0),
-			 * so fix up the copy for non-root disks
-			 * and recalculate the CRCs.
+			 * Per-disk volume-header fixup.  volsync was copied from
+			 * the root volume so it carries that disk's identity in
+			 * a couple of fields; before writing this copy to disk
+			 * `vi` we have to substitute vi's identity:
+			 *
+			 *   volu_id              — the per-disk slot number
+			 *   raid_config.v4_disk_id — same, in the v4 addendum
+			 *                            (validated at mount in
+			 *                            hammer2_init_volumes_3;
+			 *                            mismatch = remount EINVAL)
+			 *
+			 * After mutating either field the SECT0 + volheader
+			 * CRCs must be recomputed or the loader will reject the
+			 * header on the next mount.
 			 */
 			{
 				hammer2_volume_data_t *vd;
@@ -1601,22 +1611,32 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 
 				vd = (hammer2_volume_data_t *)bp->b_data;
 				for (vi = 0; vi < hmp->nvolumes; vi++) {
-					if (hmp->volumes[vi].dev == e) {
-						if (vd->volu_id != vi) {
-							vd->volu_id = vi;
-							vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0] =
-							    hammer2_icrc32(
-								(char *)vd +
-								HAMMER2_VOLUME_ICRC0_OFF,
-								HAMMER2_VOLUME_ICRC0_SIZE);
-							vd->icrc_volheader =
-							    hammer2_icrc32(
-								(char *)vd +
-								HAMMER2_VOLUME_ICRCVH_OFF,
-								HAMMER2_VOLUME_ICRCVH_SIZE);
-						}
-						break;
+					if (hmp->volumes[vi].dev != e)
+						continue;
+					int dirty = 0;
+					if (vd->volu_id != vi) {
+						vd->volu_id = vi;
+						dirty = 1;
 					}
+					if (hmp->voldata.version >=
+					     HAMMER2_VOL_VERSION_RAIDZ2 &&
+					    vd->raid_config.v4_disk_id != vi) {
+						vd->raid_config.v4_disk_id = vi;
+						dirty = 1;
+					}
+					if (dirty) {
+						vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0] =
+						    hammer2_icrc32(
+							(char *)vd +
+							HAMMER2_VOLUME_ICRC0_OFF,
+							HAMMER2_VOLUME_ICRC0_SIZE);
+						vd->icrc_volheader =
+						    hammer2_icrc32(
+							(char *)vd +
+							HAMMER2_VOLUME_ICRCVH_OFF,
+							HAMMER2_VOLUME_ICRCVH_SIZE);
+					}
+					break;
 				}
 			}
 			vol_error = bwrite(bp);
