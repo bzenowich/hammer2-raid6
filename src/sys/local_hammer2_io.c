@@ -1306,7 +1306,7 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  * excluded from future I/Os via raid_failed[]; the vnode is released
  * at unmount.
  */
-static int
+int
 hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 {
 	hammer2_voldata_lock(hmp);

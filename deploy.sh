@@ -9,10 +9,10 @@
 #   all     — sync + build + install + tests (default)
 #
 # Environment:
-#   DFLY_IP — VM IP address (default: 192.168.25.66)
+#   DFLY_HOST — VM SSH host alias (default: h2dev)
 
-DFLY_IP="${DFLY_IP:-192.168.25.66}"
-VM="root@${DFLY_IP}"
+DFLY_HOST="${DFLY_HOST:-h2dev}"
+VM="${DFLY_HOST}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # scp a local file to the VM, renaming it to $dst
@@ -38,8 +38,28 @@ do_sync() {
     scp_as "$DIR/src/sys/local_hammer2_freemap.c" \
         "/usr/src/sys/vfs/hammer2/hammer2_freemap.c"
 
+    echo "==> Syncing kernel Makefile -> /usr/src/sys/vfs/hammer2/Makefile"
+    scp_as "$DIR/src/sys/local_Makefile" \
+        "/usr/src/sys/vfs/hammer2/Makefile"
+
+    echo "==> Patching /usr/src/sys/conf/files for hammer2_raid6.c"
+    ssh "$VM" sh <<'ENDSSH'
+set -e
+F=/usr/src/sys/conf/files
+if grep -q '^vfs/hammer2/hammer2_raid6\.c' "$F"; then
+    echo "    already present"
+else
+    sed -i '' '/^vfs\/hammer2\/hammer2_ondisk\.c.*optional hammer2$/a\
+vfs/hammer2/hammer2_raid6.c	optional hammer2
+' "$F"
+    echo "    inserted hammer2_raid6.c entry"
+fi
+ENDSSH
+
     echo "==> Syncing newfs_hammer2 sources -> /usr/src/sbin/newfs_hammer2/"
-    for f in "$DIR/src/sbin"/local_mkfs_*.c; do
+    for f in "$DIR/src/sbin"/local_mkfs_*.c \
+             "$DIR/src/sbin"/local_mkfs_hammer2.h \
+             "$DIR/src/sbin"/local_newfs_hammer2.c; do
         [ -f "$f" ] || continue
         base="$(basename "$f")"
         scp_as "$f" "/usr/src/sbin/newfs_hammer2/${base#local_}"
@@ -55,7 +75,7 @@ do_sync() {
 }
 
 do_build() {
-    echo "==> Building on VM (${DFLY_IP})..."
+    echo "==> Building on VM (${DFLY_HOST})..."
     ssh "$VM" sh <<'ENDSSH'
 set -e
 echo "--- hammer2 kernel module ---"

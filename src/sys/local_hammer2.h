@@ -2000,6 +2000,7 @@ int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		void *buf, size_t bytes, int is_physical);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
+int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
 
 /*
  * More complex inlines
