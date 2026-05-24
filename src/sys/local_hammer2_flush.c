@@ -821,14 +821,14 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			}
 
 			/*
-			 * v4 RAIDZ2-native: bump per-TXG sequence number on
+			 * v3 RAIDZ2-native: bump per-TXG sequence number on
 			 * every commit so mount-time discovery can find the
 			 * most-recent durable volhdr by max(seqno) across
 			 * disks (docs/volhdr_quorum.md).
 			 */
 			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
 			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
-				hmp->voldata.raid_config.v4_txg_seq++;
+				hmp->voldata.raid_config.rz_txg_seq++;
 			}
 
 			/*
@@ -1596,7 +1596,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			 * `vi` we have to substitute vi's identity:
 			 *
 			 *   volu_id              — the per-disk slot number
-			 *   raid_config.v4_disk_id — same, in the v4 addendum
+			 *   raid_config.rz_disk_id — same, in the v3 addendum
 			 *                            (validated at mount in
 			 *                            hammer2_init_volumes_3;
 			 *                            mismatch = remount EINVAL)
@@ -1620,8 +1620,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 					}
 					if (hmp->voldata.version >=
 					     HAMMER2_VOL_VERSION_RAIDZ2 &&
-					    vd->raid_config.v4_disk_id != vi) {
-						vd->raid_config.v4_disk_id = vi;
+					    vd->raid_config.rz_disk_id != vi) {
+						vd->raid_config.rz_disk_id = vi;
 						dirty = 1;
 					}
 					if (dirty) {

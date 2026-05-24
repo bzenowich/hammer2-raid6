@@ -1,7 +1,15 @@
-# HAMMER2 v4 RAIDZ2-native — In-Place-Overwrite Audit
+# HAMMER2 v3 RAIDZ2-native — In-Place-Overwrite Audit
 
 **Status**: Phase 0 audit. Phase 1 inserts the guards itemized here.
 **Cross-refs**: `newplan.md` §5.3, §9.5. `raidz2_snapshot_interaction.md`.
+
+> **Numbering note (2026-05-24).** The text below uses "v3" for the
+> pre-rewrite RAID6-below-HAMMER2 path that this audit plans to remove,
+> and "v4" for the RAIDZ2-native design that replaces it.  The on-disk
+> format that now ships is `HAMMER2_VOL_VERSION_RAIDZ2 = 3`; the
+> intermediate `=4` numbering used during Phase 1 was collapsed.
+> Treat every "v4 guard" / "v4 array" / "v4 design" in this doc as
+> referring to what now ships as v3 RAIDZ2-native.
 
 ---
 
@@ -243,4 +251,4 @@ hammer2 raid stripe-trace /mnt/file > after.txt
 # data_off should differ from the snapshot's reference.
 ```
 
-Phase 2 adds this as `tests/v4/test_inplace_guard.sh`.
+Phase 2 adds this as `tests/v3/test_inplace_guard.sh`.

@@ -1,4 +1,4 @@
-# HAMMER2 v4 RAIDZ2-native — Resilver Order
+# HAMMER2 v3 RAIDZ2-native — Resilver Order
 
 **Status**: Phase 0 spec. Implementation in Phase 1–2.
 **Cross-refs**: `newplan.md` §5.9. `metadata_zone.md`, `stripe_bitmap.md`.
@@ -13,20 +13,21 @@ Reconstruct a failed disk's contents onto a replacement disk by:
 2. **Data area**: blockref-reachability walk, reconstructing only the
    columns that the failed disk hosted for live blockrefs.
 
-The v4 resilver is structurally simpler than v3's because the
-per-stripe physical layout is encoded in `bref.copyid` + `bref.data_off`,
-not in a logical-to-physical mapping that has to be re-derived per
-stripe range.
+The v3 resilver (the design that now ships; previously called "v4" in
+the dev-tree numbering) is structurally simpler than the older
+RAID6-below-HAMMER2 path because the per-stripe physical layout is
+encoded in `bref.copyid` + `bref.data_off`, not in a logical-to-physical
+mapping that has to be re-derived per stripe range.
 
 ---
 
 ## Pre-conditions
 
-- Replacement disk is attached and recognized at `v4_disk_id`
+- Replacement disk is attached and recognized at `rz_disk_id`
   matching the failed slot.
 - Array is mounted and the failed slot is marked replaced via
   `hammer2 raid replace`.
-- `v4_array_uuid` of the replacement is the array's UUID (newly
+- `rz_array_uuid` of the replacement is the array's UUID (newly
   written, or zeroed for a blank disk).
 
 ---
@@ -104,9 +105,10 @@ Wastes time on free slots; for sparse-stripe usage (most workloads),
 this is significant. Blockref walk reconstructs only the slots that
 matter.
 
-Memory: v3 had a `resilver_dirty_lo/hi` range (Fix 12) tracking
-stripes that races with concurrent writes during resilver. v4
-doesn't need this: concurrent writes land in fresh slots; if those
+Memory: the pre-rewrite RAID6 path had a `resilver_dirty_lo/hi` range
+(Fix 12) tracking stripes that race with concurrent writes during
+resilver.  v3 RAIDZ2-native doesn't need this: concurrent writes land
+in fresh slots; if those
 slots happen to use the replacement disk's `copyid`, the write goes
 to the replacement directly (no race). If they don't, the resilver
 doesn't care.
@@ -161,7 +163,7 @@ After Phase B finishes:
    the walk is for paranoia.)
 2. Update `voldata.raid_config.disk_state[failed_disk_id]` =
    `ONLINE`, clear the replacing flag.
-3. Bump `v4_txg_seq`, commit.
+3. Bump `rz_txg_seq`, commit.
 
 The replacement disk is now part of the live array; subsequent
 writes treat it as ordinary.

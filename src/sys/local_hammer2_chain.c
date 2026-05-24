@@ -1752,7 +1752,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			newmod = 1;
 		}
 		/*
-		 * RAIDZ2-native (v4): always allocate a fresh stripe slot.
+		 * RAIDZ2-native (v3): always allocate a fresh stripe slot.
 		 * The scratch P/Q path in _hammer2_io_putblk assumes all
 		 * columns of a new stripe slot are zero; in-place overwrite
 		 * violates that invariant and would require RMW delta parity.
@@ -1866,9 +1866,9 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 						HAMMER2_CHAIN_DEDUPABLE);
 			} else {
 				/*
-				 * v4 COW: free prior stripe slot before
+				 * v3 COW: free prior stripe slot before
 				 * allocating a new one. hammer2_freemap_alloc
-				 * internally dispatches DATA/DIRENT on v4 to
+				 * internally dispatches DATA/DIRENT on v3 to
 				 * hammer2_raid6_stripe_alloc; all other types
 				 * fall through to the freemap radix.
 				 */
@@ -1902,7 +1902,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				 * are virtually guaranteed to corrupt any
 				 * snapshots related to this filesystem.
 				 *
-				 * v4 RAIDZ2-native: in-place reuse violates
+				 * v3 RAIDZ2-native: in-place reuse violates
 				 * the no-RMW invariant. Refuse the fallback
 				 * and surface the original allocation error.
 				 */

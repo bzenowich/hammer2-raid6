@@ -1185,7 +1185,7 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
 
 /*
- * v4 RAIDZ2-native stripe bitmap zone (zone 41 on disk 0).
+ * v3 RAIDZ2-native stripe bitmap zone (zone 41 on disk 0).
  * Per docs/stripe_bitmap.md:
  *
  *   [page 0]       header  (4 KB)
@@ -1202,10 +1202,10 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_STRIPE_BITMAP_MAGIC_END	0x00484D32535452ULL   /* reversed */
 
 /*
- * Lowest stripe slot eligible for v4 DATA/DIRENT allocation.  Slots
+ * Lowest stripe slot eligible for v3 DATA/DIRENT allocation.  Slots
  * below this reserve physical space at the start of every disk's data
  * area for HAMMER2 reserved zones (freemap rotations) that v3-era
- * metadata-via-freemap can still consume; v4 DATA must not collide
+ * metadata-via-freemap can still consume; v3 DATA must not collide
  * with those.
  */
 #define HAMMER2_STRIPE_V4_START		1024
@@ -1235,7 +1235,7 @@ struct hammer2_stripe_bitmap_footer {
 typedef struct hammer2_stripe_bitmap_footer hammer2_stripe_bitmap_footer_t;
 
 /*
- * v4 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
+ * v3 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
  *
  * INODE / INDIRECT / FREEMAP_NODE / FREEMAP_LEAF blocks live in a
  * dedicated per-disk LBA range that is N-way mirrored across every
@@ -1275,14 +1275,14 @@ struct hammer2_raid_config {
 	uint8_t		disk_state[HAMMER2_MAX_VOLUMES]; /* per-disk state */
 
 	/*
-	 * v4 RAIDZ2-native addendum (volhdr_quorum.md, metadata_zone.md).
+	 * v3 RAIDZ2-native addendum (volhdr_quorum.md, metadata_zone.md).
 	 * Present on HAMMER2_VOL_VERSION_RAIDZ2 volumes; zero on older.
 	 */
-	uint64_t	v4_txg_seq;	/* monotonic per-TXG sequence number */
-	uint8_t		v4_array_uuid[16]; /* identifies this RAID6 array */
-	uint8_t		v4_disk_id;	/* this disk's slot (0..N-1) */
-	uint8_t		v4_ndisks;	/* total disks (cross-check) */
-	uint8_t		v4_pad[6];
+	uint64_t	rz_txg_seq;	/* monotonic per-TXG sequence number */
+	uint8_t		rz_array_uuid[16]; /* identifies this RAID6 array */
+	uint8_t		rz_disk_id;	/* this disk's slot (0..N-1) */
+	uint8_t		rz_ndisks;	/* total disks (cross-check) */
+	uint8_t		rz_pad[6];
 	uint32_t	md_nextents;	/* number of metadata-zone extents */
 	uint32_t	md_reserved;
 	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];

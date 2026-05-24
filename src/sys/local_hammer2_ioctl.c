@@ -1068,7 +1068,7 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
 
 	pmp = ip->pmp;
 	/*
-	 * v4 RAIDZ2-native arrays cannot honor emergency in-place
+	 * v3 RAIDZ2-native arrays cannot honor emergency in-place
 	 * overwrite without breaking the no-RMW invariant. Refuse.
 	 */
 	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {

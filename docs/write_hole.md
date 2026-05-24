@@ -1,13 +1,16 @@
 # HAMMER2 RAID6 — The Write Hole Problem
 
-> **STATUS (2026-05-21)**: v3-era analysis. WIB ("write-intent bitmap")
-> approach is **not applicable** to v4. Under v4 RAIDZ2-native (COW +
-> TXG-commit atomicity, `newplan.md` §5.6), the write hole closes
-> structurally: pre-commit crashes orphan fresh stripes that bulkfree
-> reclaims; post-commit crashes inherit a valid new TXG. Sections of
-> this document on synchronous-writes and md-RAID WIB describe
-> abandoned designs. The ZFS RAIDZ2 comparison remains useful as
-> background.
+> **STATUS (2026-05-21, updated 2026-05-24)**: This is pre-rewrite
+> analysis of the RAID6-below-HAMMER2 path.  The WIB ("write-intent
+> bitmap") approach is **not applicable** to v3 RAIDZ2-native (the
+> design that now ships as `HAMMER2_VOL_VERSION_RAIDZ2 = 3`; this
+> doc's original wording said "v4", before the numbering collapse).
+> Under v3 RAIDZ2-native (COW + TXG-commit atomicity, `newplan.md`
+> §5.6), the write hole closes structurally: pre-commit crashes
+> orphan fresh stripes that bulkfree reclaims; post-commit crashes
+> inherit a valid new TXG.  Sections of this document on
+> synchronous-writes and md-RAID WIB describe abandoned designs.
+> The ZFS RAIDZ2 comparison remains useful as background.
 
 Analysis of the write hole in RAID5/RAID6 implementations and a comparison of
 the three main approaches used to eliminate or mitigate it: synchronous writes

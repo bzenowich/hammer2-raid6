@@ -99,16 +99,16 @@ forwarder objects link silently against stale layouts otherwise.
 
 Tests live at `/root/hammer2-tests/` on the VM after `./deploy.sh tests`.
 
-### v4 RAIDZ2-native tests (`tests/v4/`)
+### v3 RAIDZ2-native tests (`tests/v3/`)
 
 ```bash
-ssh h2dev 'cd /root/hammer2-tests/v4 && sh run_all.sh'
+ssh h2dev 'cd /root/hammer2-tests/v3 && sh run_all.sh'
 
 # Specific groups only
-ssh h2dev 'cd /root/hammer2-tests/v4 && sh run_all.sh A B C'
+ssh h2dev 'cd /root/hammer2-tests/v3 && sh run_all.sh A B C'
 
 # 6-disk run
-ssh h2dev 'cd /root/hammer2-tests/v4 && NDISKS=6 sh run_all.sh'
+ssh h2dev 'cd /root/hammer2-tests/v3 && NDISKS=6 sh run_all.sh'
 ```
 
 Test groups:
@@ -200,5 +200,5 @@ Test scripts must self-load the module; UFS root doesn't pull it in:
 kldstat -q -m hammer2 || kldload hammer2
 ```
 
-This is already in every `tests/v4/test_*.sh` — copy the pattern for
+This is already in every `tests/v3/test_*.sh` — copy the pattern for
 new scripts.

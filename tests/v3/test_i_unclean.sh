@@ -11,7 +11,7 @@ echo "=== Group I: Unclean Unmount (NDISKS=$NDISKS) ==="
 
 # I1: Write data, simulate crash (forced unmount without sync), remount, verify
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/clean bs=65536 count=256 2>/dev/null
 sha256 $MNTPT/clean > /var/tmp/i1_ref.txt
 sync; sync
@@ -47,7 +47,7 @@ teardown "I1"
 # Fail disk 3 (valid for NDISKS >= 4)
 I2_DISK=3
 setup_fresh
-check_v4
+check_v3
 write_ref_data "ref"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $I2_DISK)" > /dev/null 2>&1
@@ -60,7 +60,7 @@ sync; sync
 umount -f $MNTPT 2>/dev/null || umount $MNTPT 2>/dev/null || true
 
 # Remount degraded (without I2_DISK)
-DEGRADED="$(degraded_spec $I2_DISK)@V4TEST"
+DEGRADED="$(degraded_spec $I2_DISK)@V3TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     verify_ref "I2: pre-crash reference intact after degraded unclean unmount" "ref"
     check_no_checkfail "I2"
@@ -82,7 +82,7 @@ done
 # and reports freed bytes > 0 (otherwise the orphan-reclaim contract
 # isn't exercised).
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/keep bs=65536 count=128 2>/dev/null
 sync; sync
 

@@ -7,6 +7,13 @@ build-path closeout — what each landed and what it deferred.
 `181c1d9`.  Phase 1 commits land roughly bottom-up — code deletion first,
 then v4-specific format/quorum/recovery layers, then test + build closeout.
 
+> **Numbering note (2026-05-24).** "v3" in entries below = the prior
+> RAID6-below-HAMMER2 path that was deleted; "v4" = the RAIDZ2-native
+> design these commits built.  The dev-tree later collapsed both
+> unshipped on-disk numbers into a single `HAMMER2_VOL_VERSION_RAIDZ2 = 3`,
+> so anything an entry calls "v4" is what now ships as v3.  Branch
+> name `v4-rebuild` is kept.
+
 - `eb9593a` Group G interim (DIO key dispatch consolidated).
 - `dc02c9a` Group F (in-place guards: F1 chain newmod version check,
   F2 EMERG alloc-fail refused on v4, F3 ioctl emerg_mode → EOPNOTSUPP,
@@ -54,7 +61,7 @@ then v4-specific format/quorum/recovery layers, then test + build closeout.
   default close of the Group H bitmap walker gap.  Net +17.
 - `38899bf` J2-full: per-disk pre-scan + majority quorum + rollback
   envelope (default 8 TXGs).  rootvoldata now reflects the highest
-  v4_txg_seq; no-majority returns ENXIO.  Net +127/-3.
+  rz_txg_seq; no-majority returns ENXIO.  Net +127/-3.
 - `1153d91` I5-wire: putblk mirrors v4 metadata payloads; getblk
   failover via metadata_mirror_read.  Net +181/-36.
 - `4e325fa` Hard freemap restriction (bmin/bmax in fiterate; v4 metadata
@@ -67,13 +74,13 @@ then v4-specific format/quorum/recovery layers, then test + build closeout.
   `stripe_bitmap_invalid` is set; success clears the flag and RW mount
   proceeds.  Net +115/-9.
 - `37d3808` Group K: tests/mdraid deleted; tests/raidz2native →
-  tests/v4 against /dev/vbd* only.  vn paths stripped from common.sh +
+  tests/v3 against /dev/vbd* only.  vn paths stripped from common.sh +
   run_all.sh.  Net +33/-3834.
 - `8d1c551` Build-path gaps (session 2026-05-23).  Ships
   `src/sys/local_Makefile` (adds `hammer2_raid6.c` to SRCS);
   `src/sbin/local_mkfs_hammer2.h` adds `RaidType`/`Ndisks`;
   `src/sbin/local_newfs_hammer2.c` adds `-R raid` + `-N ndisks`
-  (matches `newfs_hammer2 -R 6 ...` in tests/v4); deploy.sh syncs the
+  (matches `newfs_hammer2 -R 6 ...` in tests/v3); deploy.sh syncs the
   Makefile and idempotently appends the matching `optional hammer2`
   line to `/usr/src/sys/conf/files`; deploy.sh now uses the `h2dev`
   SSH alias.  `hammer2_raid6_auto_fail_disk` no longer `static`;
@@ -95,7 +102,7 @@ then v4-specific format/quorum/recovery layers, then test + build closeout.
   (J2-full + sysctl).
 - Failure handling: bitmap_invalid auto-rebuilds via blockref walk
   (H4-deep); failed-disk metadata reads fall back to siblings.
-- Tests: tests/v4 against virtio-blk; tests/perf scaffold.
+- Tests: tests/v3 against virtio-blk; tests/perf scaffold.
 
 All builds clean -Werror on VM (hammer2.ko 477024 bytes incl. raid6.o).
 Userspace newfs_hammer2 + hammer2 utility also build clean.

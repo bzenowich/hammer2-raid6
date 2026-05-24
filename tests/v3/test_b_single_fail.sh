@@ -14,7 +14,7 @@ echo "=== Group B: Single Disk Failure (NDISKS=$NDISKS) ==="
 DISK=0
 while [ "$DISK" -lt "$NDISKS" ]; do
     setup_fresh
-    check_v4
+    check_v3
     write_ref_data "ref"
 
     hammer2 -s $MNTPT raid fail-disk "$(disk_dev $DISK)" > /dev/null 2>&1
@@ -27,7 +27,7 @@ done
 
 # B_last: Degraded write after single failure, then verify through dual reconstruction
 setup_fresh
-check_v4
+check_v3
 write_ref_data "ref"
 
 FAIL1=2

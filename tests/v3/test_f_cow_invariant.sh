@@ -11,7 +11,7 @@ echo "=== Group F: COW Invariant and Parity Correctness ==="
 
 # F1: Overwrite test — each write cycle must use distinct stripe slots
 setup_fresh
-check_v4
+check_v3
 
 # Write, record addresses, overwrite, check no overlap
 dd if=/dev/urandom of=$MNTPT/cow1 bs=65536 count=16 2>/dev/null
@@ -58,7 +58,7 @@ fi
 
 if [ -n "$H2CHECK" ]; then
     setup_fresh
-    check_v4
+    check_v3
     # Write enough data to allocate several stripes
     dd if=/dev/urandom of=$MNTPT/parity_test bs=65536 count=64 2>/dev/null
     sync; sync
@@ -82,7 +82,7 @@ fi
 
 # F3: Snapshot COW — snapshot preserves old data, new write uses fresh slot
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/snap_test bs=65536 count=32 2>/dev/null
 sha256 $MNTPT/snap_test > /var/tmp/f3_snap.txt
 sync; sync

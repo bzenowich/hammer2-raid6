@@ -61,7 +61,7 @@ static void alloc_direct(hammer2_off_t *basep, hammer2_blockref_t *bref,
 
 /*
  * Write one HAMMER2_PBUFSIZE block at logical_off to every disk for the
- * v4 RAIDZ2-native metadata mirror layout.
+ * v3 RAIDZ2-native metadata mirror layout.
  *
  * Uses the same left-symmetric layout as the kernel's hammer2_raid6_map().
  * For a fresh filesystem all disks are zero, so incremental XOR from zero
@@ -75,11 +75,11 @@ format_raid6_pwrite(hammer2_ondisk_t *fso, hammer2_off_t logical_off,
 	size_t n;
 
 	/*
-	 * v4 RAID6 (RAIDZ2-native): the kernel mount path (Path C in
+	 * v3 RAID6 (RAIDZ2-native): the kernel mount path (Path C in
 	 * hammer2_dio_key) resolves INODE/INDIRECT/FREEMAP bref->data_off
 	 * via hammer2_get_volume(pbase), which picks one volume (disk 0
 	 * for any offset inside vol[0].size) and reads dev_pbase = pbase -
-	 * vol->offset directly.  v4 DATA/DIRENT goes through the runtime
+	 * vol->offset directly.  v3 DATA/DIRENT goes through the runtime
 	 * kernel stripe allocator (Path A), never written by mkfs at
 	 * format time.  So everything mkfs emits — the boot/aux clear and
 	 * the super-root/root inode page — is metadata: mirror the same
@@ -89,7 +89,7 @@ format_raid6_pwrite(hammer2_ondisk_t *fso, hammer2_off_t logical_off,
 	 *
 	 * A previous v3-era implementation here used a left-symmetric
 	 * stripe layout with rotating P/Q.  That landed the super-root on
-	 * the wrong disk at the wrong offset under v4 (e.g. disk 2 + 6 MiB
+	 * the wrong disk at the wrong offset under v3 (e.g. disk 2 + 6 MiB
 	 * vs kernel reading disk 0 + 4 MiB) and produced a CHECK FAIL on
 	 * every first mount — silently masked while the harness booted the
 	 * upstream baked-in HAMMER2 instead of the local sources.
@@ -98,7 +98,7 @@ format_raid6_pwrite(hammer2_ondisk_t *fso, hammer2_off_t logical_off,
 		n = pwrite(fso->volumes[v].fd, buf, HAMMER2_PBUFSIZE,
 			   logical_off);
 		if (n != HAMMER2_PBUFSIZE) {
-			perror("write (raid6 v4 mirror)");
+			perror("write (raid6 v3 mirror)");
 			exit(1);
 		}
 	}
@@ -672,21 +672,21 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 			rc->disk_state[i] = 0; /* ONLINE */
 
 		/*
-		 * v4 RAIDZ2-native addendum (volhdr_quorum.md).  Array UUID is
+		 * v3 RAIDZ2-native addendum (volhdr_quorum.md).  Array UUID is
 		 * shared by all disks (reuse VolFSID, which mkfs already
 		 * generates once and writes identically into every disk's
-		 * voldata.fsid).  v4_disk_id is the per-disk volu_id, so
+		 * voldata.fsid).  rz_disk_id is the per-disk volu_id, so
 		 * mount can identify a disk even if device names reshuffle.
 		 * Initial seqno = 1; flush bumps it per TXG.
 		 */
 		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 			hammer2_off_t md_size;
 
-			rc->v4_txg_seq = 1;
-			bcopy(&opt->Hammer2_VolFSID, rc->v4_array_uuid,
-			    sizeof(rc->v4_array_uuid));
-			rc->v4_disk_id = (uint8_t)vol->id;
-			rc->v4_ndisks = (uint8_t)fso->nvolumes;
+			rc->rz_txg_seq = 1;
+			bcopy(&opt->Hammer2_VolFSID, rc->rz_array_uuid,
+			    sizeof(rc->rz_array_uuid));
+			rc->rz_disk_id = (uint8_t)vol->id;
+			rc->rz_ndisks = (uint8_t)fso->nvolumes;
 
 			md_size = min_size * HAMMER2_MD_EXTENT0_PCT / 100;
 			if (md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
@@ -746,7 +746,7 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	fsync(vol->fd);
 
 	/*
-	 * RAIDZ2-native (v4): write an empty but valid stripe bitmap to
+	 * RAIDZ2-native (v3): write an empty but valid stripe bitmap to
 	 * zone slot 41 on disk 0.  Header+footer with generation 1 + CRC;
 	 * bitmap region all-zero (no stripes allocated).  The kernel reads
 	 * this at mount; without the header it would mark bitmap_invalid.
@@ -906,7 +906,7 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 		fso.total_size = (hammer2_off_t)(fso.nvolumes - 2) * min_size;
 
 		/*
-		 * RAIDZ2-native (v4): upgrade the filesystem version so the
+		 * RAIDZ2-native (v3): upgrade the filesystem version so the
 		 * kernel uses physical stripe addressing (bref.copyid = disk,
 		 * bref.data_off = physical column offset).
 		 */

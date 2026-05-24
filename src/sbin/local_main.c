@@ -35,7 +35,7 @@
 
 #include "hammer2.h"
 
-/* v4 RAIDZ2-native cmd_raid front-end (cmd_raid.c). */
+/* v3 RAIDZ2-native cmd_raid front-end (cmd_raid.c). */
 int cmd_raid(const char *sel_path, int ac, const char **av);
 
 int DebugOpt;
@@ -518,7 +518,7 @@ main(int ac, char **av)
 	} else if (strcmp(av[0], "cleanup") == 0) {
 		ecode = cmd_cleanup(av[1]);	/* can be NULL */
 	} else if (strcmp(av[0], "raid") == 0) {
-		/* v4 RAIDZ2-native: status / fail-disk / replace */
+		/* v3 RAIDZ2-native: status / fail-disk / replace */
 		ecode = cmd_raid(sel_path, ac - 1,
 				 (const char **)(void *)&av[1]);
 	} else {

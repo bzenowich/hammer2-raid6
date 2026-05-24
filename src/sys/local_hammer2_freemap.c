@@ -204,7 +204,7 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	}
 
 	/*
-	 * v4 RAIDZ2-native: DATA/DIRENT blocks are allocated from the
+	 * v3 RAIDZ2-native: DATA/DIRENT blocks are allocated from the
 	 * stripe bitmap, not the freemap. Centralizing the dispatch here
 	 * covers every caller, not just hammer2_chain_modify.
 	 * INODE/INDIRECT/FREEMAP_* still flow through the freemap radix
@@ -283,7 +283,7 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	iter.relaxed = hmp->freemap_relaxed;
 
 	/*
-	 * v4 RAIDZ2-native: hard-restrict non-DATA/DIRENT allocations to
+	 * v3 RAIDZ2-native: hard-restrict non-DATA/DIRENT allocations to
 	 * the metadata zone (metadata_zone.md).  Setting bmin/bmax causes
 	 * hammer2_freemap_iterate to wrap inside the zone instead of into
 	 * the data area, and to return ENOSPC if the entire zone is full.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# common.sh — shared helpers for v4 (RAIDZ2-native) integration tests.
+# common.sh — shared helpers for v3 (RAIDZ2-native) integration tests.
 # Authoritative test substrate is virtio-blk (/dev/vbd*); per
 # newplan.md §8, vn-backed runs are no longer supported.
 #
@@ -14,7 +14,7 @@
 
 NDISKS="${NDISKS:-4}"
 DISK_BASE="${DISK_BASE:-1}"
-MNTPT=/mnt/v4test
+MNTPT=/mnt/v3test
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
 
 # Build device list and colon-separated DEVSPEC
@@ -31,7 +31,7 @@ while [ "$i" -lt "$NDISKS" ]; do
     fi
     i=$((i + 1))
 done
-PFSPATH="${DEVSPEC}@V4TEST"
+PFSPATH="${DEVSPEC}@V3TEST"
 
 # Return the device path for disk index $1 (logical 0..NDISKS-1)
 disk_dev() {
@@ -99,7 +99,7 @@ setup_fresh() {
     local attempt=0
     while [ "$attempt" -lt 5 ]; do
         # shellcheck disable=SC2086
-        if newfs_hammer2 -R 6 -L V4TEST $DEVS > /dev/null 2>&1; then
+        if newfs_hammer2 -R 6 -L V3TEST $DEVS > /dev/null 2>&1; then
             newfs_ok=1
             break
         fi
@@ -109,7 +109,7 @@ setup_fresh() {
     if [ "$newfs_ok" = "0" ]; then
         echo "  FATAL: newfs_hammer2 failed after 5 attempts in setup_fresh"
         # shellcheck disable=SC2086
-        newfs_hammer2 -R 6 -L V4TEST $DEVS 2>&1 | head -5
+        newfs_hammer2 -R 6 -L V3TEST $DEVS 2>&1 | head -5
         exit 1
     fi
     mkdir -p $MNTPT
@@ -160,7 +160,7 @@ summary() {
 }
 
 # Version guard: check that the mounted filesystem is RAIDZ2-native (v3).
-check_v4() {
+check_v3() {
     if hammer2 -s $MNTPT volume-list 2>/dev/null | grep -q "^version 3"; then
         return 0
     fi

@@ -18,7 +18,7 @@ while [ "$A" -lt "$NDISKS" ]; do
         LABEL=$(printf "C%02d" $N)
 
         setup_fresh
-        check_v4
+        check_v3
         write_ref_data "ref"
 
         hammer2 -s $MNTPT raid fail-disk "$(disk_dev $A)" > /dev/null 2>&1

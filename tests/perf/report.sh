@@ -54,7 +54,7 @@ for f in files:
         configs_seen.append(cfg)
 
 # stable cfg order
-preferred = ["h2-1disk", "v4-healthy", "v4-degraded"]
+preferred = ["h2-1disk", "v3-healthy", "v3-degraded"]
 configs = [c for c in preferred if c in configs_seen] + \
           [c for c in configs_seen if c not in preferred]
 

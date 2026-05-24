@@ -1,4 +1,4 @@
-# HAMMER2 v4 RAIDZ2-native — Volume Header Sequence + Quorum
+# HAMMER2 v3 RAIDZ2-native — Volume Header Sequence + Quorum
 
 **Status**: Phase 0 spec. Implementation in Phase 1.
 **Cross-refs**: `newplan.md` §5.6, §9.2.
@@ -34,29 +34,29 @@ relevant fields:
 - HAMMER2 already writes the volume header to all N disks in the
   TXG-commit flush loop.
 
-**New for v4** (in the existing raid_config substructure or volhdr
+**New for v3** (in the existing raid_config substructure or volhdr
 addendum):
 
 ```c
-uint64_t v4_txg_seq;        /* per-TXG sequence number, monotonic */
-uint64_t v4_array_uuid[2];  /* identifies this RAID6 array */
-uint8_t  v4_disk_id;        /* this disk's slot in the array (0..N-1) */
-uint8_t  v4_ndisks;         /* total disks in the array */
-uint8_t  v4_pad[6];
+uint64_t rz_txg_seq;        /* per-TXG sequence number, monotonic */
+uint64_t rz_array_uuid[2];  /* identifies this RAID6 array */
+uint8_t  rz_disk_id;        /* this disk's slot in the array (0..N-1) */
+uint8_t  rz_ndisks;         /* total disks in the array */
+uint8_t  rz_pad[6];
 ```
 
-`v4_txg_seq` increases by 1 per TXG commit. Initial value (after
+`rz_txg_seq` increases by 1 per TXG commit. Initial value (after
 `newfs_hammer2 --raid6`) = 1.
 
-`v4_array_uuid` is generated at format time and identical across all
+`rz_array_uuid` is generated at format time and identical across all
 N disks. It distinguishes "this is a disk that belongs to this array"
 from "this is a disk with a HAMMER2 header that came from somewhere
 else." Detected mismatches at mount: refuse to attach the disk; log a
 clear error.
 
-`v4_disk_id` lets a disk identify its column index even when device
+`rz_disk_id` lets a disk identify its column index even when device
 names reshuffle between reboots (a known DragonFlyBSD behavior on real
-hardware). HAMMER2 already has `volu_id`; this is the v4-aware
+hardware). HAMMER2 already has `volu_id`; this is the v3-aware
 equivalent.
 
 ---
@@ -72,7 +72,7 @@ For each TXG:
 4. `BUF_CMD_FLUSH` per disk — hardware cache flush. (This already
    exists; reuse unconditionally per `newplan.md` §6.)
 5. **Volume header write loop**: for each disk i in 0..N−1:
-   - Set `voldata.v4_txg_seq = current_txg`.
+   - Set `voldata.rz_txg_seq = current_txg`.
    - Compute `voldata.icrc_volheader`.
    - `bwrite` (synchronous) to the disk's primary volume header
      zone.
@@ -99,17 +99,17 @@ for each disk in pool:
     read volhdr zone 0 → vh0
     read volhdr zone 1 → vh1
     if vh0 valid and vh1 valid:
-        disk_seq[i] = max(vh0.v4_txg_seq, vh1.v4_txg_seq)
+        disk_seq[i] = max(vh0.rz_txg_seq, vh1.rz_txg_seq)
         disk_uuid[i] = (the valid header's array_uuid)
     elif vh0 valid:
-        disk_seq[i] = vh0.v4_txg_seq
+        disk_seq[i] = vh0.rz_txg_seq
     elif vh1 valid:
-        disk_seq[i] = vh1.v4_txg_seq
+        disk_seq[i] = vh1.rz_txg_seq
     else:
         disk_seq[i] = INVALID
         mark disk failed
 
-verify all valid disks share the same v4_array_uuid (reject foreign
+verify all valid disks share the same rz_array_uuid (reject foreign
 disks with EINVAL).
 
 # Sort surviving disks by seqno, descending.
@@ -189,8 +189,8 @@ explicitly, but the default refuses silent multi-TXG rollback.
 ## Interaction with `hammer2 raid fail-disk` / `replace`
 
 The runtime fail/replace ioctls (memory: Fix 11) update `voldata.raid_config.disk_state`
-and `flags`. Those fields persist via the same volhdr write path. v4
-inherits this mechanism — the ioctls also need to bump `v4_txg_seq`
+and `flags`. Those fields persist via the same volhdr write path. v3
+inherits this mechanism — the ioctls also need to bump `rz_txg_seq`
 and synchronously commit so a subsequent crash doesn't lose the
 state change.
 
@@ -198,7 +198,7 @@ state change.
 
 ## Open items deferred to Phase 1
 
-- Exact placement of v4 addendum fields in `voldata` (need to verify
+- Exact placement of v3 addendum fields in `voldata` (need to verify
   there's a clean reserved area or use the raid_config substructure).
 - Mount-time UI: how clearly to surface "rolled back to seqno T−1"
   to the user. `dmesg` line plus a sysctl indicator.

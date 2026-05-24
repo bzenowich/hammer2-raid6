@@ -349,9 +349,9 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 }
 
 /*
- * RAIDZ2-native (v4) parity write: compute P and Q from scratch.
+ * RAIDZ2-native (v3) parity write: compute P and Q from scratch.
  *
- * Under v4, every data write goes to a freshly-allocated stripe slot where
+ * Under v3, every data write goes to a freshly-allocated stripe slot where
  * all other data columns are zero.  Therefore:
  *
  *   P = data_col XOR 0 XOR ... XOR 0 = data_col
@@ -391,7 +391,7 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 	KKASSERT(bytes == (size_t)stripe_unit);
 
 	/*
-	 * v4 (RAIDZ2-native) stripe geometry.
+	 * v3 (RAIDZ2-native) stripe geometry.
 	 *
 	 * pbase encodes the physical column offset:
 	 *   pbase = HAMMER2_ZONE_SEG64 + stripe_slot * stripe_unit
@@ -479,7 +479,7 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 }
 
 /*
- * v4 RAIDZ2-native: synchronously mirror a metadata block to every
+ * v3 RAIDZ2-native: synchronously mirror a metadata block to every
  * surviving disk at the same per-disk byte offset.  No parity — the
  * N-way mirror is its own redundancy.
  *
@@ -546,7 +546,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 }
 
 /*
- * v4 RAIDZ2-native: read a metadata block from the first surviving
+ * v3 RAIDZ2-native: read a metadata block from the first surviving
  * mirror copy.  Used when the primary disk for a metadata DIO is
  * failed.  Iterates disks in index order, skipping skip_disk_idx and
  * any disk marked failed/closed, until one bread succeeds.

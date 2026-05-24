@@ -2013,12 +2013,12 @@ int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
 
 /*
- * Fault injection for v4 RAID6 tests.  When a bit is set in
+ * Fault injection for v3 RAID6 tests.  When a bit is set in
  * hammer2_inject_eio_disk_mask, breadnx/bread calls against that disk
  * index are skipped and EIO is returned to the caller.  The disk is NOT
  * auto-failed (the test wants repeatable injection, not persistent
  * exclusion).  Default 0 (disabled).  See newplan §7 Phase 2 exit and
- * tests/v4/test_e_eio_inject.sh.
+ * tests/v3/test_e_eio_inject.sh.
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
 

@@ -4,6 +4,13 @@
 **Cross-refs**: `newplan.md` §6 (carry-over and deletion lists), §7 Phase 1.
 **Branch**: `v4-rebuild` (created from `harness` @ 18f4420).
 
+> **Numbering note (2026-05-24).** "v3" below means the pre-rewrite
+> RAID6-below-HAMMER2 layer that this tracker plans to delete; "v4"
+> means the RAIDZ2-native design that replaces it.  Both unshipped
+> numbers were later collapsed into a single
+> `HAMMER2_VOL_VERSION_RAIDZ2 = 3` on disk.  See `newplan.md`'s
+> numbering note for context.
+
 Goal: enter Phase 2 with code that **compiles, mounts a single-disk
 volume, and contains no v3-era complexity**. Per-item commits, each
 small enough to revert independently.
@@ -172,7 +179,7 @@ Per `volhdr_quorum.md`:
 
 | Item | Symbol                                                 | Location                                | Action |
 |------|--------------------------------------------------------|-----------------------------------------|--------|
-| J1   | `v4_txg_seq`, `v4_array_uuid`, `v4_disk_id`, `v4_ndisks` | `local_hammer2.h` (volhdr or raid_config) | Add |
+| J1   | `rz_txg_seq`, `rz_array_uuid`, `rz_disk_id`, `rz_ndisks` | `local_hammer2.h` (volhdr or raid_config) | Add |
 | J2   | Mount-time quorum logic                                | `local_hammer2_vfsops.c` (mount path)   | Add |
 | J3   | Per-TXG seqno bump                                     | `local_hammer2_flush.c` (volhdr write)  | Add |
 | J4   | `newfs_hammer2 --raid6` UUID gen                       | `local_mkfs_hammer2.c`                  | Add |
@@ -187,7 +194,7 @@ as authoritative":
 | Item | Action                                                 |
 |------|--------------------------------------------------------|
 | K1   | Delete `tests/mdraid/` (v3 test suite)                |
-| K2   | Replace `tests/raidz2native/` with `tests/v4/` against virtio-blk |
+| K2   | Replace `tests/raidz2native/` with `tests/v3/` against virtio-blk |
 | K3   | Keep combo-test structure; rewrite per v4 semantics    |
 | K4   | Delete vn-backed test paths from `common.sh`           |
 
@@ -208,4 +215,4 @@ Suggested commit order (each group ≤ 1 day of work):
 9. **K (tests)** — last; rewrite against the new code.
 
 Phase 1 exit: single-disk mount works; multi-disk RAID6 code compiles
-but is inert until ≥4 disks attached (gated by `v4_ndisks` field).
+but is inert until ≥4 disks attached (gated by `rz_ndisks` field).

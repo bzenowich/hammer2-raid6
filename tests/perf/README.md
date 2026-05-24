@@ -1,4 +1,4 @@
-# tests/perf — HAMMER2 v4 (RAID6) performance harness
+# tests/perf — HAMMER2 v3 RAIDZ2-native performance harness
 
 Drives [fio](https://github.com/axboe/fio) across three configurations on the
 DragonFly harness VM:
@@ -6,10 +6,10 @@ DragonFly harness VM:
 | config        | layout                                       |
 |---------------|----------------------------------------------|
 | `h2-1disk`    | vanilla HAMMER2 on `/dev/vbd1` (baseline)    |
-| `v4-healthy`  | v4 RAID6 across `/dev/vbd1..vbdN`            |
-| `v4-degraded` | v4 RAID6 with `/dev/vbd3` failed at runtime  |
+| `v3-healthy`  | v3 RAIDZ2-native across `/dev/vbd1..vbdN`            |
+| `v3-degraded` | v3 RAIDZ2-native with `/dev/vbd3` failed at runtime  |
 
-`vbd0` is the system disk on the harness VM (see `tests/v4/common.sh`
+`vbd0` is the system disk on the harness VM (see `tests/v3/common.sh`
 header note); test disks start at `vbd1`.  `DISK_BASE=0` overrides the
 offset if your substrate places the FS root elsewhere.
 
@@ -42,7 +42,7 @@ From the host:
 Override:
 
     ssh h2dev 'cd /root/hammer2-tests/perf && \
-        NDISKS=6 JOBS="1 8" sh run_perf.sh v4-healthy -- seq-read-1m'
+        NDISKS=6 JOBS="1 8" sh run_perf.sh v3-healthy -- seq-read-1m'
 
 Output:
 
@@ -54,10 +54,10 @@ Output:
 
 Numbers to validate after the first run lands a baseline:
 
-- `v4-healthy seq-read`  >= `h2-1disk * (ndata * 0.75)` (4-disk -> 1.5x)
-- `v4-healthy seq-write` >= `h2-1disk * 0.6` (P+Q overhead)
-- `v4-healthy rand-read` >= `h2-1disk * 0.9`
-- `v4-degraded` produces **zero** `CHECK FAIL` in dmesg
+- `v3-healthy seq-read`  >= `h2-1disk * (ndata * 0.75)` (4-disk -> 1.5x)
+- `v3-healthy seq-write` >= `h2-1disk * 0.6` (P+Q overhead)
+- `v3-healthy rand-read` >= `h2-1disk * 0.9`
+- `v3-degraded` produces **zero** `CHECK FAIL` in dmesg
 - `pg-mix` regression < 25% vs `h2-1disk`
 
 The harness records dmesg `CHECK FAIL` count pre/post each run and prints a
@@ -71,6 +71,6 @@ WARN if it grew — useful for catching parity-path regressions hiding under
   physical hardware target (see `memory/hardware_target.md`).
 - DragonFly does not have an `O_DIRECT` equivalent at the FS layer; `pg-mix`
   uses `fsync=8` to approximate commit pressure.
-- `setup_v4_degraded` fails disk index 2; for stripe 0 with NDISKS=4 that is
+- `setup_v3_degraded` fails disk index 2; for stripe 0 with NDISKS=4 that is
   a data column.  For NDISKS=5 or 6, index 2 is still a data column at
   stripe 0.  Adjust if testing higher disk counts.

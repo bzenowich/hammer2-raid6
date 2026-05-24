@@ -790,12 +790,12 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		if (orefs & HAMMER2_DIO_DIRTY) {
 			char *raid6_data = NULL;
 			char *md_mirror_data = NULL;
-			int v4_meta = 0;
+			int rz_meta = 0;
 
 			dio_write_stats_update(dio, bp);
 
 			/*
-			 * v4 RAIDZ2-native: capture the data column for
+			 * v3 RAIDZ2-native: capture the data column for
 			 * parity-protected btypes (DATA/DIRENT) before
 			 * releasing bp.  Parity is computed after bp is
 			 * released so write_scratch's P/Q writes do not
@@ -827,7 +827,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					    HAMMER2_BREF_TYPE_FREEMAP_NODE ||
 					   dio->btype ==
 					    HAMMER2_BREF_TYPE_FREEMAP_LEAF) {
-					v4_meta = 1;
+					rz_meta = 1;
 					if (bp) {
 						bkvasync(bp);
 						md_mirror_data = kmalloc(psize,
@@ -907,7 +907,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				}
 			}
 			/*
-			 * v4 RAIDZ2-native parity update.
+			 * v3 RAIDZ2-native parity update.
 			 *
 			 * COW invariant: the stripe slot is freshly
 			 * allocated, so all other data columns are zero
@@ -927,14 +927,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			}
 
 			/*
-			 * v4 RAIDZ2-native metadata mirror (I5).  After the
+			 * v3 RAIDZ2-native metadata mirror (I5).  After the
 			 * primary bp has been disposed above (bdwrite /
 			 * cluster_write / bawrite to dio->devvp), replicate
 			 * the same payload synchronously to every surviving
 			 * sibling disk at the same per-disk byte offset.
 			 * skip_disk_idx avoids re-writing to the primary.
 			 */
-			if (v4_meta && md_mirror_data) {
+			if (rz_meta && md_mirror_data) {
 				hammer2_off_t per_disk_off = pbase - dio->dbase;
 				hammer2_io_metadata_mirror_write(hmp,
 				    dio->disk_idx, per_disk_off,
@@ -1406,7 +1406,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 	if (is_physical) {
 		/*
-		 * v4 RAIDZ2-native physical addressing for DATA/DIRENT.
+		 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
 		 *
 		 * logical_off is the encoded key (top byte = disk_idx,
 		 * middle bits = per-disk physical offset; see
@@ -1637,7 +1637,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 		/*
-		 * v4 (RAIDZ2-native): iterate over all possible stripe slots
+		 * v3 (RAIDZ2-native): iterate over all possible stripe slots
 		 * in the bitmap.  Only process allocated (bit-set) slots.
 		 */
 		num_stripes = (HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64) /
@@ -1833,7 +1833,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	 * Phase 3: Rebuild each stripe.
 	 *
 	 * Flush all pending writes first so that parity on surviving disks
-	 * is up-to-date before we read it.  Under v4 COW, concurrent writes
+	 * is up-to-date before we read it.  Under v3 COW, concurrent writes
 	 * land in freshly-allocated stripe slots whose data column may or
 	 * may not be on the replacement disk — if it is, the write itself
 	 * goes there directly; if not, the resilver doesn't care.  No
@@ -1843,7 +1843,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
 		/*
-		 * v4 (RAIDZ2-native): skip unallocated stripe slots.
+		 * v3 (RAIDZ2-native): skip unallocated stripe slots.
 		 * The bitmap lives in hmp->stripe_bitmap.
 		 */
 		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&

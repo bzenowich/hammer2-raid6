@@ -777,7 +777,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	uuid_t fsid, fstype;
 	int i, zone, error = 0, version = -1, nvolumes = 0;
 	/*
-	 * J2-full: per-disk v4 sequence numbers captured during the
+	 * J2-full: per-disk v3 sequence numbers captured during the
 	 * read loop; resolved into a majority-supported target seqno
 	 * after the loop completes.  Indexed by voldata->volu_id.
 	 */
@@ -906,15 +906,15 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		}
 
 		/*
-		 * v4 RAIDZ2-native: every disk carries the same array UUID
+		 * v3 RAIDZ2-native: every disk carries the same array UUID
 		 * (mkfs writes voldata.fsid identically into every disk).
-		 * Per-disk v4_array_uuid is generated at format time and
+		 * Per-disk rz_array_uuid is generated at format time and
 		 * must match what we already verified via voldata.fsid above.
-		 * v4_disk_id must match volu_id; v4_ndisks must agree with
+		 * rz_disk_id must match volu_id; rz_ndisks must agree with
 		 * raid_config.ndisks.
 		 *
 		 * Full majority-quorum + multi-TXG rollback (volhdr_quorum.md)
-		 * is deferred; today we log per-disk v4_txg_seq and any
+		 * is deferred; today we log per-disk rz_txg_seq and any
 		 * mismatched UUIDs.  Mount-time selection of the
 		 * highest-seqno root voldata is a follow-up.
 		 */
@@ -923,31 +923,31 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		     HAMMER2_RAID_TYPE_RAID6) {
 			const hammer2_raid_config_t *vrc =
 			    &voldata->raid_config;
-			if (bcmp(vrc->v4_array_uuid, &voldata->fsid,
-				 sizeof(vrc->v4_array_uuid)) != 0) {
-				hprintf("%s: v4_array_uuid does not match "
+			if (bcmp(vrc->rz_array_uuid, &voldata->fsid,
+				 sizeof(vrc->rz_array_uuid)) != 0) {
+				hprintf("%s: rz_array_uuid does not match "
 					"voldata.fsid; refusing\n", path);
 				error = ENXIO;
 				goto done;
 			}
-			if (vrc->v4_disk_id != voldata->volu_id) {
-				hprintf("%s: v4_disk_id %u != volu_id %u\n",
-					path, vrc->v4_disk_id,
+			if (vrc->rz_disk_id != voldata->volu_id) {
+				hprintf("%s: rz_disk_id %u != volu_id %u\n",
+					path, vrc->rz_disk_id,
 					voldata->volu_id);
 				error = EINVAL;
 				goto done;
 			}
-			if (vrc->v4_ndisks != vrc->ndisks) {
-				hprintf("%s: v4_ndisks %u != ndisks %u\n",
-					path, vrc->v4_ndisks, vrc->ndisks);
+			if (vrc->rz_ndisks != vrc->ndisks) {
+				hprintf("%s: rz_ndisks %u != ndisks %u\n",
+					path, vrc->rz_ndisks, vrc->ndisks);
 				error = EINVAL;
 				goto done;
 			}
-			disk_seqs[voldata->volu_id] = vrc->v4_txg_seq;
+			disk_seqs[voldata->volu_id] = vrc->rz_txg_seq;
 			disk_seen[voldata->volu_id] = 1;
-			hprintf("%s: v4 RAID6 disk %u/%u txg_seq %ju\n",
-				path, vrc->v4_disk_id, vrc->v4_ndisks,
-				(uintmax_t)vrc->v4_txg_seq);
+			hprintf("%s: v3 RAID6 disk %u/%u txg_seq %ju\n",
+				path, vrc->rz_disk_id, vrc->rz_ndisks,
+				(uintmax_t)vrc->rz_txg_seq);
 		}
 
 		/* all per-volume tests passed */
@@ -958,8 +958,8 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		/*
 		 * Select the disk whose voldata becomes rootvoldata.
 		 *
-		 * J2-full: under v4 RAID6, prefer whichever disk has the
-		 * highest v4_txg_seq so the in-memory state reflects the
+		 * J2-full: under v3 RAID6, prefer whichever disk has the
+		 * highest rz_txg_seq so the in-memory state reflects the
 		 * most-recently committed TXG.  Otherwise (v1/v2/v3) keep
 		 * the legacy "first ROOT_VOLUME wins, else first present
 		 * disk" behavior.
@@ -968,8 +968,8 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		    voldata->raid_config.raid_type ==
 		     HAMMER2_RAID_TYPE_RAID6) {
 			if (*rootvoldevvp == NULL ||
-			    voldata->raid_config.v4_txg_seq >
-			     rootvoldata->raid_config.v4_txg_seq) {
+			    voldata->raid_config.rz_txg_seq >
+			     rootvoldata->raid_config.rz_txg_seq) {
 				bcopy(voldata, rootvoldata,
 				      sizeof(*rootvoldata));
 				*rootvolzone = zone;
@@ -997,7 +997,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	}
 
 	/*
-	 * J2-full: majority quorum on the v4 TXG seqno
+	 * J2-full: majority quorum on the v3 TXG seqno
 	 * (docs/volhdr_quorum.md §Mount-time discovery).
 	 *
 	 * We require ⌈N/2⌉+1 disks to report the same seqno as the disk
@@ -1018,7 +1018,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		const hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
 		uint32_t ndisks = rrc->ndisks;
 		uint32_t majority = (ndisks / 2) + 1;
-		uint64_t target = rrc->v4_txg_seq;
+		uint64_t target = rrc->rz_txg_seq;
 		uint64_t fallback = target;
 		uint32_t at_target;
 		uint64_t lowest = (uint64_t)-1;
@@ -1046,7 +1046,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 				break;
 			if (fallback == 0 ||
 			    target - fallback >= rollback_max) {
-				hprintf("v4 quorum: no majority within "
+				hprintf("v3 quorum: no majority within "
 					"%u-TXG rollback limit "
 					"(target seq %ju, lowest %ju, "
 					"%u disks seen of %u)\n",
@@ -1062,7 +1062,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 
 		if (fallback != target) {
 			if (!hammer2_j2_allow_rollback) {
-				hprintf("v4 quorum: would roll back "
+				hprintf("v3 quorum: would roll back "
 					"%ju -> %ju (%u/%u disks at "
 					"fallback seq); refusing.  Set "
 					"vfs.hammer2.j2_allow_rollback=1 to "
@@ -1074,7 +1074,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 				error = ENXIO;
 				goto done;
 			}
-			hprintf("v4 quorum: rolling back %ju -> %ju "
+			hprintf("v3 quorum: rolling back %ju -> %ju "
 				"(%u/%u disks at fallback seq) "
 				"per j2_allow_rollback=1\n",
 				(uintmax_t)target, (uintmax_t)fallback,
@@ -1095,7 +1095,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 				if (voldata->version <
 				    HAMMER2_VOL_VERSION_RAIDZ2)
 					continue;
-				if (voldata->raid_config.v4_txg_seq ==
+				if (voldata->raid_config.rz_txg_seq ==
 				    fallback) {
 					bcopy(voldata, rootvoldata,
 					      sizeof(*rootvoldata));
@@ -1111,7 +1111,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		 */
 		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
 			if (disk_seen[j] && disk_seqs[j] < target) {
-				hprintf("v4 quorum: disk %d at seq %ju "
+				hprintf("v3 quorum: disk %d at seq %ju "
 					"(target %ju) — needs resilver\n",
 					j, (uintmax_t)disk_seqs[j],
 					(uintmax_t)target);
@@ -1199,7 +1199,7 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
 }
 
 /*
- * H4-deep: blockref-walk reconstruction of the v4 stripe bitmap.
+ * H4-deep: blockref-walk reconstruction of the v3 stripe bitmap.
  *
  * Called from vfs_mount when hammer2_raid6_bitmap_read flagged
  * stripe_bitmap_invalid (torn write, missing/corrupt header, or
@@ -1542,7 +1542,7 @@ hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
 }
 
 /*
- * Allocate a physical stripe slot for a RAIDZ2-native (v4) data column.
+ * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
  * Sets chain->bref.data_off to the physical column offset on the chosen disk
  * and chain->bref.copyid to the disk index (0..ndisks-1).
  *

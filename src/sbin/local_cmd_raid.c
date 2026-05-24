@@ -1,5 +1,5 @@
 /*
- * v4 RAIDZ2-native userspace front-end for the RAID6 ioctls.
+ * v3 RAIDZ2-native userspace front-end for the RAID6 ioctls.
  *
  * Subcommands:
  *   raid status

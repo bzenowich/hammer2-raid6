@@ -13,7 +13,7 @@ echo "=== Group D: Resilver (NDISKS=$NDISKS) ==="
 # (Use index 3 which exists for NDISKS >= 4)
 D1_DISK=3
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/resilver_ref bs=65536 count=800 2>/dev/null
 sha256 $MNTPT/resilver_ref > /var/tmp/d1_ref.txt
 sync; sync
@@ -49,7 +49,7 @@ teardown "D1"
 D2_DISK1=1
 D2_DISK2=$((NDISKS - 2))
 setup_fresh
-check_v4
+check_v3
 write_ref_data "r1"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $D2_DISK1)" > /dev/null 2>&1
@@ -72,7 +72,7 @@ teardown "D2"
 
 # D3: Write during resilver — data written concurrently must be correct after
 setup_fresh
-check_v4
+check_v3
 write_ref_data "pre"
 sync; sync
 

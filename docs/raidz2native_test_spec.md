@@ -2,8 +2,18 @@
 
 This document specifies the test suite for the RAIDZ2-native HAMMER2
 implementation described in `raidz2_in_hammer2.md` and
-`raidz2_snapshot_interaction.md`. The RAIDZ2-native format (volume version 4)
-differs from the current RAID6 overlay (version 3) in three fundamental ways:
+`raidz2_snapshot_interaction.md`.
+
+> **Numbering note (2026-05-24).** The doc originally referred to the
+> RAIDZ2-native format as "volume version 4" and the prior RAID6 overlay
+> as "version 3".  The dev tree later collapsed those into a single
+> on-disk number: the format that now ships is
+> `HAMMER2_VOL_VERSION_RAIDZ2 = 3`.  Everywhere this spec contrasts "v3"
+> (RAID6 overlay) with "v4" (RAIDZ2-native), the latter is what now
+> ships as v3.
+
+The RAIDZ2-native format differs from the prior RAID6 overlay in three
+fundamental ways:
 
 1. `blockref.data_off` stores a **physical column offset** on the data disk,
    not a logical offset in HAMMER2's address space.
@@ -33,7 +43,7 @@ for i in 0 1 2 3 4 5; do
     vnconfig -S 1073741824 vn${i}
 done
 
-# Format with v4 (RAIDZ2-native) — requires -R 6 and new volume version
+# Format with v3 (RAIDZ2-native) — requires -R 6 and new volume version
 newfs_hammer2 -R 6 -L TEST \
     /dev/vn0 /dev/vn1 /dev/vn2 /dev/vn3 /dev/vn4 /dev/vn5
 
@@ -41,7 +51,7 @@ mount -t hammer2 \
     /dev/vn0:/dev/vn1:/dev/vn2:/dev/vn3:/dev/vn4:/dev/vn5@TEST /mnt/test
 ```
 
-The `-R 6` flag instructs `newfs_hammer2` to produce a v4 (RAIDZ2-native)
+The `-R 6` flag instructs `newfs_hammer2` to produce a v3 (RAIDZ2-native)
 volume. A v3 (RAID6 overlay) volume must not mount as v4 and vice versa; the
 kernel must reject the wrong version with a clear error message.
 
@@ -182,7 +192,7 @@ HAMMER2 volume version: 4
 ```
 
 If the version is not 4, all tests in this suite must be skipped with a clear
-message: `SKIP: v4 (RAIDZ2-native) format not yet implemented`. This ensures
+message: `SKIP: v3 (RAIDZ2-native) format not yet implemented`. This ensures
 the test suite can be added to CI before the implementation is complete without
 producing misleading failures.
 

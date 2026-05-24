@@ -6,7 +6,7 @@ Phase 1 of `docs/newplan.md` is content-complete on `v4-rebuild` (see
 ## Phase 2 exit gate
 
 Phase 2 exit criteria are met on `v4-rebuild` HEAD.  Full
-`tests/v4` suite on NDISKS=4 vbd substrate runs **44/44 PASS**
+`tests/v3` suite on NDISKS=4 vbd substrate runs **44/44 PASS**
 (A 4, B 6, C 6, D 8, E 4, F 4, G 4, H 4, I 4), no panics, no
 `CHECK FAIL` in dmesg.
 
@@ -25,7 +25,7 @@ Phase 2 exit criteria are met on `v4-rebuild` HEAD.  Full
 Stretch items (non-blocking for Phase 3):
 
 A. NDISKS=4..10 matrix test for ndata edges.
-B. Cull dead pre-v4 scripts under `tests/other/`.
+B. Cull dead pre-rewrite scripts under `tests/other/`.
 
 ## Phase 3 — real hardware bring-up
 

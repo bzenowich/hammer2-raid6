@@ -11,7 +11,7 @@ echo "=== Group G: Auto-fail and Degraded Mount (NDISKS=$NDISKS) ==="
 # G1: Explicit fail-disk + unmount + remount in degraded mode, verify data
 G1_DISK=2
 setup_fresh
-check_v4
+check_v3
 write_ref_data "ref"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G1_DISK)" > /dev/null 2>&1
@@ -20,7 +20,7 @@ umount $MNTPT
 
 # Remount without disk G1_DISK — should succeed in degraded mode
 detach_disk "$G1_DISK"
-DEGRADED="$(degraded_spec $G1_DISK)@V4TEST"
+DEGRADED="$(degraded_spec $G1_DISK)@V3TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     sha256 $MNTPT/ref_a > /var/tmp/g1_check.txt 2>&1
     sha256 $MNTPT/ref_b >> /var/tmp/g1_check.txt 2>&1
@@ -44,7 +44,7 @@ done
 # Fail second-to-last disk so the index is always valid
 G2_DISK=$((NDISKS - 2))
 setup_fresh
-check_v4
+check_v3
 write_ref_data "ref"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G2_DISK)" > /dev/null 2>&1
@@ -70,7 +70,7 @@ teardown "G2"
 # G3: Degraded write while one disk is absent, verify correctness
 G3_DISK=1
 setup_fresh
-check_v4
+check_v3
 write_ref_data "before"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G3_DISK)" > /dev/null 2>&1

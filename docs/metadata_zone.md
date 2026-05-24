@@ -1,8 +1,13 @@
-# HAMMER2 v4 RAIDZ2-native — Metadata Zone On-Disk Format
+# HAMMER2 v3 RAIDZ2-native — Metadata Zone On-Disk Format
 
 **Status**: Phase 0 spec. Implementation in Phase 1.
 **Supersedes**: any metadata-layout text in `raidz2_in_hammer2.md` §5.
 **Cross-refs**: `newplan.md` §5.3, §9.1.
+
+> **Numbering note (2026-05-24).** "v4" below = the RAIDZ2-native
+> design that now ships as `HAMMER2_VOL_VERSION_RAIDZ2 = 3`.  "v3"
+> below = the pre-rewrite RAID6-below-HAMMER2 layer, deleted in
+> Phase 1.  The dev-tree split numbering was collapsed.
 
 ---
 

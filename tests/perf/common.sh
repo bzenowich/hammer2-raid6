@@ -3,7 +3,7 @@
 #
 # The harness VM puts the SYSTEM disk at /dev/vbd0 and RAID test disks
 # at /dev/vbd1..vbd${NDISKS}.  All formatting must skip vbd0.  See
-# tests/v4/common.sh for the same DISK_BASE convention.
+# tests/v3/common.sh for the same DISK_BASE convention.
 
 NDISKS="${NDISKS:-4}"
 DISK_BASE="${DISK_BASE:-1}"
@@ -20,7 +20,7 @@ while [ "$i" -lt "$NDISKS" ]; do
     DEVSPEC="${DEVSPEC:+${DEVSPEC}:}${dev}"
     i=$((i + 1))
 done
-PFSPATH_V4="${DEVSPEC}@${LABEL}"
+PFSPATH_V3="${DEVSPEC}@${LABEL}"
 # h2-1disk baseline uses the first test disk (NOT vbd0 which is root).
 PFSPATH_1D="/dev/vbd${DISK_BASE}@${LABEL}"
 
@@ -53,17 +53,17 @@ setup_h2_1disk() {
     mount -t hammer2 "$PFSPATH_1D" "$MNTPT" || die "mount 1disk failed"
 }
 
-setup_v4_healthy() {
+setup_v3_healthy() {
     unmount_quiet
     zap_disks
     # shellcheck disable=SC2086
-    newfs_hammer2 -R 6 -L "$LABEL" $DEVS >/dev/null || die "newfs v4 failed"
+    newfs_hammer2 -R 6 -L "$LABEL" $DEVS >/dev/null || die "newfs v3 failed"
     mkdir -p "$MNTPT"
-    mount -t hammer2 "$PFSPATH_V4" "$MNTPT" || die "mount v4 failed"
+    mount -t hammer2 "$PFSPATH_V3" "$MNTPT" || die "mount v3 failed"
 }
 
-setup_v4_degraded() {
-    setup_v4_healthy
+setup_v3_degraded() {
+    setup_v3_healthy
     # Fail one data column (index 2).  Index 0 and N-1 are typically
     # P/Q for stripe 0; idx 2 is a stable data column for NDISKS>=4.
     hammer2 -s "$MNTPT" raid fail-disk /dev/vbd$((DISK_BASE + 2)) \

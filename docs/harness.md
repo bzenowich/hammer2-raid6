@@ -261,7 +261,7 @@ A background process `bin/watcher`:
 4. `launch-dfly.sh` (now headless, daemonized).
 5. Wait for SSH (poll with 60 s timeout).
 6. `bin/push` to sync the working tree to `/root/h2`.
-7. `ssh h2dev "cd /root/h2 && sh tests/v4/$script"`.
+7. `ssh h2dev "cd /root/h2 && sh tests/v3/$script"`.
 8. Watcher runs in background throughout.
 9. On test exit (any cause): `bin/pull` for dumps + artifacts; collect
    console.log; write a summary to `logs/runs/<timestamp>/`.

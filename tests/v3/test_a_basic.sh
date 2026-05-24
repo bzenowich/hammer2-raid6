@@ -1,5 +1,5 @@
 #!/bin/sh
-# Group A: Basic read/write on a healthy v4 (RAIDZ2-native) array.
+# Group A: Basic read/write on a healthy v3 (RAIDZ2-native) array.
 # Tests: A1 (write/remount/verify), A2 (small files), A3 (bref encoding),
 #        A4 (COW: overwrite allocates new stripe slot).
 
@@ -12,7 +12,7 @@ echo "=== Group A: Basic Read/Write (Healthy) ==="
 
 # A1: Write 100 MB, unmount, remount, verify
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/bigfile bs=65536 count=1600 2>/dev/null
 sha256 $MNTPT/bigfile > /var/tmp/a1_ref.txt
 sync; sync
@@ -28,7 +28,7 @@ teardown "A1"
 
 # A2: Small file variety
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/f_1k bs=1024 count=1 2>/dev/null
 dd if=/dev/urandom of=$MNTPT/f_4k bs=4096 count=1 2>/dev/null
 dd if=/dev/urandom of=$MNTPT/f_64k bs=65536 count=1 2>/dev/null
@@ -53,7 +53,7 @@ teardown "A2"
 
 # A3: Blockref encoding — copyid in [0..NDISKS-1], data_off 64KB-aligned
 setup_fresh
-check_v4
+check_v3
 dd if=/dev/urandom of=$MNTPT/probe bs=65536 count=4 2>/dev/null
 sync; sync
 hammer2 -s $MNTPT show > /var/tmp/a3_show.txt 2>&1
@@ -75,7 +75,7 @@ teardown "A3"
 
 # A4: COW — overwrite allocates new stripe slot (no address reuse)
 setup_fresh
-check_v4
+check_v3
 # Write a file large enough to span multiple DIOs (8 x 64KB = 512 KB)
 dd if=/dev/urandom of=$MNTPT/cow_test bs=65536 count=8 2>/dev/null
 sync; sync

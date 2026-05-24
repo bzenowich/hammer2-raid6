@@ -1,4 +1,4 @@
-# HAMMER2 v4 RAIDZ2-native — Stripe Bitmap On-Disk Format
+# HAMMER2 v3 RAIDZ2-native — Stripe Bitmap On-Disk Format
 
 **Status**: Phase 0 spec. Implementation in Phase 1.
 **Cross-refs**: `newplan.md` §5.2, §5.3, §9.3, §9.4. `metadata_zone.md`.
@@ -9,7 +9,7 @@
 
 The stripe bitmap zone tracks per-stripe allocation state at **column
 granularity** for DATA and DIRENT blocks. It is the allocator for the
-data area; the freemap radix is not consulted for DATA/DIRENT in v4.
+data area; the freemap radix is not consulted for DATA/DIRENT in v3.
 
 ---
 
@@ -235,7 +235,7 @@ manages per-slot column fill via in-memory state (TBD Phase 1).
 
 ## Format-version gate
 
-Stripe bitmap zone exists only on v4 (`HAMMER2_VOL_VERSION_RAIDZ2`)
+Stripe bitmap zone exists only on v3 RAIDZ2-native (`HAMMER2_VOL_VERSION_RAIDZ2`)
 volumes formatted with `--raid6`.
 
 ---

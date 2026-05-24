@@ -1,10 +1,10 @@
 #!/bin/sh
-# run_perf.sh — drive fio across {h2-1disk, v4-healthy, v4-degraded}
+# run_perf.sh — drive fio across {h2-1disk, v3-healthy, v3-degraded}
 # x {seq-read-1m, seq-write-1m, rand-read-4k, pg-mix} x numjobs.
 # Emits results/<cfg>_<workload>_j<N>.json plus a summary.md.
 #
 # Usage: sh run_perf.sh [config ...] [-- workload ...]
-#   Default configs:    h2-1disk v4-healthy v4-degraded
+#   Default configs:    h2-1disk v3-healthy v3-degraded
 #   Default workloads:  seq-read-1m seq-write-1m rand-read-4k pg-mix
 #   Override threads:   JOBS="1 4 8 16"  sh run_perf.sh
 #   Override NDISKS:    NDISKS=6 sh run_perf.sh
@@ -21,7 +21,7 @@ RESULTS="${RESULTS:-${SCRIPTDIR}/results/${RUNTAG}}"
 mkdir -p "$RESULTS"
 echo "==> Results dir: $RESULTS"
 
-ALL_CFGS="h2-1disk v4-healthy v4-degraded"
+ALL_CFGS="h2-1disk v3-healthy v3-degraded"
 ALL_WLS="seq-read-1m seq-write-1m rand-read-4k pg-mix"
 
 # Parse args:  configs [-- workloads]
@@ -77,8 +77,8 @@ for cfg in $CFGS; do
     echo "########## config: $cfg ##########"
     case "$cfg" in
         h2-1disk)     setup_h2_1disk;    ACTIVE_PFS="$PFSPATH_1D" ;;
-        v4-healthy)   setup_v4_healthy;  ACTIVE_PFS="$PFSPATH_V4" ;;
-        v4-degraded)  setup_v4_degraded; ACTIVE_PFS="$PFSPATH_V4" ;;
+        v3-healthy)   setup_v3_healthy;  ACTIVE_PFS="$PFSPATH_V3" ;;
+        v3-degraded)  setup_v3_degraded; ACTIVE_PFS="$PFSPATH_V3" ;;
         *) echo "  unknown config: $cfg"; continue ;;
     esac
 

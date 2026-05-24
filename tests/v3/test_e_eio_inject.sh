@@ -55,7 +55,7 @@ E1_INJECT=2
 [ "$E1_INJECT" = "$E1_FAIL" ] && E1_INJECT=$((E1_INJECT - 1))
 
 setup_fresh
-check_v4
+check_v3
 write_ref_data "e1"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $E1_FAIL)" > /dev/null 2>&1
@@ -97,7 +97,7 @@ teardown "E1"
 # I5 metadata mirror failover should pick a surviving sibling.
 # ---------------------------------------------------------------
 setup_fresh
-check_v4
+check_v3
 write_ref_data "e2"
 sync; sync
 umount $MNTPT
@@ -134,7 +134,7 @@ E3_SRC=0                 # disk we inject on (resilver picks first surviving)
 [ "$E3_SRC" = "$E3_RES" ] && E3_SRC=1
 
 setup_fresh
-check_v4
+check_v3
 write_ref_data "e3"
 
 hammer2 -s $MNTPT raid fail-disk "$(disk_dev $E3_RES)" > /dev/null 2>&1

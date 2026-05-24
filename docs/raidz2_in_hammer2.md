@@ -12,6 +12,12 @@
 >   test-infrastructure history; **deleted** in Phase 1.
 > - DIO key encoding discussion is superseded by the Phase 1 audit
 >   item in `newplan.md` §9.5.
+>
+> **Numbering note (2026-05-24).** Treat any "v4" / "version 4" /
+> "HAMMER2_VOLHDR_VERSION_RAID6 = 4" in this doc as referring to the
+> RAIDZ2-native format that now ships as `HAMMER2_VOL_VERSION_RAIDZ2 = 3`.
+> The dev-tree split numbering was collapsed because neither v3
+> (RAID6-below) nor v4 (intermediate RAIDZ2-native) ever escaped.
 
 This document analyzes what it would take to bring RAID6 parity into HAMMER2's
 existing chain/COW machinery — making HAMMER2 "RAID-native" the way ZFS is,

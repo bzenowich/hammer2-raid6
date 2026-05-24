@@ -16,7 +16,7 @@ SCRIPTDIR=$(dirname "$0")
 
 kldstat -q -m hammer2 || kldload hammer2
 
-SNAP_MNT=/mnt/v4snap
+SNAP_MNT=/mnt/v3snap
 
 echo "=== Group H: Snapshot across degraded states (NDISKS=$NDISKS) ==="
 
@@ -31,7 +31,7 @@ trap 'snap_unmount_quiet' EXIT INT TERM
 # H1: snapshot healthy, degrade, modify live, verify snapshot intact.
 # ----------------------------------------------------------------
 setup_fresh
-check_v4
+check_v3
 
 # sha256 prints "SHA256 (path) = hex"; the path column differs between
 # the live mount and the snapshot mount even when the data is identical,
@@ -96,7 +96,7 @@ fi
 # H2: snapshot taken WHILE degraded, then remount and verify.
 # ----------------------------------------------------------------
 setup_fresh
-check_v4
+check_v3
 
 dd if=/dev/urandom of=$MNTPT/dpayload bs=65536 count=64 2>/dev/null
 hash_of $MNTPT/dpayload > /var/tmp/h2_pre.txt
@@ -120,7 +120,7 @@ else
 
     # Cycle the live mount so caches don't fake a pass.
     umount $MNTPT
-    DEGRADED_SPEC="$(degraded_spec $H2_FAIL)@V4TEST"
+    DEGRADED_SPEC="$(degraded_spec $H2_FAIL)@V3TEST"
     if mount -t hammer2 "$DEGRADED_SPEC" $MNTPT 2>/dev/null; then
         # Mount the degraded-time snapshot
         snap_unmount_quiet

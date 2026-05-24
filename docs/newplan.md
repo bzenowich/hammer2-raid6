@@ -7,6 +7,16 @@
 preserving HAMMER2's COW architecture and snapshot model. ZFS RAIDZ2 is the
 reference design.
 
+> **Numbering note (2026-05-24).** This document predates the on-disk
+> format consolidation.  The dev tree briefly carried two unshipped
+> version numbers — `VOL_VERSION_RAID6 = 3` (RAID6-below-HAMMER2) and
+> `VOL_VERSION_RAIDZ2 = 4` (RAIDZ2-native) — as separate steps.  Neither
+> ever escaped, so they were collapsed into a single
+> `HAMMER2_VOL_VERSION_RAIDZ2 = 3`.  Wherever this document refers to
+> "v3" as a prior RAID6-below approach and "v4" as the RAIDZ2-native
+> redesign, the latter is what now ships as v3.  The git branch name
+> `v4-rebuild` is kept for continuity.
+
 ---
 
 ## 1. The Goal, Stated Cleanly
@@ -46,7 +56,7 @@ right thing." Re-evaluating against the actual goal:
   runningbufspace deadlocks). A "32/32 PASS" against vn does not predict
   behavior on a real disk array.
 
-- **v4 (RAIDZ2-native) is the right destination.** Its design eliminates
+- **v3 (RAIDZ2-native) is the right destination.** Its design eliminates
   RMW by writing every block to a freshly-allocated stripe slot, exactly
   like ZFS. The bugs that have surfaced in v4 are implementation-level
   (DIO key collisions, prefetch races, addressing edge cases), not
@@ -378,7 +388,7 @@ fails-and-replaces correctly under QEMU virtio-blk.
   disk, reconstruct and write to the replacement.
 - Implement EIO injection (sysctl: `debug.hammer2.inject_eio_disk=N`)
   to test surviving-disk failures during reconstruction.
-- Port tests to `tests/v4/` against virtio-blk. Re-baseline.
+- Port tests to `tests/v3/` against virtio-blk. Re-baseline.
 
 Exit: against virtio-blk, all of:
 - Healthy R/W passes.
@@ -395,7 +405,7 @@ Exit: against virtio-blk, all of:
 Goal: identical functionality on real disks.
 
 - Stand up the target machine. DragonFlyBSD install + custom kernel.
-- Reproduce `tests/v4/` against real disks. Expect surprises:
+- Reproduce `tests/v3/` against real disks. Expect surprises:
   - Real cache flushes have real latency. Measure TXG commit time.
   - NCQ/parallel writes are genuinely parallel; bawrite throughput
     should be higher than under vn or virtio-blk.
@@ -533,7 +543,7 @@ Full spec: `docs/stripe_bitmap.md`.
 
 ### 9.5 DIO key encoding under physical addressing — moved to Phase 1 punch list
 
-v4's recent fix ("Fix v4 RAIDZ2-native addressing, races, and stability
+v4's recent fix ("Fix v3 RAIDZ2-native addressing, races, and stability
 issues", commit `53cc7cd`, expanded in `9d537be`) placed v4 DATA/DIRENT
 DIO tree keys above `total_size` to avoid aliasing v3 logical keys.
 This must be re-derived from the design in Phase 1, not stacked on the
@@ -551,7 +561,7 @@ WIP patch.
 | Metadata zone fills before data does (HDD-heavy small-file workload) | Medium | Initial sizing ~5% per-disk LBA. Zone extensible via offline tool. Read-only fail with clear error if exhausted. |
 | Stripe fragmentation hurts long-term performance | Medium | Defer to Phase 5 repack. Document the steady-state utilization for the user. |
 | Upstream rejects the design | Low/Medium | Engage Dillon early in Phase 2 with the design doc, not at Phase 4 with code. |
-| Snapshot semantics regress in some subtle way | Medium | Dedicated snapshot test pass in Phase 2 (`tests/v4/snapshot_*`). |
+| Snapshot semantics regress in some subtle way | Medium | Dedicated snapshot test pass in Phase 2 (`tests/v3/snapshot_*`). |
 | Scope creep (ZIL, RAID-Z3, etc., pulled into v1) | High by historical pattern | This document. Phase 5 list is binding — items there do not move forward. |
 
 ## 11. Concrete First Week

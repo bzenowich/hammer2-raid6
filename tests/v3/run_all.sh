@@ -1,5 +1,5 @@
 #!/bin/sh
-# run_all.sh — run the v4 (RAIDZ2-native) integration test suite
+# run_all.sh — run the v3 (RAIDZ2-native) integration test suite
 # against virtio-blk (/dev/vbd*).  vn-backed runs are no longer
 # supported per newplan.md §8.
 #
@@ -15,7 +15,7 @@ export NDISKS
 
 SCRIPTDIR=$(dirname "$0")
 
-echo "v4 RAIDZ2-native test suite: NDISKS=$NDISKS (vbd substrate)"
+echo "v3 RAIDZ2-native test suite: NDISKS=$NDISKS (vbd substrate)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -63,7 +63,7 @@ done
 
 echo ""
 echo "========================================="
-echo "  v4 RAIDZ2-native Integration Test Suite"
+echo "  v3 RAIDZ2-native Integration Test Suite"
 echo "  NDISKS=$NDISKS (vbd substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
 echo "========================================="
