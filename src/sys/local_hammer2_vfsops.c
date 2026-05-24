@@ -80,6 +80,7 @@ int hammer2_limit_saved_depth;
 int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
+int hammer2_raid6_pack_open_rows = 1;	/* v3: enable 6C packing */
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -150,6 +151,10 @@ SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_eio_disk_mask, CTLFLAG_RW,
 	   &hammer2_inject_eio_disk_mask, 0,
 	   "v3 RAID6 fault injection: bitmask of disk indices to force "
 	   "EIO on (no auto-fail).  Default 0 (disabled).");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_pack_open_rows, CTLFLAG_RW,
+	   &hammer2_raid6_pack_open_rows, 0,
+	   "v3 RAID6: enable 6C open-row packing (default 1).  Set 0 to "
+	   "force single-chain-per-row while keeping deferred-P/Q seal.");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
 	   &hammer2_chain_allocs, 0, "");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,
@@ -1345,10 +1350,12 @@ next_hmp:
 			}
 			/*
 			 * Populate per-row refcount from the loaded/rebuilt
-			 * bitmap.  Single-chain-per-row today (6B); 6C will
-			 * extend to multi-chain values.
+			 * bitmap.  Single-chain-per-row at mount; 6C grows
+			 * refcount as new writes pack rows.
 			 */
 			hammer2_raid6_row_refcount_sync(hmp);
+			/* 6C: in-memory open-row tracker for packing. */
+			hammer2_raid6_open_rows_init(hmp);
 
 			/*
 			 * Load the metadata-zone extent table from voldata.
@@ -2109,6 +2116,7 @@ again:
 		kfree(hmp->stripe_row_refcount, M_HAMMER2);
 		hmp->stripe_row_refcount = NULL;
 	}
+	hammer2_raid6_open_rows_free(hmp);
 
 	kfree(hmp, M_HAMMER2);
 }

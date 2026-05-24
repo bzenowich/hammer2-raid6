@@ -907,22 +907,22 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				}
 			}
 			/*
-			 * v3 RAIDZ2-native parity update.
+			 * v3 RAIDZ2-native deferred parity (6C packing).
 			 *
-			 * COW invariant: the stripe slot is freshly
-			 * allocated, so all other data columns are zero
-			 * — write_scratch computes P/Q without any reads.
-			 * Always synchronous; no background parity thread.
+			 * Hand the col bytes to the open-row tracker.  P/Q
+			 * is computed when the row fills (n_alloc==ndata
+			 * and all data present) or at TXG flush boundary
+			 * via hammer2_raid6_seal_all_open_rows().
 			 *
-			 * The data bp has been disposed above (bdwrite /
-			 * bwrite / brelse for failed disk) before we
-			 * compute parity, so write_scratch's P/Q getblk
-			 * calls do not contend with it.
+			 * Ownership of raid6_data passes to the tracker;
+			 * it kfree's after the row seals.
 			 */
 			if (raid6_data) {
-				hammer2_io_raid6_write_scratch(hmp, pbase,
-				    dio->disk_idx, raid6_data, psize);
-				kfree(raid6_data, M_HAMMER2);
+				hammer2_off_t phys_off =
+				    pbase & HAMMER2_RAID6_PHYS_MASK;
+				hammer2_raid6_open_row_add_data(hmp,
+				    phys_off, dio->disk_idx,
+				    raid6_data, psize);
 				raid6_data = NULL;
 			}
 

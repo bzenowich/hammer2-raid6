@@ -1471,6 +1471,16 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	hammer2_chain_drop(&hmp->vchain);
 
 	/*
+	 * 6C: seal any open rows so their P/Q bwrites land before the
+	 * VOP_FSYNC drain below sweeps them to disk.  Rows that didn't
+	 * fill to ndata seal with implicit-zero columns, which is the
+	 * COW invariant.
+	 */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		hammer2_raid6_seal_all_open_rows(hmp);
+
+	/*
 	 * We can't safely flush the volume header until we have
 	 * flushed any device buffers which have built up.
 	 *

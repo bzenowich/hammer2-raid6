@@ -1157,10 +1157,25 @@ struct hammer2_dev {
 	 * occupy a data-column slot in this row.  Bitmap bit is the union
 	 * (set iff refcount > 0).  In-memory only; rebuilt at mount from
 	 * the bitmap (and corrected by the H4-deep walker when the bitmap
-	 * is invalid).  6C will use this to allow multi-chain rows; today
-	 * (single-chain-per-row) the value is just 0 or 1.
+	 * is invalid).  6C uses this to allow multi-chain rows.
 	 */
 	uint8_t		*stripe_row_refcount;	/* num_slots bytes */
+
+	/*
+	 * Open-row tracking (6C): rows allocated during the current TXG
+	 * that haven't sealed their P/Q yet.  The allocator packs chains
+	 * into existing open rows when possible (ZFS variable-width spirit
+	 * — multiple chains per row → P/Q over union → row efficiency
+	 * scales to ndata/ndisks).  Rows seal when filled (n_alloc==ndata)
+	 * or at TXG flush boundary.
+	 *
+	 * Capped at HAMMER2_OPEN_ROWS_MAX; if full, the allocator
+	 * force-seals the oldest open row.  Memory ceiling per hmp is
+	 * MAX × ndata × stripe_unit (e.g. 16 × 2 × 64 KB = 2 MB for
+	 * NDISKS=4).
+	 */
+#define HAMMER2_OPEN_ROWS_MAX	16
+	struct hammer2_open_row *open_rows;	/* MAX entries */
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
 	uint32_t	md_nextents;
@@ -2019,6 +2034,23 @@ int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
 int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 		hammer2_off_t pbase, int data_disk_idx,
 		void *data, size_t bytes);
+
+/*
+ * Open-row packing (6C).  See struct hammer2_open_row in
+ * hammer2_ondisk.c.  open_row_init/free handle lifecycle; alloc_in_row
+ * is consulted from stripe_alloc; add_data is the putblk DATA-path
+ * sink that captures col bytes for deferred P/Q; seal_all is called
+ * from the TXG flush hook before VOP_FSYNC.
+ */
+struct hammer2_open_row;
+void hammer2_raid6_open_rows_init(hammer2_dev_t *hmp);
+void hammer2_raid6_open_rows_free(hammer2_dev_t *hmp);
+int  hammer2_raid6_open_row_pick(hammer2_dev_t *hmp,
+		hammer2_off_t *phys_off_out, int *disk_idx_out);
+void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
+		hammer2_off_t phys_off, int disk_idx,
+		void *data /* takes ownership */, size_t bytes);
+void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical);
@@ -2035,6 +2067,7 @@ int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
  * tests/v3/test_e_eio_inject.sh.
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
+extern int hammer2_raid6_pack_open_rows;
 
 static __inline int
 hammer2_inject_eio(int disk_idx)
