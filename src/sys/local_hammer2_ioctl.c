@@ -1742,5 +1742,26 @@ hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data)
 			rs->progress = 99; /* reserve 100 for completion */
 	}
 
+	/*
+	 * G2: surface persisted per-disk fail-state so `hammer2 raid status`
+	 * can prove the fail-disk ioctl survived umount/remount.  Walk the
+	 * in-memory raid_failed[] (init_volumes already lifted disk_state[]
+	 * out of voldata at mount time) so absent-disk degraded mounts are
+	 * reflected too.
+	 */
+	rs->ndisks = hmp->raid_config.ndisks;
+	bzero(rs->disk_state, sizeof(rs->disk_state));
+	{
+		uint32_t i;
+		uint32_t lim = rs->ndisks;
+		if (lim > HAMMER2_MAX_VOLUMES)
+			lim = HAMMER2_MAX_VOLUMES;
+		for (i = 0; i < lim; i++) {
+			rs->disk_state[i] = hmp->raid_failed[i] ?
+			    HAMMER2_RAID6_DISK_FAILED :
+			    HAMMER2_RAID6_DISK_ONLINE;
+		}
+	}
+
 	return 0;
 }

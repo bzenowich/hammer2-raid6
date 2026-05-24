@@ -3,54 +3,29 @@
 Phase 1 of `docs/newplan.md` is content-complete on `v4-rebuild` (see
 `phase1_changelog.md`).  Remaining work is organized by phase.
 
-## Phase 2 exit gate (must close before Phase 3)
+## Phase 2 exit gate
 
-The implementation side of Phase 2 is in (COW write path, hybrid
-metadata zone, multi-disk volhdr quorum, blockref-walk resilver,
-tests/v4 ported to virtio-blk).  Test-suite status against `v4-rebuild`
-HEAD on NDISKS=4 vbd substrate:
+Phase 2 exit criteria are met on `v4-rebuild` HEAD.  Full
+`tests/v4` suite on NDISKS=4 vbd substrate runs **44/44 PASS**
+(A 4, B 6, C 6, D 8, E 4, F 4, G 4, H 4, I 4), no panics, no
+`CHECK FAIL` in dmesg.
 
-| Group | Result | Notes |
+| Group | Result | Coverage |
 |---|---|---|
-| A | n/a (basic) | covered by smoke |
-| B | n/a (single-disk fail) | covered by D |
-| C | n/a (dual-disk fail) | covered by D |
-| D | **8/8 PASS** | resilver basic + sequential + concurrent-write |
-| E | **4/4 PASS** | EIO injection, no panic |
-| F | **4/4 PASS** | COW invariant + snapshot COW healthy |
-| G | **3/4 PASS** | G2 fail: disk fail-state not persisted across remount |
-| H | **2/4 PASS** | H1+H2 fail: snapshot content diverges from pre-failure state |
-| I | **4/4 PASS** | unclean unmount + degraded + bulkfree-after-crash |
+| A | 4/4 | basic R/W + small files + COW slot uniqueness |
+| B | 6/6 | single-disk fail at every position |
+| C | 6/6 | C(4,2) dual-disk fail pairs |
+| D | 8/8 | resilver basic + sequential + concurrent-write |
+| E | 4/4 | EIO injection — no panic, error surfaces cleanly |
+| F | 4/4 | COW invariant + snapshot COW healthy |
+| G | 4/4 | absent-disk degraded mount + fail-state persistence |
+| H | 4/4 | snapshot under healthy + degraded states |
+| I | 4/4 | unclean unmount, degraded, bulkfree-after-crash |
 
-Phase 2 exit-criterion items now closed:
+Stretch items (non-blocking for Phase 3):
 
-1. ~~EIO injection sysctl~~ — `vfs.hammer2.inject_eio_disk_mask` shipped;
-   synthesized post-bread so buf/lock state stays consistent.
-2. ~~`tests/v4/test_e_eio_inject.sh`~~ — landed, 4/4 PASS.
-3. ~~Snapshot-during-degraded test~~ — `test_h_snap_degraded.sh` landed
-   (H1 + H2).  Test infrastructure complete; **kernel bug exposed**:
-   snapshot content diverges from pre-failure state — needs fix.
-4. ~~Bulkfree-after-crash check~~ — `test_i_unclean.sh` I3 landed,
-   PASS.
-
-Open Phase 2 exit gaps (must close before Phase 3):
-
-A. **G2 — disk fail-state not persisted across remount.**  After
-   `hammer2 raid fail-disk`, the disk is failed in-memory but the
-   `voldata.raid_config.disk_state[]` bump is either not flushed or
-   not read back on next mount.  The raid_config addendum was added
-   in Group J; the fail-disk ioctl writes it via `hammer2_voldata_modify`
-   but the flush path or the init_volumes load path is dropping it.
-
-B. **H1 / H2 — snapshot content diverges in degraded mode.**
-   Snapshot taken healthy → fail disk → modify live → snapshot mount
-   shows the *modified* content, not the pre-failure content.  Looks
-   like the snapshot's chain reads in degraded mode fall through to
-   the live chain or skip COW.  Suspect interaction between snapshot
-   PFS mount and the RAID6 degraded read path.
-
-C. *(Stretch)* NDISKS=4..10 matrix test for ndata edges.
-D. *(Stretch)* Cull dead pre-v4 scripts under `tests/other/`.
+A. NDISKS=4..10 matrix test for ndata edges.
+B. Cull dead pre-v4 scripts under `tests/other/`.
 
 ## Phase 3 — real hardware bring-up
 

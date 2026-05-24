@@ -40,6 +40,25 @@ raid_status(const char *sel_path)
 	printf("stripes_done:   %llu\n", (unsigned long long)st.stripes_done);
 	printf("stripes_total:  %llu\n", (unsigned long long)st.stripes_total);
 	printf("error:          %d\n", st.error);
+	printf("ndisks:         %u\n", st.ndisks);
+	{
+		uint32_t i;
+		for (i = 0; i < st.ndisks && i < HAMMER2_MAX_VOLUMES; i++) {
+			const char *label;
+			switch (st.disk_state[i]) {
+			case HAMMER2_RAID6_DISK_FAILED:
+				label = "FAILED";
+				break;
+			case HAMMER2_RAID6_DISK_ONLINE:
+				label = "ONLINE";
+				break;
+			default:
+				label = "UNKNOWN";
+				break;
+			}
+			printf("disk[%u]:        %s\n", i, label);
+		}
+	}
 	return 0;
 }
 
@@ -104,7 +123,9 @@ cmd_raid(const char *sel_path, int ac, const char **av)
 		return 1;
 	}
 	if (strcmp(av[0], "status") == 0) {
-		return raid_status(sel_path);
+		/* Optional positional path overrides -s sel_path. */
+		const char *path = (ac >= 2) ? av[1] : sel_path;
+		return raid_status(path);
 	} else if (strcmp(av[0], "fail-disk") == 0) {
 		if (ac != 2) {
 			fprintf(stderr, "raid fail-disk: requires <dev>\n");

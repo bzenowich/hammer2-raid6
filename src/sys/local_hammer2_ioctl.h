@@ -269,6 +269,9 @@ struct hammer2_ioc_resilver_status {
 	uint64_t stripes_total;	/* total stripes to resilver */
 	int	disk_idx;	/* disk being resilvered (-1 if none) */
 	int	error;		/* last resilver error (0 = none) */
+	/* G2: persisted fail-state visible to userspace (status command). */
+	uint32_t ndisks;	/* total disks in the array */
+	uint8_t	disk_state[HAMMER2_MAX_VOLUMES]; /* per-disk state byte */
 };
 
 typedef struct hammer2_ioc_resilver_status hammer2_ioc_resilver_status_t;

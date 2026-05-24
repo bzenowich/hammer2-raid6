@@ -33,9 +33,16 @@ trap 'snap_unmount_quiet' EXIT INT TERM
 setup_fresh
 check_v4
 
+# sha256 prints "SHA256 (path) = hex"; the path column differs between
+# the live mount and the snapshot mount even when the data is identical,
+# so reduce every capture to just the hex digest before diffing.
+hash_of() {
+    sha256 "$1" 2>/dev/null | awk '{print $NF}'
+}
+
 # Pre-snapshot content
 dd if=/dev/urandom of=$MNTPT/payload bs=65536 count=64 2>/dev/null
-sha256 $MNTPT/payload > /var/tmp/h1_pre.txt
+hash_of $MNTPT/payload > /var/tmp/h1_pre.txt
 sync; sync
 
 # Take snapshot under healthy
@@ -52,7 +59,7 @@ else
 
     # Modify live tree under degraded
     dd if=/dev/urandom of=$MNTPT/payload bs=65536 count=64 2>/dev/null
-    sha256 $MNTPT/payload > /var/tmp/h1_post.txt
+    hash_of $MNTPT/payload > /var/tmp/h1_post.txt
     sync; sync
 
     # Live tree must reflect the modification
@@ -67,7 +74,7 @@ else
     snap_unmount_quiet
     if mount -t hammer2 "${DEVSPEC}@${SNAP_LABEL}" "$SNAP_MNT" 2>/dev/null; then
         if [ -f "$SNAP_MNT/payload" ]; then
-            sha256 "$SNAP_MNT/payload" > /var/tmp/h1_snap_read.txt 2>&1
+            hash_of "$SNAP_MNT/payload" > /var/tmp/h1_snap_read.txt
             if diff -q /var/tmp/h1_pre.txt /var/tmp/h1_snap_read.txt \
                     > /dev/null 2>&1; then
                 result PASS "H1: snapshot preserves pre-failure content"
@@ -92,7 +99,7 @@ setup_fresh
 check_v4
 
 dd if=/dev/urandom of=$MNTPT/dpayload bs=65536 count=64 2>/dev/null
-sha256 $MNTPT/dpayload > /var/tmp/h2_pre.txt
+hash_of $MNTPT/dpayload > /var/tmp/h2_pre.txt
 sync; sync
 
 # Degrade BEFORE the snapshot
@@ -119,7 +126,7 @@ else
         snap_unmount_quiet
         DEGRADED_SNAP_SPEC="$(degraded_spec $H2_FAIL)@${H2_LABEL}"
         if mount -t hammer2 "$DEGRADED_SNAP_SPEC" "$SNAP_MNT" 2>/dev/null; then
-            sha256 "$SNAP_MNT/dpayload" > /var/tmp/h2_snap_read.txt 2>&1
+            hash_of "$SNAP_MNT/dpayload" > /var/tmp/h2_snap_read.txt
             if diff -q /var/tmp/h2_pre.txt /var/tmp/h2_snap_read.txt \
                     > /dev/null 2>&1; then
                 result PASS "H2: degraded-time snapshot content correct"

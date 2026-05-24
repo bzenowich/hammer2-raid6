@@ -55,12 +55,15 @@ umount $MNTPT
 # Remount with all devices present (including G2_DISK still configured)
 mount -t hammer2 $PFSPATH $MNTPT
 # After remount, disk G2_DISK should still be FAILED.
-# "raid status" reads voldata from disk directly (requires devpath).
-status_after=$(hammer2 raid status "$(disk_dev 0)" 2>/dev/null || echo "")
-if echo "$status_after" | grep -q "FAILED"; then
+# `hammer2 raid status <mntpath>` issues HAMMER2IOC_RAID_RESILVER_STATUS
+# which now returns the per-disk state populated by init_volumes from
+# voldata, so a FAILED line proves both flush and load worked.
+status_after=$(hammer2 raid status "$MNTPT" 2>/dev/null || echo "")
+if echo "$status_after" | grep -q "^disk\[${G2_DISK}\]:.*FAILED"; then
     result PASS "G2: fail state persisted across unmount/remount"
 else
     result FAIL "G2: fail state NOT persisted (disk appears ONLINE after remount)"
+    echo "$status_after" | sed 's/^/      /'
 fi
 teardown "G2"
 
