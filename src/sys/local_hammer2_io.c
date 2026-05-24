@@ -539,10 +539,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			break;
 		}
 	} else {
-		error = hammer2_inject_eio(dio->disk_idx);
-		if (error) {
-			/* fault injection: skip primary I/O, error cascades */
-		} else if (hce > 0) {
+		if (hce > 0) {
 			/*
 			 * Synchronous cluster I/O for now.
 			 */
@@ -598,6 +595,17 @@ io_done:
 		BUF_KERNPROC(dio->bp);
 		dio->bp->b_flags &= ~B_AGE;
 		/* dio->bp->b_debug_info2 = dio; */
+	}
+
+	/*
+	 * EIO injection (test sysctl): synthesize the error AFTER the I/O
+	 * completes so dio->bp / buf lock state stays consistent.  The
+	 * RAID6 reconstruction block below sees error != 0, releases the
+	 * read bp via brelse, then getblk()s a fresh one for reconstruction.
+	 */
+	if (error == 0 && dio->disk_idx >= 0 &&
+	    hammer2_inject_eio(dio->disk_idx)) {
+		error = EIO;
 	}
 	dio->error = error;
 
@@ -656,6 +664,15 @@ io_done:
 					    ? 1 : 0);
 				}
 				dio->error = error;
+				/*
+				 * io_done's BUF_KERNPROC ran on the original
+				 * bread bp; the replacement getblk bp must be
+				 * detached from this thread or a later putblk
+				 * on another thread brelse()s a lock it does
+				 * not own (lockmgr panic).
+				 */
+				BUF_KERNPROC(dio->bp);
+				dio->bp->b_flags &= ~B_AGE;
 			}
 		}
 	}
@@ -1709,7 +1726,13 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	 */
 	if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    hmp->md_nextents > 0) {
-		const size_t MD_CHUNK = 4 * 1024 * 1024; /* 4 MB */
+		/*
+		 * bread/getblk panic if size > MAXBSIZE (64 KB on DragonFly).
+		 * Stay at HAMMER2_PBUFSIZE so each chunk maps to one buf-cache
+		 * block.  Extent walks issue more loop iterations but stay
+		 * within buffer-cache limits.
+		 */
+		const size_t MD_CHUNK = HAMMER2_PBUFSIZE;
 		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
 		uint32_t ex;
 		int surv = -1;
@@ -1741,6 +1764,16 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				size_t this_chunk =
 				    (size_t)((ms - off > MD_CHUNK) ?
 					     MD_CHUNK : (ms - off));
+				/*
+				 * dscheck rejects non-sector-aligned bcount.
+				 * The trailing partial chunk of a non-aligned
+				 * extent must round up; the few extra bytes
+				 * land in the kmalloc()'d md_buf safely.
+				 */
+				this_chunk = (this_chunk + DEV_BSIZE - 1) &
+				    ~((size_t)DEV_BSIZE - 1);
+				if (this_chunk > MD_CHUNK)
+					this_chunk = MD_CHUNK;
 
 				bp = NULL;
 				lerror = hammer2_inject_eio(surv);

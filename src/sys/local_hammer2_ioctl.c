@@ -1545,7 +1545,14 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	error = hammer2_io_raid6_resilver(hmp, ip->pmp, failed_disk_idx, new_devvp);
 	if (error) {
 		kprintf("hammer2: resilver failed: %d\n", error);
+		/*
+		 * VOP_CLOSE on a devfs spec vnode expects the vnode locked
+		 * exclusively (devfs_spec_close → vn_lock → upgrade panics
+		 * otherwise).  Mirror the VOP_OPEN lock/unlock above.
+		 */
+		vn_lock(new_devvp, LK_EXCLUSIVE | LK_RETRY);
 		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
+		vn_unlock(new_devvp);
 		vrele(new_devvp);
 		return error;
 	}
@@ -1558,8 +1565,11 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 
 	/* Close old device if it is still open (may be failed/gone) */
 	if (hmp->volumes[failed_disk_idx].dev->open) {
+		vn_lock(hmp->volumes[failed_disk_idx].dev->devvp,
+			LK_EXCLUSIVE | LK_RETRY);
 		VOP_CLOSE(hmp->volumes[failed_disk_idx].dev->devvp,
 			  FREAD | FWRITE, NULL);
+		vn_unlock(hmp->volumes[failed_disk_idx].dev->devvp);
 		hmp->volumes[failed_disk_idx].dev->open = 0;
 	}
 

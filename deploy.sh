@@ -67,11 +67,27 @@ ENDSSH
 
     echo "==> Syncing hammer2 utility sources -> /usr/src/sbin/hammer2/"
     for f in "$DIR/src/sbin"/local_cmd_*.c \
+             "$DIR/src/sbin"/local_main.c \
              "$DIR/src/sbin"/local_hammer2_userspace.h; do
         [ -f "$f" ] || continue
         base="$(basename "$f")"
         scp_as "$f" "/usr/src/sbin/hammer2/${base#local_}"
     done
+
+    # Idempotently extend the hammer2 utility Makefile so cmd_raid.c is
+    # built.  Must insert BEFORE the .include line — bsd.prog.mk consumes
+    # SRCS at include time.
+    echo "==> Patching /usr/src/sbin/hammer2/Makefile for cmd_raid.c"
+    ssh "$VM" sh <<'ENDSSH'
+MF=/usr/src/sbin/hammer2/Makefile
+if grep -q 'cmd_raid\.c' "$MF"; then
+    echo "    already present"
+else
+    awk '/^\.include[[:space:]]*<bsd\.prog\.mk>/ && !done { print "SRCS+=\tcmd_raid.c"; done=1 } { print }' \
+        "$MF" > "$MF.new" && mv "$MF.new" "$MF"
+    echo "    inserted SRCS+= cmd_raid.c before .include"
+fi
+ENDSSH
 }
 
 do_build() {
@@ -120,6 +136,10 @@ kldload /usr/src/sys/vfs/hammer2/hammer2.ko
 kldstat | grep hammer2
 echo "    sysctl probe:"
 sysctl vfs.hammer2.inject_eio_disk_mask 2>/dev/null || echo "      (sysctl absent)"
+# Userspace binaries need to be on PATH for the test suite; cp here so
+# `fast` matches what `install` does for these (kernel-tree .ko aside).
+install -m 755 /usr/src/sbin/newfs_hammer2/newfs_hammer2 /sbin/newfs_hammer2
+install -m 755 /usr/src/sbin/hammer2/hammer2 /sbin/hammer2
 ENDSSH
 }
 
