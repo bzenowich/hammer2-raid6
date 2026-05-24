@@ -52,9 +52,8 @@
 /* Volume header magic */
 #define HAMMER2_VOLUME_ID_HBO		0x48414d3205172011ULL
 
-/* Volume version where RAID6 config is valid */
-#define HAMMER2_VOL_VERSION_RAID6	3
-#define HAMMER2_VOL_VERSION_RAIDZ2	4
+/* Volume version where RAID6 config is valid (v3 = RAIDZ2-native). */
+#define HAMMER2_VOL_VERSION_RAIDZ2	3
 
 /* RAID type stored in hammer2_raid_config.raid_type */
 #define HAMMER2_RAID_TYPE_RAID6		6
@@ -82,7 +81,7 @@
 
 /*
  * Sector 3 of the volume header (bytes 0x0600..0x07FF) holds
- * hammer2_raid_config when version >= HAMMER2_VOL_VERSION_RAID6.
+ * hammer2_raid_config when version >= HAMMER2_VOL_VERSION_RAIDZ2.
  *
  * hammer2_raid_config layout (512 bytes total, __packed):
  *   uint8_t  raid_type;		+0x00
@@ -233,10 +232,10 @@ read_volhdr(int *ndisks_out, int *ndata_out, uint64_t *stripe_unit_out)
 		return -1;
 	}
 
-	if (version < HAMMER2_VOL_VERSION_RAID6) {
+	if (version < HAMMER2_VOL_VERSION_RAIDZ2) {
 		fprintf(stderr,
 		    "Volume version %u < %u: not a RAID6 array\n",
-		    version, HAMMER2_VOL_VERSION_RAID6);
+		    version, HAMMER2_VOL_VERSION_RAIDZ2);
 		return -1;
 	}
 

@@ -1269,7 +1269,7 @@ next_hmp:
 		 * Must use hmp instead of volume header for these two
 		 * in order to handle volume versions transparently.
 		 */
-		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAID6) {
+		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 			hmp->nvolumes = hmp->voldata.nvolumes;
 			hmp->total_size = hmp->voldata.raid_config.array_size;
 			hmp->raid_type = hmp->voldata.raid_config.raid_type;

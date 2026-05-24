@@ -159,11 +159,11 @@ summary() {
     [ $FAIL -eq 0 ]
 }
 
-# Version guard: check that the mounted filesystem is v4 (RAIDZ2-native)
+# Version guard: check that the mounted filesystem is RAIDZ2-native (v3).
 check_v4() {
-    if hammer2 -s $MNTPT volume-list 2>/dev/null | grep -q "^version 4"; then
+    if hammer2 -s $MNTPT volume-list 2>/dev/null | grep -q "^version 3"; then
         return 0
     fi
-    echo "SKIP: v4 (RAIDZ2-native) format not detected; skipping test suite"
+    echo "SKIP: RAIDZ2-native (v3) format not detected; skipping test suite"
     exit 77
 }

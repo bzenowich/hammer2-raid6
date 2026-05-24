@@ -123,17 +123,17 @@ DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  * Two dispatch paths; downstream cache and strategy code consumes
  * (pbase, dbase, devvp, disk_idx) and stays encoding-blind.
  *
- * Path A — v4 RAIDZ2-native DATA/DIRENT:
+ * Path A — v3 RAIDZ2-native DATA/DIRENT:
  *   bref->copyid   = physical disk index (0..ndisks-1)
- *   bref->data_off = (disk_idx<<56) | per_disk_phys_off | radix
- *                    (HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h)
- *   pbase = data_off & pmask           (top byte = disk_idx)
- *   dbase = disk_idx << 56              (so dev_pbase = per_disk_phys)
+ *   bref->data_off = per_disk_phys_off | radix     (no disk bits)
+ *   pbase = (disk_idx << 56) | per_disk_phys_off   (synthetic cache key)
+ *   dbase = disk_idx << 56                          (so dev_pbase = per_disk_phys)
  *
- *   Collision-avoidance is structural: different disks → different
- *   top bytes → different pbase. No vol->offset arithmetic involved.
+ *   The (disk_idx<<56) bits are NOT stored on disk; they live only in
+ *   the in-memory DIO cache key so distinct disks at the same phys_off
+ *   don't alias.
  *
- * Path C — JBOD / non-RAID, and v4 metadata pre-Group I:
+ * Path C — JBOD / non-RAID, and v3 metadata:
  *   pbase = data_off & pmask
  *   vol   = hammer2_get_volume(pbase)
  *   dbase = vol->offset                 (so dev_pbase = pbase - vol->offset)
@@ -156,20 +156,21 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 	    bref != NULL &&
 	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
 	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
-		/* Path A: v4 RAIDZ2-native DATA/DIRENT. */
+		/* Path A: v3 RAIDZ2-native DATA/DIRENT. */
 		disk_idx = (int)bref->copyid;
 		KKASSERT(disk_idx >= 0 && disk_idx < hmp->nvolumes);
-		KKASSERT((int)(pbase >> HAMMER2_RAID6_DISK_SHIFT) == disk_idx);
 		vol = &hmp->volumes[disk_idx];
 		dbase = (hammer2_off_t)disk_idx << HAMMER2_RAID6_DISK_SHIFT;
+		/* Synthesize the per-disk cache key. */
+		pbase = dbase | pbase;
 		*devvp_out = vol->dev ? vol->dev->devvp : NULL;
 	} else {
-		/* Path C: JBOD / non-RAID, or v4 metadata. */
+		/* Path C: JBOD / non-RAID, or v3 metadata. */
 		vol = hammer2_get_volume(hmp, pbase);
 		dbase = vol->offset;
 		*devvp_out = vol->dev->devvp;
 		/*
-		 * v4 RAIDZ2-native metadata: identify the primary disk so
+		 * v3 RAIDZ2-native metadata: identify the primary disk so
 		 * putblk can mirror the write to surviving siblings, and
 		 * getblk can read from a sibling if this disk is failed.
 		 */
@@ -1238,6 +1239,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
  * a modified chain is destroyed or by the bulkfree code.  No buffer
  * is needed for this operation.  If the DIO no longer exists it is
  * equivalent to the bits not being set.
+ *
+ * Signature kept stable so the upstream hammer2_bulkfree.c (not in our
+ * local_*.c set) keeps linking.  v3 RAIDZ2-native DATA never reaches
+ * the freemap that bulkfree walks (DATA dispatches to stripe_alloc),
+ * so the bref-NULL Path C fallback in dio_alloc covers the only
+ * scenarios this is actually called from.
  */
 void
 hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,

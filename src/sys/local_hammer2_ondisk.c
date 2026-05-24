@@ -649,7 +649,7 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
 	if (error)
 		return error;
 
-	if (rootvoldata->version >= HAMMER2_VOL_VERSION_RAID6)
+	if (rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2)
 		return hammer2_verify_volumes_3(volumes, rootvoldata);
 	else if (rootvoldata->version >= HAMMER2_VOL_VERSION_MULTI_VOLUMES)
 		return hammer2_verify_volumes_2(volumes, rootvoldata);
@@ -1125,7 +1125,7 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	 * volumes.  This allows code that accesses vol->dev->path or
 	 * vol->dev->open to work without NULL checks everywhere.
 	 */
-	if (!error && rootvoldata->version >= HAMMER2_VOL_VERSION_RAID6) {
+	if (!error && rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 		hammer2_raid_config_t *rc = &rootvoldata->raid_config;
 		int slot;
 
@@ -1222,7 +1222,7 @@ hammer2_v4_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0)
 		return 0;
 
-	phys_off = bref->data_off & HAMMER2_RAID6_PHYS_MASK;
+	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return 0;
 	slot = (phys_off - HAMMER2_ZONE_SEG64) /
@@ -1658,19 +1658,19 @@ have_disk:
 	while (n > 1) { n >>= 1; radix++; }
 
 	/*
-	 * Encode (disk_idx, phys_off) into bref.data_off so the DIO tree
-	 * key is unique by construction across all disks.  Layout is
-	 * documented at HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h.
+	 * v3 encoding: bref.data_off holds only per-disk phys_off | radix.
+	 * Disk identity lives exclusively in bref.copyid.  The DIO cache
+	 * synthesizes a (disk_idx<<56)|phys_off key at lookup time to keep
+	 * per-disk entries distinct.
 	 */
-	chain->bref.data_off = ((hammer2_off_t)disk_idx <<
-	    HAMMER2_RAID6_DISK_SHIFT) | phys_off | (hammer2_off_t)radix;
+	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
 	chain->bref.copyid   = (uint8_t)disk_idx;
 
 	return 0;
 }
 
 /*
- * Free a physical stripe slot for a RAIDZ2-native (v4) data column.
+ * Free a physical stripe slot for a RAIDZ2-native (v3) data column.
  * Clears the stripe bitmap bit for the slot encoded in bref->data_off.
  */
 void
@@ -1683,10 +1683,11 @@ hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	int byte_idx, bit_idx;
 
 	/*
-	 * Decode per-disk physical offset from bref->data_off (top byte
-	 * holds disk_idx; see HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).
+	 * v3 encoding: data_off carries phys_off|radix only.  Mask off the
+	 * radix bits; copyid (disk_idx) is irrelevant for the bitmap lookup
+	 * since the bitmap is per-row, not per-(disk,row).
 	 */
-	phys_off = bref->data_off & HAMMER2_RAID6_PHYS_MASK;
+	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return; /* metadata block, not a stripe slot */
 

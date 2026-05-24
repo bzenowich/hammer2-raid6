@@ -1133,7 +1133,7 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
  */
 /*
  * RAID configuration stored in volume header sector3 (0x0600-0x07FF).
- * Used when version >= HAMMER2_VOL_VERSION_RAID6.
+ * Used when version >= HAMMER2_VOL_VERSION_RAIDZ2.
  *
  * RAID 6 provides dual-parity striping across ndisks devices.
  * ndata = ndisks - 2 (the remaining 2 are P and Q parity).
@@ -1142,25 +1142,27 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
  * The stripe_unit is the size of each column in a stripe and defaults
  * to HAMMER2_PBUFSIZE (64KB), aligning naturally with HAMMER2's DIO size.
  *
- * v4 RAIDZ2-native (HAMMER2_VOL_VERSION_RAIDZ2): DATA/DIRENT blockrefs
+ * v3 RAIDZ2-native (HAMMER2_VOL_VERSION_RAIDZ2): DATA/DIRENT blockrefs
  * encode disk index in bref->copyid and per-disk physical byte offset in
  * bref->data_off; no logical→physical mapping. P+Q rotate left-symmetric:
  *   stripe_slot = (per_disk_phys - HAMMER2_ZONE_SEG64) / stripe_unit
  *   P disk      = stripe_slot % ndisks
  *   Q disk      = (stripe_slot + 1) % ndisks
  *
- * The bref->data_off layout for v4 DATA/DIRENT is:
- *   [63:56] disk_idx (0..ndisks-1)   — also redundantly in bref->copyid
- *   [55:6]  per-disk physical byte offset (50 bits = 1 PB / disk max)
+ * The bref->data_off layout for v3 DATA/DIRENT is:
+ *   [63:6]  per-disk physical byte offset (sole, no disk bits)
  *   [5:0]   radix (= log2(chain->bytes))
- *
- * Putting disk_idx in the top byte means two (disk, phys) pairs that
- * differ in disk produce different keys structurally; the DIO cache
- * cannot alias. No vol->offset arithmetic is involved.
+ * Disk identity is carried exclusively in bref->copyid.
  */
 #define HAMMER2_RAID_TYPE_JBOD		0
 #define HAMMER2_RAID_TYPE_RAID6		6
 
+/*
+ * In-memory DIO cache key uses (disk_idx << HAMMER2_RAID6_DISK_SHIFT) | phys_off
+ * to keep cache entries distinct across disks at the same physical offset.
+ * These macros describe that synthetic key shape; they are NOT used in the
+ * on-disk encoding of bref->data_off (v3 stores phys_off|radix only).
+ */
 #define HAMMER2_RAID6_DISK_SHIFT	56
 #define HAMMER2_RAID6_DISK_MASK		((hammer2_off_t)0xFFULL << HAMMER2_RAID6_DISK_SHIFT)
 #define HAMMER2_RAID6_PHYS_MASK		(~HAMMER2_RAID6_DISK_MASK & ~HAMMER2_OFF_MASK_RADIX)
@@ -1458,8 +1460,17 @@ typedef struct hammer2_volume_data hammer2_volume_data_t;
 #define HAMMER2_VOLUME_ICRCVH_SIZE	(65536 - 4)
 
 #define HAMMER2_VOL_VERSION_MULTI_VOLUMES	2
-#define HAMMER2_VOL_VERSION_RAID6		3
-#define HAMMER2_VOL_VERSION_RAIDZ2		4	/* RAIDZ2-native: bref.data_off=physical col, bref.copyid=disk index */
+/*
+ * v3 = RAIDZ2-native (HAMMER2_VOL_VERSION_RAIDZ2).
+ *   bref.copyid   = physical disk index (0..ndisks-1)
+ *   bref.data_off = per-disk physical byte offset | radix  (no disk_idx
+ *                   bits — disk identity lives only in copyid).
+ *   Stripe bitmap + hybrid metadata zone are in use.
+ * (The dev-tree carried a brief split-numbering pass where 3 named the
+ * v3-without-RAIDZ2 step and 4 named the RAIDZ2-native step.  Neither
+ * format escaped the dev tree, so the numbering is collapsed back to 3.)
+ */
+#define HAMMER2_VOL_VERSION_RAIDZ2		3
 
 #define HAMMER2_VOL_VERSION_MIN		1
 #define HAMMER2_VOL_VERSION_DEFAULT	HAMMER2_VOL_VERSION_MULTI_VOLUMES

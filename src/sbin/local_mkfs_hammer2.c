@@ -650,7 +650,7 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	/*
 	 * RAID 6 configuration
 	 */
-	if (voldata->version >= HAMMER2_VOL_VERSION_RAID6 &&
+	if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    opt->RaidType == 6) {
 		hammer2_raid_config_t *rc = &voldata->raid_config;
 		hammer2_off_t min_size = fso->volumes[0].size;
