@@ -2002,6 +2002,20 @@ int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
+
+/*
+ * One data column in a v3 RAIDZ2-native row.  Used to drive
+ * hammer2_io_raid6_write_row() with one or many columns at once.
+ */
+typedef struct hammer2_row_col {
+	int	disk_idx;	/* per-row data column's disk (not p/q) */
+	void	*data;		/* column bytes (stripe_unit long) */
+	size_t	bytes;		/* always == stripe_unit */
+} hammer2_row_col_t;
+
+int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
+		hammer2_off_t phys_off, const hammer2_row_col_t *cols,
+		int ncols, size_t bytes);
 int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 		hammer2_off_t pbase, int data_disk_idx,
 		void *data, size_t bytes);

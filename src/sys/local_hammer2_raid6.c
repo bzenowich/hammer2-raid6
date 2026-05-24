@@ -349,121 +349,113 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 }
 
 /*
- * RAIDZ2-native (v3) parity write: compute P and Q from scratch.
+ * RAIDZ2-native (v3) parity write: compute P and Q from scratch over a
+ * row of data columns and write all parity columns.
  *
- * Under v3, every data write goes to a freshly-allocated stripe slot where
- * all other data columns are zero.  Therefore:
+ * Each row at per-disk offset phys_off can hold up to ndata independent
+ * data columns (one per data-eligible disk).  Multi-column rows are 6C
+ * packing; today's allocator gives one column per row so cols[]/ncols
+ * is typically {single col, 1} but the API takes the row as a whole.
  *
- *   P = data_col XOR 0 XOR ... XOR 0 = data_col
- *   Q = gf_mul(2^my_col, data_col) XOR 0 XOR ... XOR 0
+ * COW invariant: a row is written exactly once, in one TXG.  All cols
+ * that aren't in the cols[] array are zero on disk (slot just
+ * allocated), so P/Q computed over `cols + zeros` is correct without
+ * any prior reads.  No RMW.
  *
- * No reads of old P/Q are needed.  No RMW.
+ * phys_off is the per-disk physical column offset for this row (same
+ * on every disk).  Each col carries (disk_idx, data, bytes).  bytes
+ * must equal stripe_unit for every column.
  *
- * logical_off is the HAMMER2 logical base of the column that was written
- * (same value as pbase from _hammer2_io_putblk).  data contains the bytes
- * written to that column (stripe_unit bytes).
- *
- * Writes P and Q synchronously (bwrite) in all modes.
+ * Writes P and Q synchronously (bwrite); a past attempt at bawrite
+ * here deadlocked the buffer cache under virtio-blk load (accumulation
+ * outran completions).  Async P/Q is a follow-up perf task gated on
+ * runningbufspace throttling.
  *
  * Returns 0 on success, EIO on I/O error.
  */
 int
-hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
-			       int data_disk_idx, void *data, size_t bytes)
+hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
+			   const hammer2_row_col_t *cols, int ncols,
+			   size_t bytes)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
-	int ndata __unused = rc->ndata;
+	int ndata = rc->ndata;
 	uint64_t stripe_unit = rc->stripe_unit;
 	uint64_t stripe_slot;
-	int my_col;
 	int p_disk, q_disk;
-	hammer2_off_t phys_off;
 	hammer2_volume_t *vol;
-	struct buf *pbp, *qbp;
-	uint8_t coeff;
-	uint8_t *src;
-	uint8_t *dst;
-	size_t i;
+	struct buf *pbp = NULL, *qbp = NULL;
+	uint8_t *p_dst = NULL;
+	uint8_t *q_dst = NULL;
 	int error = 0;
+	int c, d;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(bytes == (size_t)stripe_unit);
+	KKASSERT(ncols >= 1 && ncols <= ndata);
 
-	/*
-	 * v3 (RAIDZ2-native) stripe geometry.
-	 *
-	 * pbase encodes the physical column offset:
-	 *   pbase = HAMMER2_ZONE_SEG64 + stripe_slot * stripe_unit
-	 *
-	 * All columns in the same stripe slot share this physical offset
-	 * on their respective disks.
-	 *
-	 * P disk = stripe_slot % ndisks
-	 * Q disk = (P disk + 1) % ndisks
-	 *
-	 * my_col: logical data column index for data_disk_idx.  Count
-	 * disk indices < data_disk_idx that are neither p_disk nor q_disk.
-	 */
-	/*
-	 * Decode per-disk physical offset from pbase (top byte holds
-	 * disk_idx; see HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).
-	 * All columns (data, P, Q) share this per-disk physical offset.
-	 */
-	phys_off    = pbase & HAMMER2_RAID6_PHYS_MASK;
 	stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
 	p_disk      = (int)(stripe_slot % ndisks);
 	q_disk      = (p_disk + 1) % ndisks;
 
-	{
-		int d;
-		my_col = 0;
-		for (d = 0; d < data_disk_idx; d++) {
-			if (d != p_disk && d != q_disk)
-				my_col++;
-		}
-	}
-
 	/*
-	 * Write P column.
-	 * P = data_col (all other columns in this fresh slot are zero).
+	 * Allocate the P column buffer up-front and accumulate XOR into it.
+	 * Skip the disk entirely if it's failed.
 	 */
-	pbp = NULL;
 	if (!hmp->raid_failed[p_disk]) {
 		vol = &hmp->volumes[p_disk];
 		pbp = getblk(vol->dev->devvp, phys_off,
 			     stripe_unit, GETBLK_KVABIO, 0);
 		if (pbp) {
 			bkvasync(pbp);
-			bcopy(data, pbp->b_data, stripe_unit);
+			bzero(pbp->b_data, stripe_unit);
+			p_dst = (uint8_t *)pbp->b_data;
 		}
 	}
 
-	/*
-	 * Write Q column.
-	 * Q = gf_mul(2^my_col, data_col) byte-by-byte.
-	 */
-	qbp = NULL;
 	if (!hmp->raid_failed[q_disk]) {
 		vol = &hmp->volumes[q_disk];
 		qbp = getblk(vol->dev->devvp, phys_off,
 			     stripe_unit, GETBLK_KVABIO, 0);
 		if (qbp) {
 			bkvasync(qbp);
-			coeff = hammer2_gf_exp[my_col % 255];
-			src = (uint8_t *)data;
-			dst = (uint8_t *)qbp->b_data;
-			for (i = 0; i < stripe_unit; i++)
-				dst[i] = hammer2_gf_mul(coeff, src[i]);
+			bzero(qbp->b_data, stripe_unit);
+			q_dst = (uint8_t *)qbp->b_data;
 		}
 	}
 
 	/*
-	 * Issue P and Q writes synchronously.  Using bwrite() prevents
-	 * async parity bawrite() calls from accumulating in runningbufspace
-	 * faster than vtbd completions drain them, which caused a buffer
-	 * cache deadlock on physical virtio-blk devices.
+	 * Walk the cols[] array, accumulating P and Q.
+	 * P[i] ^= col[i];   Q[i] ^= gf_mul(2^my_col, col[i])
+	 * Unwritten data columns in the row are implicitly zero.
 	 */
+	for (c = 0; c < ncols; c++) {
+		const hammer2_row_col_t *col = &cols[c];
+		uint8_t *src = (uint8_t *)col->data;
+		uint8_t coeff;
+		int my_col = 0;
+		size_t i;
+
+		KKASSERT(col->disk_idx != p_disk &&
+			 col->disk_idx != q_disk);
+
+		for (d = 0; d < col->disk_idx; d++) {
+			if (d != p_disk && d != q_disk)
+				my_col++;
+		}
+
+		if (p_dst) {
+			for (i = 0; i < stripe_unit; i++)
+				p_dst[i] ^= src[i];
+		}
+		if (q_dst) {
+			coeff = hammer2_gf_exp[my_col % 255];
+			for (i = 0; i < stripe_unit; i++)
+				q_dst[i] ^= hammer2_gf_mul(coeff, src[i]);
+		}
+	}
+
 	if (pbp) {
 		int e = bwrite(pbp);
 		if (e && !error)
@@ -476,6 +468,25 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
 	}
 
 	return error;
+}
+
+/*
+ * Single-column convenience wrapper preserved for the current
+ * one-chain-per-row putblk path.  6C-2 packing will convert call sites
+ * to hammer2_io_raid6_write_row() directly.
+ */
+int
+hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
+			       int data_disk_idx, void *data, size_t bytes)
+{
+	hammer2_row_col_t col = {
+		.disk_idx = data_disk_idx,
+		.data = data,
+		.bytes = bytes,
+	};
+	hammer2_off_t phys_off = pbase & HAMMER2_RAID6_PHYS_MASK;
+
+	return hammer2_io_raid6_write_row(hmp, phys_off, &col, 1, bytes);
 }
 
 /*
