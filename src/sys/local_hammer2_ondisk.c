@@ -1373,6 +1373,30 @@ hammer2_raid6_bitmap_init(hammer2_dev_t *hmp)
 	hmp->stripe_bitmap_invalid = 0;
 	spin_init(&hmp->stripe_bitmap_spin, "h2smap");
 	hmp->stripe_next_disk = 0;
+	hmp->stripe_row_refcount = kmalloc((size_t)max_stripes, M_HAMMER2,
+					   M_WAITOK | M_ZERO);
+}
+
+/*
+ * Rebuild stripe_row_refcount[] from the loaded bitmap.  Caller holds
+ * no locks; runs at mount after either bitmap_read or the H4-deep
+ * walker (rebuild_stripe_bitmap) has populated stripe_bitmap.  Pre-6C
+ * the row→chain mapping is 1:1, so refcount per row == bitmap bit.
+ * 6C will replace this with a walker-driven count.
+ */
+void
+hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp)
+{
+	uint64_t i;
+
+	if (hmp->stripe_row_refcount == NULL || hmp->stripe_bitmap == NULL)
+		return;
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	for (i = 0; i < hmp->stripe_num_slots; i++) {
+		uint8_t bit = (hmp->stripe_bitmap[i / 8] >> (i % 8)) & 1;
+		hmp->stripe_row_refcount[i] = bit;
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }
 
 /*
@@ -1614,6 +1638,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			break;
 		if ((hmp->stripe_bitmap[byte_idx] & (1 << bit_idx)) == 0) {
 			hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+			if (hmp->stripe_row_refcount)
+				hmp->stripe_row_refcount[slot] = 1;
 			hmp->stripe_cursor = slot + 1;
 			goto found;
 		}
@@ -1645,6 +1671,8 @@ found:
 		}
 		/* All disks are P or Q — can't happen for ndisks >= 4 */
 		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+		if (hmp->stripe_row_refcount)
+			hmp->stripe_row_refcount[slot] = 0;
 		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 		return ENOSPC;
 	}
@@ -1699,6 +1727,19 @@ hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 		return; /* out of range */
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+	/*
+	 * Per-row refcount: only clear the bitmap bit when the row's last
+	 * live data chain has been freed.  Pre-6C the row is single-chain
+	 * so refcount is 0 or 1 and this is equivalent to clearing.
+	 */
+	if (hmp->stripe_row_refcount) {
+		if (hmp->stripe_row_refcount[slot] > 0)
+			hmp->stripe_row_refcount[slot]--;
+		if (hmp->stripe_row_refcount[slot] == 0)
+			hmp->stripe_bitmap[byte_idx] &=
+			    ~(uint8_t)(1 << bit_idx);
+	} else {
+		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }

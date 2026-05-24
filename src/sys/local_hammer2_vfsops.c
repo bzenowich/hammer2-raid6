@@ -1343,6 +1343,12 @@ next_hmp:
 					return EROFS;
 				}
 			}
+			/*
+			 * Populate per-row refcount from the loaded/rebuilt
+			 * bitmap.  Single-chain-per-row today (6B); 6C will
+			 * extend to multi-chain values.
+			 */
+			hammer2_raid6_row_refcount_sync(hmp);
 
 			/*
 			 * Load the metadata-zone extent table from voldata.
@@ -2098,6 +2104,10 @@ again:
 		spin_uninit(&hmp->stripe_bitmap_spin);
 		kfree(hmp->stripe_bitmap, M_HAMMER2);
 		hmp->stripe_bitmap = NULL;
+	}
+	if (hmp->stripe_row_refcount) {
+		kfree(hmp->stripe_row_refcount, M_HAMMER2);
+		hmp->stripe_row_refcount = NULL;
 	}
 
 	kfree(hmp, M_HAMMER2);

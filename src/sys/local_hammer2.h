@@ -1143,15 +1143,24 @@ struct hammer2_dev {
 	int		raid_failed[HAMMER2_MAX_VOLUMES]; /* failed disk tracking */
 	int		raid_nfailed;		/* count of failed disks */
 
-	/* RAIDZ2-native physical stripe bitmap (v4 format) */
+	/* RAIDZ2-native physical stripe bitmap (v3 format) */
 	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
 	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
 	uint64_t	stripe_num_slots;	/* total slots covered */
 	uint64_t	stripe_cursor;		/* sequential allocator cursor */
 	uint64_t	stripe_generation;	/* bumped on every TXG flush */
 	int		stripe_bitmap_invalid;	/* 1 if on-disk header was bad */
-	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + next_disk */
+	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk */
 	int		stripe_next_disk;	/* round-robin data disk counter */
+	/*
+	 * Per-row reference count: number of live DATA/DIRENT chains that
+	 * occupy a data-column slot in this row.  Bitmap bit is the union
+	 * (set iff refcount > 0).  In-memory only; rebuilt at mount from
+	 * the bitmap (and corrected by the H4-deep walker when the bitmap
+	 * is invalid).  6C will use this to allow multi-chain rows; today
+	 * (single-chain-per-row) the value is just 0 or 1.
+	 */
+	uint8_t		*stripe_row_refcount;	/* num_slots bytes */
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
 	uint32_t	md_nextents;
@@ -1973,6 +1982,7 @@ void hammer2_raid6_bitmap_init(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_read(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_write(hammer2_dev_t *hmp);
 int  hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
+void hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp);
 int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
 void hammer2_raid6_stripe_free(hammer2_dev_t *hmp,
 				const hammer2_blockref_t *bref);
