@@ -53,7 +53,7 @@ Blocked on Phase 3.  Per newplan §7 Phase 4:
   thresholds in `tests/perf/README.md` against the first physical run.
 - Crash-safety statement (COW + TXG-commit atomicity, no WIB needed,
   failure modes enumerated).
-- Draft `docs/RAID6_MERGE_REQUEST.md` v2.
+- Draft `docs/archive/RAID6_MERGE_REQUEST.md` v2.
 
 ## Phase 5 — optional follow-ups (post-v1)
 

@@ -460,15 +460,20 @@ deferred-P/Q seal hook.
 `hammer2_raid6_seal_all_open_rows` (called from
 `hammer2_flush.c` at every TXG commit):
 
-- For each `open_row` with `in_use`, calls
-  `hammer2_raid6_seal_row_locked_to_unlocked` which builds
-  `cols[]` from the row's tracker and invokes `write_row`.
-- After write_row returns, the row entry is freed and its data
-  buffers kfree'd.
+- Walks the open_rows TAILQ via repeated `TAILQ_FIRST`,
+  calling `hammer2_raid6_seal_row_locked_to_unlocked` for each
+  entry (seal_row removes itself from the TAILQ, freeing its
+  metadata and col_data buffers).
 
-A row also seals from inside the allocator when packing fills it
+A row also seals from inside `add_data` when packing fills it
 (`n_alloc == ndata` *and* all data cols have received their
 chain bytes).
+
+`hammer2_raid6_open_row_add_data` itself never sees a
+"row-not-found" — every chain reaches it via the allocator's
+`open_row_register_locked` path, which TAILQ_INSERTs an entry
+before the chain's bp is ever flushed.  The function
+KKASSERTs the row is present.
 
 ### Partial-row parity fix (seal-time zero-fill)
 

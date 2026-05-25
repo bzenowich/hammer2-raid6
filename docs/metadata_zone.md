@@ -1,7 +1,7 @@
 # HAMMER2 v3 RAIDZ2-native — Metadata Zone On-Disk Format
 
 **Status**: Phase 0 spec. Implementation in Phase 1.
-**Supersedes**: any metadata-layout text in `raidz2_in_hammer2.md` §5.
+**Supersedes**: any metadata-layout text in `archive/raidz2_in_hammer2.md` §5.
 **Cross-refs**: `newplan.md` §5.3, §9.1.
 
 > **Numbering note (2026-05-24).** "v4" below = the RAIDZ2-native
@@ -250,7 +250,7 @@ the resilver-by-sequential-copy invariant.
 
 ## Snapshots
 
-Snapshots are blockref-tree references (per `raidz2_snapshot_interaction.md`).
+Snapshots are blockref-tree references (per `archive/raidz2_snapshot_interaction.md`).
 A snapshot's reachable blockrefs may point at any metadata block in
 any extent — extents are not snapshot-partitioned. Bulkfree walks
 live + all snapshots; a metadata block is freed only when no root

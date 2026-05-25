@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-21
 **Status**: Proposed
-**Supersedes**: NEXT_STEPS.md (v3 work plan); previous draft of newplan.md
+**Supersedes**: archive/NEXT_STEPS.md (v3 work plan); previous draft of newplan.md
 **Target**: Production-grade RAID6 for HAMMER2 on real server hardware,
 preserving HAMMER2's COW architecture and snapshot model. ZFS RAIDZ2 is the
 reference design.
@@ -62,7 +62,7 @@ right thing." Re-evaluating against the actual goal:
   (DIO key collisions, prefetch races, addressing edge cases), not
   architectural. They are fixable.
 
-- **`raidz2_snapshot_interaction.md` already specifies the architecture
+- **`archive/raidz2_snapshot_interaction.md` already specifies the architecture
   cleanly.** It identified the one place HAMMER2's in-place overwrite
   contradicts the no-RMW invariant, and proposed the one-line fix
   (unconditional COW in RAID6 mode). This is the right design, not a
@@ -144,7 +144,7 @@ Until then, HAMMER2's existing flush-on-sync is the answer.
 
 ## 5. The Clean Design (Revised v4)
 
-This consolidates `raidz2_in_hammer2.md` and `raidz2_snapshot_interaction.md`
+This consolidates `archive/raidz2_in_hammer2.md` and `archive/raidz2_snapshot_interaction.md`
 with the lessons from v4's bugs.
 
 ### 5.1 On-disk encoding
@@ -242,13 +242,13 @@ The TXG commit boundary closes the write hole structurally:
   uberblock-discovery logic from ZFS.
 
 This is the entire write-hole closure mechanism. No WIB. No write-intent
-zones. No stripe-dirty bitmap. Delete the WIB design from `write_hole.md`
+zones. No stripe-dirty bitmap. Delete the WIB design from `archive/write_hole.md`
 or reframe it as "alternative design for non-COW RAID6, not applicable
 here."
 
 ### 5.7 Snapshots
 
-Unchanged from `raidz2_snapshot_interaction.md`. The snapshot inode
+Unchanged from `archive/raidz2_snapshot_interaction.md`. The snapshot inode
 copies `pmp->pfs_iroot_blocksets[0]`, which already contains physical
 stripe addresses. Snapshots share stripe slots with the live tree until
 the live tree COWs them away. Bulkfree walks all roots (live + snapshots)
@@ -329,8 +329,8 @@ Tests, recovered:
 Goal: lock the design before any more code.
 
 - Finalize this document. Address every "TBD" inline.
-- Reconcile against `raidz2_in_hammer2.md` and
-  `raidz2_snapshot_interaction.md`. Resolve any conflict in favor of
+- Reconcile against `archive/raidz2_in_hammer2.md` and
+  `archive/raidz2_snapshot_interaction.md`. Resolve any conflict in favor of
   this plan and update those docs.
 - Decide and write down: metadata mirror layout, stripe bitmap on-disk
   format, volume header sequence-number policy across N disks, resilver
@@ -348,7 +348,7 @@ Goal: lock the design before any more code.
   IT mode gives clean per-disk EIO and SMART pass-through.
 
 Exit: a single design doc with no open questions; per-topic specs
-landed (§13); Phase 1 punch list (`docs/tracker.md`) populated.
+landed (§13); Phase 1 punch list (`docs/archive/tracker.md`) populated.
 
 ### Phase 1 — Clean rebase (1–2 weeks)
 
@@ -435,7 +435,7 @@ Goal: a patch series Dillon can review.
   baseline of HAMMER2 on a single disk and on a 4-disk N-way mirror.
 - Crash-safety statement: COW + TXG-commit atomicity, no WIB needed,
   failure modes enumerated.
-- Draft `RAID6_MERGE_REQUEST.md` v2.
+- Draft `archive/RAID6_MERGE_REQUEST.md` v2.
 
 Exit: patch series posted to upstream.
 
@@ -549,7 +549,7 @@ DIO tree keys above `total_size` to avoid aliasing v3 logical keys.
 This must be re-derived from the design in Phase 1, not stacked on the
 WIP patch.
 
-- Move to Phase 1 punch list (§7 Phase 1, `docs/tracker.md`).
+- Move to Phase 1 punch list (§7 Phase 1, `docs/archive/tracker.md`).
 - Acceptance criterion: collision-avoidance falls out of the address
   encoding by construction, not by post-hoc offset arithmetic.
 
@@ -573,7 +573,7 @@ WIP patch.
 4. Audit `local_hammer2_chain.c:1693` (the `newmod` decision). Add the
    one-line RAID6 COW guard. Verify with a small write test that COW
    triggers as expected.
-5. Open a tracking issue (or `docs/tracker.md`) listing every v3-era
+5. Open a tracking issue (or `docs/archive/tracker.md`) listing every v3-era
    workaround to be deleted in Phase 1, file by file, function by
    function. This becomes the Phase 1 punch list.
 
@@ -608,15 +608,15 @@ Detail bodies live in their own files so this document stays the index:
 - `docs/stripe_bitmap.md` — zone-41 stripe bitmap on-disk format (§9.4).
 - `docs/volhdr_quorum.md` — volume-header seqno + majority quorum (§9.2).
 - `docs/resilver_v4.md` — blockref-reachability resilver order (§5.9).
-- `docs/inplace_audit.md` — catalog of in-place-overwrite paths and the
+- `docs/archive/inplace_audit.md` — catalog of in-place-overwrite paths and the
   RAID6 guard at each (§5.3, §11.4).
-- `docs/tracker.md` — Phase 1 deletion punch list (§11.5).
+- `docs/archive/tracker.md` — Phase 1 deletion punch list (§11.5).
 
 Superseded v3-era docs that need reconciliation in Phase 0:
 
-- `docs/raidz2_in_hammer2.md` — original v4 design proposal. Reconcile
+- `docs/archive/raidz2_in_hammer2.md` — original v4 design proposal. Reconcile
   against this plan; flag any divergence as superseded.
-- `docs/raidz2_snapshot_interaction.md` — snapshot interaction analysis.
+- `docs/archive/raidz2_snapshot_interaction.md` — snapshot interaction analysis.
   Folded into §5.7; verify no contradictions remain.
-- `docs/write_hole.md` — v3 WIB design. Reframe as "v3-era; not
+- `docs/archive/write_hole.md` — v3 WIB design. Reframe as "v3-era; not
   applicable under COW + TXG-commit closure (§5.6)."

@@ -1,8 +1,8 @@
 # HAMMER2 RAIDZ2-Native: Test Specification
 
 This document specifies the test suite for the RAIDZ2-native HAMMER2
-implementation described in `raidz2_in_hammer2.md` and
-`raidz2_snapshot_interaction.md`.
+implementation described in `archive/raidz2_in_hammer2.md` and
+`archive/raidz2_snapshot_interaction.md`.
 
 > **Numbering note (2026-05-24).** The doc originally referred to the
 > RAIDZ2-native format as "volume version 4" and the prior RAID6 overlay
@@ -329,7 +329,7 @@ EOF
 
 **Purpose**: Verify that overwriting a file allocates a new physical stripe
 slot (fresh `data_off`) rather than reusing the old one. This is the
-unconditional COW invariant from `raidz2_snapshot_interaction.md`.
+unconditional COW invariant from `archive/raidz2_snapshot_interaction.md`.
 
 **Setup**: `setup_fresh`
 
@@ -708,7 +708,7 @@ teardown "D4"
 ## Group E: Snapshot and RAID6 Interaction
 
 **Purpose**: Verify that HAMMER2 snapshots function correctly under RAIDZ2-native
-with the unconditional COW invariant from `raidz2_snapshot_interaction.md`.
+with the unconditional COW invariant from `archive/raidz2_snapshot_interaction.md`.
 
 ### E1: Snapshot visibility isolation
 
