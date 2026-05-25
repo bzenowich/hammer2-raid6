@@ -2007,79 +2007,58 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 {
 	struct hammer2_open_row *r;
 	void *to_free = NULL;
+	int complete;
 	int d;
-	int found = 0;
 
-	if (!hmp->open_rows_inited) {
-		/* shouldn't happen on v3 mounts; safety net */
-		kfree(data, M_HAMMER2);
-		return;
-	}
+	/*
+	 * With the TAILQ-backed tracker every chain that makes it
+	 * through stripe_alloc has a row registered before its bp's
+	 * putblk can fire add_data — there is no "not found" case.
+	 * KKASSERT it; a hit here means a chain bypassed the
+	 * allocator's register path and we'd otherwise silently drop
+	 * its bytes.
+	 */
+	KKASSERT(hmp->open_rows_inited);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		int complete = 1;
-
-		if (r->phys_off != phys_off)
-			continue;
-		KKASSERT(r->bytes == bytes);
-		KKASSERT(r->alloc_mask & (1U << disk_idx));
-		found = 1;
-		/*
-		 * A single chain's dio can putblk multiple times in one TXG
-		 * if it's re-dirtied after the first bawrite (in-TXG modify-
-		 * after-flush).  The latest copy wins — detach the prior
-		 * col_data here, kfree it AFTER releasing the spinlock
-		 * (kfree of a stripe_unit buffer can call vm_map_remove
-		 * which sleeps on the kernel map lock — not safe under
-		 * a spinlock).
-		 */
-		if (r->col_data[disk_idx] != NULL) {
-			to_free = r->col_data[disk_idx];
-			r->col_data[disk_idx] = NULL;
-		}
-		r->col_data[disk_idx] = data;
-
-		/* Check if every reserved col now has data. */
-		for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
-			if ((r->alloc_mask & (1U << d)) == 0)
-				continue;
-			if (r->col_data[d] == NULL) {
-				complete = 0;
-				break;
-			}
-		}
-		if (complete && r->n_alloc >= r->ndata) {
-			/* Row full and all data present → seal now. */
-			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
-		}
-		break;
+		if (r->phys_off == phys_off)
+			break;
 	}
+	KKASSERT(r != NULL);
+	KKASSERT(r->bytes == bytes);
+	KKASSERT(r->alloc_mask & (1U << disk_idx));
+
+	/*
+	 * A single chain's dio can putblk multiple times in one TXG
+	 * if it's re-dirtied after the first bawrite (in-TXG modify-
+	 * after-flush).  The latest copy wins — detach the prior
+	 * col_data here, kfree it AFTER releasing the spinlock (kfree
+	 * of a stripe_unit buffer can call vm_map_remove which sleeps
+	 * on the kernel map lock — not safe under a spinlock).
+	 */
+	if (r->col_data[disk_idx] != NULL) {
+		to_free = r->col_data[disk_idx];
+		r->col_data[disk_idx] = NULL;
+	}
+	r->col_data[disk_idx] = data;
+
+	/* Seal immediately if the row is full and every alloc'd col has data. */
+	complete = 1;
+	for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
+		if ((r->alloc_mask & (1U << d)) == 0)
+			continue;
+		if (r->col_data[d] == NULL) {
+			complete = 0;
+			break;
+		}
+	}
+	if (complete && r->n_alloc >= r->ndata)
+		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
 	if (to_free)
 		kfree(to_free, M_HAMMER2);
-
-	if (found)
-		return;
-
-	/*
-	 * No matching open row.  With the TAILQ-backed tracker this
-	 * should be unreachable in steady state: every chain that
-	 * makes it through stripe_alloc has a row registered before
-	 * putblk's add_data can run.  Krateprintf and drop the data
-	 * so an unexpected reach here is loud (and doesn't corrupt
-	 * by going through the old single-col write_row fallback,
-	 * which clobbered parity).
-	 */
-	{
-		static struct krate krate_h2of = { .freq = 1 };
-		krateprintf(&krate_h2of,
-			"hammer2: open_row add_data: no matching row for "
-			"phys_off=%016jx disk_idx=%d — chain data dropped\n",
-			(uintmax_t)phys_off, disk_idx);
-	}
-	kfree(data, M_HAMMER2);
 }
 
 /*
