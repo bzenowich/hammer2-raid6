@@ -1150,6 +1150,7 @@ struct hammer2_dev {
 	uint64_t	stripe_cursor;		/* sequential allocator cursor */
 	uint64_t	stripe_generation;	/* bumped on every TXG flush */
 	int		stripe_bitmap_invalid;	/* 1 if on-disk header was bad */
+	int		stripe_refcount_invalid; /* 1 if persisted refcount bad/missing */
 	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk */
 	int		stripe_next_disk;	/* round-robin data disk counter */
 	/*
@@ -2004,6 +2005,8 @@ hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
 void hammer2_raid6_bitmap_init(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_read(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_write(hammer2_dev_t *hmp);
+void hammer2_raid6_refcount_read(hammer2_dev_t *hmp);
+void hammer2_raid6_refcount_write(hammer2_dev_t *hmp);
 int  hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
 int  hammer2_raid6_rebuild_row_refcount(hammer2_dev_t *hmp);
 void hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp);

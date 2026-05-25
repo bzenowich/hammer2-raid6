@@ -1991,12 +1991,20 @@ resilver_done:
  * reconstruction's CHECK matches, writes the corrected column back to
  * the corrupt disk.
  *
- * v1 concurrency: walks the live vchain with the same
- * (RESOLVE_ALWAYS) chain-lock pattern the mount-time bitmap walker
- * uses.  Concurrent writes that need to traverse vchain will serialize
- * with the scrub.  A future v2 will move to the bulkfree snapshot
- * pattern (hammer2_chain_bulksnap + SHARED locks + unlock-recurse-relock)
- * to let writers proceed unimpeded.
+ * Concurrency model (mirrors bulkfree): operates on a chain snapshot
+ * taken via hammer2_chain_bulksnap() so live writes proceed unimpeded.
+ * Inside the walk we use SHARED chain locks and a bulkfree-style
+ * unlock-recurse-relock so writers that need to take EXCLUSIVE on a
+ * chain we're past can do so without waiting for the whole walk.  The
+ * snapshot view is "state as of the last TXG flush"; chains created
+ * since then aren't visible to this scrub but will be covered by the
+ * next one.
+ *
+ * Repair side: the scrub repair-write goes raw against the failed
+ * disk's devvp (see hammer2_scrub_verify_bref) and the slots it
+ * touches are always "old" (already on disk before the scrub started),
+ * so it never collides with the new chains that concurrent writers
+ * land in fresh slots from COW.
  */
 struct hammer2_scrub_ctx {
 	hammer2_dev_t	*hmp;
@@ -2158,23 +2166,41 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	return 0;
 }
 
+/*
+ * Recursive walker.  Caller passes parent *unlocked*; walker locks
+ * parent SHARED at entry, unlocks at out:.  Before descending into a
+ * child it drops both locks and re-acquires them after the recursive
+ * call returns — bulkfree's pattern so writers that need EXCLUSIVE on
+ * a chain we already walked past can take it without waiting for the
+ * full scrub.
+ */
 static int
 hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 {
 	hammer2_chain_t *chain = NULL;
 	hammer2_blockref_t bref;
 	int first = 1;
-	int error;
+	int error = 0;
+	int e;
+
+	hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS |
+				   HAMMER2_RESOLVE_SHARED);
+
+	if (parent->error & HAMMER2_ERROR_CHECK) {
+		hammer2_chain_unlock(parent);
+		return 0;
+	}
 
 	for (;;) {
-		error = hammer2_chain_scan(parent, &chain, &bref, &first,
-					   HAMMER2_LOOKUP_ALWAYS);
-		if (error & HAMMER2_ERROR_EOF) {
-			error = 0;
+		e = hammer2_chain_scan(parent, &chain, &bref, &first,
+				       HAMMER2_LOOKUP_NODATA |
+				       HAMMER2_LOOKUP_SHARED);
+		if (e & HAMMER2_ERROR_EOF)
+			break;
+		if (e & ~HAMMER2_ERROR_CHECK) {
+			error = e;
 			break;
 		}
-		if (error)
-			break;
 
 		hammer2_scrub_verify_bref(ctx, &bref);
 		ctx->hmp->scrub_brefs_done = ctx->done;
@@ -2182,25 +2208,36 @@ hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 		ctx->hmp->scrub_brefs_repaired = ctx->repaired;
 		ctx->hmp->scrub_brefs_unrepairable = ctx->unrepairable;
 
+		if (chain == NULL)
+			continue;
+
 		/*
-		 * Only recurse into interior chain types.  chain_scan
-		 * panics ("unrecognized blockref type") if invoked on a
-		 * leaf bref like DATA / DIRENT / FREEMAP_LEAF.
+		 * Recurse only into interior chain types.  chain_scan
+		 * panics on leaves (DATA / DIRENT / FREEMAP_LEAF) and
+		 * leaves don't have children to walk anyway.
 		 */
-		if (chain) {
-			switch (chain->bref.type) {
-			case HAMMER2_BREF_TYPE_INODE:
-			case HAMMER2_BREF_TYPE_INDIRECT:
-			case HAMMER2_BREF_TYPE_VOLUME:
-			case HAMMER2_BREF_TYPE_FREEMAP:
-			case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+		switch (chain->bref.type) {
+		case HAMMER2_BREF_TYPE_INODE:
+		case HAMMER2_BREF_TYPE_INDIRECT:
+		case HAMMER2_BREF_TYPE_VOLUME:
+		case HAMMER2_BREF_TYPE_FREEMAP:
+		case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+			if ((chain->error & HAMMER2_ERROR_CHECK) == 0) {
+				hammer2_chain_unlock(chain);
+				hammer2_chain_unlock(parent);
 				error = hammer2_scrub_walk(ctx, chain);
+				hammer2_chain_lock(parent,
+				    HAMMER2_RESOLVE_ALWAYS |
+				    HAMMER2_RESOLVE_SHARED);
+				hammer2_chain_lock(chain,
+				    HAMMER2_RESOLVE_ALWAYS |
+				    HAMMER2_RESOLVE_SHARED);
 				if (error)
 					goto out;
-				break;
-			default:
-				break;
 			}
+			break;
+		default:
+			break;
 		}
 		if ((ctx->done & 255) == 0)
 			lwkt_yield();
@@ -2210,6 +2247,7 @@ out:
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
 	}
+	hammer2_chain_unlock(parent);
 	return error;
 }
 
@@ -2217,6 +2255,7 @@ int
 hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 {
 	struct hammer2_scrub_ctx ctx;
+	hammer2_chain_t *vsnap;
 	int error;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
@@ -2235,9 +2274,17 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	hmp->scrub_brefs_unrepairable = 0;
 	hmp->scrub_error = 0;
 
-	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
-	error = hammer2_scrub_walk(&ctx, &hmp->vchain);
-	hammer2_chain_unlock(&hmp->vchain);
+	/*
+	 * Bulksnap the volume chain so the walker operates on the
+	 * synced state from the last TXG flush.  Live writes proceed
+	 * against the real vchain unimpeded; chains created since the
+	 * last sync aren't covered by this scrub but the next one
+	 * picks them up.  Caller passes vsnap *unlocked* — the walker
+	 * locks and unlocks parent at every level itself.
+	 */
+	vsnap = hammer2_chain_bulksnap(hmp);
+	error = hammer2_scrub_walk(&ctx, vsnap);
+	hammer2_chain_bulkdrop(vsnap);
 
 	hmp->scrub_brefs_done = ctx.done;
 	hmp->scrub_brefs_bad = ctx.bad;

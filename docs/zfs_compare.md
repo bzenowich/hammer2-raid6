@@ -1,9 +1,10 @@
 # HAMMER2 v3 RAIDZ2-Native vs ZFS — Design Comparison and Improvement Plan
 
-**Status (2026-05-24).**  M1 (item 6 — variable-width stripes)
+**Status (2026-05-25).**  M1 (item 6 — variable-width stripes)
 shipped.  M2 item 1 (bitmap-aware resilver) shipped.  M3 (scrub —
-item 3) shipped (v1, fs-locking walker).  M2 item 2 (TRIM)
-deferred.  Item 4 absorbed into M1.  Item 5 deferred.
+item 3) shipped, including concurrent-write support via
+bulksnap.  M2 item 2 (TRIM) deferred.  Item 4 absorbed into M1.
+Item 5 deferred.
 
 This document compares the v3 RAIDZ2-native HAMMER2 RAID6 design to
 ZFS RAIDZ2 along the axes where ZFS made deliberate, well-considered
@@ -206,14 +207,21 @@ repair), `local_hammer2.h` (scrub progress fields + extern),
 (`scrub` subcommand), `tests/v3/test_k_scrub.sh` (new),
 `tests/v3/run_all.sh` (K added to default group set).
 
-**Concurrency — v1 limitation.** The walker locks `hmp->vchain`
-RESOLVE_ALWAYS for the entire walk (same pattern the mount-time
-`hammer2_raid6_rebuild_stripe_bitmap` walker uses).  Concurrent FS
-writes that need to traverse `vchain` will serialize with the
-scrub.  An attempted v2 using `hammer2_chain_bulksnap` + SHARED
-locks + bulkfree-style unlock/recurse/relock deadlocked on the
-test substrate (`send_ipiq` IPI stuck) before completing one
-walk — left for a follow-up.
+**Concurrency model.** The walker operates on a
+`hammer2_chain_bulksnap` snapshot of `hmp->vchain` taken at scrub
+start.  The snapshot represents the FS state as of the last TXG
+flush (`hmp->volsync`); live writes proceed against the real
+vchain unimpeded.  Chains created since the last sync are not
+covered by this scrub — the next one picks them up.  Inside the
+walk, chains are locked SHARED with `HAMMER2_LOOKUP_NODATA |
+HAMMER2_LOOKUP_SHARED` and a bulkfree-style
+unlock-recurse-relock pattern keeps lock hold-times short so
+writers that need EXCLUSIVE on a chain we've already walked
+past don't wait for the full scrub.
+
+Group K's K3 test exercises this: foreground writes complete in
+0–1 s on the vbd substrate while a 32 MB-file scrub runs to
+completion in the background.
 
 **Partial-row parity fix (seal-time zero-fill).**  M3 surfaced a
 long-latent write-path bug: when a packed row sealed with
@@ -312,8 +320,13 @@ exclusively in `bref.copyid`.  The DIO cache key synthesizes
 **6B — in-memory per-row refcount** (commit `67d71ce`).
 `hmp->stripe_row_refcount[]`: one byte per row, indicates how many
 live DATA/DIRENT chains currently occupy a data column in that
-row.  Bitmap bit is the union (set iff refcount > 0).  Not
-persisted on disk — rebuilt at mount.
+row.  Bitmap bit is the union (set iff refcount > 0).
+Persisted on disk in a 64 KB block at offset
+`HAMMER2_STRIPE_REFCOUNT_OFFSET` within the bitmap zone (slot
+41 on disk 0); same torn-write-safe header/footer/CRC pattern
+as the bitmap.  Mount loads it directly; only falls back to
+walking the chain tree if the block is missing (fresh upgrade)
+or corrupt.
 
 **6C-1 — write_row multi-col API** (commit `b6d02e9`).
 `hammer2_io_raid6_write_row(hmp, phys_off, cols[], ncols, bytes)`.
@@ -355,7 +368,7 @@ H4 I4 **J2**), no panics, no `CHECK FAIL`.
 |---|---|---|---|
 | **M1 — v3 RAIDZ2-native variable-width** | item 6 (6A–6D) | yes (v2→v3) | **DONE** |
 | **M2 — resilver + TRIM** | items 1, 2 | none | item 1 DONE; item 2 deferred |
-| **M3 — scrub** | item 3 | none | **DONE** (v1, fs-locking walker) |
+| **M3 — scrub** | item 3 | none | **DONE** (concurrent-write via bulksnap) |
 | *(deferred)* item 4 — async P/Q | needs cache throttling | none | partial |
 | *(deferred)* item 5 — DTL | future v4 (DTL zone) | yes | not started |
 
@@ -369,10 +382,11 @@ H4 I4 **J2**), no panics, no `CHECK FAIL`.
 - **Item 5 DTL persistence.** Inside `raid_config` addendum?
   Dedicated zone like the stripe bitmap?  How is the DTL itself
   protected when it lives on a single disk?
-- **Item 6 row-refcount persistence.** O(metadata) walk at every
-  mount works but is wasted I/O on healthy mounts.  Persisting the
-  refcount alongside the bitmap zone would skip the walk.  Sizing
-  is the concern — 1 byte per row times millions of rows on a
-  multi-TB array.
+- **Item 6 row-refcount persistence — DONE.**  Persisted in a
+  64 KB block at offset `HAMMER2_STRIPE_REFCOUNT_OFFSET` within
+  zone slot 41 (= bitmap zone + 64 KB).  Mount loads it
+  directly; only falls back to the chain-tree walker when the
+  block is absent or corrupt.  At PBUFSIZE / num_slots one byte,
+  the table is well under 64 KB for any practical zone size.
 - **Beyond 1–6**: items 7 (ZIL), 8 (birth-txg snapshots), 9
   (metaslab), 10 (dRAID).  All large; no plan yet.

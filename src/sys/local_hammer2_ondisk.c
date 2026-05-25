@@ -1583,6 +1583,196 @@ hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
 }
 
 /*
+ * Persisted row-refcount block (zone 41 on disk 0, byte offset
+ * HAMMER2_STRIPE_REFCOUNT_OFFSET within the zone — i.e. 64 KB past
+ * the stripe bitmap block).  See hammer2_disk.h for layout.  Saves
+ * the O(metadata) chain-tree walk that hammer2_raid6_rebuild_row_refcount
+ * would otherwise run at every mount; the cost is one extra 64 KB
+ * write per TXG flush.
+ */
+#define HAMMER2_STRIPE_REFCOUNT_PAGES_MAX	\
+	((HAMMER2_PBUFSIZE - 2 * HAMMER2_STRIPE_REFCOUNT_PAGE) / \
+	 HAMMER2_STRIPE_REFCOUNT_PAGE)
+
+static uint32_t
+hammer2_stripe_refcount_crc(const hammer2_stripe_refcount_header_t *hdr,
+			    const uint8_t *refcount, size_t refcount_pages,
+			    const hammer2_stripe_refcount_footer_t *ftr)
+{
+	static const uint8_t zero_crc[sizeof(hdr->crc)] = { 0 };
+	const size_t hdr_crc_off =
+	    offsetof(hammer2_stripe_refcount_header_t, crc);
+	const size_t ftr_crc_off =
+	    offsetof(hammer2_stripe_refcount_footer_t, crc);
+	uint32_t c;
+
+	c = hammer2_icrc32(hdr, hdr_crc_off);
+	c = hammer2_icrc32c(zero_crc, sizeof(zero_crc), c);
+	c = hammer2_icrc32c((const uint8_t *)hdr + hdr_crc_off + sizeof(hdr->crc),
+			    sizeof(*hdr) - hdr_crc_off - sizeof(hdr->crc), c);
+	c = hammer2_icrc32c(refcount,
+			    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE, c);
+	c = hammer2_icrc32c(ftr, ftr_crc_off, c);
+	c = hammer2_icrc32c(zero_crc, sizeof(zero_crc), c);
+	c = hammer2_icrc32c((const uint8_t *)ftr + ftr_crc_off + sizeof(ftr->crc),
+			    sizeof(*ftr) - ftr_crc_off - sizeof(ftr->crc), c);
+	return c;
+}
+
+void
+hammer2_raid6_refcount_read(hammer2_dev_t *hmp)
+{
+	struct vnode *devvp;
+	struct buf *bp;
+	off_t pbase;
+	hammer2_stripe_refcount_header_t *hdr;
+	hammer2_stripe_refcount_footer_t *ftr;
+	uint8_t *refcount;
+	size_t refcount_pages;
+	uint32_t hdr_crc, ftr_crc, want_crc;
+	int error;
+
+	if (hmp->stripe_row_refcount == NULL) {
+		hmp->stripe_refcount_invalid = 1;
+		return;
+	}
+
+	refcount_pages = (size_t)((hmp->stripe_num_slots +
+	    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
+	    HAMMER2_STRIPE_REFCOUNT_PAGE);
+	if (refcount_pages == 0)
+		refcount_pages = 1;
+	if (refcount_pages > HAMMER2_STRIPE_REFCOUNT_PAGES_MAX) {
+		kprintf("hammer2: refcount pages %zu exceeds max %d; "
+			"refcount invalid\n", refcount_pages,
+			(int)HAMMER2_STRIPE_REFCOUNT_PAGES_MAX);
+		hmp->stripe_refcount_invalid = 1;
+		return;
+	}
+
+	devvp = hmp->volumes[0].dev->devvp;
+	if (devvp == NULL || !hmp->volumes[0].dev->open) {
+		hmp->stripe_refcount_invalid = 1;
+		return;
+	}
+
+	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
+	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
+	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
+	if (error || bp == NULL) {
+		if (bp)
+			brelse(bp);
+		hmp->stripe_refcount_invalid = 1;
+		return;
+	}
+
+	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
+	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
+	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
+	    HAMMER2_STRIPE_REFCOUNT_PAGE +
+	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+
+	if (hdr->magic != HAMMER2_STRIPE_REFCOUNT_MAGIC ||
+	    hdr->version != HAMMER2_STRIPE_REFCOUNT_VERSION ||
+	    hdr->ndisks != hmp->raid_config.ndisks ||
+	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
+	    hdr->num_slots != hmp->stripe_num_slots ||
+	    ftr->magic_end != HAMMER2_STRIPE_REFCOUNT_MAGIC_END ||
+	    ftr->generation != hdr->generation) {
+		/*
+		 * Quiet on missing block (fresh upgrade from a volume
+		 * mkfs'd before this format existed); the walker will
+		 * rebuild and the next flush persists.
+		 */
+		hmp->stripe_refcount_invalid = 1;
+		brelse(bp);
+		return;
+	}
+
+	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
+	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
+	want_crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages,
+					       ftr);
+	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
+		kprintf("hammer2: refcount CRC mismatch "
+			"(hdr %08x ftr %08x want %08x); falling back to walker\n",
+			hdr_crc, ftr_crc, want_crc);
+		hmp->stripe_refcount_invalid = 1;
+		brelse(bp);
+		return;
+	}
+
+	bcopy(refcount, hmp->stripe_row_refcount,
+	    (size_t)hmp->stripe_num_slots);
+	hmp->stripe_refcount_invalid = 0;
+	brelse(bp);
+}
+
+void
+hammer2_raid6_refcount_write(hammer2_dev_t *hmp)
+{
+	struct vnode *devvp;
+	struct buf *bp;
+	off_t pbase;
+	hammer2_stripe_refcount_header_t *hdr;
+	hammer2_stripe_refcount_footer_t *ftr;
+	uint8_t *refcount;
+	size_t refcount_pages;
+	uint32_t crc;
+
+	if (hmp->stripe_row_refcount == NULL)
+		return;
+
+	refcount_pages = (size_t)((hmp->stripe_num_slots +
+	    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
+	    HAMMER2_STRIPE_REFCOUNT_PAGE);
+	if (refcount_pages == 0)
+		refcount_pages = 1;
+	if (refcount_pages > HAMMER2_STRIPE_REFCOUNT_PAGES_MAX)
+		return;
+
+	devvp = hmp->volumes[0].dev->devvp;
+	if (devvp == NULL || !hmp->volumes[0].dev->open)
+		return;
+
+	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
+	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
+
+	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+	if (bp == NULL) {
+		kprintf("hammer2_raid6_refcount_write: getblk failed\n");
+		return;
+	}
+	bkvasync(bp);
+	bzero(bp->b_data, HAMMER2_PBUFSIZE);
+
+	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
+	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
+	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
+	    HAMMER2_STRIPE_REFCOUNT_PAGE +
+	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+
+	hdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
+	hdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
+	hdr->ndisks = hmp->raid_config.ndisks;
+	hdr->stripe_unit = hmp->raid_config.stripe_unit;
+	hdr->num_slots = hmp->stripe_num_slots;
+	hdr->generation = hmp->stripe_generation;
+
+	ftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
+	ftr->generation = hmp->stripe_generation;
+
+	bcopy(hmp->stripe_row_refcount, refcount,
+	    (size_t)hmp->stripe_num_slots);
+
+	crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages, ftr);
+	bcopy(&crc, hdr->crc, sizeof(crc));
+	bcopy(&crc, ftr->crc, sizeof(crc));
+
+	bwrite(bp);
+}
+
+/*
  * Open-row tracking — see hmp->open_rows comment in hammer2.h.
  *
  * Each entry tracks a row (stripe slot) allocated during the current

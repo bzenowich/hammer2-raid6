@@ -807,6 +807,66 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 			perror("write (stripe bitmap zone)");
 			exit(1);
 		}
+
+		/*
+		 * Persisted row refcount block at offset HAMMER2_PBUFSIZE
+		 * within the same zone.  Empty (all-zero refcount) with a
+		 * valid header so the kernel can load it at first mount
+		 * without falling back to the walker.
+		 */
+		{
+			hammer2_stripe_refcount_header_t *rhdr;
+			hammer2_stripe_refcount_footer_t *rftr;
+			uint8_t *refcount;
+			size_t refcount_pages =
+			    (size_t)((max_stripes +
+			    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
+			    HAMMER2_STRIPE_REFCOUNT_PAGE);
+			hammer2_stripe_refcount_header_t rhtmp;
+			hammer2_stripe_refcount_footer_t rftmp;
+			uint32_t rcrc;
+
+			if (refcount_pages == 0)
+				refcount_pages = 1;
+
+			bzero(buf, HAMMER2_PBUFSIZE);
+			rhdr = (hammer2_stripe_refcount_header_t *)buf;
+			refcount = (uint8_t *)buf + HAMMER2_STRIPE_REFCOUNT_PAGE;
+			rftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)
+			    buf + HAMMER2_STRIPE_REFCOUNT_PAGE +
+			    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+
+			rhdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
+			rhdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
+			rhdr->ndisks = (uint32_t)fso->nvolumes;
+			rhdr->stripe_unit = stripe_unit;
+			rhdr->num_slots = max_stripes;
+			rhdr->generation = 1;
+
+			rftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
+			rftr->generation = 1;
+
+			rhtmp = *rhdr;
+			rftmp = *rftr;
+			bzero(rhtmp.crc, sizeof(rhtmp.crc));
+			bzero(rftmp.crc, sizeof(rftmp.crc));
+			rcrc = hammer2_icrc32(&rhtmp, sizeof(rhtmp));
+			rcrc = hammer2_icrc32c(refcount,
+			    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE,
+			    rcrc);
+			rcrc = hammer2_icrc32c(&rftmp, sizeof(rftmp), rcrc);
+			bcopy(&rcrc, rhdr->crc, sizeof(rcrc));
+			bcopy(&rcrc, rftr->crc, sizeof(rcrc));
+
+			n = pwrite(vol->fd, buf, HAMMER2_PBUFSIZE,
+				   (hammer2_off_t)HAMMER2_ZONE_RAID6_BITMAP *
+				   HAMMER2_ZONE_SEG +
+				   HAMMER2_STRIPE_REFCOUNT_OFFSET);
+			if (n != HAMMER2_PBUFSIZE) {
+				perror("write (stripe refcount zone)");
+				exit(1);
+			}
+		}
 	}
 
 	/*

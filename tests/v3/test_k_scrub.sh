@@ -111,4 +111,66 @@ else
 fi
 teardown "K2"
 
+# K3: concurrent writes during scrub.  With the bulksnap-based walker
+# the scrub operates on the last-synced state while the live FS keeps
+# accepting writes — verifies the FS isn't serialized behind scrub.
+setup_fresh
+check_v3
+dd if=/dev/urandom of=$MNTPT/k3_pre bs=65536 count=512 2>/dev/null
+sha256 $MNTPT/k3_pre > /var/tmp/k3_pre_ref.txt
+sync; sync
+
+# Kick scrub off in the background via the -n polling path.
+hammer2 -s $MNTPT raid scrub -n > /var/tmp/k3_scrub.txt 2>&1 &
+SPID=$!
+
+# Race some foreground writes against the scrub.  The bulksnap view
+# is "state as of last sync" so these new chains aren't covered by
+# *this* scrub (they'd be picked up by the next).  The point is that
+# they complete without blocking on scrub.
+WSTART=$(date +%s)
+dd if=/dev/urandom of=$MNTPT/k3_during_a bs=65536 count=128 2>/dev/null
+dd if=/dev/urandom of=$MNTPT/k3_during_b bs=65536 count=64  2>/dev/null
+WEND=$(date +%s)
+sync
+sha256 $MNTPT/k3_during_a > /var/tmp/k3_during_a_ref.txt
+sha256 $MNTPT/k3_during_b > /var/tmp/k3_during_b_ref.txt
+
+wait $SPID
+K3_RC=$?
+
+# Foreground writes shouldn't block on scrub.  Allow up to 30 s for
+# 12 MB of dd through hammer2 on the vbd substrate; in practice it
+# finishes in 1-3 s under a non-blocking scrub.  If it took ≥30 s we
+# almost certainly serialized behind the scrub.
+WELAPSED=$((WEND - WSTART))
+if [ "$WELAPSED" -lt 30 ]; then
+    result PASS "K3: foreground writes finished in ${WELAPSED}s (< 30s)"
+else
+    result FAIL "K3: foreground writes took ${WELAPSED}s — likely serialized behind scrub"
+fi
+
+if [ "$K3_RC" = "0" ]; then
+    result PASS "K3: scrub completed under concurrent writes"
+else
+    result FAIL "K3: scrub returned non-zero ($K3_RC)"
+    cat /var/tmp/k3_scrub.txt
+fi
+
+sha256 $MNTPT/k3_pre > /var/tmp/k3_pre_check.txt 2>&1
+if diff -q /var/tmp/k3_pre_ref.txt /var/tmp/k3_pre_check.txt > /dev/null 2>&1; then
+    result PASS "K3: pre-scrub file intact after concurrent scrub+write"
+else
+    result FAIL "K3: pre-scrub file mismatch"
+fi
+sha256 $MNTPT/k3_during_a > /var/tmp/k3_during_a_check.txt 2>&1
+sha256 $MNTPT/k3_during_b > /var/tmp/k3_during_b_check.txt 2>&1
+if diff -q /var/tmp/k3_during_a_ref.txt /var/tmp/k3_during_a_check.txt > /dev/null 2>&1 && \
+   diff -q /var/tmp/k3_during_b_ref.txt /var/tmp/k3_during_b_check.txt > /dev/null 2>&1; then
+    result PASS "K3: during-scrub files intact"
+else
+    result FAIL "K3: during-scrub file mismatch"
+fi
+teardown "K3"
+
 summary

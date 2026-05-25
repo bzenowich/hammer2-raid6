@@ -11,12 +11,17 @@
  *	HAMMER2IOC_RAID_REPLACE — synchronous online resilver of <old>'s
  *	stripe positions onto <new>.  Same path for both args is the
  *	"reattach the same slot" case used by the test suite.
- *   raid scrub
+ *   raid scrub [-n]
  *	HAMMER2IOC_RAID_SCRUB — walk every live DATA/DIRENT bref, verify
- *	the CHECK code, parity-repair on mismatch.
+ *	the CHECK code, parity-repair on mismatch.  Default is blocking;
+ *	with -n, forks a child to run the blocking ioctl and polls
+ *	HAMMER2IOC_RAID_SCRUB_STATUS from the parent for live progress.
  */
 
 #include "hammer2.h"
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 int cmd_raid(const char *sel_path, int ac, const char **av);
 
@@ -117,8 +122,27 @@ raid_replace(const char *sel_path, const char *old_dev, const char *new_dev)
 	return 0;
 }
 
+static void
+raid_scrub_print_final(const struct hammer2_ioc_raid_scrub *rs)
+{
+	printf("scrub complete:\n");
+	printf("  brefs_done:         %llu\n",
+	       (unsigned long long)rs->brefs_done);
+	printf("  brefs_bad:          %llu\n",
+	       (unsigned long long)rs->brefs_bad);
+	printf("  brefs_repaired:     %llu\n",
+	       (unsigned long long)rs->brefs_repaired);
+	printf("  brefs_unrepairable: %llu\n",
+	       (unsigned long long)rs->brefs_unrepairable);
+	printf("  error:              %d\n", rs->error);
+}
+
+/*
+ * Blocking scrub.  Returns the kernel's final counters; one ioctl
+ * per call.
+ */
 static int
-raid_scrub(const char *sel_path)
+raid_scrub_blocking(const char *sel_path)
 {
 	struct hammer2_ioc_raid_scrub rs;
 	int fd;
@@ -134,16 +158,77 @@ raid_scrub(const char *sel_path)
 		fprintf(stderr, "raid scrub: %s\n", strerror(errno));
 		return 1;
 	}
-	printf("scrub complete:\n");
-	printf("  brefs_done:         %llu\n",
-	       (unsigned long long)rs.brefs_done);
-	printf("  brefs_bad:          %llu\n",
-	       (unsigned long long)rs.brefs_bad);
-	printf("  brefs_repaired:     %llu\n",
-	       (unsigned long long)rs.brefs_repaired);
-	printf("  brefs_unrepairable: %llu\n",
-	       (unsigned long long)rs.brefs_unrepairable);
-	printf("  error:              %d\n", rs.error);
+	raid_scrub_print_final(&rs);
+	return (rs.error || rs.brefs_unrepairable) ? 1 : 0;
+}
+
+/*
+ * Polling scrub (-n): fork; the child issues the blocking SCRUB
+ * ioctl and exits; the parent polls SCRUB_STATUS once a second and
+ * prints progress on every change.  Useful for long scrubs where
+ * the user wants visibility into bref/sec progress without tail-f'ing
+ * dmesg.
+ */
+static int
+raid_scrub_polling(const char *sel_path)
+{
+	struct hammer2_ioc_raid_scrub rs;
+	uint64_t last_done = ~(uint64_t)0;
+	pid_t pid;
+	int status;
+	int fd;
+
+	fd = hammer2_ioctl_handle(sel_path);
+	if (fd < 0)
+		return 1;
+
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "raid scrub -n: fork: %s\n", strerror(errno));
+		close(fd);
+		return 1;
+	}
+	if (pid == 0) {
+		/* Child: blocking scrub. */
+		bzero(&rs, sizeof(rs));
+		(void)ioctl(fd, HAMMER2IOC_RAID_SCRUB, &rs);
+		_exit(rs.error ? 1 : 0);
+	}
+
+	/* Parent: poll status until the child completes. */
+	for (;;) {
+		pid_t w;
+
+		sleep(1);
+		w = waitpid(pid, &status, WNOHANG);
+		if (w == pid)
+			break;
+		if (w < 0) {
+			fprintf(stderr, "raid scrub -n: waitpid: %s\n",
+				strerror(errno));
+			break;
+		}
+		bzero(&rs, sizeof(rs));
+		if (ioctl(fd, HAMMER2IOC_RAID_SCRUB_STATUS, &rs) < 0)
+			continue;
+		if (rs.brefs_done != last_done) {
+			printf("\rscrub: %llu brefs done, %llu bad, "
+			       "%llu repaired, %llu unrep    ",
+			       (unsigned long long)rs.brefs_done,
+			       (unsigned long long)rs.brefs_bad,
+			       (unsigned long long)rs.brefs_repaired,
+			       (unsigned long long)rs.brefs_unrepairable);
+			fflush(stdout);
+			last_done = rs.brefs_done;
+		}
+	}
+	printf("\n");
+
+	/* Final snapshot from STATUS (child has exited, scrub_running=0). */
+	bzero(&rs, sizeof(rs));
+	(void)ioctl(fd, HAMMER2IOC_RAID_SCRUB_STATUS, &rs);
+	close(fd);
+	raid_scrub_print_final(&rs);
 	return (rs.error || rs.brefs_unrepairable) ? 1 : 0;
 }
 
@@ -173,7 +258,9 @@ cmd_raid(const char *sel_path, int ac, const char **av)
 		}
 		return raid_replace(sel_path, av[1], av[2]);
 	} else if (strcmp(av[0], "scrub") == 0) {
-		return raid_scrub(sel_path);
+		if (ac >= 2 && strcmp(av[1], "-n") == 0)
+			return raid_scrub_polling(sel_path);
+		return raid_scrub_blocking(sel_path);
 	}
 	fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
 	return 1;

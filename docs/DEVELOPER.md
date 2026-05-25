@@ -500,11 +500,16 @@ the bitmap *was* the per-row refcount (single-chain rows); 6C
 needs both — refcount drives stripe_free's "last chain leaving"
 decision; bitmap drives the allocator's "is this slot free".
 
-In-memory only, rebuilt at mount when the bitmap is valid
-(`hammer2_raid6_rebuild_row_refcount`) by walking the chain
-tree and `++`-ing per-bref.  When the bitmap is invalid the
-H4-deep walker (`hammer2_raid6_rebuild_stripe_bitmap`) also
-populates the refcount as it goes.
+**Persisted on disk** in a 64 KB block at byte offset
+`HAMMER2_STRIPE_REFCOUNT_OFFSET` within zone slot 41 (= bitmap
+zone + 64 KB).  Same torn-write-safe header / footer / CRC
+pattern as the bitmap.  Mount tries
+`hammer2_raid6_refcount_read` first; on success uses the
+persisted copy directly.  On torn write / missing block (fresh
+upgrade from a pre-refcount-block volume) / CRC mismatch, mount
+falls back to `hammer2_raid6_rebuild_row_refcount` which walks
+the chain tree, and the next TXG flush re-persists.  TXG flush
+writes the refcount block right after the bitmap block.
 
 ---
 
@@ -754,15 +759,27 @@ On CHECK FAIL:
    `ncols=1` and at seal would zero the surviving sibling data
    column, silently corrupting the row.
 
+### Concurrency model
+
+Scrub operates on a **chain snapshot** taken via
+`hammer2_chain_bulksnap(hmp)` — the snapshot points at the
+on-disk root from the last TXG flush (`hmp->volsync`).  Live
+writes proceed against the real `hmp->vchain` unimpeded;
+chains created since the last sync aren't covered by *this*
+scrub (the next one picks them up).
+
+The walker uses `HAMMER2_LOOKUP_NODATA | HAMMER2_LOOKUP_SHARED`
+on `hammer2_chain_scan` and the bulkfree-style
+unlock-recurse-relock pattern: before descending into a child
+chain it drops both `parent` and `child` SHARED locks, recurses
+(which re-locks at every level), and reacquires both on return.
+Writers that need EXCLUSIVE on a chain we already walked past
+proceed without waiting for the full scrub.
+
 ### Serialisation
 
 `atomic_cmpset_int` on `hmp->scrub_running` (volatile int)
-rejects a second scrub with EBUSY.  The walker holds
-`hmp->vchain` `RESOLVE_ALWAYS` for the full walk — concurrent
-FS writes that need to traverse vchain will serialise with the
-scrub.  A snapshot-based version (`hammer2_chain_bulksnap` +
-`RESOLVE_SHARED` + bulkfree-style unlock-recurse-relock)
-deadlocked on first attempt and is left as a follow-up.
+rejects a second scrub with EBUSY.
 
 ### Counters
 
@@ -831,12 +848,20 @@ newfs_hammer2 -R 6 -L LABEL /dev/vbd1 /dev/vbd2 /dev/vbd3 /dev/vbd4
 RAID config sector, the initial stripe-bitmap zone (zeros + valid
 header), the metadata zone extents, and the empty freemap.
 
-### Stripe bitmap initialization
+### Stripe bitmap + refcount initialization
 
-`format_raid6_stripe_bitmap` (in mkfs_hammer2.c) writes the
-on-disk zone slot 41 with an all-zero bitmap wrapped in a valid
-header/footer.  Otherwise the first mount would `H4-deep` the
-entire (empty) chain tree to "rebuild" it.
+`mkfs_hammer2.c` writes two blocks into zone slot 41:
+
+- At offset 0: an all-zero stripe bitmap wrapped in a valid
+  header/footer.  Without this the first mount would `H4-deep`
+  the entire (empty) chain tree to "rebuild" it.
+- At offset `HAMMER2_STRIPE_REFCOUNT_OFFSET` (= 64 KB): an
+  all-zero persisted refcount with a valid header/footer.
+  Without this the first mount would walk the metadata tree to
+  rebuild the in-memory refcount.
+
+Both blocks share the bitmap zone's 4 MB; only the first 128 KB
+is used.  The remaining 3.875 MB is reserved.
 
 ### array_size
 
@@ -857,14 +882,18 @@ Subtracts the volume-header zone per disk.
 | `raid status [path]` | `HAMMER2IOC_RAID_RESILVER_STATUS` | resilver progress + per-disk state |
 | `raid fail-disk <dev>` | `HAMMER2IOC_RAID_FAIL_DISK` | mark a disk failed (so it can be detached) |
 | `raid replace <old> <new>` | `HAMMER2IOC_RAID_REPLACE` | online resilver |
-| `raid scrub` | `HAMMER2IOC_RAID_SCRUB` | walk, verify, parity-repair |
+| `raid scrub [-n]` | `HAMMER2IOC_RAID_SCRUB` (+ `_STATUS` for `-n`) | walk, verify, parity-repair (with progress polling under `-n`) |
 
 The same-path-twice form of `replace` (`hammer2 raid replace
 /dev/vbdN /dev/vbdN`) is the "reattach the same slot" case used
 by tests after `fresh_disk()` re-zeros the failed device.
 
-`hammer2 raid scrub`'s exit code is 0 only when **all** bad
-chains were repaired (`brefs_unrepairable == 0`).
+`raid scrub [-n]` flag: `-n` runs the scrub in a forked child
+(blocking ioctl in the child) while the parent polls
+`HAMMER2IOC_RAID_SCRUB_STATUS` once a second and prints live
+bref/sec progress.  Without `-n`, the command blocks until the
+scrub completes.  Exit code is 0 only when **all** bad chains
+were repaired (`brefs_unrepairable == 0`).
 
 ---
 
@@ -972,7 +1001,7 @@ Groups currently in the suite:
 | H | 4 | snapshots under healthy + degraded |
 | I | 4 | unclean unmount + bulkfree after crash |
 | J | 2 | packed-row delete + snapshot pinning (M1/6C-6D) |
-| K | 5 | **scrub (M3)** — K1 clean array, K2 corrupt + parity-repair |
+| K | 9 | **scrub (M3)** — K1 clean, K2 corrupt + parity-repair, K3 concurrent writes during scrub |
 
 Substrate is virtio-blk (`/dev/vbd*`); see `docs/workflow.md` for
 the harness details.  No vn-backed runs are supported.
@@ -1010,15 +1039,3 @@ items:
   P + Q disks when a slot's refcount drops to 0.  Not visible
   on the vbd substrate; defer to Phase 3 SSD hardware for
   verification.
-- **Concurrent-write scrub.**  Switch the scrub walker to a
-  `hammer2_chain_bulksnap` snapshot + SHARED locks +
-  bulkfree-style unlock-recurse-relock so live writes proceed
-  while scrub runs.  Earlier attempt deadlocked the IPI
-  machinery.
-- **Persist `stripe_row_refcount`.**  The mount walker rebuilds
-  refcount in O(metadata) time on every mount.  Persisting a
-  byte-per-slot table alongside the on-disk bitmap would skip
-  the walk; the cost is bitmap-zone size (`num_slots` bytes).
-- **`raid scrub` progress polling.**  `HAMMER2IOC_RAID_SCRUB_STATUS`
-  is wired but the userspace command only calls the blocking
-  variant.  Adding a `-n` polling mode is a few lines.

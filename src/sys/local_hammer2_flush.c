@@ -1555,8 +1555,18 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * that references the array state is written.
 		 */
 		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->stripe_bitmap)
+		    hmp->stripe_bitmap) {
 			hammer2_raid6_bitmap_write(hmp);
+			/*
+			 * Persist the row refcount block right after the
+			 * bitmap.  Mount loads this and skips the
+			 * O(metadata) chain-tree walk.  On a fresh-upgrade
+			 * volume the header is absent and the walker takes
+			 * over — first flush after that writes the block.
+			 */
+			if (hmp->stripe_row_refcount)
+				hammer2_raid6_refcount_write(hmp);
+		}
 
 		/*
 		 * Write the volume header to ALL open devices.

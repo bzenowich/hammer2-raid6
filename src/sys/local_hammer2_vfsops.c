@@ -1370,16 +1370,40 @@ next_hmp:
 			 * already populated refcount alongside the bitmap.
 			 */
 			if (!hmp->stripe_bitmap_invalid) {
-				int rrerr =
-				    hammer2_raid6_rebuild_row_refcount(hmp);
-				if (rrerr && !ronly) {
-					kprintf("hammer2: row refcount "
-						"rebuild failed (err %d); "
-						"refusing RW mount\n", rrerr);
-					hammer2_unmount_helper(mp, NULL, hmp);
-					lockmgr(&hammer2_mntlk, LK_RELEASE);
-					hammer2_vfs_unmount(mp, MNT_FORCE);
-					return EROFS;
+				/*
+				 * Try the persisted on-disk refcount first;
+				 * if the header / CRC are good, skip the
+				 * O(metadata) walker entirely.  On torn
+				 * write, missing block (fresh upgrade), or
+				 * CRC mismatch, fall back to the walker —
+				 * the next TXG flush re-persists.
+				 */
+				hammer2_raid6_refcount_read(hmp);
+				if (hmp->stripe_refcount_invalid) {
+					int rrerr =
+					    hammer2_raid6_rebuild_row_refcount(hmp);
+					if (rrerr && !ronly) {
+						kprintf("hammer2: row "
+							"refcount rebuild "
+							"failed (err %d); "
+							"refusing RW mount\n",
+							rrerr);
+						hammer2_unmount_helper(mp,
+							NULL, hmp);
+						lockmgr(&hammer2_mntlk,
+							LK_RELEASE);
+						hammer2_vfs_unmount(mp,
+							MNT_FORCE);
+						return EROFS;
+					}
+					kprintf("hammer2: stripe row "
+						"refcount rebuilt via "
+						"chain-tree walker\n");
+					hmp->stripe_refcount_invalid = 0;
+				} else {
+					kprintf("hammer2: stripe row "
+						"refcount loaded from "
+						"persisted on-disk block\n");
 				}
 			}
 			/* 6C: in-memory open-row tracker for packing. */

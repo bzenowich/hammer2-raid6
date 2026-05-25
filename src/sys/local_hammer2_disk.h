@@ -1235,6 +1235,51 @@ struct hammer2_stripe_bitmap_footer {
 typedef struct hammer2_stripe_bitmap_footer hammer2_stripe_bitmap_footer_t;
 
 /*
+ * v3 RAIDZ2-native persisted row-refcount block (zone 41 on disk 0,
+ * byte offset HAMMER2_PBUFSIZE within the zone — i.e. immediately
+ * after the stripe bitmap's 64 KB block).
+ *
+ *   [page 0]       header  (4 KB)
+ *   [page 1..N]    refcount data (one byte per stripe slot)
+ *   [page N+1]     footer  (4 KB)
+ *
+ * Same torn-write-safe pattern as the bitmap: header.generation ==
+ * footer.generation + matching CRC.  Mount loads this and skips the
+ * O(metadata) chain-tree walk that rebuilds the in-memory refcount.
+ * On torn write / corrupt header / missing zone (e.g. mkfs from
+ * before the refcount block existed), mount falls back to the walker
+ * and the next TXG flush writes a fresh refcount block — old
+ * volumes upgrade transparently.
+ */
+#define HAMMER2_STRIPE_REFCOUNT_OFFSET	((off_t)HAMMER2_PBUFSIZE)
+#define HAMMER2_STRIPE_REFCOUNT_PAGE	HAMMER2_STRIPE_BITMAP_PAGE
+#define HAMMER2_STRIPE_REFCOUNT_VERSION	1
+#define HAMMER2_STRIPE_REFCOUNT_MAGIC	0x484D32535452464DULL /* "MFRTS2H\0" */
+#define HAMMER2_STRIPE_REFCOUNT_MAGIC_END 0x00484D32535452FULL /* reversed */
+
+struct hammer2_stripe_refcount_header {
+	uint64_t magic;			/* HAMMER2_STRIPE_REFCOUNT_MAGIC */
+	uint32_t version;		/* HAMMER2_STRIPE_REFCOUNT_VERSION */
+	uint32_t ndisks;		/* must match volhdr raid_config.ndisks */
+	uint64_t stripe_unit;		/* HAMMER2_PBUFSIZE */
+	uint64_t num_slots;		/* total slots covered */
+	uint64_t generation;		/* bumped on every TXG flush */
+	uint8_t  crc[16];		/* icrc32 of header+refcount+footer */
+	uint8_t  pad[4048];
+} __packed;
+
+typedef struct hammer2_stripe_refcount_header hammer2_stripe_refcount_header_t;
+
+struct hammer2_stripe_refcount_footer {
+	uint64_t magic_end;		/* HAMMER2_STRIPE_REFCOUNT_MAGIC_END */
+	uint64_t generation;		/* must match header.generation */
+	uint8_t  crc[16];		/* mirrors header.crc */
+	uint8_t  pad[4072];
+} __packed;
+
+typedef struct hammer2_stripe_refcount_footer hammer2_stripe_refcount_footer_t;
+
+/*
  * v3 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
  *
  * INODE / INDIRECT / FREEMAP_NODE / FREEMAP_LEAF blocks live in a
