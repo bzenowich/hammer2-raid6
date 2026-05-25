@@ -1186,6 +1186,14 @@ struct hammer2_dev {
 	volatile uint64_t resilver_stripes_total;
 	volatile int	resilver_running;	/* 1 while resilver active */
 	int		resilver_disk_idx;	/* disk being resilvered (-1=none) */
+
+	/* RAID6 scrub progress (M3 — written by scrub, read by status ioctl) */
+	volatile uint64_t scrub_brefs_done;	/* DATA/DIRENT brefs visited */
+	volatile uint64_t scrub_brefs_bad;	/* CHECK FAIL count */
+	volatile uint64_t scrub_brefs_repaired;	/* successfully parity-repaired */
+	volatile uint64_t scrub_brefs_unrepairable; /* CHECK FAIL, parity also bad */
+	volatile int	scrub_running;		/* 1 while scrub active */
+	int		scrub_error;		/* last scrub error (0 = none) */
 };
 
 typedef struct hammer2_dev hammer2_dev_t;
@@ -2057,6 +2065,7 @@ int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		void *buf, size_t bytes, int is_physical);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
+int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
 
 /*
@@ -2069,6 +2078,7 @@ int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_raid6_pack_open_rows;
+extern int hammer2_raid6_resilver_skip_unalloc;
 
 static __inline int
 hammer2_inject_eio(int disk_idx)

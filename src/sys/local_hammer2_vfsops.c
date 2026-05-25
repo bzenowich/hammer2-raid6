@@ -81,6 +81,7 @@ int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_raid6_pack_open_rows = 1;	/* v3: enable 6C packing */
+int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -155,6 +156,11 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_pack_open_rows, CTLFLAG_RW,
 	   &hammer2_raid6_pack_open_rows, 0,
 	   "v3 RAID6: enable 6C open-row packing (default 1).  Set 0 to "
 	   "force single-chain-per-row while keeping deferred-P/Q seal.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
+	   &hammer2_raid6_resilver_skip_unalloc, 0,
+	   "v3 RAID6: skip unallocated stripe slots during resilver "
+	   "(default 1).  Set 0 to force full-iteration baseline for "
+	   "regression timing.");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
 	   &hammer2_chain_allocs, 0, "");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,

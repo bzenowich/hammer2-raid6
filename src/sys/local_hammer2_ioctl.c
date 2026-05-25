@@ -74,6 +74,8 @@ static int hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data);
+static int hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data);
+static int hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data);
 
 int
 hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
@@ -182,6 +184,14 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 	case HAMMER2IOC_RAID_RESILVER_STATUS:
 		/* No privilege required — read-only status query */
 		error = hammer2_ioctl_resilver_status(ip, data);
+		break;
+	case HAMMER2IOC_RAID_SCRUB:
+		if (error == 0)
+			error = hammer2_ioctl_raid_scrub(ip, data);
+		break;
+	case HAMMER2IOC_RAID_SCRUB_STATUS:
+		/* No privilege required — read-only status query */
+		error = hammer2_ioctl_raid_scrub_status(ip, data);
 		break;
 	default:
 		error = EOPNOTSUPP;
@@ -1763,5 +1773,63 @@ hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data)
 		}
 	}
 
+	return 0;
+}
+
+/*
+ * Run a RAID6 scrub: walks every live DATA/DIRENT bref, verifies its
+ * CHECK code against the on-disk data, and on mismatch attempts parity
+ * repair.  Blocks until the walk completes.  Concurrent
+ * HAMMER2IOC_RAID_SCRUB_STATUS calls can poll progress.
+ */
+static int
+hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data)
+{
+	hammer2_ioc_raid_scrub_t *rs = data;
+	hammer2_dev_t *hmp;
+	int error;
+
+	hmp = ip->pmp->pfs_hmps[0];
+	if (hmp == NULL)
+		return EINVAL;
+	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return ENOTSUP;
+	if (hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2)
+		return ENOTSUP;
+
+	/* hammer2_io_raid6_scrub() atomically serializes concurrent runs */
+	error = hammer2_io_raid6_scrub(hmp);
+
+	rs->running		= 0;
+	rs->error		= error;
+	rs->brefs_done		= hmp->scrub_brefs_done;
+	rs->brefs_bad		= hmp->scrub_brefs_bad;
+	rs->brefs_repaired	= hmp->scrub_brefs_repaired;
+	rs->brefs_unrepairable	= hmp->scrub_brefs_unrepairable;
+	return error;
+}
+
+/*
+ * Non-blocking scrub-progress poll.  Safe to call while a scrub is in
+ * progress in another thread.
+ */
+static int
+hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data)
+{
+	hammer2_ioc_raid_scrub_t *rs = data;
+	hammer2_dev_t *hmp;
+
+	hmp = ip->pmp->pfs_hmps[0];
+	if (hmp == NULL)
+		return EINVAL;
+	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return ENOTSUP;
+
+	rs->running		= hmp->scrub_running;
+	rs->error		= hmp->scrub_error;
+	rs->brefs_done		= hmp->scrub_brefs_done;
+	rs->brefs_bad		= hmp->scrub_brefs_bad;
+	rs->brefs_repaired	= hmp->scrub_brefs_repaired;
+	rs->brefs_unrepairable	= hmp->scrub_brefs_unrepairable;
 	return 0;
 }

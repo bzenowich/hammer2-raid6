@@ -256,6 +256,8 @@ typedef struct hammer2_ioc_volume_list hammer2_ioc_volume_list_t;
 #define HAMMER2IOC_RAID_REPLACE		_IOWR('h', 98, struct hammer2_ioc_raid_replace)
 #define HAMMER2IOC_RAID_FAIL_DISK	_IOWR('h', 99, struct hammer2_ioc_raid_fail_disk)
 #define HAMMER2IOC_RAID_RESILVER_STATUS	_IOWR('h', 100, struct hammer2_ioc_resilver_status)
+#define HAMMER2IOC_RAID_SCRUB		_IOWR('h', 101, struct hammer2_ioc_raid_scrub)
+#define HAMMER2IOC_RAID_SCRUB_STATUS	_IOWR('h', 102, struct hammer2_ioc_raid_scrub)
 
 /*
  * Ioctl to query resilver progress.
@@ -275,5 +277,24 @@ struct hammer2_ioc_resilver_status {
 };
 
 typedef struct hammer2_ioc_resilver_status hammer2_ioc_resilver_status_t;
+
+/*
+ * Ioctl to run / poll a RAID6 scrub (M3 — docs/zfs_compare.md item 3).
+ *
+ * HAMMER2IOC_RAID_SCRUB blocks in the kernel for the full walk and
+ * returns the final counters in the same struct.  HAMMER2IOC_RAID_SCRUB_STATUS
+ * is a non-blocking poll that may be called from a second thread while a
+ * scrub is in progress.
+ */
+struct hammer2_ioc_raid_scrub {
+	int		running;	/* 1 if scrub in progress, 0 if idle */
+	int		error;		/* final/last scrub error (0 = none) */
+	uint64_t	brefs_done;	/* DATA/DIRENT brefs verified */
+	uint64_t	brefs_bad;	/* CHECK FAIL count */
+	uint64_t	brefs_repaired;	/* successfully parity-repaired */
+	uint64_t	brefs_unrepairable; /* CHECK FAIL, parity also bad */
+};
+
+typedef struct hammer2_ioc_raid_scrub hammer2_ioc_raid_scrub_t;
 
 #endif /* !_VFS_HAMMER2_IOCTL_H_ */

@@ -1,7 +1,9 @@
 # HAMMER2 v3 RAIDZ2-Native vs ZFS — Design Comparison and Improvement Plan
 
 **Status (2026-05-24).**  M1 (item 6 — variable-width stripes)
-shipped.  M2/M3 pending.  Item 4 absorbed into M1.  Item 5 deferred.
+shipped.  M2 item 1 (bitmap-aware resilver) shipped.  M3 (scrub —
+item 3) shipped (v1, fs-locking walker).  M2 item 2 (TRIM)
+deferred.  Item 4 absorbed into M1.  Item 5 deferred.
 
 This document compares the v3 RAIDZ2-native HAMMER2 RAID6 design to
 ZFS RAIDZ2 along the axes where ZFS made deliberate, well-considered
@@ -47,7 +49,7 @@ share rows.  **M1 — Item 6 closed this.**
 between 0 and `stripe_num_slots`, even though the in-memory bitmap
 knows which slots are live.  At 10% used capacity the resilver is
 10× slower than necessary.  ZFS resilvers only live blocks via the
-block-pointer tree.  **Item 1 — pending (M2).**
+block-pointer tree.  **Item 1 — DONE (M2).**
 
 **C. No DTL (Dirty Time Log).** Every replace is a full resilver.
 ZFS keeps a per-vdev dirty time log: only stripes written *while*
@@ -59,8 +61,7 @@ deferred.**
 **D. No scrub.** ZFS scrub walks every live block, verifies the
 checksum, and optionally repairs from parity.  HAMMER2 has no
 scrub — bit rot accumulates silently.  `tests/v3/test_f_cow_invariant.sh`
-mentions `h2stripe_check` but it's still SKIP.  **Item 3 — pending
-(M3).**
+mentions `h2stripe_check` but it's still SKIP.  **Item 3 — DONE (M3).**
 
 **E. No TRIM/discard on row free.** ZFS issues `BLKDISCARD` on free
 for thin-provisioned/SSD storage.  HAMMER2 doesn't.  **Item 2 —
@@ -99,28 +100,35 @@ spare capacity.  Too advanced for v1; mark for post-Phase-4.
 
 ## 4. The prioritized 1-6 plan, with status
 
-### Item 1 — Bitmap-aware resilver — **PENDING (M2)**
+### Item 1 — Bitmap-aware resilver — **DONE (M2)**
 
 **Goal.** Resilver iterates only allocated stripe slots, not all
 0..stripe_num_slots.
 
-**Design.** `hammer2_io_raid6_resilver` (`local_hammer2_io.c:1604`)
-Phase B loops `slot = 0..num_stripes − 1`.  Change to test
-`hmp->stripe_bitmap[slot/8] & (1 << slot%8)` before issuing reads.
-Free slots: skip (their on-disk content is don't-care; P/Q computed
-over zeros is also zeros).  Also skip slots whose `data_disk_idx`
-isn't `failed_disk_idx` AND parity disks aren't `failed_disk_idx` —
-that slot doesn't touch the failed disk.
+**What landed.**
 
-**Files.** `local_hammer2_io.c` Phase B loop (~50 LOC).  No header
-or format change.
+- The bitmap-skip itself was already in `hammer2_io_raid6_resilver`
+  (`local_hammer2_io.c` Phase 3 loop) since the initial v4/v3
+  RAIDZ2 implementation (commit `38d5141`): on v3 the loop tests
+  `hmp->stripe_bitmap[slot/8] & (1 << slot%8)` and `continue`s past
+  unset slots.
+- M2 added the regression-bisection gate
+  `vfs.hammer2.resilver_skip_unalloc` (default 1).  Setting it to 0
+  forces full-iteration baseline so the test harness can compare.
+- Group D **D4** writes a small reference file (~5 MB), then
+  resilvers disk 2 twice — once with skip=0 and once with skip=1 —
+  verifying both produce correct data and asserting skip=1 ≤ skip=0.
+  Measured on the vbd substrate: **skip=0 = 43 s, skip=1 = 2 s** at
+  ~0.3% slot occupancy (≈ 20× speedup).
 
-**Tests.** Extend Group D: fill 10% of array → fail disk → time
-resilver.  Compare to full-iteration baseline (sysctl
-`vfs.hammer2.resilver_skip_unalloc` defaults on, off for
-regression).
+The "skip slots whose `data_disk_idx` isn't `failed_disk_idx`" part
+of the original design doesn't apply to v3 packed rows — every row
+uses every disk (ndata data cols + P + Q = ndisks), so all live
+slots touch the failed disk.
 
-**Effort.** ~half day.  No blast radius outside resilver.
+**Files.** `local_hammer2_io.c` (gate the existing skip),
+`local_hammer2_vfsops.c` + `local_hammer2.h` (sysctl + extern),
+`tests/v3/test_d_resilver.sh` (D4).
 
 **Risk.** Bitmap stale wrt on-disk after crash — but the H4-deep
 walker (`hammer2_raid6_rebuild_stripe_bitmap`) already rebuilds an
@@ -157,44 +165,70 @@ the sysctl gate and no panic on free.
 **Effort.** ~1 day.  Probing DFly's discard API is the main
 unknown.
 
-### Item 3 — Scrub command — **PENDING (M3)**
+### Item 3 — Scrub command — **DONE (M3)**
 
 **Goal.** `hammer2 raid scrub <mnt>` walks every live blockref,
 verifies its CHECK code, repairs from parity on mismatch.
 
-**Design.**
+**What landed.**
 
-1. **Walker (kernel).** Reuse `hammer2_chain_scan` machinery
-   (already used by `hammer2_raid6_rebuild_stripe_bitmap` /
-   `hammer2_raid6_walk_chain`).  New kernel function
-   `hammer2_raid6_scrub(hmp)`.  For each DATA/DIRENT bref:
-   `hammer2_io_getblk` → verify `bref.check.*` against block
-   content.  On mismatch: invoke `hammer2_io_raid6_read_degraded`
-   against the failed column, compare to parity-reconstructed
-   value, write back the corrected version if parity wins.
+- **Kernel walker.** `hammer2_io_raid6_scrub(hmp)` in
+  `local_hammer2_io.c`.  Recursive `hammer2_chain_scan` walker
+  (mirrors the bitmap walker pattern in `local_hammer2_ondisk.c`)
+  with a `switch` on bref type so it only recurses into interior
+  chains (INODE / INDIRECT / VOLUME / FREEMAP / FREEMAP_NODE);
+  leaves (DATA / DIRENT) are verified in place.
+- **Per-bref verify.** `hammer2_io_bread` on the bref's primary
+  disk, then `hammer2_scrub_check_match` recomputes the CHECK
+  code (XXHASH64 / ISCSI32 / FREEMAP) and compares.
+- **Parity repair.** On mismatch, `hammer2_io_raid6_read_degraded`
+  treats `bref->copyid` as the failed disk and reconstructs the
+  full stripe_unit column from P+Q.  If the reconstruction's CHECK
+  matches the bref, the dio buffer is overwritten with the
+  reconstructed column and `hammer2_io_bwrite` flushes it back to
+  the corrupt disk.
+- **Serialization.** `atomic_cmpset_int` on `hmp->scrub_running`
+  rejects a second scrub with EBUSY.
+- **Ioctl + userspace.** `HAMMER2IOC_RAID_SCRUB` blocks for the
+  walk and returns counters; `HAMMER2IOC_RAID_SCRUB_STATUS` is the
+  non-blocking poll.  `hammer2 raid scrub` calls the blocking
+  ioctl and prints `brefs_done / bad / repaired / unrepairable`.
+- **Group K tests** (`tests/v3/test_k_scrub.sh`):
+  - K1 — clean array → bad=0, repaired=0.
+  - K2 — `dd` corrupts 16 MB of disk 1's stripe data, scrub
+    detects every affected chain (~128 on a 32 MB / NDISKS=4 file),
+    parity-repairs each, post-scrub content matches the
+    pre-corruption sha256, follow-up scrub clean.
 
-2. **ioctl + userspace cmd.** New `HAMMER2IOC_RAID_SCRUB` ioctl,
-   blocking + progress fields (mirror `resilver_status` struct).
-   `cmd_raid scrub` calls it.
+**Files touched.** `local_hammer2_io.c` (scrub walker + verify +
+repair), `local_hammer2.h` (scrub progress fields + extern),
+`local_hammer2_ioctl.{c,h}` (two new ioctls), `local_cmd_raid.c`
+(`scrub` subcommand), `tests/v3/test_k_scrub.sh` (new),
+`tests/v3/run_all.sh` (K added to default group set).
 
-For metadata (mirrored, N-way): on mismatch, fall back to a sibling
-that does match (already implicit via `metadata_mirror_read`).
+**Concurrency — v1 limitation.** The walker locks `hmp->vchain`
+RESOLVE_ALWAYS for the entire walk (same pattern the mount-time
+`hammer2_raid6_rebuild_stripe_bitmap` walker uses).  Concurrent FS
+writes that need to traverse `vchain` will serialize with the
+scrub.  An attempted v2 using `hammer2_chain_bulksnap` + SHARED
+locks + bulkfree-style unlock/recurse/relock deadlocked on the
+test substrate (`send_ipiq` IPI stuck) before completing one
+walk — left for a follow-up.
 
-**Files.** `local_hammer2_raid6.c` (new scrub function),
-`local_hammer2_ioctl.{c,h}` (ioctl), `local_cmd_raid.c` (cmd),
-`tests/v3/test_k_scrub.sh` (new).
-
-**Tests.** New group K: write data, deliberately corrupt one disk's
-column (write garbage to a known phys_off via `dd`), scrub, verify
-`CHECK FAIL` count = 0 after, verify data still readable.
-
-**Effort.** ~3–4 days.  Walker is the bulk; reuse rebuild_stripe_bitmap's
-recursion.
-
-**Risk.** Concurrent writes during scrub need to skip in-flight
-chains or hold a per-pmp scrub lock.  Defer concurrent-write support
-to a follow-up; v1 scrub takes the FS read-only-ish (allow writes
-but only verify chains already on-disk).
+**Pre-existing write-path bug surfaced by scrub.**  When
+`hammer2_io_raid6_write_row` seals a packed row with `ncols <
+ndata`, it computes P/Q assuming the unwritten data columns are
+zero but does *not* actually zero those columns on disk.  If the
+slot was previously allocated and freed, the disk still carries
+the prior chain's bytes there, so parity reconstruction of any
+*written* column in that row yields wrong data.  K2 dodges this
+by `dd if=/dev/zero` over each disk's stripe-data zone before its
+`setup_fresh`.  Other groups have always been latently exposed
+(Group D resilver also hits it), but the failure mode depends on
+the exact disk content left by prior tests — sometimes benign,
+sometimes a CHECK FAIL after remount.  Real fix is in the
+allocator/seal path: either zero the unwritten cols at seal time,
+or zero stripe slots at allocation.  Tracked as a separate item.
 
 ### Item 4 — Parallel P/Q writes — **PARTIAL (folded into M1/6C-1)**
 
@@ -306,8 +340,8 @@ H4 I4 **J2**), no panics, no `CHECK FAIL`.
 | Milestone | Contents | Format break | Status |
 |---|---|---|---|
 | **M1 — v3 RAIDZ2-native variable-width** | item 6 (6A–6D) | yes (v2→v3) | **DONE** |
-| **M2 — resilver + TRIM** | items 1, 2 | none | pending |
-| **M3 — scrub** | item 3 | none | pending |
+| **M2 — resilver + TRIM** | items 1, 2 | none | item 1 DONE; item 2 deferred |
+| **M3 — scrub** | item 3 | none | **DONE** (v1, fs-locking walker) |
 | *(deferred)* item 4 — async P/Q | needs cache throttling | none | partial |
 | *(deferred)* item 5 — DTL | future v4 (DTL zone) | yes | not started |
 

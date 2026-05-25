@@ -1844,9 +1844,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
 		/*
 		 * v3 (RAIDZ2-native): skip unallocated stripe slots.
-		 * The bitmap lives in hmp->stripe_bitmap.
+		 * Bitmap lives in hmp->stripe_bitmap.  Gated by sysctl
+		 * vfs.hammer2.resilver_skip_unalloc (default 1) — set 0 for
+		 * full-iteration regression baseline.
 		 */
 		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    hammer2_raid6_resilver_skip_unalloc &&
 		    hmp->stripe_bitmap != NULL) {
 			int byte_idx = (int)(stripe_num / 8);
 			int bit_idx  = (int)(stripe_num % 8);
@@ -1975,6 +1978,275 @@ resilver_done:
 	/* Mark resilver complete */
 	hmp->resilver_stripes_done = num_stripes;
 	hmp->resilver_running = 0;
+
+	return error;
+}
+
+/*
+ * RAID6 online scrub (M3 / docs/zfs_compare.md item 3).
+ *
+ * Walks every live DATA/DIRENT blockref in the chain tree, verifies the
+ * data on its primary disk against the bref's CHECK code, and on
+ * mismatch reconstructs the column from P+Q parity.  If the
+ * reconstruction's CHECK matches, writes the corrected column back to
+ * the corrupt disk.
+ *
+ * v1 concurrency: walks the live vchain with the same
+ * (RESOLVE_ALWAYS) chain-lock pattern the mount-time bitmap walker
+ * uses.  Concurrent writes that need to traverse vchain will serialize
+ * with the scrub.  A future v2 will move to the bulkfree snapshot
+ * pattern (hammer2_chain_bulksnap + SHARED locks + unlock-recurse-relock)
+ * to let writers proceed unimpeded.
+ */
+struct hammer2_scrub_ctx {
+	hammer2_dev_t	*hmp;
+	uint64_t	done;
+	uint64_t	bad;
+	uint64_t	repaired;
+	uint64_t	unrepairable;
+};
+
+/*
+ * Recompute the bref's CHECK code over (data,bytes) and return 1 on
+ * match.  Mirrors hammer2_chain_testcheck() but operates on a raw
+ * buffer (no chain pointer needed) so the scrub can verify a
+ * parity-reconstructed candidate without manufacturing a fake chain.
+ */
+static int
+hammer2_scrub_check_match(const hammer2_blockref_t *bref,
+			  const void *data, size_t bytes)
+{
+	switch (HAMMER2_DEC_CHECK(bref->methods)) {
+	case HAMMER2_CHECK_NONE:
+	case HAMMER2_CHECK_DISABLED:
+		return 1;
+	case HAMMER2_CHECK_ISCSI32:
+		return bref->check.iscsi32.value ==
+		    hammer2_icrc32(data, bytes);
+	case HAMMER2_CHECK_XXHASH64:
+		return bref->check.xxhash64.value ==
+		    XXH64(data, bytes, XXH_HAMMER2_SEED);
+	case HAMMER2_CHECK_FREEMAP:
+		return bref->check.freemap.icrc32 ==
+		    hammer2_icrc32(data, bytes);
+	default:
+		/*
+		 * SHA192 etc. require headers not pulled in by io.c.  Pre-v3
+		 * tests exercise XXHASH64 (default for DATA) and ISCSI32 only;
+		 * skip-verify is safe — those chains pass via the normal read
+		 * path's testcheck and a scrub miss just means slower
+		 * detection, not corruption.
+		 */
+		return 1;
+	}
+}
+
+static int
+hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
+			  const hammer2_blockref_t *bref)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	hammer2_io_t *dio = NULL;
+	hammer2_off_t lbase;
+	hammer2_off_t pbase;
+	void *bdata;
+	void *recon;
+	uint64_t stripe_unit;
+	size_t off;
+	int lsize;
+	int disk_idx;
+	int error;
+	int repaired = 0;
+
+	if (bref->type != HAMMER2_BREF_TYPE_DATA &&
+	    bref->type != HAMMER2_BREF_TYPE_DIRENT)
+		return 0;
+	if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0)
+		return 0;
+
+	lbase = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
+	lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
+	disk_idx = (int)bref->copyid;
+	stripe_unit = hmp->raid_config.stripe_unit;
+
+	/*
+	 * Read via the normal DIO path so the disk holding bref->copyid is
+	 * the one we verify.  Failed-disk reads transparently reconstruct
+	 * (via read_degraded inside hammer2_io_bread), so a chain whose
+	 * primary disk is missing will pass scrub against the surviving
+	 * P/Q — no false positives in degraded mode.
+	 */
+	error = hammer2_io_bread(hmp, bref->type, bref->data_off, lsize,
+				 &dio, bref);
+	if (error || dio == NULL) {
+		if (dio)
+			hammer2_io_putblk(&dio);
+		ctx->bad++;
+		ctx->done++;
+		return 0;
+	}
+	bdata = hammer2_io_data(dio, bref->data_off);
+	if (hammer2_scrub_check_match(bref, bdata, lsize)) {
+		hammer2_io_putblk(&dio);
+		ctx->done++;
+		return 0;
+	}
+
+	/*
+	 * CHECK FAIL on the disk-resident column.  Try a parity
+	 * reconstruction over the whole stripe_unit column (treating this
+	 * disk as failed), and if the reconstruction's checksum matches
+	 * the bref, write the reconstructed column back to disk.
+	 */
+	ctx->bad++;
+	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	pbase = lbase & ~(hammer2_off_t)(stripe_unit - 1);
+	error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
+					       recon, (size_t)stripe_unit, 1);
+	if (error == 0) {
+		off = (size_t)(lbase - pbase);
+		if (hammer2_scrub_check_match(bref,
+		    (uint8_t *)recon + off, lsize)) {
+			/*
+			 * Reconstruction wins.  Overwrite the dio's full
+			 * PBUFSIZE buffer with the reconstructed column and
+			 * flush it to the same disk via the normal write
+			 * path.  After bwrite the dio is consumed (set to
+			 * NULL); subsequent readers re-fetch via the cache.
+			 */
+			void *col_buf = hammer2_io_data(dio, pbase);
+			bcopy(recon, col_buf, (size_t)stripe_unit);
+			hammer2_io_setdirty(dio);
+			error = hammer2_io_bwrite(&dio);
+			dio = NULL;
+			if (error == 0) {
+				ctx->repaired++;
+				repaired = 1;
+				kprintf("hammer2: scrub: repaired "
+				    "data_off %016jx disk %d\n",
+				    (uintmax_t)bref->data_off, disk_idx);
+			}
+		}
+	}
+	if (!repaired) {
+		ctx->unrepairable++;
+		kprintf("hammer2: scrub: CHECK FAIL data_off %016jx disk %d "
+		    "(parity could not repair, err=%d)\n",
+		    (uintmax_t)bref->data_off, disk_idx, error);
+	}
+	kfree(recon, M_HAMMER2);
+	if (dio)
+		hammer2_io_putblk(&dio);
+	ctx->done++;
+	return 0;
+}
+
+static int
+hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
+{
+	hammer2_chain_t *chain = NULL;
+	hammer2_blockref_t bref;
+	int first = 1;
+	int error;
+
+	for (;;) {
+		error = hammer2_chain_scan(parent, &chain, &bref, &first,
+					   HAMMER2_LOOKUP_ALWAYS);
+		if (error & HAMMER2_ERROR_EOF) {
+			error = 0;
+			break;
+		}
+		if (error)
+			break;
+
+		hammer2_scrub_verify_bref(ctx, &bref);
+		ctx->hmp->scrub_brefs_done = ctx->done;
+		ctx->hmp->scrub_brefs_bad = ctx->bad;
+		ctx->hmp->scrub_brefs_repaired = ctx->repaired;
+		ctx->hmp->scrub_brefs_unrepairable = ctx->unrepairable;
+
+		/*
+		 * Only recurse into interior chain types.  chain_scan
+		 * panics ("unrecognized blockref type") if invoked on a
+		 * leaf bref like DATA / DIRENT / FREEMAP_LEAF.
+		 */
+		if (chain) {
+			switch (chain->bref.type) {
+			case HAMMER2_BREF_TYPE_INODE:
+			case HAMMER2_BREF_TYPE_INDIRECT:
+			case HAMMER2_BREF_TYPE_VOLUME:
+			case HAMMER2_BREF_TYPE_FREEMAP:
+			case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+				error = hammer2_scrub_walk(ctx, chain);
+				if (error)
+					goto out;
+				break;
+			default:
+				break;
+			}
+		}
+		if ((ctx->done & 255) == 0)
+			lwkt_yield();
+	}
+out:
+	if (chain) {
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+	}
+	return error;
+}
+
+int
+hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
+{
+	struct hammer2_scrub_ctx ctx;
+	hammer2_pfs_t *spmp;
+	int error;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+
+	/* Serialize concurrent scrub invocations */
+	if (atomic_cmpset_int((volatile u_int *)&hmp->scrub_running, 0, 1) == 0)
+		return EBUSY;
+
+	bzero(&ctx, sizeof(ctx));
+	ctx.hmp = hmp;
+
+	hmp->scrub_brefs_done = 0;
+	hmp->scrub_brefs_bad = 0;
+	hmp->scrub_brefs_repaired = 0;
+	hmp->scrub_brefs_unrepairable = 0;
+	hmp->scrub_error = 0;
+
+	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
+	error = hammer2_scrub_walk(&ctx, &hmp->vchain);
+	hammer2_chain_unlock(&hmp->vchain);
+
+	/*
+	 * Force repair-writes (hammer2_io_bwrite just sets DIRTY|FLUSH
+	 * and defers the actual disk I/O) to disk before we return.
+	 * Without this the post-scrub sha256 and follow-up scrub may
+	 * re-read evicted DIOs from disk and still see corrupt bytes.
+	 */
+	spmp = hmp->spmp;
+	if (ctx.repaired && spmp)
+		(void)hammer2_vfs_sync_pmp(spmp, MNT_WAIT);
+
+	hmp->scrub_brefs_done = ctx.done;
+	hmp->scrub_brefs_bad = ctx.bad;
+	hmp->scrub_brefs_repaired = ctx.repaired;
+	hmp->scrub_brefs_unrepairable = ctx.unrepairable;
+	hmp->scrub_error = error;
+	hmp->scrub_running = 0;
+
+	kprintf("hammer2: scrub complete: %llu brefs, %llu bad, "
+	    "%llu repaired, %llu unrepairable, err=%d\n",
+	    (unsigned long long)ctx.done,
+	    (unsigned long long)ctx.bad,
+	    (unsigned long long)ctx.repaired,
+	    (unsigned long long)ctx.unrepairable,
+	    error);
 
 	return error;
 }

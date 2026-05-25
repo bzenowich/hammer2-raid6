@@ -11,6 +11,9 @@
  *	HAMMER2IOC_RAID_REPLACE — synchronous online resilver of <old>'s
  *	stripe positions onto <new>.  Same path for both args is the
  *	"reattach the same slot" case used by the test suite.
+ *   raid scrub
+ *	HAMMER2IOC_RAID_SCRUB — walk every live DATA/DIRENT bref, verify
+ *	the CHECK code, parity-repair on mismatch.
  */
 
 #include "hammer2.h"
@@ -114,12 +117,42 @@ raid_replace(const char *sel_path, const char *old_dev, const char *new_dev)
 	return 0;
 }
 
+static int
+raid_scrub(const char *sel_path)
+{
+	struct hammer2_ioc_raid_scrub rs;
+	int fd;
+	int rc;
+
+	fd = hammer2_ioctl_handle(sel_path);
+	if (fd < 0)
+		return 1;
+	bzero(&rs, sizeof(rs));
+	rc = ioctl(fd, HAMMER2IOC_RAID_SCRUB, &rs);
+	close(fd);
+	if (rc < 0) {
+		fprintf(stderr, "raid scrub: %s\n", strerror(errno));
+		return 1;
+	}
+	printf("scrub complete:\n");
+	printf("  brefs_done:         %llu\n",
+	       (unsigned long long)rs.brefs_done);
+	printf("  brefs_bad:          %llu\n",
+	       (unsigned long long)rs.brefs_bad);
+	printf("  brefs_repaired:     %llu\n",
+	       (unsigned long long)rs.brefs_repaired);
+	printf("  brefs_unrepairable: %llu\n",
+	       (unsigned long long)rs.brefs_unrepairable);
+	printf("  error:              %d\n", rs.error);
+	return (rs.error || rs.brefs_unrepairable) ? 1 : 0;
+}
+
 int
 cmd_raid(const char *sel_path, int ac, const char **av)
 {
 	if (ac < 1) {
 		fprintf(stderr,
-		    "raid: subcommand required (status|fail-disk|replace)\n");
+		    "raid: subcommand required (status|fail-disk|replace|scrub)\n");
 		return 1;
 	}
 	if (strcmp(av[0], "status") == 0) {
@@ -139,6 +172,8 @@ cmd_raid(const char *sel_path, int ac, const char **av)
 			return 1;
 		}
 		return raid_replace(sel_path, av[1], av[2]);
+	} else if (strcmp(av[0], "scrub") == 0) {
+		return raid_scrub(sel_path);
 	}
 	fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
 	return 1;

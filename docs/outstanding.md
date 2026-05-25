@@ -27,6 +27,39 @@ Stretch items (non-blocking for Phase 3):
 A. NDISKS=4..10 matrix test for ndata edges.
 B. Cull dead pre-rewrite scripts under `tests/other/`.
 
+## Known latent bugs
+
+**Stale data in unwritten packed-row columns.** When `write_row`
+seals a packed row with `ncols < ndata` (e.g. only one chain
+landed before a TXG flush or before open_rows[] capped at 16
+forced an early seal), P/Q are computed assuming the unwritten
+data columns are zero — but those columns aren't actually zeroed
+on disk.  If the slot ever held content from a previously-freed
+chain (or the underlying disk was never zeroed past the metadata
+zone), the disk carries non-zero bytes there, so parity
+reconstruction of the *written* column in that row yields wrong
+data on resilver or scrub.
+
+Surfaced by:
+
+- **M3 Group K** scrub repair test.  K2 dodges by writing a small
+  file (2 MB / 16 rows ≤ open_rows cap) so every row packs full,
+  plus `dd if=/dev/zero` over every disk before its `setup_fresh`.
+- **Group D** resilver, intermittently.  D1's "post-remount data
+  mismatch" reproduces: after the resilver onto a fresh disk
+  completes, remounting and re-reading the test file finds N
+  CHECK FAIL chains.  The resilver's stripe-by-stripe
+  reconstruction used the same zero-assumed-but-non-zero columns
+  the scrub repair did, so it wrote wrong bytes to the
+  replacement.  This failure is *not* caused by the M3 scrub
+  changes (scrub doesn't run in Group D); it was always latent
+  and happens to surface depending on the slot reuse pattern.
+
+Real fix is in the allocator/seal path: either zero the unwritten
+cols at seal time (cheap — one extra bwrite per missing data col
+per partial row), or zero stripe slots at allocation time (more
+work but bounds the cost).
+
 ## Phase 3 — real hardware bring-up
 
 Blocked on Phase 2 exit + a physical target machine (spec is in

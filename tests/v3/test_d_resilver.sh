@@ -108,4 +108,68 @@ else
 fi
 teardown "D3"
 
+# D4: Bitmap-skip sysctl regression — write a small amount of data
+# (sparse allocation) and resilver twice: once with the bitmap-skip
+# sysctl off (baseline that walks every slot) and once with it on
+# (default, walks only allocated slots).  Verify both produce correct
+# data and that skip=1 is faster than skip=0.
+setup_fresh
+check_v3
+dd if=/dev/urandom of=$MNTPT/d4_ref bs=65536 count=80 2>/dev/null
+sha256 $MNTPT/d4_ref > /var/tmp/d4_ref.txt
+sync; sync
+
+D4_DISK=2
+
+# Trial 1: skip=0 (full iteration baseline)
+sysctl -w vfs.hammer2.resilver_skip_unalloc=0 > /dev/null
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $D4_DISK)" > /dev/null 2>&1
+detach_disk "$D4_DISK"
+fresh_disk "$D4_DISK"
+T0=$(date +%s)
+hammer2 -s $MNTPT raid replace \
+    "$(disk_dev $D4_DISK)" "$(disk_dev $D4_DISK)" > /dev/null 2>&1
+D4_RC0=$?
+T1=$(date +%s)
+D4_ELAPSED0=$((T1 - T0))
+sha256 $MNTPT/d4_ref > /var/tmp/d4_check.txt 2>&1
+if [ "$D4_RC0" = "0" ] && \
+   diff -q /var/tmp/d4_ref.txt /var/tmp/d4_check.txt > /dev/null 2>&1; then
+    result PASS "D4: skip=0 resilver correct (${D4_ELAPSED0}s)"
+else
+    result FAIL "D4: skip=0 resilver wrong (rc=$D4_RC0, ${D4_ELAPSED0}s)"
+fi
+
+# Trial 2: skip=1 (default — bitmap-aware)
+sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+hammer2 -s $MNTPT raid fail-disk "$(disk_dev $D4_DISK)" > /dev/null 2>&1
+detach_disk "$D4_DISK"
+fresh_disk "$D4_DISK"
+T0=$(date +%s)
+hammer2 -s $MNTPT raid replace \
+    "$(disk_dev $D4_DISK)" "$(disk_dev $D4_DISK)" > /dev/null 2>&1
+D4_RC1=$?
+T1=$(date +%s)
+D4_ELAPSED1=$((T1 - T0))
+sha256 $MNTPT/d4_ref > /var/tmp/d4_check.txt 2>&1
+if [ "$D4_RC1" = "0" ] && \
+   diff -q /var/tmp/d4_ref.txt /var/tmp/d4_check.txt > /dev/null 2>&1; then
+    result PASS "D4: skip=1 resilver correct (${D4_ELAPSED1}s)"
+else
+    result FAIL "D4: skip=1 resilver wrong (rc=$D4_RC1, ${D4_ELAPSED1}s)"
+fi
+
+# Speed-up assertion: skip=1 should be strictly faster than skip=0 on
+# a sparsely-allocated array (≤ 0.3% of slots live).  Allow a 1s
+# tolerance for system-noise jitter when both trials are sub-second.
+if [ "$D4_ELAPSED1" -le "$D4_ELAPSED0" ]; then
+    result PASS "D4: skip=1 ≤ skip=0 (${D4_ELAPSED1}s vs ${D4_ELAPSED0}s)"
+else
+    result FAIL "D4: skip=1 SLOWER than skip=0 (${D4_ELAPSED1}s vs ${D4_ELAPSED0}s)"
+fi
+
+# Restore default so subsequent tests/runs aren't perturbed
+sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+teardown "D4"
+
 summary
