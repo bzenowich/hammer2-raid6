@@ -50,27 +50,13 @@ teardown "K1"
 # begins at HAMMER2_ZONE_SEG64 (4MB) + HAMMER2_STRIPE_RAID6_START (slot
 # 1024) * 64KB = 68 MB; corrupt 16 MB starting there to cover early
 # allocations of our reference file.
-#
-# Wipe the data zone of every disk before newfs so unfilled packed-row
-# columns (open-row pack with ncols<ndata at TXG seal) start zeroed.
-# Pre-existing on-disk bytes there would break parity reconstruction:
-# write_row computes P/Q assuming unwritten cols == 0, but does not
-# itself zero the disk.  Other test groups happen to overwrite the same
-# slots full-row and mask this; scrub is the first thing that surfaces
-# it.  Tracked as a separate write-path fix.
-i=0
-while [ "$i" -lt "$NDISKS" ]; do
-    dd if=/dev/zero of=$(disk_dev $i) bs=1M conv=notrunc 2>/dev/null || true
-    i=$((i + 1))
-done
 setup_fresh
 check_v3
-# Write a small file (2 MB = 16 rows on NDISKS=4) so the allocator
-# fits all of it into one batch of open_rows (cap = 16) and every row
-# gets both data columns before TXG seal — keeps us out of the
-# partial-row write_row bug while still landing enough chains on
-# disk 1 to exercise scrub repair.
-dd if=/dev/urandom of=$MNTPT/k2 bs=65536 count=32 2>/dev/null
+# 32 MB file = 256 rows; with NDISKS=4 / open_rows cap = 16, many
+# rows get TXG-force-sealed partial (ncols=1).  write_row zeros the
+# unwritten data cols on disk (see local_hammer2_raid6.c), so parity
+# reconstruction on those rows works correctly under scrub repair.
+dd if=/dev/urandom of=$MNTPT/k2 bs=65536 count=512 2>/dev/null
 sha256 $MNTPT/k2 > /var/tmp/k2_ref.txt
 sync; sync
 umount $MNTPT
@@ -78,7 +64,7 @@ umount $MNTPT
 # Corrupt 16 MB on logical disk 1 (= vbd$((DISK_BASE+1))) at byte 68 MB,
 # the start of the stripe data zone.
 CORRUPT_DEV=$(disk_dev 1)
-dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=32 seek=1088 \
+dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=1088 \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT

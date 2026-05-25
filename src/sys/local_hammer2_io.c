@@ -2095,10 +2095,26 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	/*
 	 * CHECK FAIL on the disk-resident column.  Try a parity
 	 * reconstruction over the whole stripe_unit column (treating this
-	 * disk as failed), and if the reconstruction's checksum matches
-	 * the bref, write the reconstructed column back to disk.
+	 * disk as failed), and if the reconstruction's CHECK matches the
+	 * bref, write the reconstructed column back to disk *directly*
+	 * via raw getblk/bwrite on the failed disk's devvp.
+	 *
+	 * Two reasons to bypass hammer2_io_bwrite():
+	 *
+	 *  1. Under v3 the DIO putblk path for DATA/DIRENT btypes hands the
+	 *     payload to hammer2_raid6_open_row_add_data() — a repair routed
+	 *     through the DIO write API would land in an open packed-row
+	 *     tracker with ncols=1 and at seal would zero the surviving
+	 *     sibling data column, silently corrupting the row.
+	 *
+	 *  2. We must release the read-side dio *before* the write-side
+	 *     getblk on the same (devvp, phys_off).  The dio holds the buf
+	 *     busy via its internal getblk; a second getblk on the same
+	 *     key would deadlock waiting for that ref to drop.
 	 */
 	ctx->bad++;
+	hammer2_io_putblk(&dio);
+
 	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
 	pbase = lbase & ~(hammer2_off_t)(stripe_unit - 1);
 	error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
@@ -2107,24 +2123,27 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 		off = (size_t)(lbase - pbase);
 		if (hammer2_scrub_check_match(bref,
 		    (uint8_t *)recon + off, lsize)) {
-			/*
-			 * Reconstruction wins.  Overwrite the dio's full
-			 * PBUFSIZE buffer with the reconstructed column and
-			 * flush it to the same disk via the normal write
-			 * path.  After bwrite the dio is consumed (set to
-			 * NULL); subsequent readers re-fetch via the cache.
-			 */
-			void *col_buf = hammer2_io_data(dio, pbase);
-			bcopy(recon, col_buf, (size_t)stripe_unit);
-			hammer2_io_setdirty(dio);
-			error = hammer2_io_bwrite(&dio);
-			dio = NULL;
-			if (error == 0) {
-				ctx->repaired++;
-				repaired = 1;
-				kprintf("hammer2: scrub: repaired "
-				    "data_off %016jx disk %d\n",
-				    (uintmax_t)bref->data_off, disk_idx);
+			struct vnode *devvp;
+			struct buf *wbp;
+			int werr;
+
+			devvp = hmp->volumes[disk_idx].dev->devvp;
+			wbp = getblk(devvp, pbase, (int)stripe_unit,
+				     GETBLK_KVABIO, 0);
+			if (wbp) {
+				bkvasync(wbp);
+				bcopy(recon, wbp->b_data, (size_t)stripe_unit);
+				werr = bwrite(wbp);
+				if (werr == 0) {
+					ctx->repaired++;
+					repaired = 1;
+					kprintf("hammer2: scrub: repaired "
+					    "data_off %016jx disk %d\n",
+					    (uintmax_t)bref->data_off,
+					    disk_idx);
+				} else {
+					error = werr;
+				}
 			}
 		}
 	}
@@ -2135,8 +2154,6 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 		    (uintmax_t)bref->data_off, disk_idx, error);
 	}
 	kfree(recon, M_HAMMER2);
-	if (dio)
-		hammer2_io_putblk(&dio);
 	ctx->done++;
 	return 0;
 }
@@ -2200,7 +2217,6 @@ int
 hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 {
 	struct hammer2_scrub_ctx ctx;
-	hammer2_pfs_t *spmp;
 	int error;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
@@ -2222,16 +2238,6 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
 	error = hammer2_scrub_walk(&ctx, &hmp->vchain);
 	hammer2_chain_unlock(&hmp->vchain);
-
-	/*
-	 * Force repair-writes (hammer2_io_bwrite just sets DIRTY|FLUSH
-	 * and defers the actual disk I/O) to disk before we return.
-	 * Without this the post-scrub sha256 and follow-up scrub may
-	 * re-read evicted DIOs from disk and still see corrupt bytes.
-	 */
-	spmp = hmp->spmp;
-	if (ctx.repaired && spmp)
-		(void)hammer2_vfs_sync_pmp(spmp, MNT_WAIT);
 
 	hmp->scrub_brefs_done = ctx.done;
 	hmp->scrub_brefs_bad = ctx.bad;

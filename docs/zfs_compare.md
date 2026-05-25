@@ -215,20 +215,34 @@ locks + bulkfree-style unlock/recurse/relock deadlocked on the
 test substrate (`send_ipiq` IPI stuck) before completing one
 walk — left for a follow-up.
 
-**Pre-existing write-path bug surfaced by scrub.**  When
-`hammer2_io_raid6_write_row` seals a packed row with `ncols <
-ndata`, it computes P/Q assuming the unwritten data columns are
-zero but does *not* actually zero those columns on disk.  If the
-slot was previously allocated and freed, the disk still carries
-the prior chain's bytes there, so parity reconstruction of any
-*written* column in that row yields wrong data.  K2 dodges this
-by `dd if=/dev/zero` over each disk's stripe-data zone before its
-`setup_fresh`.  Other groups have always been latently exposed
-(Group D resilver also hits it), but the failure mode depends on
-the exact disk content left by prior tests — sometimes benign,
-sometimes a CHECK FAIL after remount.  Real fix is in the
-allocator/seal path: either zero the unwritten cols at seal time,
-or zero stripe slots at allocation.  Tracked as a separate item.
+**Partial-row parity fix (seal-time zero-fill).**  M3 surfaced a
+long-latent write-path bug: when a packed row sealed with
+`ncols < ndata` (TXG flush before the row filled, or open_rows[]
+cap forcing an early seal), P/Q were computed assuming the
+unwritten data columns were zero but the disk itself was never
+zero-written.  For a freshly-allocated slot whose disk previously
+held a chain (reuse-after-free, or a never-touched region under
+the array's initial garbage), parity reconstruction on a later
+read/resilver/scrub used those stale bytes and produced wrong
+data for the *written* columns.  Fixed in
+`hammer2_raid6_seal_row_locked_to_unlocked`: before calling
+write_row, it now issues a sync `bwrite(zeros)` to each data-disk
+column NOT in `r->alloc_mask`.  Disks reserved by a chain
+(alloc_mask bit set) whose bytes haven't arrived yet are left
+alone — the chain's own bp.bdwrite will deliver them; a
+seal-time zero-write there would race the chain.
+
+**Scrub repair routes around the DIO packing path.**  The v3
+putblk path for DATA/DIRENT btypes hands the payload to
+`hammer2_raid6_open_row_add_data` (the open-row packing tracker).
+A scrub "repair" via `hammer2_io_bwrite` would therefore re-enter
+the allocator, spawn a fresh open_row with `ncols=1`, and at seal
+zero the surviving sibling data column — silently corrupting
+the very row it was trying to fix.  Scrub repair instead releases
+the read-side dio with `hammer2_io_putblk` (so the write-side
+getblk doesn't deadlock on the same busy buf) and then issues a
+raw `getblk + bwrite` on the failed disk's `devvp` at `phys_off`,
+fully bypassing the DIO write API.
 
 ### Item 4 — Parallel P/Q writes — **PARTIAL (folded into M1/6C-1)**
 

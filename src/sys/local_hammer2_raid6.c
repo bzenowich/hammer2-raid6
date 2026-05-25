@@ -428,7 +428,12 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	/*
 	 * Walk the cols[] array, accumulating P and Q.
 	 * P[i] ^= col[i];   Q[i] ^= gf_mul(2^my_col, col[i])
-	 * Unwritten data columns in the row are implicitly zero.
+	 * Unwritten data columns are implicitly zero in memory.  The
+	 * caller (hammer2_raid6_seal_row_locked_to_unlocked) is
+	 * responsible for zero-writing the disk locations of any
+	 * truly-unused data cols *before* calling write_row, so parity
+	 * reconstruction over the on-disk bytes agrees with the
+	 * zero-padded math here.  See docs/DEVELOPER.md §6.
 	 */
 	for (c = 0; c < ncols; c++) {
 		const hammer2_row_col_t *col = &cols[c];

@@ -1653,8 +1653,11 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
 	void *to_free[HAMMER2_MAX_VOLUMES];
 	hammer2_off_t phys_off;
+	uint32_t alloc_mask_snap;
 	size_t bytes;
 	int ncols = 0;
+	int p_disk_snap, q_disk_snap;
+	int ndisks = hmp->raid_config.ndisks;
 	int d, i;
 
 	/* Snapshot the row under the spinlock, then release before I/O. */
@@ -1672,14 +1675,53 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	}
 	phys_off = r->phys_off;
 	bytes = r->bytes;
+	alloc_mask_snap = r->alloc_mask;
+	p_disk_snap = r->p_disk;
+	q_disk_snap = r->q_disk;
 	r->in_use = 0;
 	r->alloc_mask = 0;
 	r->n_alloc = 0;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
-	if (ncols > 0)
+	if (ncols > 0) {
+		/*
+		 * Zero data-disk columns that no chain ever reserved.  P/Q
+		 * are computed assuming those cols are zero, but the disk
+		 * itself still holds whatever bytes a prior tenant left
+		 * (or factory garbage in a never-touched region); without
+		 * this zero-write, parity reconstruction over the on-disk
+		 * column on a later resilver/scrub would yield wrong data
+		 * for the *written* columns.  Only fires for data disks NOT
+		 * in alloc_mask — disks that are reserved but whose chain
+		 * has not yet putblk'd will receive their bytes through the
+		 * chain's own bp.bdwrite path.
+		 */
+		for (d = 0; d < ndisks; d++) {
+			struct buf *zbp;
+			int werr;
+
+			if (d == p_disk_snap || d == q_disk_snap)
+				continue;
+			if (alloc_mask_snap & (1U << d))
+				continue;
+			if (hmp->raid_failed[d])
+				continue;
+			if (hmp->volumes[d].dev == NULL ||
+			    hmp->volumes[d].dev->devvp == NULL)
+				continue;
+			zbp = getblk(hmp->volumes[d].dev->devvp, phys_off,
+				     (int)bytes, GETBLK_KVABIO, 0);
+			if (zbp == NULL)
+				continue;
+			bkvasync(zbp);
+			bzero(zbp->b_data, bytes);
+			werr = bwrite(zbp);
+			(void)werr;
+		}
+
 		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 						 ncols, bytes);
+	}
 
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
