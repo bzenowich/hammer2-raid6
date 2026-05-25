@@ -1101,6 +1101,30 @@ typedef struct hammer2_volume hammer2_volume_t;
  * many PFSs and those PFSs might combine together in various ways to form
  * the set of available clusters.
  */
+/*
+ * v3 RAID6 open-row tracker entry.  See hmp->open_rows comment in
+ * struct hammer2_dev for the lifecycle.  Stored on the
+ * hmp->open_rows TAILQ; entries are kmalloc'd at register and
+ * kfree'd at seal.
+ *
+ * col_data[disk_idx] is the kmalloc'd byte buffer of that column's
+ * data; ownership passes from putblk's raid6_data via
+ * hammer2_raid6_open_row_add_data().  NULL until the chain
+ * putblk's; alloc_mask bit set means the slot is reserved but
+ * col_data may still be NULL until the chain flushes.
+ */
+struct hammer2_open_row {
+	TAILQ_ENTRY(hammer2_open_row) entry;
+	hammer2_off_t	phys_off;	/* per-disk byte offset for this row */
+	uint64_t	row_id;		/* slot index */
+	int		p_disk, q_disk;
+	uint32_t	alloc_mask;	/* bit per allocated data disk */
+	int		n_alloc;	/* popcount(alloc_mask) */
+	int		ndata;		/* cached rc->ndata */
+	size_t		bytes;		/* cached stripe_unit */
+	void		*col_data[HAMMER2_MAX_VOLUMES];
+};
+
 struct hammer2_dev {
 	struct vnode	*devvp;		/* device vnode for root volume */
 	int		ronly;		/* read-only mount */
@@ -1165,32 +1189,28 @@ struct hammer2_dev {
 	/*
 	 * Open-row tracking (6C): rows allocated during the current TXG
 	 * that haven't sealed their P/Q yet.  The allocator packs chains
-	 * into existing open rows when possible (ZFS variable-width spirit
-	 * — multiple chains per row → P/Q over union → row efficiency
-	 * scales to ndata/ndisks).  Rows seal when filled (n_alloc==ndata)
-	 * or at TXG flush boundary.
+	 * into existing open rows when possible (ZFS variable-width
+	 * spirit — multiple chains per row → P/Q over union → row
+	 * efficiency scales to ndata/ndisks).  Rows seal when filled
+	 * (n_alloc == ndata) or at TXG flush boundary.
 	 *
-	 * Capped at HAMMER2_OPEN_ROWS_MAX; if full, the allocator
-	 * force-seals the oldest open row.  Memory ceiling per hmp is
-	 * MAX × ndata × stripe_unit (e.g. 16 × 2 × 64 KB = 2 MB for
-	 * NDISKS=4).
+	 * Stored as a TAILQ — entries kmalloc'd at register time and
+	 * kfree'd at seal — so there's no upper bound on concurrent
+	 * partially-filled rows in flight.  Earlier fixed-array
+	 * versions forced a seal of incomplete rows when the array
+	 * filled, which clobbered parity for any chain whose putblk
+	 * arrived after the seal (see commit history; the
+	 * hammer2_raid6_open_row_add_data fallback path documents the
+	 * bug).
+	 *
+	 * Peak memory per hmp is (in-flight rows) × ndata × stripe_unit
+	 * for col_data buffers, briefly at TXG flush.  Row metadata
+	 * itself is ~160 bytes per entry.
 	 */
-/*
- * Open-row tracker capacity.  Sized so a write burst can keep many
- * partially-filled rows in flight (each tracking up to `ndata`
- * chains) without forcing the allocator to seal an incomplete row.
- * Sealing an incomplete row would land later putblk's of its
- * still-in-flight chains in hammer2_raid6_open_row_add_data's
- * fallback path — which writes a single col + recomputes P/Q,
- * clobbering parity for the cols that were sealed first.
- *
- * Memory ceiling per hmp is MAX × ndata × stripe_unit when every
- * row's col_data is filled (peak briefly at TXG flush) — at
- * NDISKS=4 that's 1024 × 2 × 64KB = 128 MB worst case.  Typical
- * workloads see far fewer rows pending at any moment.
- */
-#define HAMMER2_OPEN_ROWS_MAX	1024
-	struct hammer2_open_row *open_rows;	/* MAX entries */
+	TAILQ_HEAD(, hammer2_open_row) open_rows;
+	int		open_rows_inited;	/* TAILQ_INIT done */
+	long		open_rows_count;	/* current entry count (diag) */
+	long		open_rows_high;		/* peak entry count (diag) */
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
 	uint32_t	md_nextents;

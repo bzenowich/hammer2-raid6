@@ -1778,63 +1778,53 @@ hammer2_raid6_refcount_write(hammer2_dev_t *hmp)
  * Each entry tracks a row (stripe slot) allocated during the current
  * TXG that hasn't sealed P/Q yet.  The allocator packs additional
  * chains into existing open rows so up to ndata chains share one
- * row's parity columns.  Rows seal when full (n_alloc == ndata) or
- * at TXG flush boundary.
+ * row's parity columns.  Rows seal when full (n_alloc == ndata and
+ * every alloc'd col has col_data) or at TXG flush boundary.
  *
- * col_data[disk_idx] is the kmalloc'd byte buffer of that column's
- * data; ownership passes from putblk's raid6_data via open_row_add_data.
- * NULL until the chain putblks; alloc_mask bit set means the slot is
- * reserved but col_data may still be NULL until the chain flushes.
+ * Stored as a TAILQ.  Entries are kmalloc'd at register time and
+ * kfree'd at seal time — no fixed cap, never force-seal an
+ * incomplete row.
  */
-struct hammer2_open_row {
-	int		in_use;
-	hammer2_off_t	phys_off;	/* per-disk offset for this row */
-	uint64_t	row_id;		/* slot index */
-	int		p_disk, q_disk;
-	uint32_t	alloc_mask;	/* bit per allocated data disk */
-	int		n_alloc;	/* popcount(alloc_mask) */
-	int		ndata;		/* cached rc->ndata */
-	size_t		bytes;		/* cached stripe_unit */
-	void		*col_data[HAMMER2_MAX_VOLUMES];
-};
 
 void
 hammer2_raid6_open_rows_init(hammer2_dev_t *hmp)
 {
-	if (hmp->open_rows != NULL)
+	if (hmp->open_rows_inited)
 		return;
-	hmp->open_rows = kmalloc(sizeof(struct hammer2_open_row) *
-				 HAMMER2_OPEN_ROWS_MAX, M_HAMMER2,
-				 M_WAITOK | M_ZERO);
+	TAILQ_INIT(&hmp->open_rows);
+	hmp->open_rows_inited = 1;
+	hmp->open_rows_count = 0;
+	hmp->open_rows_high = 0;
 }
 
 void
 hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 {
-	int i, d;
+	struct hammer2_open_row *r;
+	int d;
 
-	if (hmp->open_rows == NULL)
+	if (!hmp->open_rows_inited)
 		return;
-	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-		struct hammer2_open_row *r = &hmp->open_rows[i];
-		if (!r->in_use)
-			continue;
+	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL) {
+		TAILQ_REMOVE(&hmp->open_rows, r, entry);
 		for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
 			if (r->col_data[d]) {
 				kfree(r->col_data[d], M_HAMMER2);
 				r->col_data[d] = NULL;
 			}
 		}
-		r->in_use = 0;
+		kfree(r, M_HAMMER2);
 	}
-	kfree(hmp->open_rows, M_HAMMER2);
-	hmp->open_rows = NULL;
+	hmp->open_rows_count = 0;
+	hmp->open_rows_inited = 0;
 }
 
 /*
  * Seal a row: build cols[] from in-memory col_data, call write_row,
- * free col data, mark entry inactive.  Caller must NOT hold
- * stripe_bitmap_spin (write_row sleeps inside getblk/bwrite).
+ * free col data, remove the entry from the open_rows TAILQ and free
+ * the entry itself.  Caller holds stripe_bitmap_spin; this function
+ * releases the spin around the (sleeping) I/O and re-acquires it
+ * before returning.
  */
 static void
 hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
@@ -1868,9 +1858,8 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	alloc_mask_snap = r->alloc_mask;
 	p_disk_snap = r->p_disk;
 	q_disk_snap = r->q_disk;
-	r->in_use = 0;
-	r->alloc_mask = 0;
-	r->n_alloc = 0;
+	TAILQ_REMOVE(&hmp->open_rows, r, entry);
+	hmp->open_rows_count--;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
 	if (ncols > 0) {
@@ -1915,6 +1904,7 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
+	kfree(r, M_HAMMER2);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 }
@@ -1936,15 +1926,13 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
 	int ndata = rc->ndata;
-	int i, t, candidate;
+	struct hammer2_open_row *r;
+	int t, candidate;
 
-	if (hmp->open_rows == NULL)
+	if (!hmp->open_rows_inited)
 		return 0;
 
-	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-		struct hammer2_open_row *r = &hmp->open_rows[i];
-		if (!r->in_use)
-			continue;
+	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
 		if (r->n_alloc >= ndata)
 			continue;
 		for (t = 0; t < ndisks; t++) {
@@ -1983,65 +1971,29 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	int ndata = rc->ndata;
 	int p_disk = (int)(row_id % ndisks);
 	int q_disk = (p_disk + 1) % ndisks;
-	int free_slot = -1;
-	int seal_slot;
-	int i;
+	struct hammer2_open_row *r;
 
-	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-		if (!hmp->open_rows[i].in_use) {
-			free_slot = i;
-			break;
-		}
-	}
-	if (free_slot < 0) {
-		/*
-		 * All slots in use — force-seal a row.  Only seal a row
-		 * whose alloc_mask bits ALL have col_data filled in
-		 * (chain bytes already delivered through putblk).  Sealing
-		 * a row where col_data is still NULL for some allocated
-		 * disk would split that chain's eventual P/Q update into
-		 * the broken add_data fallback path which clobbers parity.
-		 *
-		 * If no row is complete, force-seal the oldest as a last
-		 * resort — under sustained write bursts this can still
-		 * hit the fallback bug.  HAMMER2_OPEN_ROWS_MAX is sized
-		 * so this is rare on practical workloads.
-		 */
-		seal_slot = -1;
-		for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-			struct hammer2_open_row *r = &hmp->open_rows[i];
-			uint32_t filled = 0;
-			int d2;
-			if (!r->in_use)
-				continue;
-			for (d2 = 0; d2 < HAMMER2_MAX_VOLUMES; d2++) {
-				if (r->col_data[d2])
-					filled |= (1U << d2);
-			}
-			if (filled == r->alloc_mask) {
-				seal_slot = i;
-				break;
-			}
-		}
-		if (seal_slot < 0)
-			seal_slot = 0;
-		hammer2_raid6_seal_row_locked_to_unlocked(hmp,
-		    &hmp->open_rows[seal_slot]);
-		free_slot = seal_slot;
-	}
+	/*
+	 * TAILQ-backed tracker — never force-seal.  Each new row
+	 * allocates its own entry; entries are freed at seal time.
+	 * Memory is bounded by (in-flight rows) × (per-entry metadata
+	 * + per-col_data buffer); typical TXG flushes drain everything
+	 * via hammer2_raid6_seal_all_open_rows.
+	 */
+	r = kmalloc(sizeof(*r), M_HAMMER2, M_WAITOK | M_ZERO);
+	r->phys_off   = phys_off;
+	r->row_id     = row_id;
+	r->p_disk     = p_disk;
+	r->q_disk     = q_disk;
+	r->alloc_mask = (1U << disk_idx);
+	r->n_alloc    = 1;
+	r->ndata      = ndata;
+	r->bytes      = rc->stripe_unit;
 
-	{
-		struct hammer2_open_row *r = &hmp->open_rows[free_slot];
-		r->in_use     = 1;
-		r->phys_off   = phys_off;
-		r->row_id     = row_id;
-		r->p_disk     = p_disk;
-		r->q_disk     = q_disk;
-		r->alloc_mask = (1U << disk_idx);
-		r->n_alloc    = 1;
-		r->ndata      = ndata;
-		r->bytes      = rc->stripe_unit;
-	}
+	TAILQ_INSERT_TAIL(&hmp->open_rows, r, entry);
+	hmp->open_rows_count++;
+	if (hmp->open_rows_count > hmp->open_rows_high)
+		hmp->open_rows_high = hmp->open_rows_count;
 }
 
 /*
@@ -2053,22 +2005,22 @@ void
 hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 				int disk_idx, void *data, size_t bytes)
 {
+	struct hammer2_open_row *r;
 	void *to_free = NULL;
-	int i, d;
+	int d;
 	int found = 0;
 
-	if (hmp->open_rows == NULL) {
+	if (!hmp->open_rows_inited) {
 		/* shouldn't happen on v3 mounts; safety net */
 		kfree(data, M_HAMMER2);
 		return;
 	}
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-		struct hammer2_open_row *r = &hmp->open_rows[i];
+	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
 		int complete = 1;
 
-		if (!r->in_use || r->phys_off != phys_off)
+		if (r->phys_off != phys_off)
 			continue;
 		KKASSERT(r->bytes == bytes);
 		KKASSERT(r->alloc_mask & (1U << disk_idx));
@@ -2112,32 +2064,22 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		return;
 
 	/*
-	 * No matching open row.  Caller allocated us before the open_rows
-	 * machinery was alive (e.g. mount/recovery path) — fall back to
-	 * a 1-column write.  Krateprintf so a runtime regression that
-	 * sends writes down this path under load shows up but doesn't
-	 * spam dmesg.  This fallback is BROKEN for partial-row writes
-	 * (the single-col write_row recomputes P/Q ignoring the row's
-	 * other already-on-disk chains and corrupts parity); the right
-	 * fix is to grow open_rows[] / never force-seal incomplete rows.
+	 * No matching open row.  With the TAILQ-backed tracker this
+	 * should be unreachable in steady state: every chain that
+	 * makes it through stripe_alloc has a row registered before
+	 * putblk's add_data can run.  Krateprintf and drop the data
+	 * so an unexpected reach here is loud (and doesn't corrupt
+	 * by going through the old single-col write_row fallback,
+	 * which clobbered parity).
 	 */
 	{
 		static struct krate krate_h2of = { .freq = 1 };
 		krateprintf(&krate_h2of,
-			"hammer2: open_row add_data FALLBACK phys_off=%016jx "
-			"disk_idx=%d — partial-row write_row may skew P/Q\n",
+			"hammer2: open_row add_data: no matching row for "
+			"phys_off=%016jx disk_idx=%d — chain data dropped\n",
 			(uintmax_t)phys_off, disk_idx);
 	}
-	{
-		hammer2_row_col_t col = {
-			.disk_idx = disk_idx,
-			.data = data,
-			.bytes = bytes,
-		};
-		(void)hammer2_io_raid6_write_row(hmp, phys_off, &col, 1,
-						 bytes);
-		kfree(data, M_HAMMER2);
-	}
+	kfree(data, M_HAMMER2);
 }
 
 /*
@@ -2149,17 +2091,18 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 void
 hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 {
-	int i;
+	struct hammer2_open_row *r;
 
-	if (hmp->open_rows == NULL)
+	if (!hmp->open_rows_inited)
 		return;
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
-		if (hmp->open_rows[i].in_use)
-			hammer2_raid6_seal_row_locked_to_unlocked(hmp,
-			    &hmp->open_rows[i]);
-	}
+	/*
+	 * seal_row removes its entry from the TAILQ, so each iteration
+	 * just walks the new TAILQ_FIRST until the list is empty.
+	 */
+	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL)
+		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }
 

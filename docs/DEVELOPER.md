@@ -413,25 +413,31 @@ reconstruction does not need GF math.
 
 ## 6. Open-Row Packing (M1/6C)
 
-**Files:** `hammer2_ondisk.c` (`open_rows[]`, allocator), plus
+**Files:** `hammer2_ondisk.c` (open_rows TAILQ, allocator), plus
 `hammer2_raid6.c::hammer2_io_raid6_write_row`.
 
 ### In-memory row tracker
 
 ```c
-#define HAMMER2_OPEN_ROWS_MAX 16
 struct hammer2_open_row {
-    hammer2_off_t phys_off;     /* row's slot byte offset */
-    uint8_t       n_alloc;      /* reserved data-col count */
-    uint8_t       n_data;       /* col bytes received */
-    int           disk[ndata];  /* per-col disk_idx */
-    char         *data[ndata];  /* col buffers (kmalloc'd) */
-    /* in_use, generation, etc. */
+    TAILQ_ENTRY(hammer2_open_row) entry;
+    hammer2_off_t phys_off;            /* row's slot byte offset */
+    uint64_t      row_id;              /* slot index */
+    int           p_disk, q_disk;
+    uint32_t      alloc_mask;          /* bit per allocated data disk */
+    int           n_alloc;             /* popcount(alloc_mask) */
+    int           ndata;               /* cached rc->ndata */
+    size_t        bytes;               /* cached stripe_unit */
+    void         *col_data[HAMMER2_MAX_VOLUMES];
 };
 ```
 
-`hmp->open_rows[HAMMER2_OPEN_ROWS_MAX]` is per-mount.  Memory
-ceiling = MAX × ndata × stripe_unit (2 MB at NDISKS=4).
+`hmp->open_rows` is a TAILQ.  Entries are `kmalloc`'d at
+register time and `kfree`'d at seal — no fixed cap, never
+force-seal an incomplete row.  Memory peak per hmp is
+(in-flight rows) × ndata × stripe_unit for col_data buffers,
+briefly at TXG flush.  hmp also tracks `open_rows_count` and
+`open_rows_high` for diagnostics.
 
 ### Allocator (`hammer2_raid6_stripe_alloc`)
 
@@ -467,8 +473,7 @@ chain bytes).
 ### Partial-row parity fix (seal-time zero-fill)
 
 If a row seals with `ncols < ndata` (TXG flush before the row
-fills, or `n_alloc < ndata` because open_rows[] capped out),
-P/Q is computed assuming the unwritten data cols are zero.
+fills), P/Q is computed assuming the unwritten data cols are zero.
 `hammer2_raid6_seal_row_locked_to_unlocked` issues a sync
 `bwrite(zeros)` to each data-disk column NOT in `r->alloc_mask`
 *before* calling `write_row`, so the disk actually holds zeros
