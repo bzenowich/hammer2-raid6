@@ -1209,8 +1209,15 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
  * mount can proceed RW.  The new bitmap is persisted at the next
  * TXG flush via the existing hammer2_raid6_bitmap_write path.
  */
+/*
+ * Per-bref accounting at walker time.  Each live DATA/DIRENT bref
+ * contributes one column to its row, so refcount = count of live
+ * brefs sharing the slot.  Bitmap bit is the union (set iff any
+ * bref).  6C packing depends on this — under-counting would let the
+ * allocator reuse a slot that still has live cols.
+ */
 static int
-hammer2_v4_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+hammer2_raid6_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 {
 	hammer2_off_t phys_off;
 	uint64_t slot;
@@ -1236,6 +1243,9 @@ hammer2_v4_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+	if (hmp->stripe_row_refcount &&
+	    hmp->stripe_row_refcount[slot] < 0xff)
+		hmp->stripe_row_refcount[slot]++;
 	if (slot >= hmp->stripe_cursor)
 		hmp->stripe_cursor = slot + 1;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
@@ -1243,7 +1253,7 @@ hammer2_v4_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 }
 
 static int
-hammer2_v4_walk_chain(hammer2_dev_t *hmp, hammer2_chain_t *parent)
+hammer2_raid6_walk_chain(hammer2_dev_t *hmp, hammer2_chain_t *parent)
 {
 	hammer2_chain_t *chain = NULL;
 	hammer2_blockref_t bref;
@@ -1260,10 +1270,10 @@ hammer2_v4_walk_chain(hammer2_dev_t *hmp, hammer2_chain_t *parent)
 		if (error)
 			break;
 
-		(void)hammer2_v4_record_bref(hmp, &bref);
+		(void)hammer2_raid6_record_bref(hmp, &bref);
 
 		if (chain) {
-			error = hammer2_v4_walk_chain(hmp, chain);
+			error = hammer2_raid6_walk_chain(hmp, chain);
 			if (error)
 				break;
 		}
@@ -1276,7 +1286,7 @@ hammer2_v4_walk_chain(hammer2_dev_t *hmp, hammer2_chain_t *parent)
 }
 
 int
-hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
+hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
 {
 	int error;
 
@@ -1285,10 +1295,41 @@ hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
 	KKASSERT(hmp->stripe_bitmap != NULL);
 
 	bzero(hmp->stripe_bitmap, hmp->stripe_bitmap_size);
-	hmp->stripe_cursor = HAMMER2_STRIPE_V4_START;
+	if (hmp->stripe_row_refcount)
+		bzero(hmp->stripe_row_refcount,
+		      (size_t)hmp->stripe_num_slots);
+	hmp->stripe_cursor = HAMMER2_STRIPE_RAID6_START;
 
 	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
-	error = hammer2_v4_walk_chain(hmp, &hmp->vchain);
+	error = hammer2_raid6_walk_chain(hmp, &hmp->vchain);
+	hammer2_chain_unlock(&hmp->vchain);
+	return error;
+}
+
+/*
+ * Walk only to rebuild stripe_row_refcount.  Bitmap and cursor are
+ * preserved (assumed already loaded from disk).  Walker's
+ * record_bref OR's the bit (no-op when bit already set) and
+ * increments refcount.  After this call refcount is the live bref
+ * count per slot, which 6C packing's stripe_free relies on.
+ *
+ * Mount cost: O(metadata size).  6D simple-path; later phases can
+ * persist refcount alongside the bitmap to skip the walk.
+ */
+int
+hammer2_raid6_rebuild_row_refcount(hammer2_dev_t *hmp)
+{
+	int error;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+
+	if (hmp->stripe_row_refcount == NULL)
+		return 0;
+	bzero(hmp->stripe_row_refcount, (size_t)hmp->stripe_num_slots);
+
+	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
+	error = hammer2_raid6_walk_chain(hmp, &hmp->vchain);
 	hammer2_chain_unlock(&hmp->vchain);
 	return error;
 }
@@ -1368,7 +1409,7 @@ hammer2_raid6_bitmap_init(hammer2_dev_t *hmp)
 	hmp->stripe_bitmap = kmalloc(bsize, M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->stripe_bitmap_size = bsize;
 	hmp->stripe_num_slots = max_stripes;
-	hmp->stripe_cursor = HAMMER2_STRIPE_V4_START;
+	hmp->stripe_cursor = HAMMER2_STRIPE_RAID6_START;
 	hmp->stripe_generation = 0;
 	hmp->stripe_bitmap_invalid = 0;
 	spin_init(&hmp->stripe_bitmap_spin, "h2smap");
@@ -1903,8 +1944,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	}
 
 	start = hmp->stripe_cursor;
-	if (start < HAMMER2_STRIPE_V4_START || start >= max_stripes)
-		start = HAMMER2_STRIPE_V4_START;
+	if (start < HAMMER2_STRIPE_RAID6_START || start >= max_stripes)
+		start = HAMMER2_STRIPE_RAID6_START;
 	slot = start;
 
 	for (;;) {
@@ -1917,7 +1958,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			if (wrapped)
 				break;
 			wrapped = 1;
-			slot = HAMMER2_STRIPE_V4_START;
+			slot = HAMMER2_STRIPE_RAID6_START;
 			if (slot >= start)
 				break;
 			continue;

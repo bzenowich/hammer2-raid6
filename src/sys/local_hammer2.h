@@ -1996,7 +1996,8 @@ hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
 void hammer2_raid6_bitmap_init(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_read(hammer2_dev_t *hmp);
 void hammer2_raid6_bitmap_write(hammer2_dev_t *hmp);
-int  hammer2_v4_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
+int  hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
+int  hammer2_raid6_rebuild_row_refcount(hammer2_dev_t *hmp);
 void hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp);
 int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
 void hammer2_raid6_stripe_free(hammer2_dev_t *hmp,

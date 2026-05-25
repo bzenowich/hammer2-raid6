@@ -1332,7 +1332,7 @@ next_hmp:
 
 				kprintf("hammer2: stripe bitmap invalid; "
 					"walking blockref tree to rebuild...\n");
-				rerr = hammer2_v4_rebuild_stripe_bitmap(hmp);
+				rerr = hammer2_raid6_rebuild_stripe_bitmap(hmp);
 				if (rerr == 0) {
 					kprintf("hammer2: stripe bitmap "
 						"reconstructed from blockref "
@@ -1349,11 +1349,33 @@ next_hmp:
 				}
 			}
 			/*
-			 * Populate per-row refcount from the loaded/rebuilt
-			 * bitmap.  Single-chain-per-row at mount; 6C grows
-			 * refcount as new writes pack rows.
+			 * 6D: rebuild per-row refcount by walking the live
+			 * blockref tree.  Required because 6C packing can
+			 * place multiple chains in one row; the on-disk
+			 * bitmap is the union (one bit per row) and doesn't
+			 * carry per-chain counts.  Without an accurate
+			 * refcount, freeing one chain in a packed row could
+			 * clear the bitmap bit prematurely and let the
+			 * allocator reuse a slot whose other cols are
+			 * still live.
+			 *
+			 * Skipped when stripe_bitmap_invalid was just
+			 * rebuilt — that path's walker (record_bref) has
+			 * already populated refcount alongside the bitmap.
 			 */
-			hammer2_raid6_row_refcount_sync(hmp);
+			if (!hmp->stripe_bitmap_invalid) {
+				int rrerr =
+				    hammer2_raid6_rebuild_row_refcount(hmp);
+				if (rrerr && !ronly) {
+					kprintf("hammer2: row refcount "
+						"rebuild failed (err %d); "
+						"refusing RW mount\n", rrerr);
+					hammer2_unmount_helper(mp, NULL, hmp);
+					lockmgr(&hammer2_mntlk, LK_RELEASE);
+					hammer2_vfs_unmount(mp, MNT_FORCE);
+					return EROFS;
+				}
+			}
 			/* 6C: in-memory open-row tracker for packing. */
 			hammer2_raid6_open_rows_init(hmp);
 

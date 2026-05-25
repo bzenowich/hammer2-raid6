@@ -783,7 +783,7 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 		hdr->stripe_unit = stripe_unit;
 		hdr->num_slots = max_stripes;
 		hdr->slot_origin = HAMMER2_ZONE_SEG64;
-		hdr->cursor = HAMMER2_STRIPE_V4_START;
+		hdr->cursor = HAMMER2_STRIPE_RAID6_START;
 		hdr->generation = 1;
 
 		ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;

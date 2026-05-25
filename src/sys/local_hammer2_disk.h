@@ -1208,7 +1208,7 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
  * metadata-via-freemap can still consume; v3 DATA must not collide
  * with those.
  */
-#define HAMMER2_STRIPE_V4_START		1024
+#define HAMMER2_STRIPE_RAID6_START		1024
 
 struct hammer2_stripe_bitmap_header {
 	uint64_t magic;			/* HAMMER2_STRIPE_BITMAP_MAGIC */
