@@ -1984,7 +1984,7 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	int p_disk = (int)(row_id % ndisks);
 	int q_disk = (p_disk + 1) % ndisks;
 	int free_slot = -1;
-	int oldest = 0;
+	int seal_slot;
 	int i;
 
 	for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
@@ -1994,10 +1994,40 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 		}
 	}
 	if (free_slot < 0) {
-		/* All slots in use — seal the oldest to make room. */
+		/*
+		 * All slots in use — force-seal a row.  Only seal a row
+		 * whose alloc_mask bits ALL have col_data filled in
+		 * (chain bytes already delivered through putblk).  Sealing
+		 * a row where col_data is still NULL for some allocated
+		 * disk would split that chain's eventual P/Q update into
+		 * the broken add_data fallback path which clobbers parity.
+		 *
+		 * If no row is complete, force-seal the oldest as a last
+		 * resort — under sustained write bursts this can still
+		 * hit the fallback bug.  HAMMER2_OPEN_ROWS_MAX is sized
+		 * so this is rare on practical workloads.
+		 */
+		seal_slot = -1;
+		for (i = 0; i < HAMMER2_OPEN_ROWS_MAX; i++) {
+			struct hammer2_open_row *r = &hmp->open_rows[i];
+			uint32_t filled = 0;
+			int d2;
+			if (!r->in_use)
+				continue;
+			for (d2 = 0; d2 < HAMMER2_MAX_VOLUMES; d2++) {
+				if (r->col_data[d2])
+					filled |= (1U << d2);
+			}
+			if (filled == r->alloc_mask) {
+				seal_slot = i;
+				break;
+			}
+		}
+		if (seal_slot < 0)
+			seal_slot = 0;
 		hammer2_raid6_seal_row_locked_to_unlocked(hmp,
-		    &hmp->open_rows[oldest]);
-		free_slot = oldest;
+		    &hmp->open_rows[seal_slot]);
+		free_slot = seal_slot;
 	}
 
 	{
@@ -2084,8 +2114,20 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	/*
 	 * No matching open row.  Caller allocated us before the open_rows
 	 * machinery was alive (e.g. mount/recovery path) — fall back to
-	 * a 1-column write.  Same shape as 6C-1's write_scratch.
+	 * a 1-column write.  Krateprintf so a runtime regression that
+	 * sends writes down this path under load shows up but doesn't
+	 * spam dmesg.  This fallback is BROKEN for partial-row writes
+	 * (the single-col write_row recomputes P/Q ignoring the row's
+	 * other already-on-disk chains and corrupts parity); the right
+	 * fix is to grow open_rows[] / never force-seal incomplete rows.
 	 */
+	{
+		static struct krate krate_h2of = { .freq = 1 };
+		krateprintf(&krate_h2of,
+			"hammer2: open_row add_data FALLBACK phys_off=%016jx "
+			"disk_idx=%d — partial-row write_row may skew P/Q\n",
+			(uintmax_t)phys_off, disk_idx);
+	}
 	{
 		hammer2_row_col_t col = {
 			.disk_idx = disk_idx,

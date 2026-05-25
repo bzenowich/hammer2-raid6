@@ -1175,7 +1175,21 @@ struct hammer2_dev {
 	 * MAX × ndata × stripe_unit (e.g. 16 × 2 × 64 KB = 2 MB for
 	 * NDISKS=4).
 	 */
-#define HAMMER2_OPEN_ROWS_MAX	16
+/*
+ * Open-row tracker capacity.  Sized so a write burst can keep many
+ * partially-filled rows in flight (each tracking up to `ndata`
+ * chains) without forcing the allocator to seal an incomplete row.
+ * Sealing an incomplete row would land later putblk's of its
+ * still-in-flight chains in hammer2_raid6_open_row_add_data's
+ * fallback path — which writes a single col + recomputes P/Q,
+ * clobbering parity for the cols that were sealed first.
+ *
+ * Memory ceiling per hmp is MAX × ndata × stripe_unit when every
+ * row's col_data is filled (peak briefly at TXG flush) — at
+ * NDISKS=4 that's 1024 × 2 × 64KB = 128 MB worst case.  Typical
+ * workloads see far fewer rows pending at any moment.
+ */
+#define HAMMER2_OPEN_ROWS_MAX	1024
 	struct hammer2_open_row *open_rows;	/* MAX entries */
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
