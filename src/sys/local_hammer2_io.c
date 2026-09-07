@@ -35,6 +35,8 @@
 #include "hammer2.h"
 #include "hammer2_raid6.h"
 
+#include <sys/kthread.h>
+
 #define HAMMER2_DOP_READ	1
 #define HAMMER2_DOP_NEW		2
 #define HAMMER2_DOP_NEWNZ	3
@@ -1369,6 +1371,273 @@ hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 }
 
 /*
+ * Read-path self-heal repair queue (bitrot.md §7.4).
+ *
+ * The reader that detects a CHECK failure still holds the DIO buf
+ * covering the corrupt block, so it cannot write the repair itself
+ * (getblk on the same (devvp, offset) would deadlock on the busy buf —
+ * the same constraint that makes the scrub release its read dio before
+ * repairing).  Instead the verified-good bytes are queued here and a
+ * per-device kthread performs the write once the reader's buf ref
+ * drains.
+ *
+ * COW note: repair targets are always live (allocated) slots that held
+ * the corrupt data before the heal, and hammer2 never rewrites a live
+ * slot in place, so the deferred write cannot collide with new row
+ * writes.  The residual freed-and-reallocated window is shared with the
+ * scrub repair design and is bounded by the queue latency (typically
+ * milliseconds).
+ */
+#define HAMMER2_REPAIR_QUEUE_MAX	256
+
+static void
+hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
+{
+	hammer2_volume_t *vol;
+	struct vnode *devvp;
+	struct buf *bp;
+	int error;
+
+	if (req->disk_idx < 0 || req->disk_idx >= hmp->raid_config.ndisks)
+		return;
+	if (hmp->raid_failed[req->disk_idx])
+		return;
+	vol = &hmp->volumes[req->disk_idx];
+	if (vol->dev == NULL || vol->dev->devvp == NULL || !vol->dev->open)
+		return;
+	devvp = vol->dev->devvp;
+
+	if (req->patch_off == 0 && req->patch_len == req->bufsize) {
+		/*
+		 * Full-buffer overwrite (DATA/DIRENT stripe column).
+		 */
+		bp = getblk(devvp, req->base, req->bufsize, GETBLK_KVABIO, 0);
+		if (bp == NULL)
+			return;
+		bkvasync(bp);
+		bcopy(req->data, bp->b_data, req->bufsize);
+	} else {
+		/*
+		 * Sub-buffer patch (metadata block inside a shared device
+		 * buffer): read-modify-write so sibling blocks in the same
+		 * buffer are preserved.
+		 */
+		bp = NULL;
+		error = bread(devvp, req->base, req->bufsize, &bp);
+		if (error || bp == NULL) {
+			if (bp)
+				brelse(bp);
+			return;
+		}
+		bkvasync(bp);
+		bcopy(req->data, (char *)bp->b_data + req->patch_off,
+		      req->patch_len);
+	}
+	error = bwrite(bp);
+	if (error == 0) {
+		atomic_add_64(&hmp->repair_writes_done, 1);
+		kprintf("hammer2: selfheal: repair write disk %d base %016jx "
+		    "off %d len %d\n",
+		    req->disk_idx, (uintmax_t)req->base,
+		    req->patch_off, req->patch_len);
+	} else {
+		kprintf("hammer2: selfheal: repair write FAILED disk %d "
+		    "base %016jx err %d\n",
+		    req->disk_idx, (uintmax_t)req->base, error);
+	}
+}
+
+static void
+hammer2_io_repair_thread(void *arg)
+{
+	hammer2_dev_t *hmp = arg;
+	hammer2_repair_req_t *req;
+
+	for (;;) {
+		hammer2_spin_ex(&hmp->repair_spin);
+		req = TAILQ_FIRST(&hmp->repair_queue);
+		if (req) {
+			TAILQ_REMOVE(&hmp->repair_queue, req, entry);
+			hmp->repair_queue_count--;
+		}
+		hammer2_spin_unex(&hmp->repair_spin);
+
+		if (req) {
+			hammer2_io_repair_execute(hmp, req);
+			kfree(req->data, M_HAMMER2);
+			kfree(req, M_HAMMER2);
+			continue;
+		}
+		if (hmp->repair_thread_exit)
+			break;
+		tsleep(&hmp->repair_queue, 0, "h2repi", hz);
+	}
+	hmp->repair_thread_running = 0;
+	wakeup(__DEVOLATILE(void *, &hmp->repair_thread_running));
+	kthread_exit();
+}
+
+void
+hammer2_io_repair_start(hammer2_dev_t *hmp)
+{
+	int error;
+
+	if (hmp->repair_thread_running)
+		return;
+	hammer2_spin_init(&hmp->repair_spin, "h2repair");
+	TAILQ_INIT(&hmp->repair_queue);
+	hmp->repair_queue_count = 0;
+	hmp->repair_thread_exit = 0;
+	hmp->repair_thread_running = 1;
+	error = kthread_create(hammer2_io_repair_thread, hmp,
+			       &hmp->repair_td, "h2repair");
+	if (error) {
+		hmp->repair_thread_running = 0;
+		kprintf("hammer2: selfheal: repair kthread create failed "
+		    "(%d) — read-path heals will be memory-only\n", error);
+	}
+}
+
+void
+hammer2_io_repair_stop(hammer2_dev_t *hmp)
+{
+	hammer2_repair_req_t *req;
+
+	if (hmp->repair_thread_running) {
+		/*
+		 * Ask the thread to exit; it drains the queue first (all
+		 * devvps are still open at this point in unmount).
+		 */
+		hmp->repair_thread_exit = 1;
+		wakeup(&hmp->repair_queue);
+		while (hmp->repair_thread_running)
+			tsleep(__DEVOLATILE(void *, &hmp->repair_thread_running),
+			       0, "h2reps", hz / 10);
+	}
+	/* Safety net: free anything left if the thread never started. */
+	while ((req = TAILQ_FIRST(&hmp->repair_queue)) != NULL) {
+		TAILQ_REMOVE(&hmp->repair_queue, req, entry);
+		kfree(req->data, M_HAMMER2);
+		kfree(req, M_HAMMER2);
+	}
+	hmp->repair_queue_count = 0;
+}
+
+/*
+ * Queue a repair write.  Takes ownership of `data` (kmalloc'd); frees
+ * it if the request is dropped (thread not running, queue full, or a
+ * repair for the same buffer already queued).
+ */
+void
+hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
+			  hammer2_off_t base, int bufsize, int patch_off,
+			  int patch_len, char *data)
+{
+	hammer2_repair_req_t *req;
+	hammer2_repair_req_t *scan;
+
+	if (!hmp->repair_thread_running) {
+		kfree(data, M_HAMMER2);
+		return;
+	}
+	req = kmalloc(sizeof(*req), M_HAMMER2, M_WAITOK | M_ZERO);
+	req->disk_idx = disk_idx;
+	req->base = base;
+	req->bufsize = bufsize;
+	req->patch_off = patch_off;
+	req->patch_len = patch_len;
+	req->data = data;
+
+	hammer2_spin_ex(&hmp->repair_spin);
+	if (hmp->repair_queue_count >= HAMMER2_REPAIR_QUEUE_MAX) {
+		hammer2_spin_unex(&hmp->repair_spin);
+		atomic_add_64(&hmp->repair_writes_dropped, 1);
+		kfree(req->data, M_HAMMER2);
+		kfree(req, M_HAMMER2);
+		kprintf("hammer2: selfheal: repair queue full, dropped "
+		    "disk %d base %016jx (scrub will re-detect)\n",
+		    disk_idx, (uintmax_t)base);
+		return;
+	}
+	TAILQ_FOREACH(scan, &hmp->repair_queue, entry) {
+		if (scan->disk_idx == disk_idx && scan->base == base &&
+		    scan->patch_off == patch_off) {
+			/* already queued; keep the earlier payload */
+			hammer2_spin_unex(&hmp->repair_spin);
+			kfree(req->data, M_HAMMER2);
+			kfree(req, M_HAMMER2);
+			return;
+		}
+	}
+	TAILQ_INSERT_TAIL(&hmp->repair_queue, req, entry);
+	hmp->repair_queue_count++;
+	hammer2_spin_unex(&hmp->repair_spin);
+	wakeup(&hmp->repair_queue);
+}
+
+/*
+ * Metadata mirror check-aware failover (bitrot.md §7.4 bullet 2, and
+ * metadata_zone.md "Read path": on CHECK FAIL, try disk 1, disk 2, ...
+ * until a copy verifies).
+ *
+ * Reads each surviving sibling's copy of the device buffer
+ * (dev_pbase, psize), verifies the chain's range [off, off+bytes)
+ * against the bref CHECK code, and on the first verifying copy fixes
+ * *bdata in place and queues a patch-repair of the primary disk.
+ *
+ * Returns 0 on success, EIO if no sibling has a verifying copy.
+ */
+int
+hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
+				hammer2_off_t dev_pbase, int psize, int off,
+				const hammer2_blockref_t *bref,
+				void *bdata, size_t bytes)
+{
+	hammer2_volume_t *vol;
+	struct buf *bp;
+	char *patch;
+	int i;
+	int error;
+
+	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
+	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+
+	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+		if (i == bad_disk_idx)
+			continue;
+		if (hmp->raid_failed[i])
+			continue;
+		vol = &hmp->volumes[i];
+		if (vol->dev == NULL || vol->dev->devvp == NULL ||
+		    !vol->dev->open)
+			continue;
+
+		bp = NULL;
+		error = hammer2_inject_eio(i);
+		if (error == 0)
+			error = bread(vol->dev->devvp, dev_pbase, psize, &bp);
+		if (error || bp == NULL) {
+			if (bp)
+				brelse(bp);
+			continue;
+		}
+		bkvasync(bp);
+		if (hammer2_bref_check_match(bref,
+		    (char *)bp->b_data + off, bytes)) {
+			bcopy((char *)bp->b_data + off, bdata, bytes);
+			brelse(bp);
+			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
+			bcopy(bdata, patch, bytes);
+			hammer2_io_repair_enqueue(hmp, bad_disk_idx,
+			    dev_pbase, psize, off, (int)bytes, patch);
+			return 0;
+		}
+		brelse(bp);
+	}
+	return EIO;
+}
+
+/*
  * RAID 6 degraded read.
  *
  * Read a data block from a RAID 6 array in degraded mode.
@@ -2024,29 +2293,12 @@ static int
 hammer2_scrub_check_match(const hammer2_blockref_t *bref,
 			  const void *data, size_t bytes)
 {
-	switch (HAMMER2_DEC_CHECK(bref->methods)) {
-	case HAMMER2_CHECK_NONE:
-	case HAMMER2_CHECK_DISABLED:
-		return 1;
-	case HAMMER2_CHECK_ISCSI32:
-		return bref->check.iscsi32.value ==
-		    hammer2_icrc32(data, bytes);
-	case HAMMER2_CHECK_XXHASH64:
-		return bref->check.xxhash64.value ==
-		    XXH64(data, bytes, XXH_HAMMER2_SEED);
-	case HAMMER2_CHECK_FREEMAP:
-		return bref->check.freemap.icrc32 ==
-		    hammer2_icrc32(data, bytes);
-	default:
-		/*
-		 * SHA192 etc. require headers not pulled in by io.c.  Pre-v3
-		 * tests exercise XXHASH64 (default for DATA) and ISCSI32 only;
-		 * skip-verify is safe — those chains pass via the normal read
-		 * path's testcheck and a scrub miss just means slower
-		 * detection, not corruption.
-		 */
-		return 1;
-	}
+	/*
+	 * Shared quiet matcher from hammer2_chain.c — covers every check
+	 * method including SHA192 (previously skip-verified here because
+	 * io.c lacked the SHA headers).
+	 */
+	return hammer2_bref_check_match(bref, data, bytes);
 }
 
 static int
@@ -2091,6 +2343,8 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 			hammer2_io_putblk(&dio);
 		ctx->bad++;
 		ctx->done++;
+		if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks)
+			atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
 		return 0;
 	}
 	bdata = hammer2_io_data(dio, bref->data_off);
@@ -2121,6 +2375,8 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	 *     key would deadlock waiting for that ref to drop.
 	 */
 	ctx->bad++;
+	if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks)
+		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
 	hammer2_io_putblk(&dio);
 
 	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
@@ -2145,6 +2401,12 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 				if (werr == 0) {
 					ctx->repaired++;
 					repaired = 1;
+					if (disk_idx >= 0 &&
+					    disk_idx < hmp->raid_config.ndisks) {
+						atomic_add_64(
+						    &hmp->raid_cksum_healed[
+							disk_idx], 1);
+					}
 					kprintf("hammer2: scrub: repaired "
 					    "data_off %016jx disk %d\n",
 					    (uintmax_t)bref->data_off,
@@ -2157,6 +2419,10 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	}
 	if (!repaired) {
 		ctx->unrepairable++;
+		if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks) {
+			atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx],
+				      1);
+		}
 		kprintf("hammer2: scrub: CHECK FAIL data_off %016jx disk %d "
 		    "(parity could not repair, err=%d)\n",
 		    (uintmax_t)bref->data_off, disk_idx, error);
@@ -2187,6 +2453,20 @@ hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 				   HAMMER2_RESOLVE_SHARED);
 
 	if (parent->error & HAMMER2_ERROR_CHECK) {
+		/*
+		 * The chain load already attempted a read-path self-heal
+		 * (mirror-copy failover for metadata); a persisting CHECK
+		 * error means no verifying copy exists.  Count it as
+		 * bad+unrepairable instead of silently pruning the
+		 * subtree (bitrot.md §7.2 sharp edge).
+		 */
+		ctx->bad++;
+		ctx->unrepairable++;
+		ctx->hmp->scrub_brefs_bad = ctx->bad;
+		ctx->hmp->scrub_brefs_unrepairable = ctx->unrepairable;
+		kprintf("hammer2: scrub: metadata CHECK FAIL data_off %016jx "
+		    "type %d — subtree skipped\n",
+		    (uintmax_t)parent->bref.data_off, parent->bref.type);
 		hammer2_chain_unlock(parent);
 		return 0;
 	}
@@ -2234,6 +2514,18 @@ hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 				    HAMMER2_RESOLVE_SHARED);
 				if (error)
 					goto out;
+			} else {
+				/* self-heal failed on an interior chain */
+				ctx->bad++;
+				ctx->unrepairable++;
+				ctx->hmp->scrub_brefs_bad = ctx->bad;
+				ctx->hmp->scrub_brefs_unrepairable =
+				    ctx->unrepairable;
+				kprintf("hammer2: scrub: metadata CHECK FAIL "
+				    "data_off %016jx type %d — subtree "
+				    "skipped\n",
+				    (uintmax_t)chain->bref.data_off,
+				    chain->bref.type);
 			}
 			break;
 		default:

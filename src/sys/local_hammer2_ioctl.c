@@ -1761,6 +1761,9 @@ hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data)
 	 */
 	rs->ndisks = hmp->raid_config.ndisks;
 	bzero(rs->disk_state, sizeof(rs->disk_state));
+	bzero(rs->cksum_errors, sizeof(rs->cksum_errors));
+	bzero(rs->cksum_healed, sizeof(rs->cksum_healed));
+	bzero(rs->cksum_unrepairable, sizeof(rs->cksum_unrepairable));
 	{
 		uint32_t i;
 		uint32_t lim = rs->ndisks;
@@ -1770,8 +1773,14 @@ hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data)
 			rs->disk_state[i] = hmp->raid_failed[i] ?
 			    HAMMER2_RAID6_DISK_FAILED :
 			    HAMMER2_RAID6_DISK_ONLINE;
+			rs->cksum_errors[i] = hmp->raid_cksum_errors[i];
+			rs->cksum_healed[i] = hmp->raid_cksum_healed[i];
+			rs->cksum_unrepairable[i] =
+			    hmp->raid_cksum_unrepairable[i];
 		}
 	}
+	rs->selfheal_writes_done = hmp->repair_writes_done;
+	rs->selfheal_writes_dropped = hmp->repair_writes_dropped;
 
 	return 0;
 }

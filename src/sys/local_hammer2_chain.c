@@ -87,6 +87,14 @@ static void hammer2_chain_lru_flush(hammer2_pfs_t *pmp);
  * not impede operations.
  */
 static struct krate krate_h2chk = { .freq = 5 };
+/*
+ * Self-heal gets its own rate limiter: the CHECK FAIL prints above
+ * share krate_h2chk and would starve the heal messages during a
+ * corruption storm (every heal is preceded by a CHECK FAIL print).
+ */
+static struct krate krate_h2heal = { .freq = 5 };
+
+static int hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata);
 static struct krate krate_h2me = { .freq = 1 };
 static struct krate krate_h2em = { .freq = 1 };
 
@@ -1277,7 +1285,19 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 		 */
 	} else if ((chain->flags & HAMMER2_CHAIN_TESTEDGOOD) == 0) {
 		if (hammer2_chain_testcheck(chain, bdata) == 0) {
-			chain->error = HAMMER2_ERROR_CHECK;
+			/*
+			 * Read-path self-heal (bitrot.md §7.4): on RAID6
+			 * try to reconstruct from parity (DATA/DIRENT) or
+			 * a sibling mirror copy (metadata) before giving
+			 * up.  A successful heal fixes bdata in place and
+			 * queues the on-disk repair write.
+			 */
+			if (hammer2_chain_selfheal(chain, bdata) == 0) {
+				atomic_set_int(&chain->flags,
+					       HAMMER2_CHAIN_TESTEDGOOD);
+			} else {
+				chain->error = HAMMER2_ERROR_CHECK;
+			}
 		} else {
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_TESTEDGOOD);
 		}
@@ -5889,6 +5909,172 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 		kprintf("   In pfs %s on device %s\n",
 			pfsname, ochain->hmp->devrepname);
 	}
+}
+
+/*
+ * Quiet raw-buffer CHECK matcher: recompute bref's check code over
+ * (data,bytes) and return 1 on match, 0 on mismatch.  No logging — used
+ * to verify candidate reconstructions (parity rebuilds, mirror copies)
+ * where a mismatch is an expected outcome, and by the scrub.  Supports
+ * every check method including SHA192 (the io.c scrub previously
+ * skip-verified SHA192 trees).
+ */
+int
+hammer2_bref_check_match(const hammer2_blockref_t *bref,
+			 const void *data, size_t bytes)
+{
+	switch (HAMMER2_DEC_CHECK(bref->methods)) {
+	case HAMMER2_CHECK_NONE:
+	case HAMMER2_CHECK_DISABLED:
+		return 1;
+	case HAMMER2_CHECK_ISCSI32:
+		return (bref->check.iscsi32.value ==
+			hammer2_icrc32(__DECONST(void *, data), bytes));
+	case HAMMER2_CHECK_XXHASH64:
+		return (bref->check.xxhash64.value ==
+			XXH64(data, bytes, XXH_HAMMER2_SEED));
+	case HAMMER2_CHECK_SHA192:
+		{
+			SHA256_CTX hash_ctx;
+			union {
+				uint8_t digest[SHA256_DIGEST_LENGTH];
+				uint64_t digest64[SHA256_DIGEST_LENGTH/8];
+			} u;
+
+			SHA256_Init(&hash_ctx);
+			SHA256_Update(&hash_ctx, data, bytes);
+			SHA256_Final(u.digest, &hash_ctx);
+			u.digest64[2] ^= u.digest64[3];
+			return (bcmp(u.digest, bref->check.sha192.data,
+				     sizeof(bref->check.sha192.data)) == 0);
+		}
+	case HAMMER2_CHECK_FREEMAP:
+		return (bref->check.freemap.icrc32 ==
+			hammer2_icrc32(__DECONST(void *, data), bytes));
+	default:
+		return 1;
+	}
+}
+
+/*
+ * Read-path self-heal (bitrot.md §7.4 bullet 1 — the ZFS behavior).
+ *
+ * Called when hammer2_chain_testcheck() fails on data read from an
+ * ONLINE disk.  Attempts to reconstruct the block:
+ *
+ *   DATA/DIRENT: P/Q parity reconstruction of the whole stripe_unit
+ *	column, treating bref->copyid's disk as failed (the CHECK code
+ *	converts the corruption into an erasure).
+ *   INODE/INDIRECT/FREEMAP_NODE/FREEMAP_LEAF: the metadata zone is
+ *	N-way mirrored; try each surviving sibling copy in turn.
+ *
+ * The reconstruction is re-verified against the same CHECK code before
+ * being used — a silently-corrupt P or Q (or a stale mirror copy) must
+ * not overwrite good data.  On success the in-memory buffer is fixed so
+ * the current read succeeds, and the on-disk repair write is queued to
+ * the per-device repair kthread (we cannot write here: this thread
+ * still holds the DIO buf covering the corrupt block).
+ *
+ * Returns 0 if healed (caller may treat data as good), HAMMER2_ERROR_CHECK
+ * if the corruption could not be repaired.
+ */
+static int
+hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
+{
+	hammer2_dev_t *hmp = chain->hmp;
+	hammer2_blockref_t *bref = &chain->bref;
+	hammer2_io_t *dio = chain->dio;
+	hammer2_off_t lbase;
+	int disk_idx;
+	int error;
+
+	if (hmp == NULL || hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return HAMMER2_ERROR_CHECK;
+	if (hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2)
+		return HAMMER2_ERROR_CHECK;
+	if (dio == NULL)
+		return HAMMER2_ERROR_CHECK;
+	disk_idx = dio->disk_idx;
+	if (disk_idx < 0 || disk_idx >= hmp->raid_config.ndisks)
+		return HAMMER2_ERROR_CHECK;
+	if (hmp->raid_failed[disk_idx]) {
+		/*
+		 * The read was already served by degraded reconstruction;
+		 * a CHECK failure here means the redundancy itself is bad.
+		 * Nothing further to try inline.
+		 */
+		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
+		atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx], 1);
+		return HAMMER2_ERROR_CHECK;
+	}
+
+	atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
+	lbase = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
+
+	switch (bref->type) {
+	case HAMMER2_BREF_TYPE_DATA:
+	case HAMMER2_BREF_TYPE_DIRENT:
+	    {
+		uint64_t stripe_unit = hmp->raid_config.stripe_unit;
+		hammer2_off_t phys = lbase & HAMMER2_RAID6_PHYS_MASK;
+		hammer2_off_t col_base = phys &
+		    ~(hammer2_off_t)(stripe_unit - 1);
+		size_t off = (size_t)(phys - col_base);
+		char *recon;
+
+		recon = kmalloc((size_t)stripe_unit, M_HAMMER2,
+				M_WAITOK | M_ZERO);
+		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
+						       recon,
+						       (size_t)stripe_unit, 1);
+		if (error == 0 &&
+		    hammer2_bref_check_match(bref, recon + off, chain->bytes)) {
+			bcopy(recon + off, bdata, chain->bytes);
+			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
+			krateprintf(&krate_h2heal,
+			    "hammer2: selfheal: read-path repair data_off "
+			    "%016jx disk %d (parity reconstruction)\n",
+			    (uintmax_t)bref->data_off, disk_idx);
+			/* ownership of recon passes to the repair queue */
+			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
+			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+			return 0;
+		}
+		kfree(recon, M_HAMMER2);
+		break;
+	    }
+	case HAMMER2_BREF_TYPE_INODE:
+	case HAMMER2_BREF_TYPE_INDIRECT:
+	case HAMMER2_BREF_TYPE_FREEMAP_NODE:
+	case HAMMER2_BREF_TYPE_FREEMAP_LEAF:
+	    {
+		hammer2_off_t dev_pbase = dio->pbase - dio->dbase;
+		int off = (int)((lbase & HAMMER2_RAID6_PHYS_MASK) - dev_pbase);
+
+		if (off < 0 || off + (int)chain->bytes > dio->psize)
+			break;
+		error = hammer2_io_metadata_mirror_heal(hmp, disk_idx,
+		    dev_pbase, dio->psize, off, bref, bdata, chain->bytes);
+		if (error == 0) {
+			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
+			krateprintf(&krate_h2heal,
+			    "hammer2: selfheal: read-path repair data_off "
+			    "%016jx disk %d (metadata mirror copy)\n",
+			    (uintmax_t)bref->data_off, disk_idx);
+			return 0;
+		}
+		break;
+	    }
+	default:
+		break;
+	}
+
+	atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx], 1);
+	krateprintf(&krate_h2heal,
+	    "hammer2: selfheal: UNREPAIRABLE data_off %016jx disk %d "
+	    "type %d\n",
+	    (uintmax_t)bref->data_off, disk_idx, bref->type);
+	return HAMMER2_ERROR_CHECK;
 }
 
 /*

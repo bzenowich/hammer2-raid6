@@ -44,7 +44,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K}"
+GROUPS="${*:-A B C D E F G H I J K L}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -59,7 +59,8 @@ for GROUP in $GROUPS; do
     I) run_group "Group I" "$SCRIPTDIR/test_i_unclean.sh"      ;;
     J) run_group "Group J" "$SCRIPTDIR/test_j_packed_row.sh"   ;;
     K) run_group "Group K" "$SCRIPTDIR/test_k_scrub.sh"        ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K)" ;;
+    L) run_group "Group L" "$SCRIPTDIR/test_l_selfheal.sh"     ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L)" ;;
     esac
 done
 

@@ -25,6 +25,8 @@
 
 int cmd_raid(const char *sel_path, int ac, const char **av);
 
+static int raid_scrub_blocking(const char *sel_path);
+
 static int
 raid_status(const char *sel_path)
 {
@@ -64,9 +66,16 @@ raid_status(const char *sel_path)
 				label = "UNKNOWN";
 				break;
 			}
-			printf("disk[%u]:        %s\n", i, label);
+			printf("disk[%u]:        %-8s cksum_err %llu  "
+			       "healed %llu  unrepairable %llu\n", i, label,
+			       (unsigned long long)st.cksum_errors[i],
+			       (unsigned long long)st.cksum_healed[i],
+			       (unsigned long long)st.cksum_unrepairable[i]);
 		}
 	}
+	printf("selfheal_writes: %llu done, %llu dropped\n",
+	       (unsigned long long)st.selfheal_writes_done,
+	       (unsigned long long)st.selfheal_writes_dropped);
 	return 0;
 }
 
@@ -119,7 +128,17 @@ raid_replace(const char *sel_path, const char *old_dev, const char *new_dev)
 		return 1;
 	}
 	printf("raid replace %s -> %s complete\n", old_dev, new_dev);
-	return 0;
+
+	/*
+	 * The resilver copies surviving columns verbatim — it performs no
+	 * checksum verification of its own (bitrot.md §7.4), so any latent
+	 * corruption on a surviving disk was just written to the new disk
+	 * too.  Chain a scrub to verify and repair the whole tree while
+	 * full redundancy is available again.
+	 */
+	printf("raid replace: running post-resilver scrub "
+	       "(resilver does not verify checksums)...\n");
+	return raid_scrub_blocking(sel_path);
 }
 
 static void

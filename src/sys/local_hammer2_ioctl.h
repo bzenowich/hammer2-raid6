@@ -274,6 +274,16 @@ struct hammer2_ioc_resilver_status {
 	/* G2: persisted fail-state visible to userspace (status command). */
 	uint32_t ndisks;	/* total disks in the array */
 	uint8_t	disk_state[HAMMER2_MAX_VOLUMES]; /* per-disk state byte */
+	/*
+	 * Cumulative checksum-error accounting since mount (the zpool
+	 * status CKSUM column; bitrot.md §7.6 item 3).  Written by both
+	 * the read-path self-heal and the scrub.
+	 */
+	uint64_t cksum_errors[HAMMER2_MAX_VOLUMES];	 /* CHECK failures */
+	uint64_t cksum_healed[HAMMER2_MAX_VOLUMES];	 /* verified repairs */
+	uint64_t cksum_unrepairable[HAMMER2_MAX_VOLUMES]; /* data loss */
+	uint64_t selfheal_writes_done;	/* completed deferred repair writes */
+	uint64_t selfheal_writes_dropped; /* queue-full drops */
 };
 
 typedef struct hammer2_ioc_resilver_status hammer2_ioc_resilver_status_t;

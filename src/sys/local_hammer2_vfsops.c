@@ -1410,6 +1410,14 @@ next_hmp:
 			hammer2_raid6_open_rows_init(hmp);
 
 			/*
+			 * Read-path self-heal repair kthread
+			 * (bitrot.md §7.4): performs the deferred
+			 * on-disk repair writes queued by
+			 * hammer2_chain_selfheal().
+			 */
+			hammer2_io_repair_start(hmp);
+
+			/*
 			 * Load the metadata-zone extent table from voldata.
 			 * mkfs (--raid6) writes md_extents[0] at format time.
 			 * If older media has md_nextents == 0 we fall back to
@@ -2045,6 +2053,14 @@ again:
 	hammer2_iocom_uninit(hmp);
 
 	hammer2_bulkfree_uninit(hmp);
+
+	/*
+	 * Drain and stop the self-heal repair kthread while all devvps
+	 * are still open (queued repair writes must land before the
+	 * final flush below).
+	 */
+	hammer2_io_repair_stop(hmp);
+
 	hammer2_pfsfree_scan(hmp, 0);
 
 	/*

@@ -366,6 +366,23 @@ Mapped against §2's five layers:
 | Memory | **No** | Checksum is computed after data is already in RAM — the FAST '10 ZFS caveat from §5.5 applies verbatim |
 | Compute (mercurial cores) | **No** | Nothing here defends against a CPU that computes the wrong XXH64 |
 
+Detection now triggers repair in *two* places, not one:
+
+- **Read path** — `hammer2_chain_selfheal()`
+  (`src/sys/local_hammer2_chain.c`): when `hammer2_chain_testcheck()`
+  fails on a read from an ONLINE disk, the block is reconstructed
+  inline (P/Q for DATA/DIRENT columns; sibling mirror copies for
+  metadata), re-verified against the same CHECK code, the in-memory
+  buffer is fixed so the read succeeds, and the on-disk repair write is
+  queued to a per-device `h2repair` kthread.  This is the ZFS
+  behavior: ordinary reads quietly repair as they go.
+- **Scrub** — as before (§7.2), for data nobody reads.
+
+The deferred-write kthread exists because the reader still holds the
+DIO buffer covering the corrupt block; a synchronous `getblk()` on the
+same (devvp, offset) would deadlock — the same constraint that makes
+the scrub release its read dio before repairing.
+
 ### 7.2 Detecting it: `hammer2 raid scrub`
 
 ```
@@ -391,13 +408,15 @@ It is **not a background daemon**: the walk runs inside the blocking ioctl in th
 calling process, and nothing in the tree schedules it. Scrubbing is something you
 arrange (§7.6), not something that happens.
 
-One sharp edge: the walker locks each parent `RESOLVE_ALWAYS | RESOLVE_SHARED`,
-so interior chains *are* checksum-verified in passing — but a parent carrying
-`HAMMER2_ERROR_CHECK` causes the walker to return immediately
-(`local_hammer2_io.c:2189-2192`, `:2225`). **A corrupt INDIRECT block silently
-removes its entire subtree from the scrub**, and the event is counted in neither
-`brefs_done` nor `brefs_bad`. A scrub that reports far fewer `brefs_done` than
-the previous run is the only signal.
+Interior chains are checksum-verified in passing by the walker's
+`RESOLVE_ALWAYS | RESOLVE_SHARED` locks, and that load now runs the
+read-path self-heal (§7.1) — a corrupt INDIRECT block is repaired from
+its mirror copies before the walker even sees it.  Only if *no* mirror
+copy verifies does the walker prune the subtree, and that event is now
+counted (`brefs_bad` + `brefs_unrepairable`) and logged
+(`hammer2: scrub: metadata CHECK FAIL ... subtree skipped`) instead of
+being silent.  A sudden drop in `brefs_done` still deserves attention,
+but it can no longer happen without a matching unrepairable count.
 
 **Scrub runs concurrently with a live workload.** Group K's K3 test writes in the
 foreground (0–1 s completions on the vbd substrate) while a 32 MB scrub runs to
@@ -472,32 +491,39 @@ Stating these plainly matters more than the feature list, because §3.2's
 finding — 8% of NetApp's checksum mismatches surfaced during RAID reconstruction,
 when redundancy was already gone — is exactly the scenario these gaps feed.
 
-- **There is no self-heal on the read path.** When `hammer2_chain_testcheck()`
-  fails on a normal read, `hammer2_chain_load_data()` sets
-  `chain->error = HAMMER2_ERROR_CHECK` (`src/sys/local_hammer2_chain.c:1279`) and
-  the error propagates to the caller. It does **not** trigger parity
-  reconstruction. Read-path reconstruction fires only when the disk is already
-  marked failed in `raid_failed[]`, not on a checksum mismatch from an ONLINE
-  disk. ZFS repairs inline here; this implementation does not. **Consequence: a
-  latent corruption is fixed only when a scrub reaches it, so scrub cadence is
-  load-bearing, not hygiene.**
-- **Scrub *repairs* DATA and DIRENT only.** `hammer2_scrub_verify_bref()` returns
-  immediately for every other bref type. INODE, INDIRECT, FREEMAP_NODE and
-  FREEMAP_LEAF live in the N-way-mirrored metadata zone (`docs/metadata_zone.md`);
-  they get checksum-verified incidentally by the walker's `RESOLVE_ALWAYS` lock,
-  but a failure is neither counted nor repaired — it just prunes the subtree.
-  Their mirror copies are consulted by `hammer2_io_metadata_mirror_read()`
-  (`src/sys/local_hammer2_raid6.c:574`) only when the primary disk is *failed*,
-  never on CHECK mismatch, even though `docs/metadata_zone.md:175-177` specifies
-  check-aware failover. **Metadata bitrot is detected on access and reported, but
-  no code path repairs it.**
+*(2026-07-28: the three worst items that used to lead this list — no
+read-path self-heal, no metadata repair path, SHA192 invisible to scrub
+— are implemented and verified by `tests/v3/test_l_selfheal.sh`.  What
+follows is the remaining honest gap list.)*
+
+- **Self-heal requires the disk to be ONLINE and redundancy intact.** A
+  CHECK failure on a block whose disk is already marked failed means the
+  *reconstruction itself* is bad — there is nothing left to try inline,
+  and the error propagates as before. Likewise a corruption discovered
+  while already double-degraded is unrepairable by construction.
+- **The deferred repair write is asynchronous.** Between the in-memory
+  heal and the `h2repair` kthread's write (typically milliseconds; queue
+  cap 256 entries, drops are counted in `raid status` as
+  `selfheal_writes dropped`), the on-disk block is still corrupt. A
+  crash in that window leaves the corruption for the next read or scrub
+  to heal again — detected, not lost.
+- **Scrub verifies only the primary metadata copy.** The walker's loads
+  check (and now heal) the copy on the bref's primary disk; the N-1
+  sibling mirror copies are read only when the primary fails
+  verification. A rotting *mirror* copy on a non-primary disk is not
+  detected by scrub until the day it is needed. (`h2stripe_check`
+  does not cover the metadata zone either.)
 - **Resilver does not verify checksums.** Neither the metadata-zone bulk copy
-  (Phase A, `local_hammer2_io.c:1734`) nor the per-stripe rebuild
-  (Phase 3, `:1844`) checks a CHECK code on the data it reads. A silently corrupt
-  surviving column is faithfully reconstructed onto the replacement disk, and
-  `raid replace` does not chain a scrub on completion. This is the mechanism
-  behind §3.2's most dangerous statistic, applied to this implementation
-  specifically.
+  (Phase A, `local_hammer2_io.c`) nor the per-stripe rebuild checks a
+  CHECK code on the data it reads — at the physical-stripe layer there
+  is no bref context to check against. A silently corrupt surviving
+  column is faithfully reconstructed onto the replacement disk.
+  **Mitigation:** `hammer2 raid replace` now chains an automatic
+  blocking scrub on completion, so the corruption is found and repaired
+  while full redundancy is available — but the *pre-existing* rule
+  (scrub before replacing, §7.6.4) still applies, because a latent
+  corruption plus a real dead disk during the resilver window is
+  exactly §3.2's 8% scenario.
 - **Volume-header quorum can gate mount before RAID6 gives up.** Mount requires
   the newest TXG sequence durable on `(ndisks/2)+1` disks
   (`local_hammer2_ondisk.c:1020`). At N=6 that is 4, so three failed disks are
@@ -508,11 +534,10 @@ when redundancy was already gone — is exactly the scenario these gaps feed.
   (default 8 TXGs). See `docs/volhdr_quorum.md:126-139`.
 - **The stripe bitmap lives on disk 0 only and is not mirrored.** Losing disk 0
   forces a full chain-walk rebuild at mount.
-- **SHA192 blocks are skipped by scrub.** `hammer2_scrub_check_match()`'s
-  `default:` arm returns "match" for check types it cannot compute in `io.c`, so
-  a tree set to `hammer2 setcheck sha192` gets weaker scrub coverage than the
-  XXHASH64 default. `CHECK_NONE` / `CHECK_DISABLED` return "match"
-  unconditionally — no detection at all.
+- **`CHECK_NONE` / `CHECK_DISABLED` blocks have no detection at all** —
+  both scrub and the read path treat them as always-matching, so
+  neither detects nor repairs them. (SHA192 is now fully covered: the
+  scrub shares `hammer2_bref_check_match()` with the chain layer.)
 - **Memory and CPU corruption are out of scope**, per §7.1's table. Given §3.4's
   finding that floating-point SDC predominantly flips low-order bits — producing
   plausible-looking wrong answers — and §5.5's ZFS caveat, ECC RAM is not
@@ -559,26 +584,28 @@ The field data in §3 gives the cadence its justification:
    ```
    0 3 * * 0  hammer2 -s /mnt/tank raid scrub || logger -p daemon.err "hammer2 scrub found unrepairable blocks"
    ```
-2. **Alert on `brefs_bad > 0`, not just on `brefs_unrepairable`.** §3.2's
-   strongest operational finding is that errors are clustered, not Poisson: mean
-   mismatches per corrupt disk was 104 with a median of 3, and a handful of sick
-   drives produce nearly all corruption. The first repaired block on a given disk
-   is a leading indicator, not a curiosity. `hammer2 raid scrub` only exits
-   non-zero on unrepairable blocks, so watch the `brefs_repaired` /
-   `brefs_bad` counters explicitly.
-3. **Log every run's counters yourself.** The kernel fields are zeroed at the
-   start of each scrub (`local_hammer2_io.c:2271-2275`) and do not survive
-   unmount. There is no cumulative corruption count, no per-disk CKSUM column,
-   and no sysctl exposing either — the `zpool status` equivalent does not exist.
-   A per-run history file is the only way to see the trend that §3.2 says is the
-   actual predictive signal. Track `brefs_done` too: a sudden drop means the
-   walker pruned a subtree behind a corrupt indirect block (§7.2).
+2. **Alert on the per-disk CKSUM counters, not just on scrub exit codes.**
+   §3.2's strongest operational finding is that errors are clustered, not
+   Poisson: mean mismatches per corrupt disk was 104 with a median of 3, and a
+   handful of sick drives produce nearly all corruption. The first healed block
+   on a given disk is a leading indicator, not a curiosity. `hammer2 raid
+   status` now carries the `zpool status` CKSUM equivalent — cumulative
+   per-disk `cksum_err` / `healed` / `unrepairable` since mount, fed by both
+   the read-path self-heal and the scrub, plus `selfheal_writes done/dropped`
+   for the deferred repair queue. Alert on any disk whose `cksum_err` grows.
+3. **Log the counters across remounts yourself.** The per-disk counters are
+   in-memory and reset at mount; scrub counters are zeroed at the start of
+   each scrub. A per-run history file (of `raid status` + scrub output) is
+   still the only way to see the long-term trend that §3.2 says is the actual
+   predictive signal.
 4. **Scrub *before* you resilver, never only after a disk dies.** 8% of NetApp's
    mismatches were discovered during reconstruction — the one moment redundancy
-   is gone. This is doubly true here, because per §7.4 `raid replace` performs no
-   checksum verification of its own: any latent corruption on a surviving column
-   is copied verbatim onto the new disk, and it will still be there after the
-   array reports itself healthy. A clean scrub is what makes a replace safe.
+   is gone. The resilver itself performs no checksum verification (§7.4): any
+   latent corruption on a surviving column is copied verbatim onto the new
+   disk. `raid replace` now runs an automatic scrub *after* completion, which
+   repairs what the resilver propagated — but only a scrub *before* the
+   replace protects the resilver window itself. A clean scrub is what makes a
+   replace safe.
 5. **Watch dmesg — but do not trust it for volume.** CHECK-failure reporting goes
    through `krate_h2chk`, rate-limited to `.freq = 5`
    (`src/sys/local_hammer2_chain.c:89`), so a corruption storm is heavily
@@ -608,16 +635,24 @@ The field data in §3 gives the cadence its justification:
      over one disk's stripe-data region while unmounted, remount, scrub, and
      confirm both that the pre-corruption sha256 is restored and that a follow-up
      scrub is clean.
+   - `tests/v3/test_l_selfheal.sh` is the read-path drill: same corruption
+     profile, but the file is *read* with no scrub — content must come back
+     correct (inline P/Q heal), `raid status` must show the per-disk counters,
+     a follow-up scrub must be clean (deferred repair writes landed), and a
+     corrupted primary-metadata disk must leave the whole tree reachable via
+     mirror-copy failover.
    - `sysctl vfs.hammer2.resilver_skip_unalloc=0` forces a full-iteration
      resilver baseline for comparison against the default bitmap-aware path.
 9. **Use ECC RAM, and keep XXHASH64.** Per §7.4, these two are where the
    remaining exposure actually is.
 
-The regimen above is doing real work because of §7.4's first bullet. On ZFS,
-ordinary reads quietly repair as they go and scrub is a background sweep for
-what nobody has read lately. Here, scrub is the *only* thing that repairs
-anything — an unscrubbed hammer2-raid6 array accumulates corruption exactly the
-way §5.4 describes, with full redundancy sitting unused next to it.
+Since the read-path self-heal landed, ordinary reads quietly repair as they
+go — the ZFS behavior — and scrub's job narrows to what it is on ZFS: a
+background sweep for the data *nobody reads*. That is still load-bearing for
+an archival array (cold data is precisely what bitrot eats first, and §3.2
+says half of all corruption is discoverable only by scrubbing), so the
+monthly cadence stands. What changed is the failure mode of skipping it:
+detected-and-healed-late instead of silently accumulating.
 
 ---
 

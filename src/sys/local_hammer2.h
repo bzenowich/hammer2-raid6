@@ -1229,6 +1229,37 @@ struct hammer2_dev {
 	volatile uint64_t scrub_brefs_unrepairable; /* CHECK FAIL, parity also bad */
 	volatile int	scrub_running;		/* 1 while scrub active */
 	int		scrub_error;		/* last scrub error (0 = none) */
+
+	/*
+	 * RAID6 read-path self-heal (bitrot.md §7.4 bullet 1).
+	 *
+	 * When hammer2_chain_testcheck() fails on a read from an ONLINE
+	 * disk, hammer2_chain_selfheal() reconstructs the block (P/Q for
+	 * DATA/DIRENT columns, sibling mirror copies for metadata),
+	 * verifies the reconstruction against the same CHECK code, fixes
+	 * the in-memory buffer so the read succeeds, and queues the
+	 * on-disk repair write here.  A dedicated kthread performs the
+	 * writes because the reader still holds the DIO buf for the
+	 * corrupt block — a synchronous getblk on the same (devvp,offset)
+	 * would deadlock (same constraint as the scrub repair path).
+	 */
+	hammer2_spin_t	repair_spin;		/* protects repair_queue */
+	TAILQ_HEAD(, hammer2_repair_req) repair_queue;
+	int		repair_queue_count;
+	volatile int	repair_thread_running;	/* 1 while kthread alive */
+	volatile int	repair_thread_exit;	/* request kthread exit */
+	struct thread	*repair_td;
+	volatile uint64_t repair_writes_done;	/* completed repair writes */
+	volatile uint64_t repair_writes_dropped; /* queue-full drops */
+
+	/*
+	 * Cumulative per-disk checksum-error accounting (zpool status
+	 * CKSUM equivalent).  In-memory; zeroed at mount.  Written by
+	 * both the read-path self-heal and the scrub.
+	 */
+	volatile uint64_t raid_cksum_errors[HAMMER2_MAX_VOLUMES];
+	volatile uint64_t raid_cksum_healed[HAMMER2_MAX_VOLUMES];
+	volatile uint64_t raid_cksum_unrepairable[HAMMER2_MAX_VOLUMES];
 };
 
 typedef struct hammer2_dev hammer2_dev_t;
@@ -2104,6 +2135,39 @@ int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
+
+/*
+ * Read-path self-heal repair queue (bitrot.md §7.4).
+ *
+ * A repair request writes `data` (verified-good bytes) into the buffer
+ * (disk_idx, base, bufsize) at [patch_off, patch_off+patch_len).  When
+ * the patch covers the whole buffer the write is a plain overwrite;
+ * otherwise the buffer is bread() first and only the patch range is
+ * replaced (metadata blocks share 64K device buffers with siblings).
+ * `data` is kmalloc'd by the caller; ownership passes to the queue.
+ */
+struct hammer2_repair_req {
+	TAILQ_ENTRY(hammer2_repair_req) entry;
+	int		disk_idx;
+	hammer2_off_t	base;		/* per-disk buffer base offset */
+	int		bufsize;	/* device buffer size */
+	int		patch_off;	/* offset of patch within buffer */
+	int		patch_len;	/* length of patch */
+	char		*data;		/* patch payload (owned) */
+};
+
+typedef struct hammer2_repair_req hammer2_repair_req_t;
+
+void hammer2_io_repair_start(hammer2_dev_t *hmp);
+void hammer2_io_repair_stop(hammer2_dev_t *hmp);
+void hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
+		hammer2_off_t base, int bufsize, int patch_off,
+		int patch_len, char *data);
+int hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
+		hammer2_off_t dev_pbase, int psize, int off,
+		const hammer2_blockref_t *bref, void *bdata, size_t bytes);
+int hammer2_bref_check_match(const hammer2_blockref_t *bref,
+		const void *data, size_t bytes);
 
 /*
  * Fault injection for v3 RAID6 tests.  When a bit is set in
