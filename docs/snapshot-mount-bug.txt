@@ -1,0 +1,2 @@
+Kernel panic — mounting a snapshot PFS of a multi-volume HAMMER2 panics 6.4 (hammer2_base_delete in
+  flush).
