@@ -134,10 +134,16 @@ if [ "$MODE" = "install" ]; then
     DISPLAY_ARGS=(-vga std -display gtk,window-close=off)
 fi
 
+# KVM when available; TCG fallback otherwise (containers without /dev/kvm)
+ACCEL_ARGS=(-enable-kvm -cpu host)
+if [ ! -c /dev/kvm ]; then
+    echo "launch-dfly: /dev/kvm not available, falling back to TCG" >&2
+    ACCEL_ARGS=(-accel "tcg,thread=multi" -cpu qemu64)
+fi
+
 QEMU_ARGS=(
     -name h2dev
-    -enable-kvm
-    -cpu host
+    "${ACCEL_ARGS[@]}"
     -smp "$CPUS"
     -m "$RAM"
     "${DISPLAY_ARGS[@]}"
