@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Put the harness SSH key back into the guest's /root/.ssh/authorized_keys.
+
+Usage:
+    recover-key             reset, install the key, reboot, wait for sshd
+    recover-key enter       stop at the single-user prompt
+    recover-key write       install into a single-user shell already up
+
+This is the way back in when key auth breaks — the guest's home directory has
+been wiped more than once. Root has a serial-console password nobody has, so
+the login prompt is not a fallback: single-user is the only route, and it is
+reachable with nothing but the two sockets in run/, which is what makes this
+work from inside the claude-box sandbox.
+
+Getting there is fiddly, and every awkward step below is load-bearing:
+
+  * The loader takes serial input only. QMP send-key is PS/2 and never reaches
+    it, and `boot -s` and `set boot_single=YES` at the OK prompt are both
+    ignored by dloader, so the single 's' of the menu is the whole interface —
+    spammed, because there is no prompt to wait for. `init_path=/bin/sh`
+    panics ("Going nowhere without my init"); don't.
+  * After a hard reset the root fs is dirty, and `mount -u -w /` is REFUSED
+    until `fsck -y /` has run. It fails quietly: the mount is still read-only
+    and the writes that follow go nowhere. Hence the explicit RWOK check.
+  * Serial input is lossy under load — characters double. The key therefore
+    goes out in 36-char chunks and is verified with md5, not trusted to one
+    long echo.
+
+The identity comes from vmenv.sh's resolution order, so this finds the same
+key ssh.sh does. $H2_VM_KEY / $H2_VM_PUBKEY override; $H2_QMP_SOCK and
+$H2_SERIAL_SOCK override the socket paths.
+
+Assembled from run/sukey8.py (menu -> single-user) and run/sukey11.py (fsck ->
+verified write), which could never be run back to back: sukey8 exited to
+multiuser, destroying the shell sukey11 needed.
+"""
+
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+
+VM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUN = os.path.join(VM_ROOT, "run")
+QMP_SOCK = os.environ.get("H2_QMP_SOCK") or os.path.join(RUN, "qmp.sock")
+SERIAL_SOCK = os.environ.get("H2_SERIAL_SOCK") or os.path.join(RUN, "serial.sock")
+
+
+def say(msg):
+    print("### %s" % msg, flush=True)
+
+
+# --- identity -------------------------------------------------------------
+
+def resolve_key():
+    """Private key path, in vmenv.sh's order. None if nothing is on disk."""
+    if os.environ.get("H2_VM_KEY"):
+        return os.environ["H2_VM_KEY"]
+    for cand in (os.path.join(VM_ROOT, "harness", "id_ed25519"),
+                 os.path.expanduser("~/.ssh/h2dev_ed25519")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def resolve_pubkey():
+    """The public key line to install.
+
+    $H2_VM_PUBKEY wins, then <key>.pub, then ssh-keygen -y on the private key.
+    An agent-only identity cannot be recovered from here — there is no agent in
+    single-user mode — so that is a hard error rather than a silently empty
+    authorized_keys, which would lock the guest away for good.
+    """
+    env = os.environ.get("H2_VM_PUBKEY")
+    if env:
+        return open(env).read().strip() if os.path.isfile(env) else env.strip()
+    key = resolve_key()
+    if not key:
+        sys.exit("recover-key: no SSH identity — set H2_VM_KEY or H2_VM_PUBKEY,\n"
+                 "            or drop the key at %s/harness/id_ed25519"
+                 % VM_ROOT)
+    pub = key + ".pub"
+    if os.path.isfile(pub):
+        return open(pub).read().strip()
+    try:
+        out = subprocess.run(["ssh-keygen", "-y", "-f", key],
+                             capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        sys.exit("recover-key: cannot derive a pubkey from %s: %s" % (key, e))
+    return out.stdout.strip()
+
+
+# --- the two channels -----------------------------------------------------
+
+def qmp(command):
+    """One QMP command, past the greeting and capabilities negotiation."""
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(QMP_SOCK)
+    except OSError as e:
+        sys.exit("recover-key: cannot connect to %s: %s (is the VM running?)"
+                 % (QMP_SOCK, e))
+    f = s.makefile("rw", encoding="utf-8", newline="\n")
+    f.readline()
+    for cmd in ("qmp_capabilities", command):
+        f.write(json.dumps({"execute": cmd}) + "\n")
+        f.flush()
+        while True:
+            reply = json.loads(f.readline())
+            if "return" in reply or "error" in reply:
+                break
+        if "error" in reply:
+            sys.exit("recover-key: qmp %s failed: %s" % (cmd, reply["error"]))
+    s.close()
+
+
+class Serial:
+    """The guest's serial console, with the read/match discipline the loader
+    and the single-user shell need.
+
+    Everything ever read stays in .seen, and .mark is where the current wait
+    began, so a match can never be satisfied by output from an earlier step.
+    """
+
+    def __init__(self):
+        self.s = socket.socket(socket.AF_UNIX)
+        try:
+            self.s.connect(SERIAL_SOCK)
+        except OSError as e:
+            sys.exit("recover-key: cannot connect to %s: %s" % (SERIAL_SOCK, e))
+        self.s.settimeout(0.2)
+        self.seen = ""
+        self.mark = 0
+
+    def pump(self):
+        try:
+            data = self.s.recv(65536)
+            if data:
+                self.seen += data.decode("utf-8", "replace")
+        except socket.timeout:
+            pass
+
+    def raw(self, data):
+        self.s.sendall(data)
+
+    def send(self, text, cps=0.03):
+        # Per character, with a gap: the guest drops or doubles pasted input.
+        for ch in text:
+            self.s.sendall(ch.encode())
+            time.sleep(cps)
+
+    def waitfor(self, pattern, timeout, label):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.pump()
+            if re.search(pattern, self.seen[self.mark:]):
+                say("got: %s" % label)
+                return True
+        say("TIMEOUT: %s\n--- tail ---\n%s" % (label, self.seen[-1000:]))
+        return False
+
+    def run(self, command, expect=r"#\s*$", timeout=300, cps=0.05):
+        """One shell command at the single-user prompt."""
+        time.sleep(0.4)
+        self.mark = len(self.seen)
+        self.send(command + "\r", cps)
+        return self.waitfor(expect, timeout, "after: %s" % command[:44])
+
+
+# --- phases ---------------------------------------------------------------
+
+def enter(ser):
+    """Hard-reset and steer the loader into single-user. Leaves a live shell."""
+    qmp("system_reset")
+    say("reset")
+
+    if not ser.waitfor(r"Escape to loader prompt", 600, "loader menu"):
+        return False
+
+    # 's' registers only while the countdown is up. Stop the moment the kernel
+    # starts loading, or the leftover keystrokes land in whatever comes next.
+    ser.mark = len(ser.seen)
+    deadline = time.time() + 300
+    state = None
+    while time.time() < deadline:
+        ser.pump()
+        recent = ser.seen[ser.mark:]
+        if "pathname of shell" in recent or "RETURN for /bin/sh" in recent:
+            state = "su"
+            break
+        if re.search(r"login:", recent):
+            state = "multi"
+            break
+        if "kernel text=" not in recent and "Copyright (c) 2003-2022" not in recent:
+            ser.raw(b"s")
+        time.sleep(0.2)
+    say("state=%s" % state)
+    if state != "su":
+        say("the countdown escaped into a normal boot; try again")
+        return False
+
+    # Ctrl-U first: the spam above leaves stray 's' on the prompt line, and
+    # anything but an empty answer is taken as a pathname.
+    time.sleep(1)
+    ser.mark = len(ser.seen)
+    ser.send("\x15\r")
+    return ser.waitfor(r"#", 60, "root shell")
+
+
+def write(ser, pubkey):
+    """Install the key from an already-live single-user shell, then reboot."""
+    ser.raw(b"\r")
+    time.sleep(2)
+    ser.pump()
+    if not re.search(r"# $", ser.seen[-20:]):
+        say("no shell at serial; abort\n--- tail ---\n%s" % ser.seen[-400:])
+        return False
+    say("shell present")
+
+    ser.run("fsck -y /", timeout=1800)
+    if not ser.run("mount -u -w / && echo RWOK", expect=r"RWOK", timeout=120):
+        say("root fs would not go read-write — did fsck actually finish?")
+        return False
+    ser.run("mkdir -p /root/.ssh; chmod 700 /root/.ssh")
+
+    want = hashlib.md5((pubkey + "\n").encode()).hexdigest()
+    chunks = [pubkey[i:i + 36] for i in range(0, len(pubkey), 36)]
+    for attempt in range(1, 7):
+        ser.run(": > /root/.ssh/authorized_keys")
+        for chunk in chunks:
+            ser.run("echo -n '%s' >> /root/.ssh/authorized_keys" % chunk, cps=0.06)
+        ser.run("echo '' >> /root/.ssh/authorized_keys")
+        time.sleep(0.5)
+        ser.mark = len(ser.seen)
+        ser.send("md5 -q /root/.ssh/authorized_keys\r")
+        time.sleep(4)
+        ser.pump()
+        seen_md5 = re.findall(r"\b[0-9a-f]{32}\b", ser.seen[ser.mark:])
+        got = seen_md5[-1] if seen_md5 else None
+        say("md5 got=%s want=%s" % (got, want))
+        if got == want:
+            break
+        say("mismatch on attempt %d" % attempt)
+    else:
+        say("FAILED: key never verified")
+        return False
+
+    ser.run("chmod 600 /root/.ssh/authorized_keys")
+    ser.run("sync")
+    time.sleep(1)
+    ser.mark = len(ser.seen)
+    ser.send("reboot\r")
+    say("key verified; clean reboot issued")
+    return True
+
+
+def console_tail():
+    """Last non-blank console line, as a sign of life during the boot wait."""
+    try:
+        with open(os.path.join(VM_ROOT, "logs", "console.log"),
+                  errors="replace") as f:
+            lines = [l.strip() for l in f.read().splitlines() if l.strip()]
+        return lines[-1][:70] if lines else "(console empty)"
+    except OSError as e:
+        return "(no console: %s)" % e
+
+
+def wait_for_ssh(timeout=1200):
+    """QMP reports the CPU running long before sshd is up, so ask ssh.sh.
+
+    This can be a long wait — a reboot that cold-starts QEMU has been seen
+    taking ~9 minutes to reach multiuser, against ~1 for an in-place reset.
+    So it reports the last console line every 30s: a silent poll loop is
+    indistinguishable from a hung script, and gets killed like one.
+    """
+    say("waiting for sshd (up to %dm)" % (timeout // 60))
+    started = time.time()
+    spoke = 0.0
+    while time.time() - started < timeout:
+        probe = subprocess.run([os.path.join(VM_ROOT, "ssh.sh"), "true"],
+                               capture_output=True)
+        if probe.returncode == 0:
+            say("guest answered ssh after %ds" % int(time.time() - started))
+            return True
+        if time.time() - spoke >= 30:
+            spoke = time.time()
+            say("%4ds  %s" % (int(time.time() - started), console_tail()))
+        time.sleep(10)
+    say("TIMEOUT: guest never answered ssh")
+    return False
+
+
+def main():
+    phase = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if phase not in ("all", "enter", "write"):
+        sys.exit("usage: recover-key [all|enter|write]")
+
+    pubkey = resolve_pubkey() if phase in ("all", "write") else None
+    if pubkey:
+        say("installing: %s" % pubkey)
+    ser = Serial()
+
+    if phase in ("all", "enter") and not enter(ser):
+        return 1
+    if phase == "enter":
+        say("single-user shell ready — run `recover-key write` next")
+        return 0
+    if not write(ser, pubkey):
+        return 1
+    return 0 if wait_for_ssh() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

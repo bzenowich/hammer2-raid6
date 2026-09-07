@@ -13,6 +13,7 @@ project, which deploys to it.
 ./launch-dfly.sh run   # or: one-shot VM, no supervisor, gone when it exits
 ./launch-dfly.sh reset # discard the overlay, recreate it from the locked base
 bin/push  bin/pull     # rsync the tree in, crash dumps and artifacts out
+bin/recover-key        # key auth broken? reinstall it over the serial console
 ./mount-dfly.sh        # sshfs the guest's root at mnt/dfly
 bin/run-test <script>  # full reset → boot → push → test → collect cycle
 bin/watcher start      # panic/lockup detection and recovery
@@ -106,6 +107,26 @@ through an agent without exposing the file.
 The guest's public key is baked into the base image
 (`harness/guest-config/authorized_keys`), so a new key means re-baking the base
 — copying the existing private key is the cheap path.
+
+That baked-in copy is only the *starting* state of the overlay, though, and the
+guest's `/root/.ssh` has been lost more than once. When it goes, key auth is
+the only way in that anyone has: root's serial-console password is not written
+down anywhere, so the `login:` prompt is not a fallback. **`bin/recover-key`**
+is the way back — it hard-resets the guest, steers the loader into single-user
+over the serial socket, and reinstalls the key that `vmenv.sh` resolves:
+
+```
+./bin/recover-key            # reset, install, reboot, wait for sshd (~3-12 min)
+./bin/recover-key enter      # stop at the single-user prompt
+./bin/recover-key write      # install into a single-user shell already up
+```
+
+It needs nothing but `run/qmp.sock` and `run/serial.sock`, so it works from
+inside the sandbox. The header comment explains why each step is shaped the way
+it is; the short version is that the loader takes serial input only, `mount -u
+-w /` is refused until `fsck -y /` has run and then fails *silently*, and
+serial input doubles characters under load — so the key goes over in 36-char
+chunks and is md5-verified before the reboot.
 
 Host keys are recorded in `run/known_hosts`, never in your personal one. After
 re-baking the base image the guest's host key changes: `rm run/known_hosts`.
