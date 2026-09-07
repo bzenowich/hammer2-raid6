@@ -12,6 +12,21 @@ Examples:
     qmp cont
     qmp quit
     qmp human-monitor-command '{"command-line":"info registers"}'
+
+QEMU's control channel is line-oriented JSON over a unix socket: a greeting,
+then `qmp_capabilities` to leave negotiation mode, then one request/response
+per line. Asynchronous events arrive interleaved on the same socket and carry
+neither `return` nor `error`, so replies are matched by skipping anything
+without one.
+
+human-monitor-command is how snapshots are reached (savevm / loadvm / info
+snapshots). The monitor reports its failures — no such snapshot, no writable
+disk — as *text* on an otherwise successful QMP call, so its output is printed
+raw rather than as escaped JSON. ./vmctl.sh is the front end for all of it.
+
+The socket is a plain file in run/, which is what makes this work from inside
+the claude-box sandbox: the project directory is mounted there, so the VM is
+reachable even though /dev/kvm is not.
 """
 
 import json
@@ -19,20 +34,29 @@ import os
 import socket
 import sys
 
-SOCK_PATH = os.path.join(
+SOCK_PATH = os.environ.get("H2_QMP_SOCK") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "run", "qmp.sock"
 )
 
+# savevm/loadvm write or read the whole guest RAM and can sit for a while on a
+# cold page cache; ordinary queries should never take seconds. Without a
+# timeout a wedged QEMU hangs the caller — and the watcher — forever.
+TIMEOUT = 15
+TIMEOUT_MONITOR = 600
 
-def recv_obj(sock):
-    buf = b""
-    while not buf.endswith(b"\n"):
-        chunk = sock.recv(4096)
-        if not chunk:
-            sys.exit("qmp: socket closed unexpectedly")
-        buf += chunk
-    return json.loads(buf.decode())
+
+def call(f, command, arguments=None):
+    message = {"execute": command}
+    if arguments is not None:
+        message["arguments"] = arguments
+    f.write(json.dumps(message) + "\n")
+    f.flush()
+    for line in f:
+        reply = json.loads(line)
+        if "return" in reply or "error" in reply:
+            return reply
+    sys.exit("qmp: connection closed without a reply to %s" % command)
 
 
 def main():
@@ -42,29 +66,28 @@ def main():
     cmd_name = sys.argv[1]
     args = json.loads(sys.argv[2]) if len(sys.argv) > 2 else None
 
-    if not os.path.exists(SOCK_PATH):
-        sys.exit(f"qmp: socket {SOCK_PATH} does not exist (is the VM running?)")
-
     s = socket.socket(socket.AF_UNIX)
+    s.settimeout(TIMEOUT_MONITOR if cmd_name == "human-monitor-command" else TIMEOUT)
     try:
         s.connect(SOCK_PATH)
-    except (ConnectionRefusedError, FileNotFoundError) as e:
-        sys.exit(f"qmp: cannot connect to {SOCK_PATH}: {e}")
+    except OSError as e:
+        sys.exit(f"qmp: cannot connect to {SOCK_PATH}: {e} (is the VM running?)")
+    f = s.makefile("rw", encoding="utf-8", newline="\n")
 
-    recv_obj(s)  # banner
-    s.sendall(b'{"execute":"qmp_capabilities"}\n')
-    recv_obj(s)
-
-    cmd = {"execute": cmd_name}
-    if args is not None:
-        cmd["arguments"] = args
-    s.sendall((json.dumps(cmd) + "\n").encode())
-
-    reply = recv_obj(s)
-    print(json.dumps(reply, indent=2))
+    try:
+        f.readline()  # greeting
+        call(f, "qmp_capabilities")
+        reply = call(f, cmd_name, args)
+    except socket.timeout:
+        sys.exit("qmp: timed out waiting for a reply (is the VM wedged?)")
 
     if "error" in reply:
+        print(json.dumps(reply, indent=2))
         sys.exit(1)
+    result = reply["return"]
+    # The monitor returns text already formatted for a human; every other
+    # command returns a structure.
+    print(result if isinstance(result, str) else json.dumps(reply, indent=2))
 
 
 if __name__ == "__main__":

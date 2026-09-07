@@ -1,8 +1,15 @@
 # Autonomous QEMU Harness for HAMMER2 RAID6 Development
 
 **Date**: 2026-05-21
-**Status**: Proposed
+**Status**: Implemented; this is the rationale, not the interface.
 **Target guest**: DragonFlyBSD 6.4.2-RELEASE (released ~2026-05-11)
+
+> For how to actually use the harness — `host-run.sh`, `vmctl.sh`, `ssh.sh`,
+> snapshots, and running it from inside the claude-box sandbox — see
+> **`harness/README.md`**. Two things here have since been superseded: the
+> `~/.ssh/config` `h2dev` alias is now only a fallback (identity is resolved
+> by `vmenv.sh`, because the sandbox has no `~/.ssh`), and the VM no longer
+> has to be started by the same shell that drives it.
 
 The goal of this harness is to let the development agent build, test, observe,
 recover, and iterate on the guest kernel without requiring the human to take

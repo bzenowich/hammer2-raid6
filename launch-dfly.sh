@@ -1,5 +1,5 @@
 #!/bin/bash
-# launch-dfly.sh — start the harness VM.
+# launch-dfly.sh — start the harness VM as a one-shot QEMU.
 #
 # Modes (first positional arg):
 #   run      (default) boot from images/overlay-system.qcow2
@@ -13,36 +13,36 @@
 #   FOREGROUND=1            do not daemonize (block until QEMU exits)
 #   ISO=path/to.iso         override CDROM image for install mode
 #   SSH_PORT=2322           host forwarding port for guest SSH
+#
+# The machine itself is defined in qemu-machine.sh, shared with host-run.sh.
+#
+# This is the direct way: one QEMU, gone when it exits. When something *else*
+# has to boot and reboot the VM — an agent in the claude-box sandbox above all
+# — use ./host-run.sh on the host instead and drive it with ./vmctl.sh.
 
 set -e
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-mkdir -p run logs images iso
-
 MODE="${1:-run}"
-NDISKS="${NDISKS:-4}"
-RAM="${RAM:-4G}"
-CPUS="${CPUS:-4}"
-SSH_PORT="${SSH_PORT:-2322}"
 
-BASE="images/base-dfly-6.4.2.qcow2"
-SYS="images/overlay-system.qcow2"
-SYS_SIZE="${SYS_SIZE:-20G}"
-RAID_SIZE="${RAID_SIZE:-4G}"
-
-PIDFILE="run/qemu.pid"
-SERIAL_SOCK="run/serial.sock"
-QMP_SOCK="run/qmp.sock"
-CONSOLE_LOG="logs/console.log"
+. ./qemu-machine.sh
 
 # -------------------------------------------------------------------
-# Sanity: do not start a second VM on top of a running one.
+# Sanity: do not start a second VM on top of a running one, and never touch
+# the disk images while host-run.sh is supervising — it would boot a fresh
+# QEMU straight back onto them.
 # -------------------------------------------------------------------
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+if h2_supervised; then
+    echo "launch-dfly: ./host-run.sh is supervising the VM (pid $(cat "$SUPERVISOR_PIDFILE"))" >&2
+    echo "             stop it first, or drive the running VM with ./vmctl.sh" >&2
+    exit 1
+fi
+
+if [ "$MODE" != "reset" ] && h2_running; then
     echo "launch-dfly: VM already running (pid $(cat "$PIDFILE"))" >&2
-    echo "             stop it first: bin/qmp quit" >&2
+    echo "             stop it first: ./vmctl.sh quit" >&2
     exit 1
 fi
 
@@ -78,19 +78,16 @@ case "$MODE" in
         fi
         CDROM_ARGS=(-cdrom "$ISO")
         BOOT_ARGS=(-boot d)
+        # Install mode needs VGA + GTK because DragonFly's dfuiinstaller spawns
+        # dfuife_curses on a separate VT — there is no such VT on a serial-only
+        # guest, so the backend stalls forever waiting for a frontend. The
+        # graphical window only appears during install; the installed system
+        # uses serial via /boot/loader.conf (harness/guest-config/apply.sh).
+        H2_DISPLAY_ARGS=(-vga std -display gtk,window-close=off)
         echo "launch-dfly: install mode, CDROM=$ISO"
         ;;
     run)
-        if [ ! -f "$SYS" ]; then
-            if [ -f "$BASE" ]; then
-                qemu-img create -f qcow2 -F qcow2 -b "$(realpath "$BASE")" "$SYS"
-                echo "launch-dfly: created overlay from base"
-            else
-                echo "launch-dfly: no system disk at $SYS and no base at $BASE" >&2
-                echo "             run: ./launch-dfly.sh install" >&2
-                exit 1
-            fi
-        fi
+        h2_ensure_sys
         BOOT_ARGS=(-boot c)
         ;;
     *)
@@ -99,79 +96,12 @@ case "$MODE" in
         ;;
 esac
 
-# -------------------------------------------------------------------
-# RAID test disks
-# -------------------------------------------------------------------
-RAID_ARGS=()
-for i in $(seq 0 $((NDISKS - 1))); do
-    img="images/raid${i}.qcow2"
-    if [ ! -f "$img" ]; then
-        qemu-img create -f qcow2 "$img" "$RAID_SIZE" >/dev/null
-        echo "launch-dfly: created $img ($RAID_SIZE)"
-    fi
-    RAID_ARGS+=(
-        -drive "if=none,id=raid${i},format=qcow2,file=${img},cache=writeback"
-        -device "virtio-blk-pci,drive=raid${i},serial=RAID${i}"
-    )
-done
-
-# -------------------------------------------------------------------
-# Truncate console log per launch (panic forensics belong to the run
-# that produced them; older runs are preserved in logs/runs/).
-# -------------------------------------------------------------------
+# Truncate console log per launch (panic forensics belong to the run that
+# produced them; older runs are preserved in logs/runs/).
 : > "$CONSOLE_LOG"
 
-# -------------------------------------------------------------------
-# Build the QEMU command
-# -------------------------------------------------------------------
-# Install mode needs VGA + GTK because DragonFly's dfuiinstaller spawns
-# dfuife_curses on a separate VT — there is no such VT on a serial-only
-# guest, so the backend stalls forever waiting for a frontend. The
-# graphical window only appears during install; the installed system
-# uses serial via /boot/loader.conf (see harness/guest-config/apply.sh).
-DISPLAY_ARGS=(-nographic)
-if [ "$MODE" = "install" ]; then
-    DISPLAY_ARGS=(-vga std -display gtk,window-close=off)
-fi
-
-# KVM when available; TCG fallback otherwise (containers without /dev/kvm)
-ACCEL_ARGS=(-enable-kvm -cpu host)
-if [ ! -c /dev/kvm ]; then
-    echo "launch-dfly: /dev/kvm not available, falling back to TCG" >&2
-    ACCEL_ARGS=(-accel "tcg,thread=multi" -cpu qemu64)
-fi
-
-QEMU_ARGS=(
-    -name h2dev
-    "${ACCEL_ARGS[@]}"
-    -smp "$CPUS"
-    -m "$RAM"
-    "${DISPLAY_ARGS[@]}"
-    -nodefaults
-
-    # System disk (virtio-blk for vtbd0)
-    -drive "if=none,id=sys,format=qcow2,file=${SYS},cache=writeback"
-    -device "virtio-blk-pci,drive=sys,serial=SYS,bootindex=1"
-
-    "${RAID_ARGS[@]}"
-
-    # User-mode net with SSH port forward
-    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
-    -device "virtio-net-pci,netdev=net0"
-
-    # Serial console → Unix socket + logfile
-    -chardev "socket,id=ser,path=${SERIAL_SOCK},server=on,wait=off,logfile=${CONSOLE_LOG},logappend=on"
-    -serial "chardev:ser"
-
-    # QMP control socket
-    -chardev "socket,id=mon,path=${QMP_SOCK},server=on,wait=off"
-    -mon "chardev=mon,mode=control"
-
-    -pidfile "$PIDFILE"
-
-    "${CDROM_ARGS[@]}"
-    "${BOOT_ARGS[@]}"
-)
+h2_machine_args
+QEMU_ARGS+=("${CDROM_ARGS[@]}" "${BOOT_ARGS[@]}")
 
 if [ "${FOREGROUND:-0}" = "1" ]; then
     echo "launch-dfly: starting QEMU in foreground (FOREGROUND=1)"
@@ -180,8 +110,9 @@ else
     QEMU_ARGS+=(-daemonize)
     qemu-system-x86_64 "${QEMU_ARGS[@]}"
     echo "launch-dfly: VM started, pid $(cat "$PIDFILE")"
-    echo "             console:  bin/console follow"
-    echo "             monitor:  bin/qmp query-status"
-    echo "             shell:    ssh h2dev"
-    echo "             stop:     bin/qmp quit"
+    echo "             wait:     ./vmctl.sh wait"
+    echo "             console:  ./vmctl.sh log   /  ./vmctl.sh console"
+    echo "             status:   ./vmctl.sh status"
+    echo "             shell:    ./ssh.sh"
+    echo "             stop:     ./vmctl.sh quit"
 fi

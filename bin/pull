@@ -1,13 +1,18 @@
 #!/bin/sh
 # pull — rsync crash dumps + test artifacts back to the host.
-# Never fails the caller; missing paths on guest are not errors.
+# Never fails the caller; missing paths on the guest are not errors.
+#
+# Identity and port come from ../vmenv.sh (see bin/push).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${PULL_SRC:-h2dev}"
+VM_ROOT="$ROOT"
+. "$ROOT/vmenv.sh"
+
+SRC="${PULL_SRC:-$VM_TARGET}"
 
 mkdir -p "$ROOT/logs/dumps" "$ROOT/logs/artifacts"
 
-rsync -a "$SRC:/var/crash/"   "$ROOT/logs/dumps/"     2>/dev/null || true
-rsync -a "$SRC:/root/h2-out/" "$ROOT/logs/artifacts/" 2>/dev/null || true
+rsync -a -e "$VM_RSYNC_RSH" "$SRC:/var/crash/"   "$ROOT/logs/dumps/"     2>/dev/null || true
+rsync -a -e "$VM_RSYNC_RSH" "$SRC:/root/h2-out/" "$ROOT/logs/artifacts/" 2>/dev/null || true
 
 exit 0

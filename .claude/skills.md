@@ -7,22 +7,25 @@ the HAMMER2 RAID6 kernel module on a remote DragonFlyBSD VM.
 
 ## VM Access
 
+Full harness reference: `harness/README.md`.
+
 ```sh
-# Run a command on the VM (SSHes as root)
-./dfly-exec.sh <command>
+# Run a command on the VM (as root, forced through sh past the tcsh login)
+./ssh.sh <command>          # ./dfly-exec.sh is a shim for the same thing
 
 # Examples:
-./dfly-exec.sh 'uname -a'
-./dfly-exec.sh 'kldstat | grep hammer2'
-./dfly-exec.sh 'cd /usr/src && make'
+./ssh.sh 'uname -a'
+./ssh.sh 'kldstat | grep hammer2'
+./ssh.sh 'cd /usr/src/sys/vfs/hammer2 && make 2>&1 | tail -20'
 
-# IMPORTANT: VM shell is tcsh — use single-quoted sh -c for compound commands
-./dfly-exec.sh 'cd /usr/src/sys/vfs/hammer2 && make 2>&1 | tail -20'
-
-# IMPORTANT: Avoid 2>&1 outside of sh -c; tcsh treats it as ambiguous
-# BAD:  ./dfly-exec.sh 'make 2>&1'
-# GOOD: ./dfly-exec.sh 'make > /tmp/out.txt 2>&1 && cat /tmp/out.txt'
+# Redirection works: the command is piped to sh in the guest, so tcsh never
+# sees it. Only `./ssh.sh --raw ...` (tunnels, stdin) hits tcsh directly.
+./ssh.sh                    # interactive shell
 ```
+
+Host, port (2322) and SSH key come from `vmenv.sh`, not from `~/.ssh/config` —
+there is no `~/.ssh` inside the claude-box sandbox. If it says "no SSH
+identity", see `harness/README.md`.
 
 ## SSHFS Mount (Browse/Edit Files Directly)
 
@@ -40,14 +43,17 @@ the HAMMER2 RAID6 kernel module on a remote DragonFlyBSD VM.
 ## Copying Files To/From VM
 
 ```sh
+# `vm:` stands for the guest — ./scp.sh fills in host, port and key.
 # Copy a file TO the VM
-scp local_file.c root@192.168.25.102:/usr/src/sys/vfs/hammer2/
+./scp.sh local_file.c vm:/usr/src/sys/vfs/hammer2/
 
 # Copy a file FROM the VM
-scp root@192.168.25.102:/usr/src/sys/vfs/hammer2/hammer2_io.c ./
+./scp.sh vm:/usr/src/sys/vfs/hammer2/hammer2_io.c ./
 
 # Copy a patch FROM the VM
-scp root@192.168.25.102:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
+./scp.sh vm:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
+
+# Whole trees: bin/push (host -> /root/h2) and bin/pull (dumps + artifacts).
 ```
 
 ## Building the Kernel Module
@@ -81,21 +87,33 @@ scp root@192.168.25.102:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
 
 ```sh
 # Reboot (required after installing a new hammer2.ko — root fs uses it)
-./dfly-exec.sh 'reboot'
+# and block until it is answering SSH again:
+./vmctl.sh reboot
 
-# Wait ~30 seconds, then check if it's back:
-sleep 30 && ./dfly-exec.sh 'uname -a'
+# Hard reset instead, when the guest is too wedged to reboot itself:
+./vmctl.sh reset
 ```
 
 ## Running the VM (QEMU)
 
 ```sh
-# Start the DragonFlyBSD VM (from this project directory)
-./launch-dfly.sh
+# One-shot: daemonized QEMU, headless, gone when it exits
+./launch-dfly.sh run
 
-# The VM gets IP 192.168.25.102 via DHCP on the bridge
-# Initial window size: 1024x768 (via OVMF EDID)
+# Supervised (run this ON THE HOST): QEMU stays out there with /dev/kvm and
+# publishes its control plane into run/ + logs/, so a sandboxed session can
+# reset, cold-boot and snapshot it. Without this the box boots under TCG:
+# 8-12 minutes to a login, every time.
+./host-run.sh &
+
+./vmctl.sh wait             # block until the guest answers SSH
+./vmctl.sh save booted      # ...then stop paying for boots
+./vmctl.sh load booted
+./vmctl.sh status | log 80 | console | reset | coldboot | nmi | quit
 ```
+
+The VM is headless with slirp networking — no bridge, no window, no IP of its
+own. Anything mentioning 192.168.25.x is from the retired bridged setup.
 
 ## Virtual Disk Management (vnconfig)
 
@@ -146,7 +164,7 @@ sleep 30 && ./dfly-exec.sh 'uname -a'
 ./dfly-exec.sh 'cat /tmp/raid6_tracked.patch /tmp/newfile_cmd_raid.patch /tmp/newfile_raid6c.patch /tmp/newfile_raid6h.patch > /tmp/hammer2_raid6_full.patch'
 
 # Copy to local project:
-scp root@192.168.25.102:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
+./scp.sh vm:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
 ```
 
 ## Applying a Patch (On VM)

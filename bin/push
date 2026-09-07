@@ -1,13 +1,20 @@
 #!/bin/sh
 # push — rsync working tree to the guest at /root/h2/.
 # Excludes VCS, build artifacts, harness state, and ISO/disk images.
+#
+# Identity and port come from ../vmenv.sh, not from a `h2dev` entry in
+# ~/.ssh/config — the sandbox has no ~/.ssh. Override the destination with
+# PUSH_DEST (a full rsync target) if you need somewhere else.
 
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${PUSH_DEST:-h2dev:/root/h2/}"
+VM_ROOT="$ROOT"
+. "$ROOT/vmenv.sh"
 
-exec rsync -a --delete \
+DEST="${PUSH_DEST:-$VM_TARGET:/root/h2/}"
+
+exec rsync -a --delete -e "$VM_RSYNC_RSH" \
     --exclude='.git/' \
     --exclude='*.o' \
     --exclude='*.ko' \

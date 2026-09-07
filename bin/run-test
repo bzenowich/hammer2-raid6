@@ -40,6 +40,16 @@ mkdir -p "$RUN_DIR"
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN_DIR/orchestrator.log" ; }
 
+# A supervisor would boot a fresh QEMU straight back onto the disk images this
+# script is about to delete and recreate. Refuse rather than corrupt the run.
+if [ -f run/supervisor.pid ] && kill -0 "$(cat run/supervisor.pid)" 2>/dev/null; then
+    echo "run-test: ./host-run.sh is supervising the VM (pid $(cat run/supervisor.pid))." >&2
+    echo "          Stop it first — this test resets the overlay from base, which" >&2
+    echo "          needs the disks to itself. For a clean state without stopping it," >&2
+    echo "          use ./vmctl.sh load <snapshot> instead." >&2
+    exit 1
+fi
+
 # -- 1. tear down --------------------------------------------------------
 log "tearing down any existing VM/watcher"
 bin/watcher stop >/dev/null 2>&1 || true
@@ -65,18 +75,16 @@ log "launching VM"
 ./launch-dfly.sh run >> "$RUN_DIR/orchestrator.log" 2>&1
 
 # -- 5. wait for SSH -----------------------------------------------------
+# BOOT_TIMEOUT is generous because a TCG boot of DragonFly takes 8-12 minutes;
+# on KVM the guest is up in well under a minute and the wait returns early.
 log "waiting for SSH"
-deadline=$(($(date +%s) + 120))
-while ! ssh -o ConnectTimeout=3 -o BatchMode=yes h2dev true 2>/dev/null; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        log "SSH did not come up in 120s; aborting"
-        cp logs/console.log "$RUN_DIR/console.log" 2>/dev/null || true
-        bin/qmp quit >/dev/null 2>&1 || true
-        echo "FAIL: ssh timeout" > "$RUN_DIR/result.txt"
-        exit 1
-    fi
-    sleep 2
-done
+if ! ./vmctl.sh wait "${BOOT_TIMEOUT:-900}" >> "$RUN_DIR/orchestrator.log" 2>&1; then
+    log "SSH did not come up in ${BOOT_TIMEOUT:-900}s; aborting"
+    cp logs/console.log "$RUN_DIR/console.log" 2>/dev/null || true
+    bin/qmp quit >/dev/null 2>&1 || true
+    echo "FAIL: ssh timeout" > "$RUN_DIR/result.txt"
+    exit 1
+fi
 log "SSH up"
 
 # -- 6. push -------------------------------------------------------------
@@ -90,7 +98,7 @@ bin/watcher start >> "$RUN_DIR/orchestrator.log" 2>&1
 # -- 8. run test ---------------------------------------------------------
 log "running test: $TEST (timeout ${TIMEOUT}s)"
 set +e
-timeout "$TIMEOUT" ssh h2dev "cd /root/h2 && sh $TEST" \
+timeout "$TIMEOUT" ./ssh.sh "cd /root/h2 && sh $TEST" \
     > "$RUN_DIR/test.stdout" 2> "$RUN_DIR/test.stderr"
 RC=$?
 set -e

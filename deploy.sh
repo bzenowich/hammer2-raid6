@@ -9,18 +9,29 @@
 #   all     — sync + build + install + tests (default)
 #
 # Environment:
-#   DFLY_HOST — VM SSH host alias (default: h2dev)
+#   DFLY_HOST — override with a plain SSH host alias (default: the harness's
+#               own identity from vmenv.sh, which needs no ~/.ssh/config and
+#               therefore also works inside the claude-box sandbox)
 
-DFLY_HOST="${DFLY_HOST:-h2dev}"
-VM="${DFLY_HOST}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+VM_ROOT="$DIR"
+. "$DIR/vmenv.sh"
+if [ -n "${DFLY_HOST:-}" ]; then
+    VM="$DFLY_HOST"
+    VM_SSH_OPTS=""
+    VM_SCP_OPTS=""
+else
+    VM="$VM_TARGET"
+fi
 
 # scp a local file to the VM, renaming it to $dst
 scp_as() {
     local src="$1"
     local dst="$2"
     printf "  %-45s -> %s\n" "$(basename "$src")" "$dst"
-    scp -q "$src" "${VM}:${dst}"
+    # shellcheck disable=SC2086  # VM_SCP_OPTS must word-split
+    scp -q $VM_SCP_OPTS "$src" "${VM}:${dst}"
 }
 
 do_sync() {
@@ -43,7 +54,7 @@ do_sync() {
         "/usr/src/sys/vfs/hammer2/Makefile"
 
     echo "==> Patching /usr/src/sys/conf/files for hammer2_raid6.c"
-    ssh "$VM" sh <<'ENDSSH'
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 set -e
 F=/usr/src/sys/conf/files
 if grep -q '^vfs/hammer2/hammer2_raid6\.c' "$F"; then
@@ -78,7 +89,7 @@ ENDSSH
     # built.  Must insert BEFORE the .include line — bsd.prog.mk consumes
     # SRCS at include time.
     echo "==> Patching /usr/src/sbin/hammer2/Makefile for cmd_raid.c"
-    ssh "$VM" sh <<'ENDSSH'
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 MF=/usr/src/sbin/hammer2/Makefile
 if grep -q 'cmd_raid\.c' "$MF"; then
     echo "    already present"
@@ -92,7 +103,7 @@ ENDSSH
 
 do_build() {
     echo "==> Building on VM (${DFLY_HOST})..."
-    ssh "$VM" sh <<'ENDSSH'
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 set -e
 # Fast KMOD build: produces /usr/src/sys/vfs/hammer2/hammer2.ko in
 # seconds.  This .ko loads fine via kldload at runtime; it just isn't
@@ -117,7 +128,7 @@ ENDSSH
 
 do_reload() {
     echo "==> Live-reloading hammer2.ko on ${DFLY_HOST}..."
-    ssh "$VM" sh <<'ENDSSH'
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 set -e
 # Drop the running hammer2 and load the freshly-built KMOD .ko in
 # place.  Requires no hammer2 filesystem to be mounted; `mount` is
@@ -145,7 +156,7 @@ ENDSSH
 
 do_install() {
     echo "==> Installing on VM..."
-    ssh "$VM" sh <<'ENDSSH'
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 set -e
 # Pick the right hammer2.ko.  The KMOD-style /usr/src/sys/vfs/hammer2/
 # hammer2.ko (produced by `make` inside the VFS dir) is a valid ELF
@@ -183,14 +194,14 @@ ENDSSH
 
 do_tests() {
     echo "==> Syncing test scripts -> /root/hammer2-tests/"
-    ssh "$VM" mkdir -p /root/hammer2-tests
+    ssh $VM_SSH_OPTS "$VM" mkdir -p /root/hammer2-tests
     # Use tar to preserve directory structure (rsync may not be on DragonFlyBSD)
-    tar -C "$DIR" -cf - tests | ssh "$VM" tar -xf - -C /root/hammer2-tests --strip-components=1
+    tar -C "$DIR" -cf - tests | ssh $VM_SSH_OPTS "$VM" tar -xf - -C /root/hammer2-tests --strip-components=1
     echo "    Tests synced to /root/hammer2-tests/"
 
     echo "==> Syncing diagnostic tools -> /root/h2diag/"
-    ssh "$VM" mkdir -p /root/h2diag
-    tar -C "$DIR/src" -cf - diag | ssh "$VM" tar -xf - -C /root/h2diag --strip-components=1
+    ssh $VM_SSH_OPTS "$VM" mkdir -p /root/h2diag
+    tar -C "$DIR/src" -cf - diag | ssh $VM_SSH_OPTS "$VM" tar -xf - -C /root/h2diag --strip-components=1
     echo "    Diagnostics synced to /root/h2diag/"
 }
 

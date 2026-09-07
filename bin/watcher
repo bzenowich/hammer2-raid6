@@ -42,6 +42,7 @@ WATCHER_PID = os.path.join(ROOT, "run", "watcher.pid")
 QEMU_PID = os.path.join(ROOT, "run", "qemu.pid")
 QMP = os.path.join(ROOT, "bin", "qmp")
 PULL = os.path.join(ROOT, "bin", "pull")
+SSH = os.path.join(ROOT, "ssh.sh")
 
 POLL_INTERVAL = 10        # seconds between SSH probes
 FAIL_THRESHOLD = 3        # consecutive failures before classifying
@@ -73,12 +74,15 @@ def log(msg):
 
 
 def ssh_alive():
+    # ssh.sh resolves host, port and identity from vmenv.sh — the harness no
+    # longer depends on a `h2dev` entry in ~/.ssh/config, which does not exist
+    # inside the claude-box sandbox.
+    env = dict(os.environ, VM_CONNECT_TIMEOUT=str(SSH_TIMEOUT))
     try:
         r = subprocess.run(
-            ["ssh", "-o", f"ConnectTimeout={SSH_TIMEOUT}",
-             "-o", "BatchMode=yes", "h2dev", "true"],
+            [SSH, "--raw", "-o", "BatchMode=yes", "true"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=SSH_TIMEOUT + 2,
+            timeout=SSH_TIMEOUT + 2, env=env,
         )
         return r.returncode == 0
     except (subprocess.TimeoutExpired, OSError):

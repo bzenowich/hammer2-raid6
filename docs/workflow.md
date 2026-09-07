@@ -4,13 +4,23 @@
 
 ### Launch the VM
 
-```bash
-# 4-disk default
-./launch-dfly.sh
+Two ways, and which one you want depends on who is driving. The full story is
+in `harness/README.md`; the short version:
 
-# 6-disk
-NDISKS=6 ./launch-dfly.sh
+```bash
+# One-shot: a daemonized QEMU, gone when it exits. You are at the keyboard.
+./launch-dfly.sh run                 # 4-disk default
+NDISKS=6 ./launch-dfly.sh run        # 6-disk
+
+# Supervised: run this ON THE HOST, once. QEMU stays out there with /dev/kvm
+# and publishes its control plane into the project, so an agent in the
+# claude-box sandbox can reset, cold-boot and snapshot it without the device.
+./host-run.sh &
 ```
+
+Under the sandbox there is no `/dev/kvm`, so a VM booted in there is TCG and
+takes 8-12 minutes to reach a login. That is what `host-run.sh` is for, and why
+`./vmctl.sh save booted` / `load booted` is worth the one-time cost.
 
 QEMU attaches `images/dfly-raid{0..N-1}.qcow2` (4 GB each, `RAID_SIZE=`
 overrides) as virtio-blk devices.  Inside DragonFlyBSD these appear as
@@ -20,15 +30,24 @@ brick the VM.
 
 ### VM access
 
-User-mode networking forwards host `127.0.0.1:2322` → guest `:22`.  An
-SSH alias `h2dev` is preconfigured.
+User-mode networking forwards host `127.0.0.1:2322` → guest `:22`.
 
 ```bash
-ssh h2dev <command>             # run a command on the VM
-scp src.c h2dev:/path           # copy file
-bin/console follow              # attach to serial console (kprintf log)
-bin/qmp query-status            # QEMU monitor command
+./ssh.sh                        # interactive shell
+./ssh.sh '<command>'            # run an sh script line on the VM
+./ssh.sh --raw -L 8443:localhost:443 -N   # tunnels, stdin, anything raw
+./vmctl.sh status               # running? QMP state + does SSH answer
+./vmctl.sh wait                 # block until the guest answers SSH
+./vmctl.sh log 80               # last 80 lines of serial console
+./vmctl.sh console              # attach to the live console (detach: C-])
+./vmctl.sh save booted          # snapshot; `load booted` restores in seconds
 ```
+
+`ssh.sh` resolves host, port and key from `vmenv.sh` — **not** from a `h2dev`
+entry in `~/.ssh/config`, which does not exist inside the claude-box sandbox.
+See `harness/README.md` under "SSH identity" for where it looks and what to do
+when it finds nothing. The `h2dev` alias still works on the host, and `bin/`,
+`vmctl.sh` and `../dfly/bin/` all go through `vmenv.sh` now.
 
 Do **not** use IP literals.  The old `192.168.25.66` / `.102` addresses
 are from the prior LAN-bridged VM and no longer reach anything.
@@ -141,6 +160,10 @@ Group K (commit `37d3808`); any reference to `DISK_MODE=vn`,
 
 ### "Ambiguous output redirect" from tcsh
 
+`./ssh.sh '<cmd>'` sidesteps this entirely — it pipes the script to `sh` in
+the guest, so ordinary sh redirection works. The rest of this section applies
+to a bare `ssh`, including `./ssh.sh --raw`.
+
 Root's shell on DragonFly is **tcsh**, which is csh-family.  Bash-style
 redirection in `ssh h2dev '<cmd>'` is silently invalid:
 
@@ -184,9 +207,13 @@ All wrapped in `sh -c` per the redirect rule above.
 If hammer2 deadlocks badly enough that ssh hangs:
 
 ```bash
-bin/qmp quit                     # graceful via QMP socket
+./vmctl.sh reset                 # hard reset — the fast reboot
+./vmctl.sh nmi                   # break the wedged kernel into ddb instead
+./vmctl.sh console               # ...and drive the ddb prompt from here
+./vmctl.sh coldboot              # quit; host-run.sh boots a fresh QEMU
+./vmctl.sh quit                  # graceful via QMP socket
 pkill -9 qemu-system-x86_64      # nuclear option
-./launch-dfly.sh                 # restart
+./launch-dfly.sh run             # restart (one-shot mode only)
 ```
 
 System root is UFS, so a hard kill triggers fsck on next boot — watch

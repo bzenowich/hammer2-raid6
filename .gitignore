@@ -7,6 +7,11 @@ mnt/
 src/diag/diag_map
 src/diag/h2raid6_test
 
+# Harness SSH identity: a copy of the key the base image was built with, so
+# the tooling works without ~/.ssh (see harness/README.md). Never committed.
+harness/id_ed25519
+harness/id_ed25519.pub
+
 # Harness runtime state and downloaded artifacts
 images/
 iso/
