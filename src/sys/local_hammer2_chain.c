@@ -5664,6 +5664,92 @@ hammer2_bref_check_match(const hammer2_blockref_t *bref,
 }
 
 /*
+ * Parity self-heal of a DATA/DIRENT block whose CHECK failed.
+ *
+ * First reconstruct the column with only disk_idx erased (skipped when
+ * disk_idx is failed: the degraded read already did exactly that).  A
+ * second column in the row can be silently corrupt too, so if that
+ * does not verify, retry with each other live column erased as well;
+ * RAID6 recovers any two erasures.  A verifying result fixes bdata,
+ * and the repair kthread rewrites disk_idx (unless it is failed) and
+ * the second bad column.
+ *
+ * Returns 0 if healed, else HAMMER2_ERROR_CHECK.
+ */
+static int
+hammer2_chain_selfheal_parity(hammer2_chain_t *chain, void *bdata,
+			      int disk_idx)
+{
+	hammer2_dev_t *hmp = chain->hmp;
+	hammer2_blockref_t *bref = &chain->bref;
+	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
+	hammer2_off_t lbase = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
+	hammer2_off_t phys = lbase & HAMMER2_RAID6_PHYS_MASK;
+	hammer2_off_t col_base = phys & ~(hammer2_off_t)(stripe_unit - 1);
+	size_t off = (size_t)(phys - col_base);
+	int target_failed = hmp->raid_failed[disk_idx];
+	char *recon;
+	char *extra;
+	int error;
+	int e;
+
+	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	if (!target_failed) {
+		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
+						       recon,
+						       (size_t)stripe_unit, 1);
+		if (error == 0 &&
+		    hammer2_bref_check_match(bref, recon + off,
+					     chain->bytes)) {
+			bcopy(recon + off, bdata, chain->bytes);
+			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
+			krateprintf(&krate_h2heal,
+			    "hammer2: selfheal: read-path repair data_off "
+			    "%016jx disk %d (parity reconstruction)\n",
+			    (uintmax_t)bref->data_off, disk_idx);
+			/* ownership of recon passes to the repair queue */
+			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
+			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+			return 0;
+		}
+	}
+
+	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	for (e = 0; e < hmp->raid_config.ndisks; e++) {
+		if (e == disk_idx || hmp->raid_failed[e])
+			continue;
+		error = hammer2_io_raid6_read_degraded_x(hmp, lbase, disk_idx,
+		    recon, (size_t)stripe_unit, 1, e, extra);
+		if (error || !hammer2_bref_check_match(bref, recon + off,
+						       chain->bytes))
+			continue;
+
+		bcopy(recon + off, bdata, chain->bytes);
+		atomic_add_64(&hmp->raid_cksum_errors[e], 1);
+		atomic_add_64(&hmp->raid_cksum_healed[e], 1);
+		if (!target_failed)
+			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
+		krateprintf(&krate_h2heal,
+		    "hammer2: selfheal: read-path repair data_off %016jx "
+		    "disk %d (dual reconstruction, disk %d also bad)\n",
+		    (uintmax_t)bref->data_off, disk_idx, e);
+		/* ownership of the buffers passes to the repair queue */
+		hammer2_io_repair_enqueue(hmp, e, col_base,
+		    (int)stripe_unit, 0, (int)stripe_unit, extra);
+		if (target_failed) {
+			kfree(recon, M_HAMMER2);
+		} else {
+			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
+			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+		}
+		return 0;
+	}
+	kfree(extra, M_HAMMER2);
+	kfree(recon, M_HAMMER2);
+	return HAMMER2_ERROR_CHECK;
+}
+
+/*
  * Read-path self-heal (bitrot.md §7.4 bullet 1 — the ZFS behavior).
  *
  * Called when hammer2_chain_testcheck() fails on data read from an
@@ -5706,10 +5792,18 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 		return HAMMER2_ERROR_CHECK;
 	if (hmp->raid_failed[disk_idx]) {
 		/*
-		 * The read was already served by degraded reconstruction;
-		 * a CHECK failure here means the redundancy itself is bad.
-		 * Nothing further to try inline.
+		 * The read was already served by degraded reconstruction,
+		 * so another column of the row is bad as well.  For data,
+		 * find it with a second erasure (the counters go to that
+		 * disk).  Metadata on a failed disk came from a mirror
+		 * copy that was already checked; nothing more to try.
 		 */
+		if ((bref->type == HAMMER2_BREF_TYPE_DATA ||
+		     bref->type == HAMMER2_BREF_TYPE_DIRENT) &&
+		    hammer2_chain_selfheal_parity(chain, bdata,
+						  disk_idx) == 0) {
+			return 0;
+		}
 		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
 		atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx], 1);
 		return HAMMER2_ERROR_CHECK;
@@ -5721,35 +5815,9 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 	switch (bref->type) {
 	case HAMMER2_BREF_TYPE_DATA:
 	case HAMMER2_BREF_TYPE_DIRENT:
-	    {
-		uint64_t stripe_unit = hmp->raid_config.stripe_unit;
-		hammer2_off_t phys = lbase & HAMMER2_RAID6_PHYS_MASK;
-		hammer2_off_t col_base = phys &
-		    ~(hammer2_off_t)(stripe_unit - 1);
-		size_t off = (size_t)(phys - col_base);
-		char *recon;
-
-		recon = kmalloc((size_t)stripe_unit, M_HAMMER2,
-				M_WAITOK | M_ZERO);
-		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
-						       recon,
-						       (size_t)stripe_unit, 1);
-		if (error == 0 &&
-		    hammer2_bref_check_match(bref, recon + off, chain->bytes)) {
-			bcopy(recon + off, bdata, chain->bytes);
-			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
-			krateprintf(&krate_h2heal,
-			    "hammer2: selfheal: read-path repair data_off "
-			    "%016jx disk %d (parity reconstruction)\n",
-			    (uintmax_t)bref->data_off, disk_idx);
-			/* ownership of recon passes to the repair queue */
-			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
-			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+		if (hammer2_chain_selfheal_parity(chain, bdata, disk_idx) == 0)
 			return 0;
-		}
-		kfree(recon, M_HAMMER2);
 		break;
-	    }
 	case HAMMER2_BREF_TYPE_INODE:
 	case HAMMER2_BREF_TYPE_INDIRECT:
 	case HAMMER2_BREF_TYPE_FREEMAP_NODE:

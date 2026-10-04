@@ -1468,6 +1468,51 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 }
 
 /*
+ * Read a sibling column or mirror copy into dst for reconstruction.
+ *
+ * The caller may hold the buffer for its own column locked (self-heal
+ * runs under the DIO buf), and another thread healing a block in the
+ * same row holds that sibling's buffer while it waits for ours.  A
+ * blocking getblk here deadlocks the two (ABBA).  Take the cached
+ * buffer only if it is free; when another thread holds it, read the
+ * media directly through a pbuf instead.  The rows read here are
+ * committed, so the media copy is current.
+ */
+static int
+hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
+			      void *dst, int bytes)
+{
+	struct buf *bp;
+	int error;
+
+	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT, 0);
+	if (bp) {
+		error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
+		if (error == 0) {
+			bkvasync(bp);
+			bcopy(bp->b_data, dst, bytes);
+		}
+		brelse(bp);
+		return error;
+	}
+
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bp->b_cmd = BUF_CMD_READ;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vn_strategy(devvp, &bp->b_bio1);
+	error = biowait(&bp->b_bio1, "h2sib");
+	if (error == 0)
+		bcopy(bp->b_data, dst, bytes);
+	relpbuf(bp, NULL);
+	return error;
+}
+
+/*
  * Metadata mirror check-aware failover (bitrot.md §7.4 bullet 2, and
  * metadata_zone.md "Read path": on CHECK FAIL, try disk 1, disk 2, ...
  * until a copy verifies).
@@ -1486,7 +1531,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 				void *bdata, size_t bytes)
 {
 	hammer2_volume_t *vol;
-	struct buf *bp;
+	char *copy;
 	char *patch;
 	int i;
 	int error;
@@ -1494,6 +1539,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 
+	copy = kmalloc(psize, M_HAMMER2, M_WAITOK);
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
 		if (i == bad_disk_idx)
 			continue;
@@ -1504,28 +1550,23 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		    !vol->dev->open)
 			continue;
 
-		bp = NULL;
 		error = hammer2_inject_eio(i);
 		if (error == 0)
-			error = bread(vol->dev->devvp, dev_pbase, psize, &bp);
-		if (error || bp == NULL) {
-			if (bp)
-				brelse(bp);
+			error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
+			    dev_pbase, copy, psize);
+		if (error)
 			continue;
-		}
-		bkvasync(bp);
-		if (hammer2_bref_check_match(bref,
-		    (char *)bp->b_data + off, bytes)) {
-			bcopy((char *)bp->b_data + off, bdata, bytes);
-			brelse(bp);
+		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
+			bcopy(copy + off, bdata, bytes);
+			kfree(copy, M_HAMMER2);
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 			bcopy(bdata, patch, bytes);
 			hammer2_io_repair_enqueue(hmp, bad_disk_idx,
 			    dev_pbase, psize, off, (int)bytes, patch);
 			return 0;
 		}
-		brelse(bp);
 	}
+	kfree(copy, M_HAMMER2);
 	return EIO;
 }
 
@@ -1544,6 +1585,26 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 			       int data_disk_idx, void *buf, size_t bytes,
 			       int is_physical)
 {
+	return hammer2_io_raid6_read_degraded_x(hmp, logical_off,
+	    data_disk_idx, buf, bytes, is_physical, -1, NULL);
+}
+
+/*
+ * As hammer2_io_raid6_read_degraded, also treating extra_disk's column
+ * as an erasure (-1 for none).  A column that reads without error can
+ * still be silently corrupt; when a reconstruction fails its CHECK,
+ * the caller retries with each other column erased in turn.  With
+ * extra_buf non-NULL, the reconstructed extra column is copied there
+ * so the caller can repair it.  Fails with EIO when the erasures
+ * exceed what P and Q can recover.
+ */
+int
+hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
+				 hammer2_off_t logical_off,
+				 int data_disk_idx, void *buf, size_t bytes,
+				 int is_physical, int extra_disk,
+				 void *extra_buf)
+{
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
 	int ndata = rc->ndata;
@@ -1551,15 +1612,17 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 	int p_disk, q_disk;
 	int target_col;
 	int phys_disk, di, col;
+	int extra_col = -1;
+	int nerased = 0;
 	hammer2_off_t phys_off;
 	void *ptrs[HAMMER2_MAX_VOLUMES];
 	void *col_bufs[HAMMER2_MAX_VOLUMES];
 	hammer2_volume_t *vol;
-	struct buf *bp;
 	int error = 0;
 	int fail_data_a = -1, fail_data_b = -1;
 	int fail_p = 0, fail_q = 0;
 
+	bzero(ptrs, sizeof(ptrs));
 	bzero(col_bufs, sizeof(col_bufs));
 
 	KKASSERT(bytes == stripe_unit);
@@ -1620,11 +1683,15 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 						M_WAITOK | M_ZERO);
 			ptrs[col] = col_bufs[col];
 
-			if (phys_disk == data_disk_idx) {
+			if (phys_disk == extra_disk)
+				extra_col = col;
+			if (phys_disk == data_disk_idx ||
+			    phys_disk == extra_disk) {
 				/*
-				 * This is the column being reconstructed.
+				 * A column being reconstructed.
 				 * Leave the buffer zeroed and mark failed.
 				 */
+				++nerased;
 				if (col < ndata) {
 					if (fail_data_a == -1)
 						fail_data_a = col;
@@ -1639,6 +1706,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 			}
 
 			if (hmp->raid_failed[phys_disk]) {
+				++nerased;
 				if (col < ndata) {
 					if (fail_data_a == -1)
 						fail_data_a = col;
@@ -1653,20 +1721,13 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 			}
 
 			vol = &hmp->volumes[phys_disk];
-			bp = NULL;
 			lerror = hammer2_inject_eio(phys_disk);
 			if (lerror == 0)
-				lerror = breadnx(vol->dev->devvp, phys_off,
-						 stripe_unit, 0, NULL, NULL,
-						 0, &bp);
-			if (lerror == 0 && bp) {
-				bkvasync(bp);
-				bcopy(bp->b_data, col_bufs[col], stripe_unit);
-				brelse(bp);
-			} else {
+				lerror = hammer2_io_raid6_read_sibling(
+				    vol->dev->devvp, phys_off,
+				    col_bufs[col], (int)stripe_unit);
+			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
-				if (bp)
-					brelse(bp);
 				if (!injected) {
 					int aerr =
 					    hammer2_raid6_auto_fail_disk(
@@ -1676,6 +1737,7 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
 						break;
 					}
 				}
+				++nerased;
 				if (col < ndata) {
 					if (fail_data_a == -1)
 						fail_data_a = col;
@@ -1704,6 +1766,10 @@ do_recovery:
 	/* Perform recovery */
 	if (error)
 		goto read_degraded_done;
+	if (nerased > 2) {
+		error = EIO;
+		goto read_degraded_done;
+	}
 	error = 0;
 	if (fail_data_a != -1) {
 		if (fail_data_b != -1) {
@@ -1743,8 +1809,18 @@ do_recovery:
 	}
 
 	/* If target_col failed and reconstruction was impossible, return error */
+	/*
+	 * Every data column is now valid.  An erased P or Q column is
+	 * still zero (the recovery above only rebuilds data), so
+	 * regenerate both before handing out a parity column.
+	 */
+	if (error == 0 && (fail_p || fail_q))
+		hammer2_raid6_gen_syndrome(ndisks, stripe_unit, ptrs);
+
 	if (error == 0) {
 		bcopy(ptrs[target_col], buf, stripe_unit);
+		if (extra_buf && extra_col >= 0)
+			bcopy(ptrs[extra_col], extra_buf, stripe_unit);
 	}
 read_degraded_done:
 	/* Free temporary buffers */
@@ -1921,7 +1997,6 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 			hmp->resilver_running = 0;
 			return ENXIO;
 		}
-		vol = &hmp->volumes[surv];
 
 		for (ex = 0; ex < hmp->md_nextents; ex++) {
 			hammer2_off_t mo = hmp->md_extents[ex].md_off;
@@ -1943,27 +2018,46 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				if (this_chunk > MD_CHUNK)
 					this_chunk = MD_CHUNK;
 
-				bp = NULL;
-				lerror = hammer2_inject_eio(surv);
-				if (lerror == 0)
-					lerror = bread(vol->dev->devvp,
-					    (off_t)(mo + off),
-					    (int)this_chunk, &bp);
-				if (lerror || bp == NULL) {
+				/*
+				 * Every survivor holds a mirror copy; on a
+				 * read error try the next one.
+				 */
+				lerror = EIO;
+				for (i = surv; i < ndisks; i++) {
+					if (i == failed_disk_idx ||
+					    hmp->raid_failed[i] ||
+					    hmp->volumes[i].dev == NULL ||
+					    hmp->volumes[i].dev->devvp == NULL ||
+					    !hmp->volumes[i].dev->open)
+						continue;
+					vol = &hmp->volumes[i];
+					bp = NULL;
+					lerror = hammer2_inject_eio(i);
+					if (lerror == 0)
+						lerror = bread(vol->dev->devvp,
+						    (off_t)(mo + off),
+						    (int)this_chunk, &bp);
+					if (lerror == 0 && bp) {
+						bkvasync(bp);
+						bcopy(bp->b_data, md_buf,
+						      this_chunk);
+						brelse(bp);
+						break;
+					}
 					if (bp)
 						brelse(bp);
+					if (lerror == 0)
+						lerror = EIO;
+				}
+				if (lerror) {
 					kprintf("hammer2: resilver Phase A: "
 						"read err %d at off %jx "
-						"(disk %d)\n",
-						lerror, (intmax_t)(mo + off),
-						surv);
+						"on every survivor\n",
+						lerror, (intmax_t)(mo + off));
 					kfree(md_buf, M_HAMMER2);
 					hmp->resilver_running = 0;
 					return EIO;
 				}
-				bkvasync(bp);
-				bcopy(bp->b_data, md_buf, this_chunk);
-				brelse(bp);
 
 				wbp = getblk(new_devvp, (off_t)(mo + off),
 				    (int)this_chunk, GETBLK_KVABIO, 0);
@@ -2074,29 +2168,27 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				int injected = hammer2_inject_eio(phys_disk);
 				if (bp)
 					brelse(bp);
-				if (injected) {
-					/* injection: surface as clean EIO, no auto-fail */
+				/*
+				 * The unreadable column is a second
+				 * erasure for this stripe, which P+Q
+				 * still recover.  A third is fatal.
+				 * Injected EIO does not auto-fail the
+				 * disk so the test stays repeatable.
+				 */
+				if (other_failed_col >= 0 ||
+				    (!injected &&
+				     hammer2_raid6_auto_fail_disk(hmp,
+							phys_disk))) {
 					error = EIO;
-					kprintf("hammer2: resilver stripe %llu: "
-						"injected EIO on disk %d\n",
-						(unsigned long long)stripe_num,
-						phys_disk);
+					kprintf("hammer2: resilver stripe"
+						" %llu: unrecoverable"
+						" I/O error on disk %d\n",
+						(unsigned long long)
+						stripe_num, phys_disk);
 					goto resilver_done;
 				}
-				{
-					int aerr = hammer2_raid6_auto_fail_disk(
-							hmp, phys_disk);
-					if (aerr) {
-						error = EIO;
-						kprintf("hammer2: resilver stripe"
-							" %llu: unrecoverable"
-							" I/O error on disk %d\n",
-							(unsigned long long)
-							stripe_num, phys_disk);
-						goto resilver_done;
-					}
-				}
-				/* disk now in raid_failed[]; treated as zeros */
+				bzero(col_bufs[col], stripe_unit);
+				other_failed_col = col;
 			}
 		}
 

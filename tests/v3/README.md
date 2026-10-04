@@ -80,10 +80,6 @@ wrong-array member at mount time.
 
 These tests fail because of kernel bugs, not test problems:
 
-- **B6, M1, E3**: reconstruction erases only the target column, so one
-  failed disk plus a corrupt or EIO row-mate is not recovered.
-- **M2**: two silently corrupt columns deadlock (two self-heals each hold
-  one column buffer and wait in getblk for the other's); reboot after.
 - **D3**: writes made during a resilver are missing on the rebuilt disk.
 - **crash_host.sh**: `r != NULL` assertion in
   `hammer2_raid6_open_row_add_data` under the write+sync loop.

@@ -15,6 +15,8 @@
 #               own identity from vmenv.sh, which needs no ~/.ssh/config and
 #               therefore also works inside the claude-box sandbox)
 
+set -e
+
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 VM_ROOT="$DIR"

@@ -2148,6 +2148,10 @@ void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical);
+int hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
+		hammer2_off_t logical_off, int data_disk_idx,
+		void *buf, size_t bytes, int is_physical,
+		int extra_disk, void *extra_buf);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
