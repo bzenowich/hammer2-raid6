@@ -1901,12 +1901,12 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 
 /*
  * Place a freshly-allocated row into open_rows[].  Called from
- * stripe_alloc after the bitmap scan.  If open_rows is full,
- * force-seal the oldest entry to make space (drop+reacquire the
- * spinlock around the seal).
+ * stripe_alloc after the bitmap scan with stripe_bitmap_spin held, so
+ * the caller allocates the entry `r` (zeroed) before taking the lock.
  */
 static void
 hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
+				       struct hammer2_open_row *r,
 				       uint64_t row_id,
 				       hammer2_off_t phys_off,
 				       int disk_idx)
@@ -1916,16 +1916,14 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	int ndata = rc->ndata;
 	int p_disk = (int)(row_id % ndisks);
 	int q_disk = (p_disk + 1) % ndisks;
-	struct hammer2_open_row *r;
 
 	/*
 	 * TAILQ-backed tracker — never force-seal.  Each new row
-	 * allocates its own entry; entries are freed at seal time.
+	 * has its own entry; entries are freed at seal time.
 	 * Memory is bounded by (in-flight rows) × (per-entry metadata
 	 * + per-col_data buffer); typical TXG flushes drain everything
 	 * via hammer2_raid6_seal_all_open_rows.
 	 */
-	r = kmalloc(sizeof(*r), M_HAMMER2, M_WAITOK | M_ZERO);
 	r->phys_off   = phys_off;
 	r->row_id     = row_id;
 	r->p_disk     = p_disk;
@@ -2155,8 +2153,15 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	int bit_idx;
 	int disk_idx;
 	hammer2_off_t phys_off;
+	struct hammer2_open_row *newrow;
 	int radix;
 	int n;
+
+	/*
+	 * The open_rows entry for a new row, allocated here because
+	 * kmalloc(M_WAITOK) may sleep and the scan holds a spinlock.
+	 */
+	newrow = kmalloc(sizeof(*newrow), M_HAMMER2, M_WAITOK | M_ZERO);
 
 	/*
 	 * 6C packing: try to land in an existing open row first so a row
@@ -2186,6 +2191,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 				hmp->stripe_row_refcount[slot]++;
 			hammer2_raid6_sm_touch(hmp, slot);
 			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			kfree(newrow, M_HAMMER2);
 			prc_radix = 0;
 			while (prc_n > 1) { prc_n >>= 1; prc_radix++; }
 			chain->bref.data_off =
@@ -2230,6 +2236,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		slot++;
 	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	kfree(newrow, M_HAMMER2);
 	return ENOSPC;
 
 found:
@@ -2257,6 +2264,7 @@ found:
 		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
 		hmp->stripe_row_refcount[slot] = 0;
 		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		kfree(newrow, M_HAMMER2);
 		return ENOSPC;
 	}
 have_disk:
@@ -2264,11 +2272,10 @@ have_disk:
 	/*
 	 * Register the newly-allocated row so subsequent stripe_alloc
 	 * calls within the same TXG can pack into it.  Done while still
-	 * holding stripe_bitmap_spin (open_row_register_locked may
-	 * temporarily release the spin to seal an oldest entry if the
-	 * array is full).
+	 * holding stripe_bitmap_spin.
 	 */
-	hammer2_raid6_open_row_register_locked(hmp, slot, phys_off, disk_idx);
+	hammer2_raid6_open_row_register_locked(hmp, newrow, slot, phys_off,
+					       disk_idx);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
 	/* Compute radix (log2 of chain->bytes) */
