@@ -1914,8 +1914,11 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 {
 	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
 	void *to_free[HAMMER2_MAX_VOLUMES];
+	void *zbuf = NULL;
 	hammer2_off_t phys_off;
+	uint64_t row_id;
 	uint32_t alloc_mask_snap;
+	uint32_t dropped_snap;
 	size_t bytes;
 	int ncols = 0;
 	int p_disk_snap, q_disk_snap;
@@ -1938,11 +1941,26 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	phys_off = r->phys_off;
 	bytes = r->bytes;
 	alloc_mask_snap = r->alloc_mask;
+	dropped_snap = r->dropped_mask;
+	row_id = r->row_id;
 	p_disk_snap = r->p_disk;
 	q_disk_snap = r->q_disk;
 	TAILQ_REMOVE(&hmp->open_rows, r, entry);
 	hmp->open_rows_count--;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+
+	/*
+	 * Hold off the resilver's copy of this slot while we write it,
+	 * and tell it the slot is done if a rebuild is running: this seal
+	 * writes every column of the rebuilding disk.
+	 */
+	lockmgr(&hmp->rebuild_lk, LK_SHARED);
+	if (hmp->rebuild_active && hmp->rebuild_done &&
+	    row_id / 8 < hmp->stripe_bitmap_size) {
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		hmp->rebuild_done[row_id / 8] |= (uint8_t)(1 << (row_id % 8));
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	}
 
 	if (ncols > 0) {
 		/*
@@ -1965,11 +1983,21 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 				continue;
 			if (alloc_mask_snap & (1U << d))
 				continue;
-			if (hmp->raid_failed[d])
+			if (!hammer2_raid6_disk_writable(hmp, d))
 				continue;
 			if (hmp->volumes[d].dev == NULL ||
 			    hmp->volumes[d].dev->devvp == NULL)
 				continue;
+			if (hmp->raid_failed[d]) {
+				/* rebuilding disk: never wait on its bufs */
+				if (zbuf == NULL)
+					zbuf = kmalloc(bytes, M_HAMMER2,
+						       M_WAITOK | M_ZERO);
+				(void)hammer2_io_raid6_write_nowait(
+				    hmp->volumes[d].dev->devvp, phys_off,
+				    zbuf, (int)bytes);
+				continue;
+			}
 			zbp = getblk(hmp->volumes[d].dev->devvp, phys_off,
 				     (int)bytes, GETBLK_KVABIO, 0);
 			if (zbp == NULL)
@@ -1980,12 +2008,34 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 			(void)werr;
 		}
 
+		/*
+		 * putblk skips the data column of a failed disk.  Write it
+		 * here if that disk now takes writes: it is being rebuilt,
+		 * or it came back online since the putblk.
+		 */
+		for (i = 0; i < ncols; i++) {
+			d = cols[i].disk_idx;
+			if ((dropped_snap & (1U << d)) == 0)
+				continue;
+			if (!hammer2_raid6_disk_writable(hmp, d))
+				continue;
+			if (hmp->volumes[d].dev == NULL ||
+			    hmp->volumes[d].dev->devvp == NULL)
+				continue;
+			(void)hammer2_io_raid6_write_nowait(
+			    hmp->volumes[d].dev->devvp, phys_off,
+			    cols[i].data, (int)bytes);
+		}
+
 		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 						 ncols, bytes);
 	}
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
+	if (zbuf)
+		kfree(zbuf, M_HAMMER2);
 	kfree(r, M_HAMMER2);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
@@ -2085,7 +2135,8 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
  */
 void
 hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
-				int disk_idx, void *data, size_t bytes)
+				int disk_idx, void *data, size_t bytes,
+				int dropped)
 {
 	struct hammer2_open_row *r;
 	void *to_free = NULL;
@@ -2124,6 +2175,10 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		r->col_data[disk_idx] = NULL;
 	}
 	r->col_data[disk_idx] = data;
+	if (dropped)
+		r->dropped_mask |= 1U << disk_idx;
+	else
+		r->dropped_mask &= ~(1U << disk_idx);
 
 	/* Seal immediately if the row is full and every alloc'd col has data. */
 	complete = 1;
@@ -2165,6 +2220,35 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL)
 		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+}
+
+/*
+ * Return 1 if stripe slot `slot` may hold a parity row.  Slots in the
+ * reserved zones and in metadata-zone extents (metadata_zone.md) hold
+ * per-disk or mirrored data instead: the allocator never places a row
+ * there, and the resilver must not rebuild one there from parity.
+ */
+int
+hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot)
+{
+	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
+	hammer2_off_t off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
+	uint64_t zone = off / HAMMER2_ZONE_SEG64;
+	uint32_t ex;
+
+	if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
+	    zone <= HAMMER2_ZONE_FREEMAP_07 &&
+	    (zone % HAMMER2_ZONE_FREEMAP_INC) == HAMMER2_ZONE_FREEMAP_00)
+		return 0;
+	if (zone == HAMMER2_ZONE_RAID6_BITMAP)
+		return 0;
+	for (ex = 0; ex < hmp->md_nextents; ex++) {
+		hammer2_off_t mo = hmp->md_extents[ex].md_off;
+		hammer2_off_t ms = hmp->md_extents[ex].md_size;
+		if (off + stripe_unit > mo && off < mo + ms)
+			return 0;
+	}
+	return 1;
 }
 
 /*
@@ -2227,11 +2311,6 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	slot = start;
 
 	for (;;) {
-		uint64_t zone;
-		hammer2_off_t cand_off;
-		uint32_t ex;
-		int in_md_zone = 0;
-
 		if (slot >= max_stripes) {
 			if (wrapped)
 				break;
@@ -2244,34 +2323,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		if (wrapped && slot >= start)
 			break;
 
-		cand_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
-		zone = cand_off / HAMMER2_ZONE_SEG64;
-		if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
-		    zone <= HAMMER2_ZONE_FREEMAP_07 &&
-		    (zone % HAMMER2_ZONE_FREEMAP_INC) ==
-		     HAMMER2_ZONE_FREEMAP_00) {
-			slot++;
-			continue;
-		}
-		if (zone == HAMMER2_ZONE_RAID6_BITMAP) {
-			slot++;
-			continue;
-		}
-		/*
-		 * Skip slots whose per-disk physical offset falls inside any
-		 * metadata-zone extent (metadata_zone.md).  Without this,
-		 * stripe data would overlap the mirrored metadata area.
-		 */
-		for (ex = 0; ex < hmp->md_nextents; ex++) {
-			hammer2_off_t mo = hmp->md_extents[ex].md_off;
-			hammer2_off_t ms = hmp->md_extents[ex].md_size;
-			if (cand_off + stripe_unit > mo &&
-			    cand_off < mo + ms) {
-				in_md_zone = 1;
-				break;
-			}
-		}
-		if (in_md_zone) {
+		if (!hammer2_raid6_slot_is_data(hmp, slot)) {
 			slot++;
 			continue;
 		}

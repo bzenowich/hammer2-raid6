@@ -80,6 +80,5 @@ wrong-array member at mount time.
 
 These tests fail because of kernel bugs, not test problems:
 
-- **D3**: writes made during a resilver are missing on the rebuilt disk.
 - **crash_host.sh**: `r != NULL` assertion in
   `hammer2_raid6_open_row_add_data` under the write+sync loop.

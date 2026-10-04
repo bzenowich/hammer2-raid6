@@ -752,6 +752,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			char *raid6_data = NULL;
 			char *md_mirror_data = NULL;
 			int rz_meta = 0;
+			int dropped;
 
 			dio_write_stats_update(dio, bp);
 
@@ -816,6 +817,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					brelse(bp);
 				bp = NULL;
 			}
+			dropped = (bp == NULL);	/* primary not written */
 
 			/*
 			 * Allows dirty buffers to accumulate and
@@ -883,7 +885,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 				    pbase & HAMMER2_RAID6_PHYS_MASK;
 				hammer2_raid6_open_row_add_data(hmp,
 				    phys_off, dio->disk_idx,
-				    raid6_data, psize);
+				    raid6_data, psize, dropped);
 				raid6_data = NULL;
 			}
 
@@ -893,12 +895,14 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * cluster_write / bawrite to dio->devvp), replicate
 			 * the same payload synchronously to every surviving
 			 * sibling disk at the same per-disk byte offset.
-			 * skip_disk_idx avoids re-writing to the primary.
+			 * skip_disk_idx avoids re-writing to the primary,
+			 * unless the primary was skipped above (failed, or
+			 * being rebuilt and so wanting the copy).
 			 */
 			if (rz_meta && md_mirror_data) {
 				hammer2_off_t per_disk_off = pbase - dio->dbase;
 				hammer2_io_metadata_mirror_write(hmp,
-				    dio->disk_idx, per_disk_off,
+				    dropped ? -1 : dio->disk_idx, per_disk_off,
 				    md_mirror_data, psize);
 				kfree(md_mirror_data, M_HAMMER2);
 				md_mirror_data = NULL;
@@ -1513,6 +1517,66 @@ hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
 }
 
 /*
+ * Write a column to a disk being rebuilt.  Callers hold rebuild_lk,
+ * which the resilver takes exclusive, so this must never wait on a
+ * buffer: a thread holding that buffer through a DIO can itself be
+ * queued for rebuild_lk.  Take the cached buffer only if it is free,
+ * otherwise write the media directly through a pbuf.  The holder's
+ * copy is of the same block, so the cache does not go stale.
+ */
+int
+hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
+			      const void *data, int bytes)
+{
+	struct buf *bp;
+	int error;
+
+	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
+	if (bp) {
+		bkvasync(bp);
+		bcopy(data, bp->b_data, bytes);
+		return bwrite(bp);
+	}
+
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bcopy(data, bp->b_data, bytes);
+	bp->b_cmd = BUF_CMD_WRITE;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vn_strategy(devvp, &bp->b_bio1);
+	error = biowait(&bp->b_bio1, "h2rbw");
+	relpbuf(bp, NULL);
+	return error;
+}
+
+/*
+ * Point the cached DIOs of one disk at a new device vnode (disk
+ * replacement).  A DIO keeps the devvp it was created with.
+ */
+void
+hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
+			 struct vnode *devvp)
+{
+	hammer2_io_hash_t *hash;
+	hammer2_io_t *dio;
+	int i;
+
+	for (i = 0; i < HAMMER2_IOHASH_SIZE; ++i) {
+		hash = &hmp->iohash[i];
+		hammer2_spin_ex(&hash->spin);
+		for (dio = hash->base; dio; dio = dio->next) {
+			if (dio->disk_idx == disk_idx)
+				dio->devvp = devvp;
+		}
+		hammer2_spin_unex(&hash->spin);
+	}
+}
+
+/*
  * Metadata mirror check-aware failover (bitrot.md §7.4 bullet 2, and
  * metadata_zone.md "Read path": on CHECK FAIL, try disk 1, disk 2, ...
  * until a copy verifies).
@@ -1904,6 +1968,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 		if (surv < 0) {
 			kprintf("hammer2: resilver: no surviving disks\n");
+			hmp->resilver_running = 0;
 			return ENXIO;
 		}
 		vol = &hmp->volumes[surv];
@@ -1923,15 +1988,16 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					bkvasync(wbp);
 					bcopy(bp->b_data, wbp->b_data,
 					      HAMMER2_VOLUME_BYTES);
-					/* Patch the copy for the target disk */
+					/*
+					 * Patch the copy for the target disk.
+					 * It stays FAILED until the resilver
+					 * completes and the replace ioctl
+					 * syncs ONLINE headers; a crash in
+					 * between leaves it failed.
+					 */
 					voldata = (hammer2_volume_data_t *)
 					    wbp->b_data;
 					voldata->volu_id = failed_disk_idx;
-					voldata->raid_config.disk_state[
-					    failed_disk_idx] =
-					    HAMMER2_RAID6_DISK_ONLINE;
-					voldata->raid_config.flags &=
-					    ~HAMMER2_RAID6_FLAG_DEGRADED;
 					/* Recompute CRCs: ICRC0 first (covers
 					 * volu_id), then ICRCVH (covers all,
 					 * including updated ICRC0). */
@@ -1980,6 +2046,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
 		uint32_t ex;
 		int surv = -1;
+		int pass;
+		int prim;
 
 		for (i = 0; i < ndisks; i++) {
 			if (i != failed_disk_idx && !hmp->raid_failed[i] &&
@@ -2020,36 +2088,51 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 				/*
 				 * Every survivor holds a mirror copy; on a
-				 * read error try the next one.
+				 * read error try the next one.  Mirror copies
+				 * are written synchronously, so read those
+				 * first (pass 0): the primary's newest copy
+				 * may still be a delayed write held by a DIO,
+				 * and read_sibling then reads the media.
+				 *
+				 * Exclusive rebuild_lk keeps a concurrent
+				 * mirror write from landing between our read
+				 * and our write to the new disk.
 				 */
+				prim = -1;	/* as hammer2_get_volume() */
+				for (i = 0; i < hmp->nvolumes; i++) {
+					vol = &hmp->volumes[i];
+					if (mo + off >= vol->offset &&
+					    mo + off < vol->offset + vol->size) {
+						prim = i;
+						break;
+					}
+				}
+				lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
 				lerror = EIO;
-				for (i = surv; i < ndisks; i++) {
+				for (pass = 0; pass < 2 && lerror; pass++) {
+				    for (i = surv; i < ndisks; i++) {
 					if (i == failed_disk_idx ||
 					    hmp->raid_failed[i] ||
 					    hmp->volumes[i].dev == NULL ||
 					    hmp->volumes[i].dev->devvp == NULL ||
 					    !hmp->volumes[i].dev->open)
 						continue;
+					if ((pass == 0) == (i == prim))
+						continue;
 					vol = &hmp->volumes[i];
-					bp = NULL;
 					lerror = hammer2_inject_eio(i);
 					if (lerror == 0)
-						lerror = bread(vol->dev->devvp,
-						    (off_t)(mo + off),
-						    (int)this_chunk, &bp);
-					if (lerror == 0 && bp) {
-						bkvasync(bp);
-						bcopy(bp->b_data, md_buf,
-						      this_chunk);
-						brelse(bp);
-						break;
-					}
-					if (bp)
-						brelse(bp);
+						lerror =
+						 hammer2_io_raid6_read_sibling(
+						    vol->dev->devvp,
+						    (off_t)(mo + off), md_buf,
+						    (int)this_chunk);
 					if (lerror == 0)
-						lerror = EIO;
+						break;
+				    }
 				}
 				if (lerror) {
+					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 					kprintf("hammer2: resilver Phase A: "
 						"read err %d at off %jx "
 						"on every survivor\n",
@@ -2059,17 +2142,14 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					return EIO;
 				}
 
-				wbp = getblk(new_devvp, (off_t)(mo + off),
-				    (int)this_chunk, GETBLK_KVABIO, 0);
-				if (wbp) {
-					bkvasync(wbp);
-					bcopy(md_buf, wbp->b_data, this_chunk);
-					lerror = bwrite(wbp);
-					if (lerror) {
-						kfree(md_buf, M_HAMMER2);
-						hmp->resilver_running = 0;
-						return lerror;
-					}
+				lerror = hammer2_io_raid6_write_nowait(
+				    new_devvp, (off_t)(mo + off), md_buf,
+				    (int)this_chunk);
+				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+				if (lerror) {
+					kfree(md_buf, M_HAMMER2);
+					hmp->resilver_running = 0;
+					return lerror;
 				}
 				if ((off >> 22) % 16 == 0)
 					lwkt_yield();
@@ -2087,12 +2167,11 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	/*
 	 * Phase 3: Rebuild each stripe.
 	 *
-	 * Flush all pending writes first so that parity on surviving disks
-	 * is up-to-date before we read it.  Under v3 COW, concurrent writes
-	 * land in freshly-allocated stripe slots whose data column may or
-	 * may not be on the replacement disk — if it is, the write itself
-	 * goes there directly; if not, the resilver doesn't care.  No
-	 * second-pass tracking is needed (newplan.md §5.9).
+	 * Flush all pending writes first so that the rows sealed before
+	 * the rebuild started are on media before we read them.  Rows
+	 * sealed since then wrote the new disk's column themselves (the
+	 * replace ioctl set rebuild_active before calling us) and are
+	 * marked in rebuild_done.
 	 */
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
@@ -2114,7 +2193,33 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				continue;
 		}
 
+		/*
+		 * Slots that never hold a row (metadata zone, bitmap zone)
+		 * were copied by Phase A or are rewritten at sync; a parity
+		 * "rebuild" there would overwrite them with garbage.
+		 */
+		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    !hammer2_raid6_slot_is_data(hmp, stripe_num))
+			continue;
+
 		phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
+
+		/*
+		 * Exclusive rebuild_lk holds off seals, the only writers
+		 * of a sealed slot's parity, until our copy is on the new
+		 * disk; a seal that follows rewrites the new disk's column
+		 * itself.  A slot already sealed during the rebuild is
+		 * done: copying it from media could read a data column
+		 * that is still a delayed write.
+		 */
+		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		if (hmp->rebuild_done != NULL &&
+		    stripe_num / 8 < hmp->stripe_bitmap_size &&
+		    (hmp->rebuild_done[stripe_num / 8] &
+		     (1 << (stripe_num % 8)))) {
+			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			continue;
+		}
 
 		/* Left-symmetric P and Q disk positions */
 		p_disk = (int)(stripe_num % ndisks);
@@ -2154,20 +2259,13 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				continue; /* second failed disk, treat as 0 */
 
 			vol = &hmp->volumes[phys_disk];
-			bp = NULL;
 			lerror = hammer2_inject_eio(phys_disk);
 			if (lerror == 0)
-				lerror = breadnx(vol->dev->devvp, phys_off,
-						 stripe_unit, 0, NULL, NULL,
-						 0, &bp);
-			if (lerror == 0 && bp) {
-				bkvasync(bp);
-				bcopy(bp->b_data, col_bufs[col], stripe_unit);
-				brelse(bp);
-			} else {
+				lerror = hammer2_io_raid6_read_sibling(
+				    vol->dev->devvp, phys_off,
+				    col_bufs[col], (int)stripe_unit);
+			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
-				if (bp)
-					brelse(bp);
 				/*
 				 * The unreadable column is a second
 				 * erasure for this stripe, which P+Q
@@ -2179,6 +2277,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				    (!injected &&
 				     hammer2_raid6_auto_fail_disk(hmp,
 							phys_disk))) {
+					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 					error = EIO;
 					kprintf("hammer2: resilver stripe"
 						" %llu: unrecoverable"
@@ -2206,15 +2305,11 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 
 		/* Write reconstructed column to the new device */
-		wbp = getblk(new_devvp, phys_off, stripe_unit,
-			     GETBLK_KVABIO, 0);
-		if (wbp) {
-			bkvasync(wbp);
-			bcopy(ptrs[failed_col], wbp->b_data, stripe_unit);
-			lerror = bwrite(wbp);
-			if (lerror && !error)
-				error = lerror;
-		}
+		lerror = hammer2_io_raid6_write_nowait(new_devvp, phys_off,
+		    ptrs[failed_col], (int)stripe_unit);
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		if (lerror && !error)
+			error = lerror;
 
 		/* Update progress and yield every 256 stripes */
 		if ((stripe_num & 255) == 255) {

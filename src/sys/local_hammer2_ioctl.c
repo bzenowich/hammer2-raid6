@@ -1504,7 +1504,9 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 {
 	hammer2_ioc_raid_replace_t *rr = data;
 	hammer2_dev_t *hmp;
+	hammer2_devvp_t *dev;
 	struct vnode *new_devvp = NULL;
+	struct vnode *old_devvp;
 	struct nlookupdata nd;
 	int failed_disk_idx = -1;
 	int error;
@@ -1563,13 +1565,62 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		return error;
 	}
 
+	/*
+	 * Install the new device before the resilver so that writes made
+	 * while it runs reach it (hammer2_raid6_disk_writable).  The disk
+	 * stays failed for reads and allocation until the resilver is done.
+	 * Taking rebuild_lk exclusive waits out writers that already
+	 * decided to skip this disk.
+	 */
+	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	if (!hmp->raid_failed[failed_disk_idx] || hmp->rebuild_active) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		kprintf("hammer2: raid replace: disk %d %s\n", failed_disk_idx,
+			hmp->rebuild_active ? "another rebuild is running" :
+			"is not failed (fail-disk it first)");
+		vn_lock(new_devvp, LK_EXCLUSIVE | LK_RETRY);
+		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
+		vn_unlock(new_devvp);
+		vrele(new_devvp);
+		return EBUSY;
+	}
+	dev = hmp->volumes[failed_disk_idx].dev;
+	old_devvp = dev->devvp;
+	if (dev->open) {
+		/* failed but never closed (auto-fail): release it now */
+		vn_lock(old_devvp, LK_EXCLUSIVE | LK_RETRY);
+		VOP_CLOSE(old_devvp, FREAD | FWRITE, NULL);
+		vn_unlock(old_devvp);
+		dev->open = 0;
+	}
+	if (hmp->stripe_bitmap_size)
+		hmp->rebuild_done = kmalloc(hmp->stripe_bitmap_size,
+					    M_HAMMER2, M_WAITOK | M_ZERO);
+	dev->devvp = new_devvp;
+	dev->open = 1;
+	hammer2_io_retarget_disk(hmp, failed_disk_idx, new_devvp);
+	hmp->rebuild_disk = failed_disk_idx;
+	hmp->rebuild_active = 1;
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+
 	kprintf("hammer2: RAID6 resilver disk %d (%s) -> %s\n",
 		failed_disk_idx, rr->old_dev, rr->new_dev);
 
 	/* Run the resilver (this may take a long time) */
 	error = hammer2_io_raid6_resilver(hmp, ip->pmp, failed_disk_idx, new_devvp);
+
+	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	hmp->rebuild_active = 0;
+	if (hmp->rebuild_done) {
+		kfree(hmp->rebuild_done, M_HAMMER2);
+		hmp->rebuild_done = NULL;
+	}
 	if (error) {
 		kprintf("hammer2: resilver failed: %d\n", error);
+		dev->devvp = old_devvp;
+		dev->open = 0;
+		hammer2_io_retarget_disk(hmp, failed_disk_idx, old_devvp);
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 		/*
 		 * VOP_CLOSE on a devfs spec vnode expects the vnode locked
 		 * exclusively (devfs_spec_close → vn_lock → upgrade panics
@@ -1583,30 +1634,14 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	}
 
 	/*
-	 * Atomically swap the volume entry to point at the new device.
-	 * Update the in-memory RAID state.
+	 * The new disk is complete.  Bring it online; this is under
+	 * rebuild_lk so no seal sees it half-way.
 	 */
 	hammer2_voldata_lock(hmp);
 
-	/* Close old device if it is still open (may be failed/gone) */
-	if (hmp->volumes[failed_disk_idx].dev->open) {
-		vn_lock(hmp->volumes[failed_disk_idx].dev->devvp,
-			LK_EXCLUSIVE | LK_RETRY);
-		VOP_CLOSE(hmp->volumes[failed_disk_idx].dev->devvp,
-			  FREAD | FWRITE, NULL);
-		vn_unlock(hmp->volumes[failed_disk_idx].dev->devvp);
-		hmp->volumes[failed_disk_idx].dev->open = 0;
-	}
-
-	hmp->volumes[failed_disk_idx].dev->devvp = new_devvp;
-	if (hmp->volumes[failed_disk_idx].dev->path) {
-		kfree(hmp->volumes[failed_disk_idx].dev->path, M_HAMMER2);
-	}
-	hmp->volumes[failed_disk_idx].dev->path =
-		kstrdup(rr->new_dev, M_HAMMER2);
-	hmp->volumes[failed_disk_idx].dev->open = 1;
-
-	/* Update DIO devvp for any cached DIOs on old device (best-effort) */
+	if (dev->path)
+		kfree(dev->path, M_HAMMER2);
+	dev->path = kstrdup(rr->new_dev, M_HAMMER2);
 
 	/* Clear failure state */
 	if (hmp->raid_failed[failed_disk_idx]) {
@@ -1626,6 +1661,11 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	hammer2_voldata_modify(hmp);
 
 	hammer2_voldata_unlock(hmp);
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+
+	/* The mount's reference to the old vnode; ours moves to dev. */
+	if (old_devvp)
+		vrele(old_devvp);
 
 	/* Flush the updated config to all disks */
 	hammer2_vfs_sync(ip->pmp->mp, MNT_WAIT);

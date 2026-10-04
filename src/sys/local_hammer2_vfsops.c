@@ -1215,6 +1215,7 @@ next_hmp:
 		lockinit(&hmp->vollk, "h2vol", 0, 0);
 		lockinit(&hmp->bulklk, "h2bulk", 0, 0);
 		lockinit(&hmp->bflock, "h2bflk", 0, 0);
+		lockinit(&hmp->rebuild_lk, "h2rbld", 0, 0);
 
 		/*
 		 * vchain setup. vchain.data is embedded.

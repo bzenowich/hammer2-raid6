@@ -1143,6 +1143,7 @@ struct hammer2_open_row {
 	int		n_alloc;	/* popcount(alloc_mask) */
 	int		ndata;		/* cached rc->ndata */
 	size_t		bytes;		/* cached stripe_unit */
+	uint32_t	dropped_mask;	/* cols putblk did not write (disk failed) */
 	void		*col_data[HAMMER2_MAX_VOLUMES];
 };
 
@@ -1243,6 +1244,22 @@ struct hammer2_dev {
 	volatile uint64_t resilver_stripes_total;
 	volatile int	resilver_running;	/* 1 while resilver active */
 	int		resilver_disk_idx;	/* disk being resilvered (-1=none) */
+
+	/*
+	 * Online rebuild.  While rebuild_active, writes also go to
+	 * rebuild_disk although raid_failed[] stays set (reads and the
+	 * allocator still treat it as failed), so blocks written during
+	 * the resilver are complete on the new disk.  Writers that may
+	 * touch the new disk hold rebuild_lk shared across their I/O; the
+	 * resilver holds it exclusive while it copies one slot or one
+	 * metadata chunk, so neither overwrites the other with stale
+	 * data.  rebuild_done marks slots a writer sealed during the
+	 * rebuild; the resilver skips them.
+	 */
+	struct lock	rebuild_lk;
+	volatile int	rebuild_active;
+	int		rebuild_disk;
+	uint8_t		*rebuild_done;		/* 1 bit per stripe slot */
 
 	/* RAID6 scrub progress (M3 — written by scrub, read by status ioctl) */
 	volatile uint64_t scrub_brefs_done;	/* DATA/DIRENT brefs visited */
@@ -2111,6 +2128,21 @@ int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
+int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
+		const void *data, int bytes);
+void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
+		struct vnode *devvp);
+
+/*
+ * A disk takes writes if it is not failed, or if it is the disk an
+ * online rebuild is filling.
+ */
+static __inline int
+hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
+{
+	return (!hmp->raid_failed[disk_idx] ||
+		(hmp->rebuild_active && hmp->rebuild_disk == disk_idx));
+}
 
 /*
  * One data column in a v3 RAIDZ2-native row.  Used to drive
@@ -2143,8 +2175,9 @@ int  hammer2_raid6_open_row_pick(hammer2_dev_t *hmp,
 		hammer2_off_t *phys_off_out, int *disk_idx_out);
 void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, int disk_idx,
-		void *data /* takes ownership */, size_t bytes);
+		void *data /* takes ownership */, size_t bytes, int dropped);
 void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
+int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical);

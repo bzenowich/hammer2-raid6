@@ -386,6 +386,7 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	int p_disk, q_disk;
 	hammer2_volume_t *vol;
 	struct buf *pbp = NULL, *qbp = NULL;
+	uint8_t *p_mem = NULL, *q_mem = NULL;
 	uint8_t *p_dst = NULL;
 	uint8_t *q_dst = NULL;
 	int error = 0;
@@ -401,9 +402,15 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 
 	/*
 	 * Allocate the P column buffer up-front and accumulate XOR into it.
-	 * Skip the disk entirely if it's failed.
+	 * Skip the disk entirely if it's failed.  A disk being rebuilt
+	 * gets its column through a private buffer and a non-blocking
+	 * write (the caller holds rebuild_lk; see seal_row).
 	 */
-	if (!hmp->raid_failed[p_disk]) {
+	if (hammer2_raid6_disk_writable(hmp, p_disk) &&
+	    hmp->raid_failed[p_disk]) {
+		p_mem = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+		p_dst = p_mem;
+	} else if (!hmp->raid_failed[p_disk]) {
 		vol = &hmp->volumes[p_disk];
 		pbp = getblk(vol->dev->devvp, phys_off,
 			     stripe_unit, GETBLK_KVABIO, 0);
@@ -414,7 +421,11 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		}
 	}
 
-	if (!hmp->raid_failed[q_disk]) {
+	if (hammer2_raid6_disk_writable(hmp, q_disk) &&
+	    hmp->raid_failed[q_disk]) {
+		q_mem = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+		q_dst = q_mem;
+	} else if (!hmp->raid_failed[q_disk]) {
 		vol = &hmp->volumes[q_disk];
 		qbp = getblk(vol->dev->devvp, phys_off,
 			     stripe_unit, GETBLK_KVABIO, 0);
@@ -471,6 +482,22 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		if (e && !error)
 			error = e;
 	}
+	if (p_mem) {
+		int e = hammer2_io_raid6_write_nowait(
+		    hmp->volumes[p_disk].dev->devvp, phys_off,
+		    p_mem, (int)stripe_unit);
+		if (e && !error)
+			error = e;
+		kfree(p_mem, M_HAMMER2);
+	}
+	if (q_mem) {
+		int e = hammer2_io_raid6_write_nowait(
+		    hmp->volumes[q_disk].dev->devvp, phys_off,
+		    q_mem, (int)stripe_unit);
+		if (e && !error)
+			error = e;
+		kfree(q_mem, M_HAMMER2);
+	}
 
 	return error;
 }
@@ -503,6 +530,10 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
  * already issued the primary bdwrite/bwrite to it through the buffer
  * cache).  Pass -1 to mirror to every healthy disk.
  *
+ * A disk being rebuilt gets the copy too, written without waiting on
+ * its buffers, under rebuild_lk so the resilver's metadata copy does
+ * not overwrite it with an older one.
+ *
  * Returns 0 if at least one disk write succeeded; EIO if every other
  * disk was either failed or had an I/O error.
  */
@@ -521,15 +552,23 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 
+	lockmgr(&hmp->rebuild_lk, LK_SHARED);
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
 		if (i == skip_disk_idx)
 			continue;
-		if (hmp->raid_failed[i])
+		if (!hammer2_raid6_disk_writable(hmp, i))
 			continue;
 		vol = &hmp->volumes[i];
 		if (vol->dev == NULL || vol->dev->devvp == NULL ||
 		    !vol->dev->open)
 			continue;
+
+		if (hmp->raid_failed[i]) {
+			/* rebuilding; its result does not count */
+			(void)hammer2_io_raid6_write_nowait(vol->dev->devvp,
+			    per_disk_off, data, (int)bytes);
+			continue;
+		}
 
 		bp = getblk(vol->dev->devvp, per_disk_off, bytes,
 			    GETBLK_KVABIO, 0);
@@ -547,6 +586,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 				aerr = hammer2_raid6_auto_fail_disk(hmp, i);
 				if (aerr) {
 					/* triple-failure or already-fatal */
+					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 					return aerr;
 				}
 				continue;
@@ -555,6 +595,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		ok++;
 		wrote_any = 1;
 	}
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 
 	if (skip_disk_idx >= 0)
 		return ok ? 0 : (last_err ? last_err : EIO);
