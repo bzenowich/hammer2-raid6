@@ -76,7 +76,11 @@ Not covered: real device I/O errors leading to auto-fail (needs a
 host-side QEMU fault: blkdebug or device_del), and a foreign or
 wrong-array member at mount time.
 
-## Known kernel failures (2026-10-04)
+## Known kernel failures
 
-These tests fail because of kernel bugs, not test problems:
+None as of 2026-10-04.
+
+Known limitation (not tested): the stripe bitmap covers only the first
+2 GB zone of each disk, so a v3 array holds at most 2 GB x ndata of
+file data whatever the disk size.  `df` reports that figure.
 

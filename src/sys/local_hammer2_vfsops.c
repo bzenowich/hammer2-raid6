@@ -2341,6 +2341,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 	hammer2_dev_t *hmp;
 	hammer2_blockref_t bref;
 	struct statfs tmp;
+	hammer2_off_t space_total;
+	hammer2_off_t space_free;
+	hammer2_off_t space_rsv;
 	int i;
 
 	/*
@@ -2361,17 +2364,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
 
 		tmp.f_files = bref.embed.stats.inode_count;
 		tmp.f_ffree = 0;
-		tmp.f_blocks = hmp->voldata.allocator_size /
-			       mp->mnt_vstat.f_bsize;
-		tmp.f_bfree = hmp->voldata.allocator_free /
-			      mp->mnt_vstat.f_bsize;
+		if (hammer2_raid6_v3(hmp)) {
+			hammer2_raid6_space(hmp, &space_total, &space_free);
+			space_rsv = space_total / 20;
+		} else {
+			space_total = hmp->voldata.allocator_size;
+			space_free = hmp->voldata.allocator_free;
+			space_rsv = hmp->free_reserved;
+		}
+		tmp.f_blocks = space_total / mp->mnt_vstat.f_bsize;
+		tmp.f_bfree = space_free / mp->mnt_vstat.f_bsize;
 		tmp.f_bavail = tmp.f_bfree;
 
 		if (cred && cred->cr_uid != 0) {
 			uint64_t adj;
 
 			/* 5% */
-			adj = hmp->free_reserved / mp->mnt_vstat.f_bsize;
+			adj = space_rsv / mp->mnt_vstat.f_bsize;
 			tmp.f_blocks -= adj;
 			tmp.f_bfree -= adj;
 			tmp.f_bavail -= adj;
@@ -2396,6 +2405,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 	hammer2_dev_t *hmp;
 	hammer2_blockref_t bref;
 	struct statvfs tmp;
+	hammer2_off_t space_total;
+	hammer2_off_t space_free;
+	hammer2_off_t space_rsv;
 	int i;
 
 	/*
@@ -2415,17 +2427,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
 
 		tmp.f_files = bref.embed.stats.inode_count;
 		tmp.f_ffree = 0;
-		tmp.f_blocks = hmp->voldata.allocator_size /
-			       mp->mnt_vstat.f_bsize;
-		tmp.f_bfree = hmp->voldata.allocator_free /
-			      mp->mnt_vstat.f_bsize;
+		if (hammer2_raid6_v3(hmp)) {
+			hammer2_raid6_space(hmp, &space_total, &space_free);
+			space_rsv = space_total / 20;
+		} else {
+			space_total = hmp->voldata.allocator_size;
+			space_free = hmp->voldata.allocator_free;
+			space_rsv = hmp->free_reserved;
+		}
+		tmp.f_blocks = space_total / mp->mnt_vstat.f_bsize;
+		tmp.f_bfree = space_free / mp->mnt_vstat.f_bsize;
 		tmp.f_bavail = tmp.f_bfree;
 
 		if (cred && cred->cr_uid != 0) {
 			uint64_t adj;
 
 			/* 5% */
-			adj = hmp->free_reserved / mp->mnt_vstat.f_bsize;
+			adj = space_rsv / mp->mnt_vstat.f_bsize;
 			tmp.f_blocks -= adj;
 			tmp.f_bfree -= adj;
 			tmp.f_bavail -= adj;

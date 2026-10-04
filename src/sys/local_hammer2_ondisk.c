@@ -2252,6 +2252,70 @@ hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot)
 }
 
 /*
+ * Usable size and free space of a v3 array for statfs.  The freemap only
+ * covers metadata on v3 (data rows live in the stripe bitmap), and it
+ * spans the raw size of every disk, so allocator_size/free mean nothing
+ * to the user.  Report the rows (ndata columns each) plus the metadata
+ * zone, counted once because it is mirrored.  A partly packed row counts
+ * as full, so free space is never overstated.
+ */
+void
+hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
+		    hammer2_off_t *freep)
+{
+	hammer2_off_t row_bytes;
+	hammer2_off_t md_size = 0;
+	hammer2_off_t md_used;
+	uint64_t slot;
+	uint64_t used;
+	uint32_t ex;
+	size_t i;
+
+	row_bytes = hmp->raid_config.stripe_unit * hmp->raid_config.ndata;
+	for (ex = 0; ex < hmp->md_nextents; ex++)
+		md_size += hmp->md_extents[ex].md_size;
+
+	if (hmp->stripe_bitmap == NULL) {
+		*totalp = md_size;
+		*freep = 0;
+		return;
+	}
+	if (hmp->stripe_data_slots == 0) {
+		for (slot = 0; slot < hmp->stripe_num_slots; slot++) {
+			if (hammer2_raid6_slot_is_data(hmp, slot))
+				++hmp->stripe_data_slots;
+		}
+	}
+
+	/*
+	 * Counting is unlocked; a racing allocation only makes the figure
+	 * slightly stale.  Recount at most once a second.
+	 */
+	if (hmp->stripe_used_ticks == 0 ||
+	    (u_int)(ticks - hmp->stripe_used_ticks) >= (u_int)hz) {
+		used = 0;
+		for (i = 0; i < hmp->stripe_bitmap_size; i++)
+			used += bitcount32(hmp->stripe_bitmap[i]);
+		hmp->stripe_used_slots = used;
+		hmp->stripe_used_ticks = ticks ? ticks : 1;
+	}
+	used = hmp->stripe_used_slots;
+	if (used > hmp->stripe_data_slots)
+		used = hmp->stripe_data_slots;
+
+	/*
+	 * Every freemap allocation on v3 is metadata.
+	 */
+	md_used = hmp->voldata.allocator_size - hmp->voldata.allocator_free;
+	if (md_used > md_size)
+		md_used = md_size;
+
+	*totalp = hmp->stripe_data_slots * row_bytes + md_size;
+	*freep = (hmp->stripe_data_slots - used) * row_bytes +
+		 (md_size - md_used);
+}
+
+/*
  * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
  * Sets chain->bref.data_off to the physical column offset on the chosen disk
  * and chain->bref.copyid to the disk index (0..ndisks-1).

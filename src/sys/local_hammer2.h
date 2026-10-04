@@ -1200,6 +1200,9 @@ struct hammer2_dev {
 	int		stripe_refcount_invalid; /* 1 if persisted refcount bad/missing */
 	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk */
 	int		stripe_next_disk;	/* round-robin data disk counter */
+	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
+	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
+	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
 	/*
 	 * Per-row reference count: number of live DATA/DIRENT chains that
 	 * occupy a data-column slot in this row.  Bitmap bit is the union
@@ -2190,6 +2193,8 @@ void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		void *data /* takes ownership */, size_t bytes, int dropped);
 void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
+void hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
+		hammer2_off_t *freep);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical);
