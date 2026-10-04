@@ -112,27 +112,38 @@ for each disk in pool:
 verify all valid disks share the same rz_array_uuid (reject foreign
 disks with EINVAL).
 
-# Sort surviving disks by seqno, descending.
-# Find the highest seqno present on a majority (⌈N/2⌉+1).
-majority = (N // 2) + 1
-for seq in sorted(disk_seq, descending):
-    count = number of disks with disk_seq[i] == seq
-    if count >= majority:
+# Disks the newest header marks FAILED do not vote: they stopped
+# receiving header writes when they failed, so their seqnos lag by
+# design.  E = the remaining electorate.
+E = N - count(newest.disk_state[i] == FAILED)
+required = max(E // 2 + 1, N - 2)
+for seq in sorted(disk_seq of voting disks, descending):
+    count = number of voting disks with disk_seq[i] == seq
+    if count >= required:
         mount with TXG = seq, using only disks at this seqno
         return
 
-# No majority for any seqno → unmountable.
+# No seqno reaches the requirement → unmountable.
 return ENXIO
 ```
 
-For `N = 4`, majority = 3. Two disks can fail; mount survives. Three
-disks failed → ENXIO (and also no RAID6 recovery possible).
+`N − 2` is the floor because that many disks are needed to read the
+data at all.
 
-For `N = 6`, majority = 4. Two disks can fail; mount survives. Three
-disks failed → still unmountable even though RAID6 could in principle
-recover the data — the volume header is the gate.
+For `N = 4` with no disk marked failed, 3 votes are needed. With one
+or two disks marked failed, the 2-3 live disks need 2. Three disks
+failed → ENXIO (no RAID6 recovery possible either).
 
-**Tradeoff**: requiring majority means a 2-disk failure where the
+For `N = 6`, 4 votes are needed whether 0, 1 or 2 disks are marked
+failed. Three failed → ENXIO.
+
+A disk that crashed or vanished without being marked failed still
+votes, so an unclean loss of two disks of four (two absent, nothing
+marked) is still refused, which protects against mounting a stale
+half of the array. Before 2026-10-04 failed disks voted too, and an
+array with two disks marked failed could not be mounted at all.
+
+**Tradeoff**: requiring a quorum means a 2-disk failure where the
 two failed disks happen to be the "ahead" ones (committed seqno N+1
 while the surviving 4 still see N) silently rolls back to seqno N.
 This is the correct ZFS-equivalent behavior — the user loses any
@@ -180,7 +191,8 @@ explicitly, but the default refuses silent multi-TXG rollback.
 | N−1            | N−1 at T, 1 dead                | Mount at T            |
 | N−1            | N−2 at T, 1 at T−1, 1 dead      | Mount at T            |
 | N−2            | N−2 at T                        | Mount at T (degraded) |
-| N−2 (4-disk N) | 2 at T, 2 dead                  | ENXIO (2 < majority=3)|
+| N−2 (4-disk N) | 2 at T, 2 marked FAILED at T    | Mount at T (degraded) |
+| N−2 (4-disk N) | 2 at T, 2 lost unmarked         | ENXIO (2 < 3)         |
 | N−2 (6-disk N) | 4 at T, 2 dead                  | Mount at T            |
 | All N          | Disks split T+1 vs T (no majority) | Roll back to T     |
 

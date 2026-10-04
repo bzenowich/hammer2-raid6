@@ -357,8 +357,14 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes,
 	int i;
 	uuid_t uuid;
 
-	/* check volume header */
-	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME) {
+	/*
+	 * check volume header.  A v3 RAID6 array adopts the header with
+	 * the newest rz_txg_seq, which belongs to whichever disk that is
+	 * (disk 0 may be failed or absent), so it has no root volume id.
+	 */
+	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME &&
+	    !(rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	      rootvoldata->raid_config.raid_type == HAMMER2_RAID_TYPE_RAID6)) {
 		hprintf("volume id %d must be %d\n", rootvoldata->volu_id,
 			HAMMER2_ROOT_VOLUME);
 		return EINVAL;
@@ -626,10 +632,9 @@ hammer2_verify_volumes_3(const hammer2_volume_t *volumes,
 			(intmax_t)rc->stripe_unit, HAMMER2_PBUFSIZE);
 		return EINVAL;
 	}
-	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME &&
-	    nvolumes == rc->ndisks) {
-		hprintf("volume id %d must be %d\n",
-			rootvoldata->volu_id, HAMMER2_ROOT_VOLUME);
+	if (rootvoldata->volu_id >= rc->ndisks) {
+		hprintf("root volume id %d exceeds ndisks %d\n",
+			rootvoldata->volu_id, rc->ndisks);
 		return EINVAL;
 	}
 
@@ -1029,7 +1034,8 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 	     HAMMER2_RAID_TYPE_RAID6) {
 		const hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
 		uint32_t ndisks = rrc->ndisks;
-		uint32_t majority = (ndisks / 2) + 1;
+		uint32_t electorate = 0;
+		uint32_t majority;
 		uint64_t target = rrc->rz_txg_seq;
 		uint64_t fallback = target;
 		uint32_t at_target;
@@ -1039,6 +1045,23 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		    (hammer2_j2_rollback_max > 0 ?
 		     hammer2_j2_rollback_max : 8);
 		int j;
+
+		/*
+		 * Disks the newest header marks FAILED stopped receiving
+		 * header writes when they failed, so their seqs lag by
+		 * design.  They do not vote.  The rest must reach a
+		 * majority of themselves and at least ndisks - 2 (the
+		 * disks needed to read the data at all).
+		 */
+		for (j = 0; j < (int)ndisks && j < HAMMER2_MAX_VOLUMES; j++) {
+			if (rrc->disk_state[j] == HAMMER2_RAID6_DISK_FAILED)
+				disk_seen[j] = 0;
+			else
+				electorate++;
+		}
+		majority = electorate / 2 + 1;
+		if (majority < ndisks - 2)
+			majority = ndisks - 2;
 
 		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
 			if (!disk_seen[j])
@@ -1106,6 +1129,9 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 					continue;
 				if (voldata->version <
 				    HAMMER2_VOL_VERSION_RAIDZ2)
+					continue;
+				if (voldata->volu_id < HAMMER2_MAX_VOLUMES &&
+				    !disk_seen[voldata->volu_id])
 					continue;
 				if (voldata->raid_config.rz_txg_seq ==
 				    fallback) {
@@ -1453,14 +1479,31 @@ hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp)
 }
 
 /*
- * Read and verify the on-disk stripe bitmap from zone slot
- * HAMMER2_ZONE_RAID6_BITMAP on disk 0.  On any header/footer/CRC
- * mismatch (or read failure), mark the bitmap invalid; the caller
- * keeps the in-memory zero bitmap and logs a warning.  A blockref-walk
- * reconstruction (newplan.md §5.9, stripe_bitmap.md "mount-time
- * verify") is a Phase 2 TODO; until it lands a torn bitmap risks
- * re-allocating live slots, so the mount path treats invalid as
- * fatal for RW mounts.
+ * The stripe bitmap and the row refcount block live in zone slot
+ * HAMMER2_ZONE_RAID6_BITMAP on every disk.  The allocator skips that
+ * zone on all disks, so each disk carries a full copy.  Return the
+ * device for disk i when it can hold a current copy: present, open
+ * and not failed.  A failed disk stops receiving copies, so its copy
+ * is stale and must not be loaded.
+ */
+static struct vnode *
+hammer2_raid6_bitmap_devvp(hammer2_dev_t *hmp, int i)
+{
+	hammer2_devvp_t *e = hmp->volumes[i].dev;
+
+	if (e == NULL || e->devvp == NULL || !e->open)
+		return NULL;
+	if (hmp->raid_failed[i])
+		return NULL;
+	return e->devvp;
+}
+
+/*
+ * Read and verify the on-disk stripe bitmap.  Every live disk carries
+ * a copy (arrays made before the copies were mirrored have one on disk
+ * 0 only); the valid copy with the highest generation wins.  If no
+ * copy passes the header/footer/CRC checks, mark the bitmap invalid;
+ * the mount path then rebuilds it with a blockref walk.
  */
 void
 hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
@@ -1474,66 +1517,75 @@ hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
 	size_t bitmap_pages = hmp->stripe_bitmap_size /
 	    HAMMER2_STRIPE_BITMAP_PAGE;
 	uint32_t hdr_crc, ftr_crc, want_crc;
+	int found = 0;
 	int error;
-
-	devvp = hmp->volumes[0].dev->devvp;
-	if (devvp == NULL || !hmp->volumes[0].dev->open) {
-		hmp->stripe_bitmap_invalid = 1;
-		return;
-	}
+	int i;
 
 	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
 
-	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
-	if (error || bp == NULL) {
-		if (bp)
+	for (i = 0; i < hmp->nvolumes; i++) {
+		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
+		if (devvp == NULL)
+			continue;
+
+		error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
+		if (error || bp == NULL) {
+			if (bp)
+				brelse(bp);
+			kprintf("hammer2: stripe bitmap read I/O error %d "
+				"on disk %d\n", error, i);
+			continue;
+		}
+
+		hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
+		bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
+		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_BITMAP_PAGE +
+		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
+
+		if (hdr->magic != HAMMER2_STRIPE_BITMAP_MAGIC ||
+		    hdr->version != HAMMER2_STRIPE_BITMAP_VERSION ||
+		    hdr->ndisks != hmp->raid_config.ndisks ||
+		    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
+		    ftr->magic_end != HAMMER2_STRIPE_BITMAP_MAGIC_END ||
+		    ftr->generation != hdr->generation) {
+			/* quiet: no copy here (array predates mirroring) */
 			brelse(bp);
-		kprintf("hammer2: stripe bitmap read I/O error %d; "
-			"bitmap invalid\n", error);
-		hmp->stripe_bitmap_invalid = 1;
-		return;
+			continue;
+		}
+
+		bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
+		bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
+		want_crc = hammer2_stripe_bitmap_crc(hdr, bitmap,
+						     bitmap_pages, ftr);
+		if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
+			kprintf("hammer2: stripe bitmap CRC mismatch on "
+				"disk %d (hdr %08x ftr %08x want %08x)\n",
+				i, hdr_crc, ftr_crc, want_crc);
+			brelse(bp);
+			continue;
+		}
+
+		if (!found || hdr->generation > hmp->stripe_generation) {
+			bcopy(bitmap, hmp->stripe_bitmap,
+			      hmp->stripe_bitmap_size);
+			hmp->stripe_cursor = hdr->cursor;
+			hmp->stripe_generation = hdr->generation;
+			found = 1;
+		}
+		brelse(bp);
 	}
 
-	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
-	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
-	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
-	    HAMMER2_STRIPE_BITMAP_PAGE +
-	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
-
-	if (hdr->magic != HAMMER2_STRIPE_BITMAP_MAGIC ||
-	    hdr->version != HAMMER2_STRIPE_BITMAP_VERSION ||
-	    hdr->ndisks != hmp->raid_config.ndisks ||
-	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
-	    ftr->magic_end != HAMMER2_STRIPE_BITMAP_MAGIC_END ||
-	    ftr->generation != hdr->generation) {
-		kprintf("hammer2: stripe bitmap header/footer mismatch; "
+	if (!found) {
+		kprintf("hammer2: no valid stripe bitmap copy; "
 			"bitmap invalid\n");
 		hmp->stripe_bitmap_invalid = 1;
-		brelse(bp);
-		return;
 	}
-
-	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
-	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
-	want_crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
-	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
-		kprintf("hammer2: stripe bitmap CRC mismatch "
-			"(hdr %08x ftr %08x want %08x); bitmap invalid\n",
-			hdr_crc, ftr_crc, want_crc);
-		hmp->stripe_bitmap_invalid = 1;
-		brelse(bp);
-		return;
-	}
-
-	bcopy(bitmap, hmp->stripe_bitmap, hmp->stripe_bitmap_size);
-	hmp->stripe_cursor = hdr->cursor;
-	hmp->stripe_generation = hdr->generation;
-	brelse(bp);
 }
 
 /*
- * Write the in-memory stripe bitmap to disk zone slot
- * HAMMER2_ZONE_RAID6_BITMAP on disk 0, synchronously.
+ * Write the in-memory stripe bitmap to zone slot
+ * HAMMER2_ZONE_RAID6_BITMAP on every live disk, synchronously.
  * Bumps the generation, computes a fresh CRC, and writes
  * header + bitmap + footer as one buffer.  Called from the TXG commit
  * path before the volume header write so the bitmap is durable before
@@ -1551,51 +1603,55 @@ hammer2_raid6_bitmap_write(hammer2_dev_t *hmp)
 	size_t bitmap_pages = hmp->stripe_bitmap_size /
 	    HAMMER2_STRIPE_BITMAP_PAGE;
 	uint32_t crc;
-
-	devvp = hmp->volumes[0].dev->devvp;
-	if (devvp == NULL || !hmp->volumes[0].dev->open)
-		return;
+	int i;
 
 	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
-
-	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
-	if (bp == NULL) {
-		kprintf("hammer2_raid6_bitmap_write: getblk failed\n");
-		return;
-	}
-	bkvasync(bp);
-	bzero(bp->b_data, HAMMER2_PBUFSIZE);
-
-	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
-	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
-	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
-	    HAMMER2_STRIPE_BITMAP_PAGE +
-	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
-
 	hmp->stripe_generation++;
-	hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
-	hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
-	hdr->ndisks = hmp->raid_config.ndisks;
-	hdr->stripe_unit = hmp->raid_config.stripe_unit;
-	hdr->num_slots = hmp->stripe_num_slots;
-	hdr->slot_origin = HAMMER2_ZONE_SEG64;
-	hdr->cursor = hmp->stripe_cursor;
-	hdr->generation = hmp->stripe_generation;
 
-	ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
-	ftr->generation = hmp->stripe_generation;
+	for (i = 0; i < hmp->nvolumes; i++) {
+		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
+		if (devvp == NULL)
+			continue;
 
-	bcopy(hmp->stripe_bitmap, bitmap, hmp->stripe_bitmap_size);
+		bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+		if (bp == NULL) {
+			kprintf("hammer2_raid6_bitmap_write: getblk failed "
+				"on disk %d\n", i);
+			continue;
+		}
+		bkvasync(bp);
+		bzero(bp->b_data, HAMMER2_PBUFSIZE);
 
-	crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
-	bcopy(&crc, hdr->crc, sizeof(crc));
-	bcopy(&crc, ftr->crc, sizeof(crc));
+		hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
+		bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
+		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_BITMAP_PAGE +
+		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
 
-	bwrite(bp);
+		hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
+		hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
+		hdr->ndisks = hmp->raid_config.ndisks;
+		hdr->stripe_unit = hmp->raid_config.stripe_unit;
+		hdr->num_slots = hmp->stripe_num_slots;
+		hdr->slot_origin = HAMMER2_ZONE_SEG64;
+		hdr->cursor = hmp->stripe_cursor;
+		hdr->generation = hmp->stripe_generation;
+
+		ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
+		ftr->generation = hmp->stripe_generation;
+
+		bcopy(hmp->stripe_bitmap, bitmap, hmp->stripe_bitmap_size);
+
+		crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
+		bcopy(&crc, hdr->crc, sizeof(crc));
+		bcopy(&crc, ftr->crc, sizeof(crc));
+
+		bwrite(bp);
+	}
 }
 
 /*
- * Persisted row-refcount block (zone 41 on disk 0, byte offset
+ * Persisted row-refcount block (zone 41 on every live disk, byte offset
  * HAMMER2_STRIPE_REFCOUNT_OFFSET within the zone — i.e. 64 KB past
  * the stripe bitmap block).  See hammer2_disk.h for layout.  Saves
  * the O(metadata) chain-tree walk that hammer2_raid6_rebuild_row_refcount
@@ -1631,6 +1687,12 @@ hammer2_stripe_refcount_crc(const hammer2_stripe_refcount_header_t *hdr,
 	return c;
 }
 
+/*
+ * Load the persisted row refcount.  Only a copy whose generation
+ * matches the stripe bitmap just loaded is used; any other copy
+ * (crash between the two writes, stale disk) leaves the refcount
+ * invalid and the mount path runs the walker.
+ */
 void
 hammer2_raid6_refcount_read(hammer2_dev_t *hmp)
 {
@@ -1643,11 +1705,11 @@ hammer2_raid6_refcount_read(hammer2_dev_t *hmp)
 	size_t refcount_pages;
 	uint32_t hdr_crc, ftr_crc, want_crc;
 	int error;
+	int i;
 
-	if (hmp->stripe_row_refcount == NULL) {
-		hmp->stripe_refcount_invalid = 1;
+	hmp->stripe_refcount_invalid = 1;
+	if (hmp->stripe_row_refcount == NULL)
 		return;
-	}
 
 	refcount_pages = (size_t)((hmp->stripe_num_slots +
 	    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
@@ -1658,66 +1720,67 @@ hammer2_raid6_refcount_read(hammer2_dev_t *hmp)
 		kprintf("hammer2: refcount pages %zu exceeds max %d; "
 			"refcount invalid\n", refcount_pages,
 			(int)HAMMER2_STRIPE_REFCOUNT_PAGES_MAX);
-		hmp->stripe_refcount_invalid = 1;
-		return;
-	}
-
-	devvp = hmp->volumes[0].dev->devvp;
-	if (devvp == NULL || !hmp->volumes[0].dev->open) {
-		hmp->stripe_refcount_invalid = 1;
 		return;
 	}
 
 	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
 	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
-	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
-	if (error || bp == NULL) {
-		if (bp)
-			brelse(bp);
-		hmp->stripe_refcount_invalid = 1;
-		return;
-	}
 
-	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
-	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
-	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
-	    HAMMER2_STRIPE_REFCOUNT_PAGE +
-	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+	for (i = 0; i < hmp->nvolumes; i++) {
+		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
+		if (devvp == NULL)
+			continue;
 
-	if (hdr->magic != HAMMER2_STRIPE_REFCOUNT_MAGIC ||
-	    hdr->version != HAMMER2_STRIPE_REFCOUNT_VERSION ||
-	    hdr->ndisks != hmp->raid_config.ndisks ||
-	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
-	    hdr->num_slots != hmp->stripe_num_slots ||
-	    ftr->magic_end != HAMMER2_STRIPE_REFCOUNT_MAGIC_END ||
-	    ftr->generation != hdr->generation) {
+		error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
+		if (error || bp == NULL) {
+			if (bp)
+				brelse(bp);
+			continue;
+		}
+
+		hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
+		refcount = (uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_REFCOUNT_PAGE;
+		ftr = (hammer2_stripe_refcount_footer_t *)
+		    ((uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_REFCOUNT_PAGE +
+		    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+
 		/*
-		 * Quiet on missing block (fresh upgrade from a volume
-		 * mkfs'd before this format existed); the walker will
-		 * rebuild and the next flush persists.
+		 * Quiet on a missing block (fresh upgrade, or an array
+		 * that predates mirroring); the walker rebuilds and the
+		 * next flush persists.
 		 */
-		hmp->stripe_refcount_invalid = 1;
+		if (hdr->magic != HAMMER2_STRIPE_REFCOUNT_MAGIC ||
+		    hdr->version != HAMMER2_STRIPE_REFCOUNT_VERSION ||
+		    hdr->ndisks != hmp->raid_config.ndisks ||
+		    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
+		    hdr->num_slots != hmp->stripe_num_slots ||
+		    ftr->magic_end != HAMMER2_STRIPE_REFCOUNT_MAGIC_END ||
+		    ftr->generation != hdr->generation ||
+		    hdr->generation != hmp->stripe_generation) {
+			brelse(bp);
+			continue;
+		}
+
+		bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
+		bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
+		want_crc = hammer2_stripe_refcount_crc(hdr, refcount,
+						       refcount_pages, ftr);
+		if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
+			kprintf("hammer2: refcount CRC mismatch on disk %d "
+				"(hdr %08x ftr %08x want %08x)\n",
+				i, hdr_crc, ftr_crc, want_crc);
+			brelse(bp);
+			continue;
+		}
+
+		bcopy(refcount, hmp->stripe_row_refcount,
+		    (size_t)hmp->stripe_num_slots);
+		hmp->stripe_refcount_invalid = 0;
 		brelse(bp);
 		return;
 	}
-
-	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
-	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
-	want_crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages,
-					       ftr);
-	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
-		kprintf("hammer2: refcount CRC mismatch "
-			"(hdr %08x ftr %08x want %08x); falling back to walker\n",
-			hdr_crc, ftr_crc, want_crc);
-		hmp->stripe_refcount_invalid = 1;
-		brelse(bp);
-		return;
-	}
-
-	bcopy(refcount, hmp->stripe_row_refcount,
-	    (size_t)hmp->stripe_num_slots);
-	hmp->stripe_refcount_invalid = 0;
-	brelse(bp);
 }
 
 void
@@ -1731,6 +1794,7 @@ hammer2_raid6_refcount_write(hammer2_dev_t *hmp)
 	uint8_t *refcount;
 	size_t refcount_pages;
 	uint32_t crc;
+	int i;
 
 	if (hmp->stripe_row_refcount == NULL)
 		return;
@@ -1743,45 +1807,51 @@ hammer2_raid6_refcount_write(hammer2_dev_t *hmp)
 	if (refcount_pages > HAMMER2_STRIPE_REFCOUNT_PAGES_MAX)
 		return;
 
-	devvp = hmp->volumes[0].dev->devvp;
-	if (devvp == NULL || !hmp->volumes[0].dev->open)
-		return;
-
 	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
 	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
 
-	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
-	if (bp == NULL) {
-		kprintf("hammer2_raid6_refcount_write: getblk failed\n");
-		return;
+	for (i = 0; i < hmp->nvolumes; i++) {
+		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
+		if (devvp == NULL)
+			continue;
+
+		bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
+		if (bp == NULL) {
+			kprintf("hammer2_raid6_refcount_write: getblk failed "
+				"on disk %d\n", i);
+			continue;
+		}
+		bkvasync(bp);
+		bzero(bp->b_data, HAMMER2_PBUFSIZE);
+
+		hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
+		refcount = (uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_REFCOUNT_PAGE;
+		ftr = (hammer2_stripe_refcount_footer_t *)
+		    ((uint8_t *)bp->b_data +
+		    HAMMER2_STRIPE_REFCOUNT_PAGE +
+		    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
+
+		hdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
+		hdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
+		hdr->ndisks = hmp->raid_config.ndisks;
+		hdr->stripe_unit = hmp->raid_config.stripe_unit;
+		hdr->num_slots = hmp->stripe_num_slots;
+		hdr->generation = hmp->stripe_generation;
+
+		ftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
+		ftr->generation = hmp->stripe_generation;
+
+		bcopy(hmp->stripe_row_refcount, refcount,
+		    (size_t)hmp->stripe_num_slots);
+
+		crc = hammer2_stripe_refcount_crc(hdr, refcount,
+						  refcount_pages, ftr);
+		bcopy(&crc, hdr->crc, sizeof(crc));
+		bcopy(&crc, ftr->crc, sizeof(crc));
+
+		bwrite(bp);
 	}
-	bkvasync(bp);
-	bzero(bp->b_data, HAMMER2_PBUFSIZE);
-
-	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
-	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
-	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
-	    HAMMER2_STRIPE_REFCOUNT_PAGE +
-	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
-
-	hdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
-	hdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
-	hdr->ndisks = hmp->raid_config.ndisks;
-	hdr->stripe_unit = hmp->raid_config.stripe_unit;
-	hdr->num_slots = hmp->stripe_num_slots;
-	hdr->generation = hmp->stripe_generation;
-
-	ftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
-	ftr->generation = hmp->stripe_generation;
-
-	bcopy(hmp->stripe_row_refcount, refcount,
-	    (size_t)hmp->stripe_num_slots);
-
-	crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages, ftr);
-	bcopy(&crc, hdr->crc, sizeof(crc));
-	bcopy(&crc, ftr->crc, sizeof(crc));
-
-	bwrite(bp);
 }
 
 /*

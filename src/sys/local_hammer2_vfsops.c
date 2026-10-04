@@ -1412,7 +1412,7 @@ next_hmp:
 				      sizeof(hmp->md_extents));
 			} else {
 				hammer2_off_t per_disk =
-				    hmp->volumes[0].size;
+				    hmp->voldata.volu_size;
 				hammer2_off_t size =
 				    per_disk * HAMMER2_MD_EXTENT0_PCT / 100;
 				if (size < HAMMER2_MD_EXTENT0_MIN_SIZE)
@@ -1833,6 +1833,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
 	hammer2_volume_t *vol;
 	struct vnode *devvp;
 	int i, ronly_save, error, result = 0;
+	int recovered = 0;
 
 	pmp = MPTOPMP(mp);
 	ronly_save = pmp->ronly;
@@ -1846,13 +1847,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
 
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		vol = &hmp->volumes[i];
+		/* RAID6: a failed or absent disk is not reopened */
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    !vol->dev->open)
+			continue;
 		devvp = vol->dev->devvp;
 		KKASSERT(devvp);
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
 		VOP_OPEN(devvp, FREAD | FWRITE, FSCRED, NULL);
 		vn_unlock(devvp);
 		error = 0;
-		if (vol->id == HAMMER2_ROOT_VOLUME) {
+		/*
+		 * Run recovery once.  RAID6 has no root volume to wait
+		 * for (disk 0 may be failed), so the first live disk
+		 * does.
+		 */
+		if (!recovered &&
+		    (vol->id == HAMMER2_ROOT_VOLUME ||
+		     hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)) {
+			recovered = 1;
 			error = hammer2_recovery(hmp);
 			if (error == 0)
 				error |= hammer2_fixup_pfses(hmp);

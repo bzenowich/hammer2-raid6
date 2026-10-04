@@ -744,13 +744,12 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 
 	/*
 	 * RAIDZ2-native (v3): write an empty but valid stripe bitmap to
-	 * zone slot 41 on disk 0.  Header+footer with generation 1 + CRC;
+	 * zone slot 41 on every disk (each disk carries a copy).  Header+footer with generation 1 + CRC;
 	 * bitmap region all-zero (no stripes allocated).  The kernel reads
 	 * this at mount; without the header it would mark bitmap_invalid.
 	 */
 	if (opt->RaidType == 6 &&
-	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-	    vol->id == HAMMER2_ROOT_VOLUME) {
+	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 		hammer2_stripe_bitmap_header_t *hdr;
 		hammer2_stripe_bitmap_footer_t *ftr;
 		uint8_t *bitmap;

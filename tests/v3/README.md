@@ -80,10 +80,6 @@ wrong-array member at mount time.
 
 These tests fail because of kernel bugs, not test problems:
 
-- **C01–C06**: an array with two failed disks will not mount (v3 quorum
-  counts failed disks' stale headers as votes).
-- **B1** (disk 0): an array with disk 0 failed will not mount ("volume
-  id 1 must be 0", `hammer2_ondisk.c` RAID6 header check).
 - **B6, M1, E3**: reconstruction erases only the target column, so one
   failed disk plus a corrupt or EIO row-mate is not recovered.
 - **M2**: two silently corrupt columns deadlock (two self-heals each hold
