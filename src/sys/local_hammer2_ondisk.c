@@ -1744,52 +1744,19 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 }
 
 /*
- * Seal a row: build cols[] from in-memory col_data, call write_row,
- * free col data, remove the entry from the open_rows TAILQ and free
- * the entry itself.  Caller holds stripe_bitmap_spin; this function
- * releases the spin around the (sleeping) I/O and re-acquires it
- * before returning.
+ * Write a row: zero the data columns no chain reserved, write the
+ * columns putblk dropped, then P/Q over cols[].  Called without
+ * stripe_bitmap_spin; sleeps.
  */
 static void
-hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
-					  struct hammer2_open_row *r)
+hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
+		     uint64_t row_id, uint32_t alloc_mask, uint32_t dropped,
+		     int p_disk, int q_disk, hammer2_row_col_t *cols,
+		     int ncols, size_t bytes)
 {
-	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
-	void *to_free[HAMMER2_MAX_VOLUMES];
 	void *zbuf = NULL;
-	hammer2_off_t phys_off;
-	uint64_t row_id;
-	uint32_t alloc_mask_snap;
-	uint32_t dropped_snap;
-	size_t bytes;
-	int ncols = 0;
-	int p_disk_snap, q_disk_snap;
 	int ndisks = hmp->raid_config.ndisks;
 	int d, i;
-
-	/* Snapshot the row under the spinlock, then release before I/O. */
-	for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
-		if ((r->alloc_mask & (1U << d)) == 0)
-			continue;
-		if (r->col_data[d] == NULL)
-			continue;	/* chain alloc'd but never putblk'd */
-		cols[ncols].disk_idx = d;
-		cols[ncols].data = r->col_data[d];
-		cols[ncols].bytes = r->bytes;
-		to_free[ncols] = r->col_data[d];
-		r->col_data[d] = NULL;
-		ncols++;
-	}
-	phys_off = r->phys_off;
-	bytes = r->bytes;
-	alloc_mask_snap = r->alloc_mask;
-	dropped_snap = r->dropped_mask;
-	row_id = r->row_id;
-	p_disk_snap = r->p_disk;
-	q_disk_snap = r->q_disk;
-	TAILQ_REMOVE(&hmp->open_rows, r, entry);
-	hmp->open_rows_count--;
-	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
 	/*
 	 * Hold off the resilver's copy of this slot while we write it,
@@ -1821,9 +1788,9 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 			struct buf *zbp;
 			int werr;
 
-			if (d == p_disk_snap || d == q_disk_snap)
+			if (d == p_disk || d == q_disk)
 				continue;
-			if (alloc_mask_snap & (1U << d))
+			if (alloc_mask & (1U << d))
 				continue;
 			if (!hammer2_raid6_disk_writable(hmp, d))
 				continue;
@@ -1857,7 +1824,7 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 		 */
 		for (i = 0; i < ncols; i++) {
 			d = cols[i].disk_idx;
-			if ((dropped_snap & (1U << d)) == 0)
+			if ((dropped & (1U << d)) == 0)
 				continue;
 			if (!hammer2_raid6_disk_writable(hmp, d))
 				continue;
@@ -1873,14 +1840,135 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 						 ncols, bytes);
 	}
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-
-	for (i = 0; i < ncols; i++)
-		kfree(to_free[i], M_HAMMER2);
 	if (zbuf)
 		kfree(zbuf, M_HAMMER2);
+}
+
+/*
+ * Seal a row: build cols[] from in-memory col_data, write it, free
+ * col data, remove the entry from the open_rows TAILQ and free the
+ * entry itself.  Caller holds stripe_bitmap_spin and has checked that
+ * every reserved column has its data (or that the row is being
+ * dropped); this function releases the spin around the (sleeping)
+ * I/O and re-acquires it before returning.
+ */
+static void
+hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
+					  struct hammer2_open_row *r)
+{
+	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
+	void *to_free[HAMMER2_MAX_VOLUMES];
+	int ncols = 0;
+	int d, i;
+
+	KKASSERT(r->sealing == 0);
+	for (d = 0; d < hmp->raid_config.ndisks; d++) {
+		if ((r->alloc_mask & (1U << d)) == 0)
+			continue;
+		if (r->col_data[d] == NULL)
+			continue;
+		cols[ncols].disk_idx = d;
+		cols[ncols].data = r->col_data[d];
+		cols[ncols].bytes = r->bytes;
+		to_free[ncols] = r->col_data[d];
+		r->col_data[d] = NULL;
+		ncols++;
+	}
+	TAILQ_REMOVE(&hmp->open_rows, r, entry);
+	hmp->open_rows_count--;
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+
+	hammer2_raid6_row_io(hmp, r->phys_off, r->row_id, r->alloc_mask,
+			     r->dropped_mask, r->p_disk, r->q_disk,
+			     cols, ncols, r->bytes);
+	for (i = 0; i < ncols; i++)
+		kfree(to_free[i], M_HAMMER2);
 	kfree(r, M_HAMMER2);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+}
+
+/*
+ * Partially seal a row at a TXG flush: some reserved column has not
+ * putblk'd yet (its chain was allocated after this flush started, or
+ * its dio still has another ref).  Write P/Q over the columns present,
+ * the pending ones counted as zero, so the flushed columns are
+ * protected, but keep the row and its column data: closed to packing,
+ * it is sealed in full when the last column arrives (add_data).
+ *
+ * Sealing it in full and dropping it here, as before, lost the late
+ * column: its putblk found no row, and the P/Q on disk did not cover
+ * it.
+ *
+ * r->sealing keeps add_data from sealing the row while the I/O runs
+ * unlocked; data arriving meanwhile goes into col_data as usual, and
+ * a column replaced meanwhile drops our older copy.  Caller holds
+ * stripe_bitmap_spin; it is released around the I/O.
+ */
+static void
+hammer2_raid6_seal_partial_locked(hammer2_dev_t *hmp,
+				  struct hammer2_open_row *r)
+{
+	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
+	void *to_free[HAMMER2_MAX_VOLUMES];
+	int nfree = 0;
+	int ncols = 0;
+	int d, i;
+
+	r->sealing = 1;
+	r->partial = 1;
+	r->dirty = 0;
+	for (d = 0; d < hmp->raid_config.ndisks; d++) {
+		if ((r->alloc_mask & (1U << d)) == 0)
+			continue;
+		if (r->col_data[d] == NULL)
+			continue;
+		cols[ncols].disk_idx = d;
+		cols[ncols].data = r->col_data[d];
+		cols[ncols].bytes = r->bytes;
+		r->col_data[d] = NULL;
+		ncols++;
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+
+	if (ncols > 0)
+		hammer2_raid6_row_io(hmp, r->phys_off, r->row_id,
+				     r->alloc_mask, r->dropped_mask,
+				     r->p_disk, r->q_disk, cols, ncols,
+				     r->bytes);
+
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	for (i = 0; i < ncols; i++) {
+		d = cols[i].disk_idx;
+		if (r->col_data[d] == NULL)
+			r->col_data[d] = cols[i].data;
+		else
+			to_free[nfree++] = cols[i].data;
+	}
+	r->sealing = 0;
+	if (nfree) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		for (i = 0; i < nfree; i++)
+			kfree(to_free[i], M_HAMMER2);
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	}
+}
+
+/*
+ * Every reserved column of the row has its data.  alloc_mask is 32
+ * bits: loop over the array's disks, not HAMMER2_MAX_VOLUMES, or the
+ * shift wraps and a col_data[] past the array counts as missing.
+ */
+static int
+hammer2_raid6_row_complete(hammer2_dev_t *hmp, struct hammer2_open_row *r)
+{
+	int d;
+
+	for (d = 0; d < hmp->raid_config.ndisks; d++) {
+		if ((r->alloc_mask & (1U << d)) && r->col_data[d] == NULL)
+			return 0;
+	}
+	return 1;
 }
 
 /*
@@ -1907,7 +1995,7 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 		return 0;
 
 	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		if (r->n_alloc >= ndata)
+		if (r->n_alloc >= ndata || r->partial)
 			continue;
 		for (t = 0; t < ndisks; t++) {
 			candidate = hmp->stripe_next_disk % ndisks;
@@ -1970,8 +2058,8 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 
 /*
  * Putblk → open_row sink.  Takes ownership of `data` (kfree'd when
- * row seals).  If this puts the row at full capacity AND every
- * alloc'd col has data present, seal immediately.
+ * row seals).  If every reserved col then has its data and the row is
+ * full, or was partially sealed and so takes no more cols, seal it.
  */
 void
 hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
@@ -1980,16 +2068,14 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 {
 	struct hammer2_open_row *r;
 	void *to_free = NULL;
-	int complete;
-	int d;
 
 	/*
-	 * With the TAILQ-backed tracker every chain that makes it
-	 * through stripe_alloc has a row registered before its bp's
-	 * putblk can fire add_data — there is no "not found" case.
-	 * KKASSERT it; a hit here means a chain bypassed the
-	 * allocator's register path and we'd otherwise silently drop
-	 * its bytes.
+	 * Every chain that makes it through stripe_alloc has a row
+	 * registered before its bp's putblk can fire add_data, and a
+	 * row leaves the list only once all its reserved cols have
+	 * arrived.  A miss means a chain bypassed the allocator's
+	 * register path, or putblk'd again after its row sealed, and
+	 * we'd otherwise silently drop its bytes from P/Q.
 	 */
 	KKASSERT(hmp->open_rows_inited);
 
@@ -1998,7 +2084,11 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		if (r->phys_off == phys_off)
 			break;
 	}
-	KKASSERT(r != NULL);
+	if (r == NULL) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		panic("hammer2: v3 putblk for a row not open: phys %016jx "
+		      "disk %d", (uintmax_t)phys_off, disk_idx);
+	}
 	KKASSERT(r->bytes == bytes);
 	KKASSERT(r->alloc_mask & (1U << disk_idx));
 
@@ -2010,27 +2100,17 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	 * of a stripe_unit buffer can call vm_map_remove which sleeps
 	 * on the kernel map lock — not safe under a spinlock).
 	 */
-	if (r->col_data[disk_idx] != NULL) {
-		to_free = r->col_data[disk_idx];
-		r->col_data[disk_idx] = NULL;
-	}
+	to_free = r->col_data[disk_idx];
 	r->col_data[disk_idx] = data;
+	r->dirty = 1;
+	r->idle = 0;
 	if (dropped)
 		r->dropped_mask |= 1U << disk_idx;
 	else
 		r->dropped_mask &= ~(1U << disk_idx);
 
-	/* Seal immediately if the row is full and every alloc'd col has data. */
-	complete = 1;
-	for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
-		if ((r->alloc_mask & (1U << d)) == 0)
-			continue;
-		if (r->col_data[d] == NULL) {
-			complete = 0;
-			break;
-		}
-	}
-	if (complete && r->n_alloc >= r->ndata)
+	if (r->sealing == 0 && hammer2_raid6_row_complete(hmp, r) &&
+	    (r->n_alloc >= r->ndata || r->partial))
 		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
@@ -2039,26 +2119,45 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
- * Seal every open row (called at TXG flush boundary, before VOP_FSYNC).
- * Rows that haven't filled to ndata still get P/Q over their current
- * col set (unfilled cols are zero on disk → P/Q is correct for what
- * was written).
+ * Seal the open rows at a TXG flush boundary, before VOP_FSYNC.
+ * A row with every reserved col present seals and leaves the list;
+ * unfilled cols are zero on disk, so P/Q is correct for what was
+ * written.  A row still waiting for a col is sealed partially (see
+ * hammer2_raid6_seal_partial_locked) and stays; one already partially
+ * sealed with no new data since is left alone.
+ *
+ * Each seal drops the spinlock, so the list is rescanned from the head
+ * after every seal; seal_gen marks the rows this pass has handled.
  */
 void
 hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 {
 	struct hammer2_open_row *r;
+	uint32_t gen;
 
 	if (!hmp->open_rows_inited)
 		return;
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	/*
-	 * seal_row removes its entry from the TAILQ, so each iteration
-	 * just walks the new TAILQ_FIRST until the list is empty.
-	 */
-	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL)
-		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+	gen = ++hmp->open_rows_sealgen;
+	for (;;) {
+		TAILQ_FOREACH(r, &hmp->open_rows, entry) {
+			if (r->seal_gen != gen && r->sealing == 0)
+				break;
+		}
+		if (r == NULL)
+			break;
+		r->seal_gen = gen;
+		if (hammer2_raid6_row_complete(hmp, r)) {
+			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+		} else if (r->partial == 0 || r->dirty) {
+			hammer2_raid6_seal_partial_locked(hmp, r);
+		} else if (++r->idle == 16) {
+			kprintf("hammer2: v3 row %ju still waiting for a "
+				"column after %d flushes (mask %08x)\n",
+				(uintmax_t)r->row_id, r->idle, r->alloc_mask);
+		}
+	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }
 

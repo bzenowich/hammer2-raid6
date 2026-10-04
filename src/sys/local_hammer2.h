@@ -1133,6 +1133,11 @@ typedef struct hammer2_volume hammer2_volume_t;
  * hammer2_raid6_open_row_add_data().  NULL until the chain
  * putblk's; alloc_mask bit set means the slot is reserved but
  * col_data may still be NULL until the chain flushes.
+ *
+ * A row whose chains have not all putblk'd at a TXG flush is sealed
+ * partially: P/Q over the columns present, the pending ones counted
+ * as zero.  It stays on the list (closed to packing, its column data
+ * kept) and is sealed again, fully, when the last column arrives.
  */
 struct hammer2_open_row {
 	TAILQ_ENTRY(hammer2_open_row) entry;
@@ -1144,6 +1149,11 @@ struct hammer2_open_row {
 	int		ndata;		/* cached rc->ndata */
 	size_t		bytes;		/* cached stripe_unit */
 	uint32_t	dropped_mask;	/* cols putblk did not write (disk failed) */
+	int		sealing;	/* partial seal I/O in progress */
+	int		partial;	/* P/Q written with cols still pending */
+	int		dirty;		/* col data arrived since the last seal */
+	int		idle;		/* flushes since the last data arrived */
+	uint32_t	seal_gen;	/* last seal_all pass that visited it */
 	void		*col_data[HAMMER2_MAX_VOLUMES];
 };
 
@@ -1249,6 +1259,7 @@ struct hammer2_dev {
 	int		open_rows_inited;	/* TAILQ_INIT done */
 	long		open_rows_count;	/* current entry count (diag) */
 	long		open_rows_high;		/* peak entry count (diag) */
+	uint32_t	open_rows_sealgen;	/* seal_all pass counter */
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
 	uint32_t	md_nextents;
