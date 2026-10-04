@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2018 The DragonFly Project.  All rights reserved.
+ * Copyright (c) 2011-2023 The DragonFly Project.  All rights reserved.
  *
  * This code is derived from software contributed to The DragonFly Project
  * by Matthew Dillon <dillon@backplane.com>
@@ -433,7 +433,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain,
 				 sizeof(pmp->pfs_clid)) == 0) {
 				break;
 			} else if (force_local && pmp->pfs_names[0] &&
-			    strcmp(pmp->pfs_names[0], ripdata->filename) == 0) {
+			    strcmp(pmp->pfs_names[0], (const char *)ripdata->filename) == 0) {
 				break;
 			}
 		}
@@ -446,13 +446,11 @@ hammer2_pfsalloc(hammer2_chain_t *chain,
 		kmalloc_create_obj(&pmp->minode, "HAMMER2-inodes",
 				   sizeof(struct hammer2_inode));
 		lockinit(&pmp->lock, "pfslk", 0, 0);
-		hammer2_spin_init(&pmp->inum_spin, "hm2pfsalloc_inum");
+		hammer2_spin_init(&pmp->blockset_spin, "h2blkset");
+		hammer2_inum_hash_init(pmp);
 		hammer2_spin_init(&pmp->xop_spin, "h2xop");
-		hammer2_spin_init(&pmp->lru_spin, "h2lru");
-		RB_INIT(&pmp->inum_tree);
 		TAILQ_INIT(&pmp->syncq);
 		TAILQ_INIT(&pmp->depq);
-		TAILQ_INIT(&pmp->lru_list);
 		hammer2_spin_init(&pmp->list_spin, "h2pfsalloc_list");
 
 		/*
@@ -523,11 +521,11 @@ hammer2_pfsalloc(hammer2_chain_t *chain,
 			pmp->pfs_types[j] = HAMMER2_PFSTYPE_MASTER;
 		else
 			pmp->pfs_types[j] = ripdata->meta.pfs_type;
-		pmp->pfs_names[j] = kstrdup(ripdata->filename, M_HAMMER2);
+		pmp->pfs_names[j] = kstrdup((const char *)ripdata->filename, M_HAMMER2);
 		pmp->pfs_hmps[j] = chain->hmp;
-		hammer2_spin_ex(&pmp->inum_spin);
+		hammer2_spin_ex(&pmp->blockset_spin);
 		pmp->pfs_iroot_blocksets[j] = chain->data->ipdata.u.blockset;
-		hammer2_spin_unex(&pmp->inum_spin);
+		hammer2_spin_unex(&pmp->blockset_spin);
 
 		/*
 		 * If the PFS is already mounted we must account
@@ -715,23 +713,6 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 		TAILQ_REMOVE(&hammer2_spmplist, pmp, mntentry);
 	else
 		TAILQ_REMOVE(&hammer2_pfslist, pmp, mntentry);
-
-	/*
-	 * Cleanup chains remaining on LRU list.
-	 */
-	hammer2_spin_ex(&pmp->lru_spin);
-	while ((chain = TAILQ_FIRST(&pmp->lru_list)) != NULL) {
-		KKASSERT(chain->flags & HAMMER2_CHAIN_ONLRU);
-		atomic_add_int(&pmp->lru_count, -1);
-		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONLRU);
-		TAILQ_REMOVE(&pmp->lru_list, chain, lru_node);
-		hammer2_chain_ref(chain);
-		hammer2_spin_unex(&pmp->lru_spin);
-		atomic_set_int(&chain->flags, HAMMER2_CHAIN_RELEASE);
-		hammer2_chain_drop(chain);
-		hammer2_spin_ex(&pmp->lru_spin);
-	}
-	hammer2_spin_unex(&pmp->lru_spin);
 
 	/*
 	 * Clean up iroot
@@ -1228,8 +1209,7 @@ next_hmp:
 				   sizeof(struct hammer2_io));
 		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
 		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
-		RB_INIT(&hmp->iotree);
-		hammer2_spin_init(&hmp->io_spin, "h2mount_io");
+		hammer2_io_hash_init(hmp);
 		hammer2_spin_init(&hmp->list_spin, "h2mount_list");
 
 		lockinit(&hmp->vollk, "h2vol", 0, 0);
@@ -1245,7 +1225,6 @@ next_hmp:
 		hmp->vchain.data = (void *)&hmp->voldata;
 		hmp->vchain.bref.type = HAMMER2_BREF_TYPE_VOLUME;
 		hmp->vchain.bref.data_off = 0 | HAMMER2_PBUFRADIX;
-		hmp->vchain.bref.mirror_tid = hmp->voldata.mirror_tid;
 		hammer2_chain_init(&hmp->vchain);
 
 		/*
@@ -1263,7 +1242,6 @@ next_hmp:
 		hmp->fchain.data = (void *)&hmp->voldata.freemap_blockset;
 		hmp->fchain.bref.type = HAMMER2_BREF_TYPE_FREEMAP;
 		hmp->fchain.bref.data_off = 0 | HAMMER2_PBUFRADIX;
-		hmp->fchain.bref.mirror_tid = hmp->voldata.freemap_tid;
 		hmp->fchain.bref.methods =
 			HAMMER2_ENC_CHECK(HAMMER2_CHECK_FREEMAP) |
 			HAMMER2_ENC_COMP(HAMMER2_COMP_NONE);
@@ -1585,7 +1563,7 @@ next_hmp:
 		spmp->iroot = hammer2_inode_get(spmp, &xop, -1, -1);
 		spmp->spmp_hmp = hmp;
 		spmp->pfs_types[0] = ripdata->meta.pfs_type;
-		spmp->pfs_hmps[0] = hmp;
+		spmp->ronly = ronly;
 		hammer2_inode_ref(spmp->iroot);
 		hammer2_inode_unlock(spmp->iroot);
 		hammer2_cluster_unlock(&xop.cluster);
@@ -1619,6 +1597,8 @@ next_hmp:
 			}
 		}
 	} else {
+		/* hmp->devvp_list is already constructed. */
+		hammer2_cleanup_devvp(&devvpl);
 		spmp = hmp->spmp;
 		if (info.hflags & HMNT2_DEVFLAGS) {
 			kprintf("hammer2_mount: Warning: mount flags pertaining "
@@ -1650,7 +1630,7 @@ next_hmp:
 				     &error, 0);
 	while (chain) {
 		if (chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
-		    strcmp(label, chain->data->ipdata.filename) == 0) {
+		    strcmp(label, (char *)chain->data->ipdata.filename) == 0) {
 			break;
 		}
 		chain = hammer2_chain_next(&parent, chain, &key_next,
@@ -1720,6 +1700,7 @@ next_hmp:
 		return EBUSY;
 	}
 
+	pmp->ronly = ronly;
 	pmp->hflags = info.hflags;
 	mp->mnt_flag |= MNT_LOCAL;
 	/*
@@ -1848,9 +1829,17 @@ int
 hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
 		struct ucred *cred)
 {
+	hammer2_pfs_t *pmp;
 	hammer2_volume_t *vol;
 	struct vnode *devvp;
-	int i, error, result = 0;
+	int i, ronly_save, error, result = 0;
+
+	pmp = MPTOPMP(mp);
+	ronly_save = pmp->ronly;
+	if (pmp->ronly == 1 && (mp->mnt_kern_flag & MNTK_WANTRDWR))
+		pmp->ronly = 0;
+	else if (pmp->ronly == 0 && (mp->mnt_flag & MNT_RDONLY))
+		pmp->ronly = 1;
 
 	if (!(hmp->ronly && (mp->mnt_kern_flag & MNTK_WANTRDWR)))
 		return 0;
@@ -1880,6 +1869,9 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
 	if (result == 0) {
 		kprintf("hammer2: enable read/write\n");
 		hmp->ronly = 0;
+		hmp->spmp->ronly = 0; /* never used */
+	} else {
+		pmp->ronly = ronly_save;
 	}
 
 	return result;
@@ -2003,7 +1995,6 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
 {
 	hammer2_cluster_t *cluster;
 	hammer2_chain_t *rchain;
-	int dumpcnt;
 	int i;
 
 	/*
@@ -2143,10 +2134,16 @@ again:
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_UPDATE);
 	}
 
-	dumpcnt = 50;
-	hammer2_dump_chain(&hmp->vchain, 0, 0, &dumpcnt, 'v', (u_int)-1);
-	dumpcnt = 50;
-	hammer2_dump_chain(&hmp->fchain, 0, 0, &dumpcnt, 'f', (u_int)-1);
+#if 0 /* kept for future debug */
+	{
+		int dumpcnt;
+
+		dumpcnt = 50;
+		hammer2_dump_chain(&hmp->vchain, 0, 0, &dumpcnt, 'v', (u_int)-1);
+		dumpcnt = 50;
+		hammer2_dump_chain(&hmp->fchain, 0, 0, &dumpcnt, 'f', (u_int)-1);
+	}
+#endif
 
 	/*
 	 * Final drop of embedded freemap root chain to
@@ -2164,7 +2161,7 @@ again:
 	 */
 	hammer2_chain_drop(&hmp->vchain);
 
-	hammer2_io_cleanup(hmp, &hmp->iotree);
+	hammer2_io_hash_cleanup_all(hmp);
 	if (hmp->iofree_count) {
 		kprintf("io_cleanup: %d I/O's left hanging\n",
 			hmp->iofree_count);
@@ -2905,14 +2902,10 @@ restart:
 				/*
 				 * Failed to get the vnode, requeue the inode
 				 * (PASS2 is already set so it will be found
-				 * again on the restart).
-				 *
-				 * Then unlock, possibly sleep, and retry
-				 * later.  We sleep if PASS2 was *previously*
-				 * set, before we set it again above.
+				 * again on the restart).  Then unlock.
 				 */
 				vp = NULL;
-				dorestart = 1;
+				dorestart |= 1;
 #ifdef HAMMER2_DEBUG_SYNC
 				kprintf("inum %ld (sync delayed by vnode)\n",
 					(long)ip->meta.inum);
@@ -2922,9 +2915,13 @@ restart:
 				hammer2_mtx_unlock(&ip->lock);
 				hammer2_inode_drop(ip);
 
-				if (pass2 & HAMMER2_INODE_SYNCQ_PASS2) {
-					tsleep(&dorestart, 0, "h2syndel", 2);
-				}
+				/*
+				 * If PASS2 was previously set we might
+				 * be looping too hard, ask for a delay
+				 * along with the restart.
+				 */
+				if (pass2 & HAMMER2_INODE_SYNCQ_PASS2)
+					dorestart |= 2;
 				hammer2_spin_ex(&pmp->list_spin);
 				continue;
 			}
@@ -2943,7 +2940,7 @@ restart:
 			hammer2_inode_drop(ip);
 			if (vp)
 				vput(vp);
-			dorestart = 1;
+			dorestart |= 1;
 			hammer2_spin_ex(&pmp->list_spin);
 			continue;
 		}
@@ -3012,7 +3009,8 @@ restart:
 					  HAMMER2_INODE_RESIZED |
 					  HAMMER2_INODE_DIRTYDATA)) == 0 &&
 			    RB_EMPTY(&vp->v_rbdirty_tree) &&
-			    !bio_track_active(&vp->v_track_write)) {
+			    !bio_track_active(&vp->v_track_write))
+			{
 				vclrisdirty(vp);
 			} else {
 				hammer2_inode_delayed_sideq(ip);
@@ -3035,6 +3033,19 @@ restart:
 	hammer2_pfs_memory_wakeup(pmp, 0);
 
 	if (dorestart || (pmp->trans.flags & HAMMER2_TRANS_RESCAN)) {
+		/*
+		 * bit 2 is set if something above thinks we might be
+		 * looping too hard, try to unclog the frontend
+		 * dependency and wait a bit before restarting.
+		 *
+		 * NOTE: The frontend could be stuck in h2memw, though
+		 *	 it isn't supposed to be holding vnode locks
+		 *	 in that case.
+		 */
+		if (dorestart & 2) {
+			wakeup(&pmp->inmem_dirty_chains);
+			tsleep(&dorestart, 0, "h2syndel", 2);
+		}
 #ifdef HAMMER2_DEBUG_SYNC
 		kprintf("FILESYSTEM SYNC STAGE 1 RESTART\n");
 		/*tsleep(&dorestart, 0, "h2STG1-R", hz*20);*/
@@ -3222,19 +3233,24 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 	uint32_t waiting;
 	int pcatch;
 	int error;
+	int started;
 
 	if (pmp == NULL || pmp->mp == NULL)
 		return;
+
+	started = 0;
 
 	for (;;) {
 		waiting = pmp->inmem_dirty_chains & HAMMER2_DIRTYCHAIN_MASK;
 		cpu_ccfence();
 
 		/*
-		 * Start the syncer running at 1/2 the limit
+		 * Start the syncer running at 1/2 the limit to try
+		 * to avoid sleeping.
 		 */
 		if (waiting > hammer2_limit_dirty_chains / 2 ||
-		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2) {
+		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2)
+		{
 			trigger_syncer(pmp->mp);
 		}
 
@@ -3244,25 +3260,37 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		 * drops below 3/4 the limit, or in one second.
 		 */
 		if (waiting < hammer2_limit_dirty_chains &&
-		    pmp->sideq_count < hammer2_limit_dirty_inodes) {
+		    pmp->sideq_count < hammer2_limit_dirty_inodes)
+		{
 			break;
 		}
 
-		pcatch = curthread->td_proc ? PCATCH : 0;
+		if (started == 0) {
+			trigger_syncer_start(pmp->mp);
+			started = 1;
+		}
 
+		/*
+		 * Interlocked re-test, sleep, and retry.
+		 */
+		pcatch = curthread->td_proc ? PCATCH : 0;
 		tsleep_interlock(&pmp->inmem_dirty_chains, pcatch);
+
 		atomic_set_int(&pmp->inmem_dirty_chains,
 			       HAMMER2_DIRTYCHAIN_WAITING);
+
 		if (waiting < hammer2_limit_dirty_chains &&
 		    pmp->sideq_count < hammer2_limit_dirty_inodes) {
 			break;
 		}
-		trigger_syncer(pmp->mp);
-		error = tsleep(&pmp->inmem_dirty_chains, PINTERLOCKED | pcatch,
+		error = tsleep(&pmp->inmem_dirty_chains,
+			       PINTERLOCKED | pcatch,
 			       "h2memw", hz);
 		if (error == ERESTART)
 			break;
 	}
+	if (started)
+		trigger_syncer_stop(pmp->mp);
 }
 
 /*

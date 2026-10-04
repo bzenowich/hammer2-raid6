@@ -361,7 +361,6 @@ int
 hammer2_flush(hammer2_chain_t *chain, int flags)
 {
 	hammer2_flush_info_t info;
-	hammer2_dev_t *hmp;
 	int loops;
 
 	/*
@@ -388,7 +387,6 @@ hammer2_flush(hammer2_chain_t *chain, int flags)
 	 * chain.
 	 */
 	hammer2_chain_ref(chain);
-	hmp = chain->hmp;
 	loops = 0;
 
 	for (;;) {
@@ -1125,10 +1123,6 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 
 		/*
 		 * Blocktable updates
-		 *
-		 * We synchronize pending statistics at this time.  Delta
-		 * adjustments designated for the current and upper level
-		 * are synchronized.
 		 */
 		if (base && (chain->flags & HAMMER2_CHAIN_BLKMAPUPD)) {
 			if (chain->flags & HAMMER2_CHAIN_BLKMAPPED) {
@@ -1349,10 +1343,10 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 
 			/* XXX cluster */
 			if (ip == pmp->iroot && pmp != hmp->spmp) {
-				hammer2_spin_ex(&pmp->inum_spin);
+				hammer2_spin_ex(&pmp->blockset_spin);
 				pmp->pfs_iroot_blocksets[clindex] =
 					chain->data->ipdata.u.blockset;
-				hammer2_spin_unex(&pmp->inum_spin);
+				hammer2_spin_unex(&pmp->blockset_spin);
 			}
 
 #if 0
@@ -1604,11 +1598,11 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			 */
 			bp = getblk(e->devvp,
 				    j * HAMMER2_ZONE_BYTES64,
-				    HAMMER2_PBUFSIZE,
+				    HAMMER2_VOLUME_BYTES,
 				    GETBLK_KVABIO, 0);
 			bkvasync(bp);
 			bcopy(&hmp->volsync, bp->b_data,
-			      HAMMER2_PBUFSIZE);
+			      HAMMER2_VOLUME_BYTES);
 			/*
 			 * Per-disk volume-header fixup.  volsync was copied from
 			 * the root volume so it carries that disk's identity in

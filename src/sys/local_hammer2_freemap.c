@@ -177,8 +177,7 @@ hammer2_freemap_reserve(hammer2_chain_t *chain, int radix)
  * allocations using the iterator as allocated, instantiating new 2GB zones,
  * and dealing with the end-of-media edge case).
  *
- * ip and bpref are only used as a heuristic to determine locality of
- * reference.  bref->key may also be used heuristically.
+ * bpref is only used as a heuristic to determine locality of reference.
  *
  * This function is a NOP if bytes is 0.
  */
@@ -242,29 +241,6 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 
 	KKASSERT(bytes >= HAMMER2_ALLOC_MIN && bytes <= HAMMER2_ALLOC_MAX);
 
-	/*
-	 * Calculate the starting point for our allocation search.
-	 *
-	 * Each freemap leaf is dedicated to a specific freemap_radix.
-	 * The freemap_radix can be more fine-grained than the device buffer
-	 * radix which results in inodes being grouped together in their
-	 * own segment, terminal-data (16K or less) and initial indirect
-	 * block being grouped together, and then full-indirect and full-data
-	 * blocks (64K) being grouped together.
-	 *
-	 * The single most important aspect of this is the inode grouping
-	 * because that is what allows 'find' and 'ls' and other filesystem
-	 * topology operations to run fast.
-	 */
-#if 0
-	if (bref->data_off & ~HAMMER2_OFF_MASK_RADIX)
-		bpref = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
-	else if (trans->tmp_bpref)
-		bpref = trans->tmp_bpref;
-	else if (trans->tmp_ip)
-		bpref = trans->tmp_ip->chain->bref.data_off;
-	else
-#endif
 	/*
 	 * Heuristic tracking index.  We would like one for each distinct
 	 * bref type if possible.  heur_freemap[] has room for two classes
@@ -349,12 +325,7 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 	int error;
 
 	/*
-	 * Calculate the number of bytes being allocated, the number
-	 * of contiguous bits of bitmap being allocated, and the bitmap
-	 * mask.
-	 *
-	 * WARNING! cpu hardware may mask bits == 64 -> 0 and blow up the
-	 *	    mask calculation.
+	 * Calculate the number of bytes being allocated.
 	 */
 	bytes = (size_t)1 << radix;
 	class = (bref->type << 8) | HAMMER2_PBUFRADIX;
@@ -392,14 +363,23 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 				     mtid, 0, 0);
 		KKASSERT(error == 0);
 		if (error == 0) {
-			hammer2_chain_modify(chain, mtid, 0, 0);
-			bzero(&chain->data->bmdata[0],
-			      HAMMER2_FREEMAP_LEVELN_PSIZE);
-			chain->bref.check.freemap.bigmask = (uint32_t)-1;
-			chain->bref.check.freemap.avail = l1size;
-			/* bref.methods should already be inherited */
+			/*
+			 * An error should not be possible here because freemap
+			 * blocks are laid out algorithmically, not dynamically.
+			 *
+			 * But have an error path anyway.
+			 */
+			error = hammer2_chain_modify(chain, mtid, 0, 0);
+			if (error == 0) {
+				bzero(&chain->data->bmdata[0],
+				      HAMMER2_FREEMAP_LEVELN_PSIZE);
+				chain->bref.check.freemap.bigmask =
+					(uint32_t)-1;
+				chain->bref.check.freemap.avail = l1size;
+				/* bref.methods should already be inherited */
 
-			hammer2_freemap_init(hmp, key, chain);
+				hammer2_freemap_init(hmp, key, chain);
+			}
 		}
 	} else if (chain->error) {
 		/*
@@ -418,8 +398,13 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 	} else {
 		/*
 		 * Modify existing chain to setup for adjustment.
+		 *
+		 * An error should not be possible here because freemap
+		 * blocks are laid out algorithmically, not dynamically.
+		 *
+		 * But have an error path anyway.
 		 */
-		hammer2_chain_modify(chain, mtid, 0, 0);
+		error = hammer2_chain_modify(chain, mtid, 0, 0);
 	}
 
 	/*
@@ -436,7 +421,16 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 		start = (int)((iter->bnext - key) >>
 			      HAMMER2_FREEMAP_LEVEL0_RADIX);
 		KKASSERT(start >= 0 && start < HAMMER2_FREEMAP_COUNT);
-		hammer2_chain_modify(chain, mtid, 0, 0);
+
+		/*
+		 * An error should not be possible here because freemap
+		 * blocks are laid out algorithmically, not dynamically.
+		 *
+		 * But have an error path anyway.
+		 */
+		error = hammer2_chain_modify(chain, mtid, 0, 0);
+		if (error)
+			goto skip_scan;
 
 		error = HAMMER2_ERROR_ENOSPC;
 		for (count = 0; count < HAMMER2_FREEMAP_COUNT; ++count) {
@@ -544,6 +538,8 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 				(uint32_t)~((size_t)1 << radix);
 		}
 		/* XXX also scan down from original count */
+skip_scan:
+		;
 	}
 
 	if (error == 0) {
@@ -633,7 +629,7 @@ hammer2_bmap_alloc(hammer2_dev_t *hmp, hammer2_bmap_data_t *bmap,
 	} else {
 		bmradix = (hammer2_bitmap_t)2 <<
 			  (radix - HAMMER2_FREEMAP_BLOCK_RADIX);
-		/* (32K-256K) 4, 8, 16, 32 bits per allocation block */
+		/* (32K-64K) 4, 8 bits per allocation block */
 	}
 
 	/*
@@ -1001,8 +997,8 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref,
 	hammer2_tid_t mtid;
 	hammer2_bitmap_t *bitmap;
 	const hammer2_bitmap_t bmmask00 = 0;
-	hammer2_bitmap_t bmmask01;
-	hammer2_bitmap_t bmmask10;
+	//hammer2_bitmap_t bmmask01;
+	//hammer2_bitmap_t bmmask10;
 	hammer2_bitmap_t bmmask11;
 	size_t bytes;
 	uint16_t class;
@@ -1115,8 +1111,8 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref,
 	 * Calculate the bitmask (runs in 2-bit pairs).
 	 */
 	start = ((int)(data_off >> HAMMER2_FREEMAP_BLOCK_RADIX) & 15) * 2;
-	bmmask01 = (hammer2_bitmap_t)1 << start;
-	bmmask10 = (hammer2_bitmap_t)2 << start;
+	//bmmask01 = (hammer2_bitmap_t)1 << start;
+	//bmmask10 = (hammer2_bitmap_t)2 << start;
 	bmmask11 = (hammer2_bitmap_t)3 << start;
 
 	/*
@@ -1225,8 +1221,8 @@ again:
 		}
 #endif
 		--count;
-		bmmask01 <<= 2;
-		bmmask10 <<= 2;
+		//bmmask01 <<= 2;
+		//bmmask10 <<= 2;
 		bmmask11 <<= 2;
 	}
 #if 0
@@ -1261,7 +1257,7 @@ again:
 	 * operations later on.
 	 *
 	 * We could calculate the largest possible allocation and set the
-	 * radii that could fit, but its easier just to set bigmask to -1.
+	 * radixes that could fit, but its easier just to set bigmask to -1.
 	 */
 	if (modified) {
 		chain->bref.check.freemap.bigmask = -1;

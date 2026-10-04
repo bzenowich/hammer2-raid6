@@ -87,7 +87,7 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 	 * Standard root cred checks, will be selectively ignored below
 	 * for ioctls that do not require root creds.
 	 */
-	error = priv_check_cred(cred, PRIV_HAMMER_IOCTL, 0);
+	error = caps_priv_check(cred, SYSCAP_NOVFS_IOCTL);
 
 	switch(com) {
 	case HAMMER2IOC_VERSION_GET:
@@ -193,6 +193,16 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 		/* No privilege required — read-only status query */
 		error = hammer2_ioctl_raid_scrub_status(ip, data);
 		break;
+	case FIOSEEKDATA:
+	case FIOSEEKHOLE:
+		if (error == 0)
+			error = EOPNOTSUPP;
+#if 0
+			/* doesn't work correctly yet */
+			error = vn_bmap_seekhole(ip->vp, com, (off_t *)data,
+			    cred);
+#endif
+		break;
 	default:
 		error = EOPNOTSUPP;
 		break;
@@ -231,16 +241,20 @@ hammer2_ioctl_recluster(hammer2_inode_t *ip, void *data)
 		error = VFS_ROOT(ip->pmp->mp, &vproot);
 		if (error == 0) {
 			cluster = &ip->pmp->iroot->cluster;
-			kprintf("reconnect to cluster: nc=%d focus=%p\n",
-				cluster->nchains, cluster->focus);
-			if (cluster->nchains != 1 || cluster->focus == NULL) {
-				kprintf("not a local device mount\n");
-				error = EINVAL;
-			} else {
+			if (cluster->focus != NULL) {
 				hammer2_cluster_reconnect(cluster->focus->hmp,
 							  fp);
-				kprintf("ok\n");
 				error = 0;
+			} else if (cluster->nchains == 1 &&
+				   cluster->array[0].chain != NULL) {
+				hammer2_cluster_reconnect(
+					cluster->array[0].chain->hmp, fp);
+				error = 0;
+			} else {
+				kprintf("hammer2: recluster: "
+					"nchains=%d focus=%p\n",
+					cluster->nchains, cluster->focus);
+				error = EINVAL;
 			}
 			vput(vproot);
 		}
@@ -678,9 +692,9 @@ hammer2_ioctl_pfs_create(hammer2_inode_t *ip, void *data)
 		 * "boot", the boot loader can't decompress (yet).
 		 */
 		nip->meta.comp_algo =
-			HAMMER2_ENC_ALGO(HAMMER2_COMP_NEWFS_DEFAULT);
+			HAMMER2_ENC_ALGO(HAMMER2_COMP_DEFAULT);
 		nip->meta.check_algo =
-			HAMMER2_ENC_ALGO( HAMMER2_CHECK_XXHASH64);
+			HAMMER2_ENC_ALGO(HAMMER2_CHECK_DEFAULT);
 
 		if (strcasecmp(pfs->name, "boot") == 0) {
 			nip->meta.comp_algo =
@@ -731,7 +745,6 @@ hammer2_ioctl_pfs_delete(hammer2_inode_t *ip, void *data)
 	hammer2_pfs_t	*pmp;
 	hammer2_xop_unlink_t *xop;
 	hammer2_inode_t *dip;
-	hammer2_inode_t *iroot;
 	int error;
 	int i;
 
@@ -776,7 +789,6 @@ hammer2_ioctl_pfs_delete(hammer2_inode_t *ip, void *data)
 	 * Ok, we found the pmp and we have the index.  Permanently remove
 	 * the PFS from the cluster
 	 */
-	iroot = pmp->iroot;
 	kprintf("FOUND PFS %s CLINDEX %d\n", pfs->name, i);
 	hammer2_pfsdealloc(pmp, i, 1);
 
@@ -830,7 +842,6 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 	hammer2_inode_t *nip;
 	hammer2_tid_t	mtid;
 	size_t name_len;
-	hammer2_key_t lhc;
 	int error;
 #if 0
 	uuid_t opfs_clid;
@@ -872,11 +883,6 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 	chain = hammer2_inode_chain(ip, 0, HAMMER2_RESOLVE_ALWAYS);
 
 	name_len = strlen(pfs->name);
-	lhc = hammer2_dirhash(pfs->name, name_len);
-
-	/*
-	 * Get the clid
-	 */
 	hmp = chain->hmp;
 
 	/*
@@ -939,9 +945,9 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 		/* XXX hack blockset copy */
 		/* XXX doesn't work with real cluster */
 		wipdata->meta = nip->meta;
-		hammer2_spin_ex(&pmp->inum_spin);
+		hammer2_spin_ex(&pmp->blockset_spin);
 		wipdata->u.blockset = pmp->pfs_iroot_blocksets[0];
-		hammer2_spin_unex(&pmp->inum_spin);
+		hammer2_spin_unex(&pmp->blockset_spin);
 
 		KKASSERT(wipdata == &nchain->data->ipdata);
 
@@ -1301,8 +1307,10 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data, struct ucred *cred)
 {
 	hammer2_ioc_growfs_t *grow = data;
 	hammer2_dev_t *hmp;
-	hammer2_off_t delta;
+	hammer2_off_t size, delta;
 	hammer2_tid_t mtid;
+	struct partinfo part;
+	struct vattr_lite va;
 	struct buf *bp;
 	int error;
 	int i;
@@ -1314,27 +1322,34 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data, struct ucred *cred)
 			"with multiple volumes\n");
 		return EOPNOTSUPP;
 	}
+	KKASSERT(hmp->total_size == hmp->voldata.volu_size);
 
 	/*
 	 * Extract from disklabel
 	 */
+	if (VOP_IOCTL(hmp->devvp, DIOCGPART, (void *)&part, 0, cred, NULL) == 0) {
+		size = part.media_size;
+		kprintf("hammer2: growfs partition-auto to %016jx\n",
+			(intmax_t)size);
+	} else if (VOP_GETATTR_LITE(hmp->devvp, &va) == 0) {
+		size = va.va_size;
+		kprintf("hammer2: growfs fstat-auto to %016jx\n",
+			(intmax_t)size);
+	} else {
+		return EINVAL;
+	}
+
+	/*
+	 * Expand to devvp size unless specified.
+	 */
 	grow->modified = 0;
 	if (grow->size == 0) {
-		struct partinfo part;
-		struct vattr_lite va;
-
-		if (VOP_IOCTL(hmp->devvp, DIOCGPART, (void *)&part,
-			      0, cred, NULL) == 0) {
-			grow->size = part.media_size;
-			kprintf("hammer2: growfs partition-auto to %jd\n",
-				(intmax_t)grow->size);
-		} else if (VOP_GETATTR_LITE(hmp->devvp, &va) == 0) {
-			grow->size = va.va_size;
-			kprintf("hammer2: growfs fstat-auto to %jd\n",
-				(intmax_t)grow->size);
-		} else {
-			return EINVAL;
-		}
+		grow->size = size;
+	} else if (grow->size > size) {
+		kprintf("hammer2: growfs size %016jx exceeds device size "
+			"%016jx\n",
+			(intmax_t)grow->size, (intmax_t)size);
+		return EINVAL;
 	}
 
 	/*
@@ -1357,7 +1372,7 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data, struct ucred *cred)
 	 */
 	if (grow->size < hmp->voldata.volu_size) {
 		kprintf("hammer2: growfs failure, "
-			"would shrink from %jd to %jd\n",
+			"would shrink from %016jx to %016jx\n",
 			(intmax_t)hmp->voldata.volu_size,
 			(intmax_t)grow->size);
 		return EINVAL;
@@ -1397,8 +1412,8 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data, struct ucred *cred)
 	hammer2_trans_init(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
 	mtid = hammer2_trans_sub(hmp->spmp);
 
-	kprintf("hammer2: growfs - expand by %jd to %jd mtid %016jx\n",
-		(intmax_t)delta, (intmax_t)grow->size, mtid);
+	kprintf("hammer2: growfs - expand by %016jx to %016jx mtid %016jx\n",
+		(intmax_t)delta, (intmax_t)grow->size, (intmax_t)mtid);
 
 
 	hammer2_voldata_lock(hmp);

@@ -34,13 +34,13 @@
  */
 
 #include <sys/types.h>
-#include <sys/param.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -140,17 +140,17 @@ hammer2_mkfs_init(hammer2_mkfs_options_t *opt)
 
 	opt->Hammer2Version = get_hammer2_version();
 	opt->Label[opt->NLabels++] = strdup("LOCAL");
-	opt->CompType = HAMMER2_COMP_NEWFS_DEFAULT; /* LZ4 */
-	opt->CheckType = HAMMER2_CHECK_XXHASH64;
+	opt->CompType = HAMMER2_COMP_DEFAULT; /* LZ4 */
+	opt->CheckType = HAMMER2_CHECK_DEFAULT; /* xxhash64 */
 	opt->DefaultLabelType = HAMMER2_LABEL_NONE;
 
 	/*
 	 * Generate a filesystem id and lookup the filesystem type
 	 */
 	srandomdev();
-	uuidgen(&opt->Hammer2_VolFSID, 1);
-	uuidgen(&opt->Hammer2_SupCLID, 1);
-	uuidgen(&opt->Hammer2_SupFSID, 1);
+	uuid_create(&opt->Hammer2_VolFSID, NULL);
+	uuid_create(&opt->Hammer2_SupCLID, NULL);
+	uuid_create(&opt->Hammer2_SupFSID, NULL);
 	uuid_from_string(HAMMER2_UUID_STRING, &opt->Hammer2_FSType, &status);
 	/*uuid_name_lookup(&Hammer2_FSType, "DragonFly HAMMER2", &status);*/
 	if (status != uuid_s_ok) {
@@ -384,8 +384,8 @@ format_hammer2_inode(hammer2_ondisk_t *fso, hammer2_volume_t *vol,
 	alloc_direct(&alloc_base, &sroot_blockref, HAMMER2_INODE_BYTES);
 
 	for (i = 0; i < opt->NLabels; ++i) {
-		uuidgen(&opt->Hammer2_PfsCLID[i], 1);
-		uuidgen(&opt->Hammer2_PfsFSID[i], 1);
+		uuid_create(&opt->Hammer2_PfsCLID[i], NULL);
+		uuid_create(&opt->Hammer2_PfsFSID[i], NULL);
 
 		alloc_direct(&alloc_base, &root_blockref[i],
 			     HAMMER2_INODE_BYTES);
@@ -410,7 +410,7 @@ format_hammer2_inode(hammer2_ondisk_t *fso, hammer2_volume_t *vol,
 		rawip->meta.name_len = strlen(opt->Label[i]);
 		bcopy(opt->Label[i], rawip->filename, rawip->meta.name_len);
 		rawip->meta.name_key =
-				dirhash(rawip->filename, rawip->meta.name_len);
+				dirhash((char *)rawip->filename, rawip->meta.name_len);
 
 		/*
 		 * Compression mode and supported copyids.
@@ -427,7 +427,7 @@ format_hammer2_inode(hammer2_ondisk_t *fso, hammer2_volume_t *vol,
 			rawip->meta.comp_algo = HAMMER2_ENC_ALGO(
 						    opt->CompType);
 			rawip->meta.check_algo = HAMMER2_ENC_ALGO(
-						    HAMMER2_CHECK_XXHASH64);
+						    opt->CheckType);
 		}
 
 		/*
@@ -485,9 +485,6 @@ format_hammer2_inode(hammer2_ondisk_t *fso, hammer2_volume_t *vol,
 	rawip->meta.mode = 0700;	/* super-root - root only */
 	rawip->meta.inum = 0;		/* super root inode, inumber 0 */
 	rawip->meta.nlinks = 2;		/* directory link count compat */
-
-	rawip->meta.name_len = 0;	/* super-root is unnamed */
-	rawip->meta.name_key = 0;
 
 	rawip->meta.comp_algo = HAMMER2_ENC_ALGO(HAMMER2_COMP_AUTOZERO);
 	rawip->meta.check_algo = HAMMER2_ENC_ALGO(HAMMER2_CHECK_XXHASH64);
@@ -913,7 +910,7 @@ blkrefary_cmp(const void *b1, const void *b2)
 void
 hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 {
-	hammer2_off_t reserved_size;
+	hammer2_off_t resid = 0, reserved_size;
 	hammer2_ondisk_t fso;
 	int i;
 	char *vol_fsid = NULL;
@@ -939,6 +936,17 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	hammer2_init_ondisk(&fso);
 	fso.version = opt->Hammer2Version;
 	fso.nvolumes = ac;
+
+	assert(ac >= 1);
+	if (opt->NFileSystemSizes == 1) {
+		resid = opt->FileSystemSize[0];
+		assert(resid >= HAMMER2_FREEMAP_LEVEL1_SIZE);
+	} else if (opt->NFileSystemSizes > 1) {
+		if (ac != opt->NFileSystemSizes)
+			errx(1, "Invalid filesystem size count %d vs %d",
+			    opt->NFileSystemSizes, ac);
+	}
+
 	for (i = 0; i < fso.nvolumes; ++i) {
 		hammer2_volume_t *vol = &fso.volumes[i];
 		hammer2_off_t size;
@@ -946,10 +954,30 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 		if (fd < 0)
 			err(1, "Unable to open %s R+W", av[i]);
 		size = check_volume(fd);
+
+		/*
+		 * Limit size if a smaller filesystem size is specified.
+		 */
+		if (opt->NFileSystemSizes == 1) {
+			if (resid == 0)
+				errx(1, "No remaining filesystem size for %s",
+				    av[i]);
+			if (size > resid)
+				size = resid;
+			resid -= size;
+		} else if (opt->NFileSystemSizes > 1) {
+			resid = opt->FileSystemSize[i];
+			assert(resid >= HAMMER2_FREEMAP_LEVEL1_SIZE);
+			if (size > resid)
+				size = resid;
+		}
+
 		if (i == fso.nvolumes - 1)
 			size &= ~HAMMER2_VOLUME_ALIGNMASK64;
 		else
 			size &= ~HAMMER2_FREEMAP_LEVEL1_MASK;
+		if (size == 0)
+			errx(1, "%s has aligned size of 0", av[i]);
 		hammer2_install_volume(vol, fd, i, av[i], fso.total_size, size);
 		fso.total_size += size;
 	}

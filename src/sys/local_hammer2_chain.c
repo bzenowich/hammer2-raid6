@@ -79,8 +79,6 @@ static hammer2_chain_t *hammer2_combined_find(
 		hammer2_blockref_t **brefp);
 static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *chain,
 				int depth);
-static void hammer2_chain_lru_flush(hammer2_pfs_t *pmp);
-
 /*
  * There are many degenerate situations where an extreme rate of console
  * output can occur from warnings and errors.  Make sure this output does
@@ -235,7 +233,6 @@ hammer2_chain_alloc(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	chain->bytes = bytes;
 	chain->refs = 1;
 	chain->flags = HAMMER2_CHAIN_ALLOCATED;
-	lockinit(&chain->diolk, "chdio", 0, 0);
 
 	/*
 	 * Set the PFS boundary flag if this chain represents a PFS root.
@@ -256,10 +253,12 @@ hammer2_chain_init(hammer2_chain_t *chain)
 	RB_INIT(&chain->core.rbtree);	/* live chains */
 	hammer2_mtx_init(&chain->lock, "h2chain");
 	hammer2_spin_init(&chain->core.spin, "h2chain");
+	lockinit(&chain->diolk, "chdio", 0, 0);
 }
 
 /*
  * Add a reference to a chain element, preventing its destruction.
+ * Undone via hammer2_chain_drop()
  *
  * (can be called with spinlock held)
  */
@@ -267,37 +266,7 @@ void
 hammer2_chain_ref(hammer2_chain_t *chain)
 {
 	if (atomic_fetchadd_int(&chain->refs, 1) == 0) {
-		/*
-		 * Just flag that the chain was used and should be recycled
-		 * on the LRU if it encounters it later.
-		 */
-		if (chain->flags & HAMMER2_CHAIN_ONLRU)
-			atomic_set_int(&chain->flags, HAMMER2_CHAIN_LRUHINT);
-
-#if 0
-		/*
-		 * REMOVED - reduces contention, lru_list is more heuristical
-		 * now.
-		 *
-		 * 0->non-zero transition must ensure that chain is removed
-		 * from the LRU list.
-		 *
-		 * NOTE: Already holding lru_spin here so we cannot call
-		 *	 hammer2_chain_ref() to get it off lru_list, do
-		 *	 it manually.
-		 */
-		if (chain->flags & HAMMER2_CHAIN_ONLRU) {
-			hammer2_pfs_t *pmp = chain->pmp;
-			hammer2_spin_ex(&pmp->lru_spin);
-			if (chain->flags & HAMMER2_CHAIN_ONLRU) {
-				atomic_add_int(&pmp->lru_count, -1);
-				atomic_clear_int(&chain->flags,
-						 HAMMER2_CHAIN_ONLRU);
-				TAILQ_REMOVE(&pmp->lru_list, chain, lru_node);
-			}
-			hammer2_spin_unex(&pmp->lru_spin);
-		}
-#endif
+		/* NOP */
 	}
 }
 
@@ -490,7 +459,6 @@ static
 hammer2_chain_t *
 hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 {
-	hammer2_pfs_t *pmp;
 	hammer2_dev_t *hmp;
 	hammer2_chain_t *parent;
 	hammer2_chain_t *rdrop;
@@ -513,8 +481,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 		 *
 		 * If the chain has a parent the MODIFIED bit prevents
 		 * scrapping.
-		 *
-		 * Chains with UPDATE/MODIFIED are *not* put on the LRU list!
 		 */
 		if (chain->flags & (HAMMER2_CHAIN_UPDATE |
 				    HAMMER2_CHAIN_MODIFIED)) {
@@ -591,8 +557,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	 *
 	 * Retry (return chain) if we fail to transition the refs to 0, else
 	 * return NULL indication nothing more to do.
-	 *
-	 * Chains with children are NOT put on the LRU list.
 	 */
 	if (chain->core.chain_count) {
 		if (atomic_cmpset_int(&chain->refs, 1, 0)) {
@@ -616,7 +580,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	 * we can safely drop chain's refs with intent to free the chain.
 	 */
 	hmp = chain->hmp;
-	pmp = chain->pmp;	/* can be NULL */
 	rdrop = NULL;
 
 	parent = chain->parent;
@@ -626,98 +589,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	 *	    will be acquired and released in the code below.  We
 	 *	    cannot be making fancy procedure calls!
 	 */
-
-	/*
-	 * We can cache the chain if it is associated with a pmp
-	 * and not flagged as being destroyed or requesting a full
-	 * release.  In this situation the chain is not removed
-	 * from its parent, i.e. it can still be looked up.
-	 *
-	 * We intentionally do not cache DATA chains because these
-	 * were likely used to load data into the logical buffer cache
-	 * and will not be accessed again for some time.
-	 */
-	if ((chain->flags &
-	     (HAMMER2_CHAIN_DESTROY | HAMMER2_CHAIN_RELEASE)) == 0 &&
-	    chain->pmp &&
-	    chain->bref.type != HAMMER2_BREF_TYPE_DATA) {
-		if (parent)
-			hammer2_spin_ex(&parent->core.spin);
-		if (atomic_cmpset_int(&chain->refs, 1, 0) == 0) {
-			/*
-			 * 1->0 transition failed, retry.  Do not drop
-			 * the chain's data yet!
-			 */
-			if (parent)
-				hammer2_spin_unex(&parent->core.spin);
-			hammer2_spin_unex(&chain->core.spin);
-			hammer2_mtx_unlock(&chain->lock);
-
-			return(chain);
-		}
-
-		/*
-		 * Success
-		 */
-		hammer2_chain_assert_no_data(chain);
-
-		/*
-		 * Make sure we are on the LRU list, clean up excessive
-		 * LRU entries.  We can only really drop one but there might
-		 * be other entries that we can remove from the lru_list
-		 * without dropping.
-		 *
-		 * NOTE: HAMMER2_CHAIN_ONLRU may only be safely set when
-		 *	 chain->core.spin AND pmp->lru_spin are held, but
-		 *	 can be safely cleared only holding pmp->lru_spin.
-		 */
-		if ((chain->flags & HAMMER2_CHAIN_ONLRU) == 0) {
-			hammer2_spin_ex(&pmp->lru_spin);
-			if ((chain->flags & HAMMER2_CHAIN_ONLRU) == 0) {
-				atomic_set_int(&chain->flags,
-					       HAMMER2_CHAIN_ONLRU);
-				TAILQ_INSERT_TAIL(&pmp->lru_list,
-						  chain, lru_node);
-				atomic_add_int(&pmp->lru_count, 1);
-			}
-			if (pmp->lru_count < HAMMER2_LRU_LIMIT)
-				depth = 1;	/* disable lru_list flush */
-			hammer2_spin_unex(&pmp->lru_spin);
-		} else {
-			/* disable lru flush */
-			depth = 1;
-		}
-
-		if (parent) {
-			hammer2_spin_unex(&parent->core.spin);
-			parent = NULL;	/* safety */
-		}
-		hammer2_spin_unex(&chain->core.spin);
-		hammer2_mtx_unlock(&chain->lock);
-
-		/*
-		 * lru_list hysteresis (see above for depth overrides).
-		 * Note that depth also prevents excessive lastdrop recursion.
-		 */
-		if (depth == 0)
-			hammer2_chain_lru_flush(pmp);
-
-		return NULL;
-		/* NOT REACHED */
-	}
-
-	/*
-	 * Make sure we are not on the LRU list.
-	 */
-	if (chain->flags & HAMMER2_CHAIN_ONLRU) {
-		hammer2_spin_ex(&pmp->lru_spin);
-		if (chain->flags & HAMMER2_CHAIN_ONLRU) {
-			atomic_add_int(&pmp->lru_count, -1);
-			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONLRU);
-			TAILQ_REMOVE(&pmp->lru_list, chain, lru_node);
-		}
-		hammer2_spin_unex(&pmp->lru_spin);
-	}
 
 	/*
 	 * Spinlock the parent and try to drop the last ref on chain.
@@ -833,78 +704,6 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	 * Possible chaining loop when parent re-drop needed.
 	 */
 	return(rdrop);
-}
-
-/*
- * Heuristical flush of the LRU, try to reduce the number of entries
- * on the LRU to (HAMMER2_LRU_LIMIT * 2 / 3).  This procedure is called
- * only when lru_count exceeds HAMMER2_LRU_LIMIT.
- */
-static
-void
-hammer2_chain_lru_flush(hammer2_pfs_t *pmp)
-{
-	hammer2_chain_t *chain;
-
-again:
-	chain = NULL;
-	hammer2_spin_ex(&pmp->lru_spin);
-	while (pmp->lru_count > HAMMER2_LRU_LIMIT * 2 / 3) {
-		/*
-		 * Pick a chain off the lru_list, just recycle it quickly
-		 * if LRUHINT is set (the chain was ref'd but left on
-		 * the lru_list, so cycle to the end).
-		 */
-		chain = TAILQ_FIRST(&pmp->lru_list);
-		TAILQ_REMOVE(&pmp->lru_list, chain, lru_node);
-
-		if (chain->flags & HAMMER2_CHAIN_LRUHINT) {
-			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_LRUHINT);
-			TAILQ_INSERT_TAIL(&pmp->lru_list, chain, lru_node);
-			chain = NULL;
-			continue;
-		}
-
-		/*
-		 * Ok, we are off the LRU.  We must adjust refs before we
-		 * can safely clear the ONLRU flag.
-		 */
-		atomic_add_int(&pmp->lru_count, -1);
-		if (atomic_cmpset_int(&chain->refs, 0, 1)) {
-			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONLRU);
-			atomic_set_int(&chain->flags, HAMMER2_CHAIN_RELEASE);
-			break;
-		}
-		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_ONLRU);
-		chain = NULL;
-	}
-	hammer2_spin_unex(&pmp->lru_spin);
-	if (chain == NULL)
-		return;
-
-	/*
-	 * If we picked a chain off the lru list we may be able to lastdrop
-	 * it.  Use a depth of 1 to prevent excessive lastdrop recursion.
-	 */
-	while (chain) {
-		u_int refs;
-
-		refs = chain->refs;
-		cpu_ccfence();
-		KKASSERT(refs > 0);
-
-		if (refs == 1) {
-			if (hammer2_mtx_ex_try(&chain->lock) == 0)
-				chain = hammer2_chain_lastdrop(chain, 1);
-			/* retry the same chain, or chain from lastdrop */
-		} else {
-			if (atomic_cmpset_int(&chain->refs, refs, refs - 1))
-				break;
-			/* retry the same chain */
-		}
-		cpu_pause();
-	}
-	goto again;
 }
 
 /*
@@ -1192,13 +991,6 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 	 * by creating a zero-fill element.  We do not mark the buffer
 	 * dirty when creating a zero-fill element (the hammer2_chain_modify()
 	 * API must still be used to do that).
-	 *
-	 * The device buffer is variable-sized in powers of 2 down
-	 * to HAMMER2_MIN_ALLOC (typically 1K).  A 64K physical storage
-	 * chunk always contains buffers of the same size. (XXX)
-	 *
-	 * The minimum physical IO size may be larger than the variable
-	 * block size.
 	 */
 	bref = &chain->bref;
 
@@ -3902,15 +3694,6 @@ _hammer2_chain_delete_helper(hammer2_chain_t *parent, hammer2_chain_t *chain,
 
 		/*
 		 * delete blockmapped chain from its parent.
-		 *
-		 * The parent is not affected by any statistics in chain
-		 * which are pending synchronization.  That is, there is
-		 * nothing to undo in the parent since they have not yet
-		 * been incorporated into the parent.
-		 *
-		 * The parent is affected by statistics stored in inodes.
-		 * Those have already been synchronized, so they must be
-		 * undone.  XXX split update possible w/delete in middle?
 		 */
 		if (base) {
 			hammer2_base_delete(parent, base, count, chain, obref);
@@ -3922,10 +3705,6 @@ _hammer2_chain_delete_helper(hammer2_chain_t *parent, hammer2_chain_t *chain,
 		 * Chain is not blockmapped but a parent is present.
 		 * Atomically remove the chain from the parent.  There is
 		 * no blockmap entry to remove.
-		 *
-		 * Because chain was associated with a parent but not
-		 * synchronized, the chain's *_count_up fields contain
-		 * inode adjustment statistics which must be undone.
 		 */
 		hammer2_spin_ex(&chain->core.spin);
 		hammer2_spin_ex(&parent->core.spin);
@@ -4287,11 +4066,6 @@ hammer2_chain_create_indirect(hammer2_chain_t *parent,
 		/*
 		 * Shift the chain to the indirect block.
 		 *
-		 * WARNING! No reason for us to load chain data, pass NOSTATS
-		 *	    to prevent delete/insert from trying to access
-		 *	    inode stats (and thus asserting if there is no
-		 *	    chain->data loaded).
-		 *
 		 * WARNING! The (parent, chain) deletion may modify the parent
 		 *	    and invalidate the base pointer.
 		 *
@@ -4354,7 +4128,7 @@ next_key_spinlocked:
 	/*
 	 * Figure out what to return.
 	 */
-	if (rounddown2(create_key ^ key, (hammer2_key_t)1 << keybits)) {
+	if (rounddown2(create_key ^ key, (hammer2_key_t)1 << keybits) != 0) {
 		/*
 		 * Key being created is outside the key range,
 		 * return the original parent.
@@ -5238,7 +5012,7 @@ static int
 hammer2_base_find(hammer2_chain_t *parent,
 		  hammer2_blockref_t *base, int count,
 		  hammer2_key_t *key_nextp,
-		  hammer2_key_t key_beg, hammer2_key_t key_end)
+		  hammer2_key_t key_beg, hammer2_key_t key_end __unused)
 {
 	hammer2_blockref_t *scan;
 	hammer2_key_t scan_end;
@@ -5696,96 +5470,6 @@ validate:
 
 }
 
-#if 0
-
-/*
- * Sort the blockref array for the chain.  Used by the flush code to
- * sort the blockref[] array.
- *
- * The chain must be exclusively locked AND spin-locked.
- */
-typedef hammer2_blockref_t *hammer2_blockref_p;
-
-static
-int
-hammer2_base_sort_callback(const void *v1, const void *v2)
-{
-	hammer2_blockref_p bref1 = *(const hammer2_blockref_p *)v1;
-	hammer2_blockref_p bref2 = *(const hammer2_blockref_p *)v2;
-
-	/*
-	 * Make sure empty elements are placed at the end of the array
-	 */
-	if (bref1->type == HAMMER2_BREF_TYPE_EMPTY) {
-		if (bref2->type == HAMMER2_BREF_TYPE_EMPTY)
-			return(0);
-		return(1);
-	} else if (bref2->type == HAMMER2_BREF_TYPE_EMPTY) {
-		return(-1);
-	}
-
-	/*
-	 * Sort by key
-	 */
-	if (bref1->key < bref2->key)
-		return(-1);
-	if (bref1->key > bref2->key)
-		return(1);
-	return(0);
-}
-
-void
-hammer2_base_sort(hammer2_chain_t *chain)
-{
-	hammer2_blockref_t *base;
-	int count;
-
-	switch(chain->bref.type) {
-	case HAMMER2_BREF_TYPE_INODE:
-		/*
-		 * Special shortcut for embedded data returns the inode
-		 * itself.  Callers must detect this condition and access
-		 * the embedded data (the strategy code does this for us).
-		 *
-		 * This is only applicable to regular files and softlinks.
-		 */
-		if (chain->data->ipdata.meta.op_flags &
-		    HAMMER2_OPFLAG_DIRECTDATA) {
-			return;
-		}
-		base = &chain->data->ipdata.u.blockset.blockref[0];
-		count = HAMMER2_SET_COUNT;
-		break;
-	case HAMMER2_BREF_TYPE_FREEMAP_NODE:
-	case HAMMER2_BREF_TYPE_INDIRECT:
-		/*
-		 * Optimize indirect blocks in the INITIAL state to avoid
-		 * I/O.
-		 */
-		KKASSERT((chain->flags & HAMMER2_CHAIN_INITIAL) == 0);
-		base = &chain->data->npdata[0];
-		count = chain->bytes / sizeof(hammer2_blockref_t);
-		break;
-	case HAMMER2_BREF_TYPE_VOLUME:
-		base = &chain->data->voldata.sroot_blockset.blockref[0];
-		count = HAMMER2_SET_COUNT;
-		break;
-	case HAMMER2_BREF_TYPE_FREEMAP:
-		base = &chain->data->blkset.blockref[0];
-		count = HAMMER2_SET_COUNT;
-		break;
-	default:
-		panic("hammer2_base_sort: unrecognized "
-		      "blockref(A) type: %d",
-		      chain->bref.type);
-		base = NULL;	/* safety */
-		count = 0;	/* safety */
-		break;
-	}
-	kqsort(base, count, sizeof(*base), hammer2_base_sort_callback);
-}
-
-#endif
 
 /*
  * Set the check data for a chain.  This can be a heavy-weight operation
@@ -5843,7 +5527,7 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
  */
 static void
 hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
-				  int bits)
+				  int bits, void *bdata)
 {
 	hammer2_chain_t *lchain;
 	hammer2_chain_t *ochain;
@@ -5871,6 +5555,24 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 	}
 
 	/*
+	 * In-kernel memory information
+	 */
+	kprintf("   chain %p bdata %p dio %p bp %p ",
+		chain,
+		bdata,
+		chain->dio,
+		(chain->dio ? chain->dio->bp : NULL));
+
+	if (chain->dio) {
+		kprintf("bp_loff %016jx,%d bdata %p/%p",
+			(intmax_t)chain->dio->bp->b_loffset,
+			chain->dio->bp->b_bufsize,
+			bdata,
+			chain->dio->bp->b_data);
+	}
+	kprintf("\n");
+
+	/*
 	 * Run up the chains to try to find the governing inode so we
 	 * can report it.
 	 *
@@ -5887,7 +5589,7 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 	    ((chain->bref.flags & HAMMER2_BREF_FLAG_PFSROOT) == 0 ||
 	     (lchain->bref.key & HAMMER2_DIRHASH_VISIBLE))) {
 		kprintf("   Resides at/in inode %ld\n",
-			chain->bref.key);
+			(long)chain->bref.key);
 	} else if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
 		kprintf("   Resides in inode index - CRITICAL!!!\n");
 	} else {
@@ -5909,6 +5611,7 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 		kprintf("   In pfs %s on device %s\n",
 			pfsname, ochain->hmp->devrepname);
 	}
+	//print_backtrace(-1);
 }
 
 /*
@@ -6101,7 +5804,8 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
 		check32 = hammer2_icrc32(bdata, chain->bytes);
 		r = (chain->bref.check.iscsi32.value == check32);
 		if (r == 0) {
-			hammer2_characterize_failed_chain(chain, check32, 32);
+			hammer2_characterize_failed_chain(chain, check32,
+							  32, bdata);
 		}
 		hammer2_process_icrc32 += chain->bytes;
 		break;
@@ -6109,7 +5813,8 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
 		check64 = XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
 		r = (chain->bref.check.xxhash64.value == check64);
 		if (r == 0) {
-			hammer2_characterize_failed_chain(chain, check64, 64);
+			hammer2_characterize_failed_chain(chain, check64,
+							  64, bdata);
 		}
 		hammer2_process_xxhash64 += chain->bytes;
 		break;
@@ -6161,7 +5866,7 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
 					kprintf("dio %p buf %016jx,%d "
 						"bdata %p/%p\n",
 						chain->dio,
-						chain->dio->bp->b_loffset,
+						(intmax_t)chain->dio->bp->b_loffset,
 						chain->dio->bp->b_bufsize,
 						bdata,
 						chain->dio->bp->b_data);
@@ -6242,9 +5947,6 @@ hammer2_chain_inode_find(hammer2_pfs_t *pmp, hammer2_key_t inum,
 		hammer2_inode_drop(ip);
 		if (*chainp)
 			return (*chainp)->error;
-		hammer2_chain_unlock(*chainp);
-		hammer2_chain_drop(*chainp);
-		*chainp = NULL;
 		if (*parentp) {
 			hammer2_chain_unlock(*parentp);
 			hammer2_chain_drop(*parentp);
@@ -6280,7 +5982,7 @@ hammer2_chain_inode_find(hammer2_pfs_t *pmp, hammer2_key_t inum,
 				if (inum != rchain->data->ipdata.meta.inum) {
 					kprintf("hammer2_chain_inode_find: lookup inum %ld, "
 						"got valid inode but with inum %ld\n",
-						inum, rchain->data->ipdata.meta.inum);
+						(long)inum, (long)rchain->data->ipdata.meta.inum);
 					error = HAMMER2_ERROR_CHECK;
 					rchain->error = error;
 				}

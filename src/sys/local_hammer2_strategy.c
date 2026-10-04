@@ -99,11 +99,9 @@ hammer2_vop_strategy(struct vop_strategy_args *ap)
 	switch(bp->b_cmd) {
 	case BUF_CMD_READ:
 		error = hammer2_strategy_read(ap);
-		++hammer2_iod_file_read;
 		break;
 	case BUF_CMD_WRITE:
 		error = hammer2_strategy_write(ap);
-		++hammer2_iod_file_write;
 		break;
 	default:
 		bp->b_error = error = EINVAL;
@@ -111,6 +109,40 @@ hammer2_vop_strategy(struct vop_strategy_args *ap)
 		biodone(biop);
 		break;
 	}
+	return (error);
+}
+
+static int
+hammer2_vop_bmap_impl(struct vop_bmap_args *ap)
+{
+	hammer2_xop_bmap_t *xop;
+	hammer2_inode_t *ip;
+	int error;
+
+	ip = VTOI(ap->a_vp);
+
+	if (ap->a_doffsetp == NULL)
+		return (0);
+	if (ap->a_runp)
+		*ap->a_runp = 0; /* unsupported */
+	if (ap->a_runb)
+		*ap->a_runb = 0; /* unsupported */
+
+	xop = hammer2_xop_alloc(ip, 0);
+	xop->loffset = ap->a_loffset;
+	hammer2_xop_start(&xop->head, &hammer2_bmap_desc);
+	error = hammer2_xop_collect(&xop->head, 0);
+	error = hammer2_error_to_errno(error);
+	if (error) {
+		if (error == ENOENT)
+			error = 0; /* sparse */
+		*ap->a_doffsetp = NOOFFSET;
+	} else {
+		KKASSERT(xop->offset != HAMMER2_OFF_MASK);
+		*ap->a_doffsetp = xop->offset;
+	}
+	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+
 	return (error);
 }
 
@@ -128,6 +160,9 @@ hammer2_vop_strategy(struct vop_strategy_args *ap)
 int
 hammer2_vop_bmap(struct vop_bmap_args *ap)
 {
+	if (ap->a_cmd == BUF_CMD_SEEK)
+		return (hammer2_vop_bmap_impl(ap));
+
 	*ap->a_doffsetp = NOOFFSET;
 	if (ap->a_runp)
 		*ap->a_runp = 0;
@@ -202,6 +237,7 @@ hammer2_decompress_ZLIB_callback(const char *data, u_int bytes, struct bio *bio)
 	bp = bio->bio_buf;
 
 	KKASSERT(bp->b_bufsize <= HAMMER2_PBUFSIZE);
+	bzero(&strm_decompress, sizeof(strm_decompress));
 	strm_decompress.avail_in = 0;
 	strm_decompress.next_in = Z_NULL;
 
@@ -316,7 +352,7 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 		error = HAMMER2_ERROR_EIO;
 		chain = NULL;
 	}
-	error = hammer2_xop_feed(&xop->head, chain, clindex, error);
+	hammer2_xop_feed(&xop->head, chain, clindex, error);
 	if (chain) {
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
@@ -391,7 +427,7 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 		break;
 	default:
 		kprintf("xop_strategy_read: error %08x loff=%016jx\n",
-			error, bp->b_loffset);
+			error, (intmax_t)bp->b_loffset);
 		xop->finished = 1;
 		hammer2_mtx_unlock(&xop->lock);
 		bp->b_flags |= B_ERROR;
@@ -424,9 +460,7 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 		 * Data is on-media, record for live dedup.  Release the
 		 * chain (try to free it) when done.  The data is still
 		 * cached by both the buffer cache in front and the
-		 * block device behind us.  This leaves more room in the
-		 * LRU chain cache for meta-data chains which we really
-		 * want to retain.
+		 * block device behind us.
 		 *
 		 * NOTE: Deduplication cannot be safely recorded for
 		 *	 records without a check code.
@@ -551,7 +585,6 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	int error;
 	int lblksize;
 	int pblksize;
-	hammer2_off_t bio_offset;
 	char *bio_data;
 
 	/*
@@ -570,7 +603,6 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	bio = xop->bio;			/* ephermal */
 	bp = bio->bio_buf;		/* ephermal */
 	ip = xop->head.ip1;		/* retained by ref */
-	bio_offset = bio->bio_offset;
 	bio_data = scratch;
 
 	/* hammer2_trans_init(parent->hmp->spmp, HAMMER2_TRANS_BUFCACHE); */
@@ -642,7 +674,7 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		biodone(bio);
 	} else {
 		kprintf("xop_strategy_write: error %d loff=%016jx\n",
-			error, bp->b_loffset);
+			error, (intmax_t)bp->b_loffset);
 		bp->b_flags |= B_ERROR;
 		bp->b_error = EIO;
 		biodone(bio);
@@ -951,6 +983,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 				comp_level = 6;
 			else if (comp_level > 9)
 				comp_level = 9;
+			bzero(&strm_compress, sizeof(strm_compress));
 			ret = deflateInit(&strm_compress, comp_level);
 			if (ret != Z_OK) {
 				kprintf("HAMMER2 ZLIB: fatal error "

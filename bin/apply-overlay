@@ -1,0 +1,40 @@
+#!/bin/sh
+# apply-overlay — install the RAID6 sources from src/ into a DragonFly
+# source tree, the local equivalent of `deploy.sh sync`.
+#
+# Usage: bin/apply-overlay SRCDIR
+#
+# SRCDIR is a checkout of DragonFly master (the overlay's base).  Files
+# are copied with the local_ prefix stripped, and sys/conf/files and
+# sbin/hammer2/Makefile gain the RAID6 entries if they lack them.
+set -e
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+D="${1:?usage: apply-overlay SRCDIR}"
+[ -d "$D/sys/vfs/hammer2" ] || { echo "$D: no sys/vfs/hammer2" >&2; exit 1; }
+
+for f in "$DIR"/src/sys/local_*; do
+    cp "$f" "$D/sys/vfs/hammer2/$(basename "$f" | sed 's/^local_//')"
+done
+for f in "$DIR"/src/sbin/local_*; do
+    n=$(basename "$f" | sed 's/^local_//')
+    case $n in
+    mkfs_*|newfs_*) cp "$f" "$D/sbin/newfs_hammer2/$n" ;;
+    *)              cp "$f" "$D/sbin/hammer2/$n" ;;
+    esac
+done
+
+F="$D/sys/conf/files"
+if ! grep -q '^vfs/hammer2/hammer2_raid6\.c' "$F"; then
+    awk '{ print } /^vfs\/hammer2\/hammer2_ondisk\.c/ {
+        print "vfs/hammer2/hammer2_raid6.c\toptional hammer2" }' \
+        "$F" > "$F.new"
+    mv "$F.new" "$F"
+fi
+
+M="$D/sbin/hammer2/Makefile"
+if ! grep -q 'cmd_raid\.c' "$M"; then
+    awk '/^\.include[[:space:]]*<bsd\.prog\.mk>/ && !done {
+        print "SRCS+=\tcmd_raid.c"; done = 1 } { print }' \
+        "$M" > "$M.new"
+    mv "$M.new" "$M"
+fi

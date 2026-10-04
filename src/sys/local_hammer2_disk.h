@@ -578,7 +578,7 @@ typedef struct hammer2_dirent_head hammer2_dirent_head_t;
  *
  * Simple check codes are not sufficient for unverified dedup.  Even with
  * a maximally-sized check code unverified dedup should only be used in
- * in subdirectory trees where you do not need 100% data integrity.
+ * subdirectory trees where you do not need 100% data integrity.
  *
  * Unverified dedup is deduping based on meta-data only without verifying
  * that the data blocks are actually identical.  Verified dedup guarantees
@@ -617,7 +617,7 @@ typedef struct hammer2_dirent_head hammer2_dirent_head_t;
  *
  * CONTENT ADDRESSABLE INDEXING (future) - Using a 256 or 512-bit check code.
  */
-struct hammer2_blockref {		/* MUST BE EXACTLY 64 BYTES */
+struct hammer2_blockref {		/* MUST BE EXACTLY 128 BYTES */
 	uint8_t		type;		/* type of underlying item */
 	uint8_t		methods;	/* check method & compression method */
 	uint8_t		copyid;		/* specify which copy this is */
@@ -725,14 +725,8 @@ typedef struct hammer2_blockref hammer2_blockref_t;
 #define HAMMER2_BREF_FLAG_EMERG_MIP	0x04	/* emerg modified-in-place */
 
 /*
- * Encode/decode check mode and compression mode for bref.methods.
- * The compression level is not encoded in bref.methods.
+ * Check mode defaults to xxhash64.
  */
-#define HAMMER2_ENC_CHECK(n)		(((n) & 15) << 4)
-#define HAMMER2_DEC_CHECK(n)		(((n) >> 4) & 15)
-#define HAMMER2_ENC_COMP(n)		((n) & 15)
-#define HAMMER2_DEC_COMP(n)		((n) & 15)
-
 #define HAMMER2_CHECK_NONE		0
 #define HAMMER2_CHECK_DISABLED		1
 #define HAMMER2_CHECK_ISCSI32		2
@@ -743,6 +737,25 @@ typedef struct hammer2_blockref hammer2_blockref_t;
 #define HAMMER2_CHECK_DEFAULT		HAMMER2_CHECK_XXHASH64
 
 /*
+ * Compression mode defaults to LZ4.
+ */
+#define HAMMER2_COMP_NONE		0
+#define HAMMER2_COMP_AUTOZERO		1
+#define HAMMER2_COMP_LZ4		2
+#define HAMMER2_COMP_ZLIB		3
+
+#define HAMMER2_COMP_DEFAULT		HAMMER2_COMP_LZ4
+
+/*
+ * Encode/decode check mode and compression mode for bref.methods.
+ * The compression level is not encoded in bref.methods.
+ */
+#define HAMMER2_ENC_CHECK(n)		(((n) & 15) << 4)
+#define HAMMER2_DEC_CHECK(n)		(((n) >> 4) & 15)
+#define HAMMER2_ENC_COMP(n)		((n) & 15)
+#define HAMMER2_DEC_COMP(n)		((n) & 15)
+
+/*
  * Encode/decode check or compression algorithm request in
  * ipdata->meta.check_algo and ipdata->meta.comp_algo.
  */
@@ -750,13 +763,6 @@ typedef struct hammer2_blockref hammer2_blockref_t;
 #define HAMMER2_DEC_ALGO(n)		((n) & 15)
 #define HAMMER2_ENC_LEVEL(n)		((n) << 4)
 #define HAMMER2_DEC_LEVEL(n)		(((n) >> 4) & 15)
-
-#define HAMMER2_COMP_NONE		0
-#define HAMMER2_COMP_AUTOZERO		1
-#define HAMMER2_COMP_LZ4		2
-#define HAMMER2_COMP_ZLIB		3
-
-#define HAMMER2_COMP_NEWFS_DEFAULT	HAMMER2_COMP_LZ4
 
 /*
  * HAMMER2 block references are collected into sets of 4 blockrefs.  These
@@ -874,7 +880,7 @@ struct hammer2_bmap_data {
 	uint32_t reserved14;	/* 14 */
 	uint32_t reserved18;	/* 18 */
 	uint32_t avail;		/* 1C */
-	uint32_t reserved20[8];	/* 20-3F 256 bits manages 128K/1KB/2-bits */
+	uint32_t reserved20[8];	/* 20-3F */
 				/* 40-7F 512 bits manages 4MB of storage */
 	hammer2_bitmap_t bitmapq[HAMMER2_BMAP_ELEMENTS];
 } __packed;
@@ -952,6 +958,8 @@ struct hammer2_inode_meta {
 	uint16_t	name_len;	/* 0080 filename length */
 	uint8_t		ncopies;	/* 0082 ncopies to local media */
 	uint8_t		comp_algo;	/* 0083 compression request & algo */
+	uint8_t		unused84;	/* 0084 */
+	uint8_t		check_algo;	/* 0085 check code request & algo */
 
 	/*
 	 * These fields are currently only applicable to PFSROOTs.
@@ -962,8 +970,6 @@ struct hammer2_inode_meta {
 	 *	 a separate node.  {pfs_clid, pfs_fsid} must be used for
 	 *	 registration in the cluster.
 	 */
-	uint8_t		target_type;	/* 0084 hardlink target type */
-	uint8_t		check_algo;	/* 0085 check code request & algo */
 	uint8_t		pfs_nmasters;	/* 0086 (if PFSROOT) if multi-master */
 	uint8_t		pfs_type;	/* 0087 (if PFSROOT) node type */
 	hammer2_tid_t	pfs_inum;	/* 0088 (if PFSROOT) inum allocator */
@@ -976,9 +982,9 @@ struct hammer2_inode_meta {
 	 * the sysop and in-memory structures keep track of inheritance.
 	 */
 	hammer2_key_t	data_quota;	/* 00B0 subtree quota in bytes */
-	hammer2_key_t	unusedB8;	/* 00B8 subtree byte count */
+	hammer2_key_t	unusedB8;	/* 00B8 */
 	hammer2_key_t	inode_quota;	/* 00C0 subtree quota inode count */
-	hammer2_key_t	unusedC8;	/* 00C8 subtree inode count */
+	hammer2_key_t	unusedC8;	/* 00C8 */
 
 	/*
 	 * The last snapshot tid is tested against modify_tid to determine
