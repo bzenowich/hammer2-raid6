@@ -63,11 +63,11 @@ else
     result FAIL "L1: content mismatch on read (self-heal failed)"
 fi
 
-if dmesg | grep -q 'selfheal: read-path repair'; then
+if kmsg | grep -q 'selfheal: read-path repair'; then
     result PASS "L1: dmesg shows read-path self-heal activity"
 else
     result FAIL "L1: no selfheal messages in dmesg"
-    dmesg | tail -20
+    kmsg | tail -20
 fi
 
 hammer2 -s $MNTPT raid status > /var/tmp/l_status.txt 2>&1
@@ -157,14 +157,14 @@ fi
 # Accept either the (rate-limited) read-path heal line or the repair
 # kthread's write line — in L3 only disk 0 metadata was corrupted, so
 # any repair write to disk 0 proves the mirror heal fired.
-if dmesg | grep -q 'selfheal: read-path repair.*metadata\|selfheal: repair write disk 0'; then
+if kmsg | grep -q 'selfheal: read-path repair.*metadata\|selfheal: repair write disk 0'; then
     result PASS "L3: dmesg shows metadata mirror self-heal"
 else
     # The walk must have hit at least some of the 4 MB corrupt window
     # on the primary metadata disk; silence here means the heal path
     # did not fire.
     result FAIL "L3: no metadata selfheal lines in dmesg"
-    dmesg | tail -15
+    kmsg | tail -15
 fi
 dmesg -c > /dev/null 2>&1
 teardown "L3"

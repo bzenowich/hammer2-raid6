@@ -38,7 +38,7 @@ bit_for_disk() {
 
 dmesg_panic_check() {
     local label="$1"
-    if dmesg | grep -q "panic:"; then
+    if kmsg | grep -q "panic:"; then
         result FAIL "$label: kernel panic in dmesg"
         return 1
     fi
@@ -114,7 +114,7 @@ if ls -la $MNTPT/ > /dev/null 2>&1; then
 else
     # Allowed: implementation may surface the error; main contract is
     # no panic and the disk does not get auto-failed.
-    if dmesg | grep -q "RAID6 disk 0 failed"; then
+    if kmsg | grep -q "RAID6 disk 0 failed"; then
         result FAIL "E2: inject auto-failed disk 0 (should be repeatable)"
     else
         result PASS "E2: metadata read returned error cleanly, no auto-fail"
@@ -153,7 +153,7 @@ RC=$?
 inject_mask 0
 
 # A clean error from the resilver ioctl is the success criterion.
-if dmesg | grep -q "injected EIO\|resilver Phase A: read err"; then
+if kmsg | grep -q "injected EIO\|resilver Phase A: read err"; then
     result PASS "E3: resilver surfaced injected EIO (rc=$RC)"
 else
     # Acceptable fallback: resilver completed without observing the

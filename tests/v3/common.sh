@@ -81,10 +81,26 @@ result() {
     fi
 }
 
+# kmsg: dmesg(8) that survives a busy kernel log.  dmesg sizes the
+# buffer with one sysctl and reads it with a second; anything logged in
+# between (the self-heal repair writes, say) makes the read fail with
+# ENOMEM and print nothing, which turns every "dmesg | grep" into a
+# silent miss.  Retry until a read succeeds.
+kmsg() {
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        dmesg 2>/dev/null && return 0
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "kmsg: dmesg failed 10 times" >&2
+    return 1
+}
+
 check_no_checkfail() {
     local label="$1"
     local cfails
-    cfails=$(dmesg | grep -c "CHECK FAIL" 2>/dev/null)
+    cfails=$(kmsg | grep -c "CHECK FAIL" 2>/dev/null)
     cfails="${cfails:-0}"
     if [ "$cfails" != "0" ]; then
         result FAIL "$label: $cfails CHECK FAIL(s) in dmesg"
