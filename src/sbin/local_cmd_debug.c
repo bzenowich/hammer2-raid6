@@ -469,6 +469,7 @@ cmd_show(const char *devpath, const char *chspec, int which)
 		errno = 0;
 	}
 
+	hammer2_raid6_ok = 1;
 	hammer2_init_volumes(devpath, 1);
 	int all_volume_headers = VerboseOpt >= 3 || show_all_volume_headers;
 
@@ -756,6 +757,20 @@ show_volhdr(hammer2_volume_data_t *voldata, int bi)
 	printf("}\n");
 }
 
+/*
+ * The volume holding bref's media.  On a RAID6 array this is the disk:
+ * DATA/DIRENT name it in copyid, metadata is located by offset.
+ */
+static int
+bref_volume_id(const hammer2_blockref_t *bref)
+{
+	if (hammer2_get_raid6_ndisks() &&
+	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
+	     bref->type == HAMMER2_BREF_TYPE_DIRENT))
+		return(bref->copyid);
+	return(hammer2_get_volume_id(bref->data_off));
+}
+
 static void
 show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 	  hammer2_blockref_t *bref, int norecurse)
@@ -817,10 +832,12 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			return;
 		}
 		if (bref->type != HAMMER2_BREF_TYPE_DATA || VerboseOpt >= 1) {
-			fd = hammer2_get_volume_fd(io_off);
-			lseek(fd, io_base - hammer2_get_volume_offset(io_base),
-			      SEEK_SET);
-			if (read(fd, &media, io_bytes) != (ssize_t)io_bytes) {
+			hammer2_off_t dev_off;
+
+			fd = hammer2_get_bref_fd(bref, io_base, &dev_off);
+			if (fd < 0 ||
+			    lseek(fd, dev_off, SEEK_SET) == -1 ||
+			    read(fd, &media, io_bytes) != (ssize_t)io_bytes) {
 				printf("(media read failed)\n");
 				return;
 			}
@@ -874,7 +891,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			  "vol=%d mir=%016jx mod=%016jx leafcnt=%d ",
 			  type_str, bi, (intmax_t)bref->data_off,
 			  (intmax_t)bref->key, (intmax_t)bref->keybits,
-			  hammer2_get_volume_id(bref->data_off),
+			  bref_volume_id(bref),
 			  (intmax_t)bref->mirror_tid,
 			  (intmax_t)bref->modify_tid,
 			  bref->leaf_count);
@@ -888,7 +905,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			tabprintf(tab + 13, "");
 		}
 		printf("vol=%d mir=%016jx mod=%016jx lfcnt=%d ",
-		       hammer2_get_volume_id(bref->data_off),
+		       bref_volume_id(bref),
 		       (intmax_t)bref->mirror_tid, (intmax_t)bref->modify_tid,
 		       bref->leaf_count);
 		if (/*norecurse > 1 && */ (bcount || bref->flags ||

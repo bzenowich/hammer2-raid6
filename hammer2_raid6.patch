@@ -8,6 +8,74 @@ index 78ccbcbf33..bef31b4b78 100644
  
 +SRCS+=	cmd_raid.c
  .include <bsd.prog.mk>
+diff --git a/sbin/hammer2/cmd_debug.c b/sbin/hammer2/cmd_debug.c
+index 63c252330b..4ad9c1bbc8 100644
+--- a/sbin/hammer2/cmd_debug.c
++++ b/sbin/hammer2/cmd_debug.c
+@@ -469,6 +469,7 @@ cmd_show(const char *devpath, const char *chspec, int which)
+ 		errno = 0;
+ 	}
+ 
++	hammer2_raid6_ok = 1;
+ 	hammer2_init_volumes(devpath, 1);
+ 	int all_volume_headers = VerboseOpt >= 3 || show_all_volume_headers;
+ 
+@@ -756,6 +757,20 @@ show_volhdr(hammer2_volume_data_t *voldata, int bi)
+ 	printf("}\n");
+ }
+ 
++/*
++ * The volume holding bref's media.  On a RAID6 array this is the disk:
++ * DATA/DIRENT name it in copyid, metadata is located by offset.
++ */
++static int
++bref_volume_id(const hammer2_blockref_t *bref)
++{
++	if (hammer2_get_raid6_ndisks() &&
++	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
++	     bref->type == HAMMER2_BREF_TYPE_DIRENT))
++		return(bref->copyid);
++	return(hammer2_get_volume_id(bref->data_off));
++}
++
+ static void
+ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
+ 	  hammer2_blockref_t *bref, int norecurse)
+@@ -817,10 +832,12 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
+ 			return;
+ 		}
+ 		if (bref->type != HAMMER2_BREF_TYPE_DATA || VerboseOpt >= 1) {
+-			fd = hammer2_get_volume_fd(io_off);
+-			lseek(fd, io_base - hammer2_get_volume_offset(io_base),
+-			      SEEK_SET);
+-			if (read(fd, &media, io_bytes) != (ssize_t)io_bytes) {
++			hammer2_off_t dev_off;
++
++			fd = hammer2_get_bref_fd(bref, io_base, &dev_off);
++			if (fd < 0 ||
++			    lseek(fd, dev_off, SEEK_SET) == -1 ||
++			    read(fd, &media, io_bytes) != (ssize_t)io_bytes) {
+ 				printf("(media read failed)\n");
+ 				return;
+ 			}
+@@ -874,7 +891,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
+ 			  "vol=%d mir=%016jx mod=%016jx leafcnt=%d ",
+ 			  type_str, bi, (intmax_t)bref->data_off,
+ 			  (intmax_t)bref->key, (intmax_t)bref->keybits,
+-			  hammer2_get_volume_id(bref->data_off),
++			  bref_volume_id(bref),
+ 			  (intmax_t)bref->mirror_tid,
+ 			  (intmax_t)bref->modify_tid,
+ 			  bref->leaf_count);
+@@ -888,7 +905,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
+ 			tabprintf(tab + 13, "");
+ 		}
+ 		printf("vol=%d mir=%016jx mod=%016jx lfcnt=%d ",
+-		       hammer2_get_volume_id(bref->data_off),
++		       bref_volume_id(bref),
+ 		       (intmax_t)bref->mirror_tid, (intmax_t)bref->modify_tid,
+ 		       bref->leaf_count);
+ 		if (/*norecurse > 1 && */ (bcount || bref->flags ||
 diff --git a/sbin/hammer2/cmd_raid.c b/sbin/hammer2/cmd_raid.c
 new file mode 100644
 index 0000000000..c4bd8a7243
@@ -300,6 +368,22 @@ index 0000000000..c4bd8a7243
 +	fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
 +	return 1;
 +}
+diff --git a/sbin/hammer2/hammer2_subs.h b/sbin/hammer2/hammer2_subs.h
+index 717c1ba9fe..5d134f6c0e 100644
+--- a/sbin/hammer2/hammer2_subs.h
++++ b/sbin/hammer2/hammer2_subs.h
+@@ -113,6 +113,11 @@ hammer2_off_t hammer2_get_volume_size(hammer2_off_t offset);
+ hammer2_off_t hammer2_get_root_volume_size(void);
+ 
+ hammer2_off_t hammer2_get_total_size(void);
++int hammer2_get_bref_fd(const hammer2_blockref_t *bref, hammer2_off_t io_off,
++	hammer2_off_t *devoffp);
++int hammer2_get_raid6_ndisks(void);
++
++extern int hammer2_raid6_ok;
+ hammer2_volume_data_t* hammer2_read_root_volume_header(void);
+ 
+ void *hammer2_decompress_LZ4(void *inbuf, size_t insize,
 diff --git a/sbin/hammer2/hammer2_userspace.h b/sbin/hammer2/hammer2_userspace.h
 new file mode 100644
 index 0000000000..fc0a4f63cd
@@ -514,6 +598,120 @@ index d005aed70f..9bd244158f 100644
  	} else {
  		fprintf(stderr, "Unrecognized command: %s\n", av[0]);
  		usage(1);
+diff --git a/sbin/hammer2/ondisk.c b/sbin/hammer2/ondisk.c
+index 79214c8060..d86c3abf39 100644
+--- a/sbin/hammer2/ondisk.c
++++ b/sbin/hammer2/ondisk.c
+@@ -53,6 +53,8 @@
+ 
+ static hammer2_ondisk_t fso;
+ static int hammer2_volumes_initialized;
++int hammer2_raid6_ok;			/* caller handles RAID6 copyids */
++static int hammer2_raid6_ndisks;	/* 0 unless a RAID6 array is open */
+ 
+ static void
+ hammer2_init_volume(hammer2_volume_t *vol)
+@@ -463,12 +465,55 @@ hammer2_verify_volumes_2(const hammer2_ondisk_t *fsp,
+ 	}
+ }
+ 
++/*
++ * v3 RAIDZ2-native (RAID6) array.  The disks are laid out like a v2
++ * multi-volume filesystem, but total_size is the usable (data-column)
++ * capacity rather than the sum of the disks, and DATA/DIRENT blockrefs
++ * name their disk in bref->copyid (see hammer2_get_bref_fd()).
++ *
++ * Only commands that set hammer2_raid6_ok understand that encoding;
++ * everything else refuses the array rather than misreading it.
++ */
++static void
++hammer2_verify_volumes_3(const hammer2_ondisk_t *fsp,
++			 const hammer2_volume_data_t *rootvoldata)
++{
++	const hammer2_raid_config_t *rc;
++	const hammer2_volume_t *vol;
++	int i, nvolumes = 0;
++
++	if (!hammer2_raid6_ok)
++		errx(1, "RAID6 arrays are not supported by this command");
++	if (rootvoldata == NULL)
++		errx(1, "No root volume header");
++	rc = &rootvoldata->raid_config;
++	if (rc->raid_type != HAMMER2_RAID_TYPE_RAID6)
++		errx(1, "Volume version %d but raid_type is %d",
++		     fsp->version, rc->raid_type);
++
++	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
++		vol = &fsp->volumes[i];
++		if (vol->id == -1)
++			continue;
++		if (vol->id >= rc->ndisks)
++			errx(1, "%s has disk id %d, array has %d disks",
++			     vol->path, vol->id, rc->ndisks);
++		nvolumes++;
++	}
++	if (nvolumes != rc->ndisks)
++		errx(1, "RAID6 array has %d disks, %d specified",
++		     rc->ndisks, nvolumes);
++	hammer2_raid6_ndisks = rc->ndisks;
++}
++
+ void
+ hammer2_verify_volumes(hammer2_ondisk_t *fsp,
+ 		       const hammer2_volume_data_t *rootvoldata)
+ {
+ 	hammer2_verify_volumes_common(fsp, rootvoldata);
+-	if (fsp->version >= HAMMER2_VOL_VERSION_MULTI_VOLUMES)
++	if (fsp->version >= HAMMER2_VOL_VERSION_RAIDZ2)
++		hammer2_verify_volumes_3(fsp, rootvoldata);
++	else if (fsp->version >= HAMMER2_VOL_VERSION_MULTI_VOLUMES)
+ 		hammer2_verify_volumes_2(fsp, rootvoldata);
+ 	else
+ 		hammer2_verify_volumes_1(fsp, rootvoldata);
+@@ -545,6 +590,7 @@ hammer2_cleanup_volumes(void)
+ 		hammer2_uninstall_volume(vol);
+ 	}
+ 	hammer2_volumes_initialized = 0;
++	hammer2_raid6_ndisks = 0;
+ }
+ 
+ typedef void (*callback)(const hammer2_volume_t*, void *data);
+@@ -730,3 +776,35 @@ hammer2_read_root_volume_header(void)
+ 	else
+ 		errx(1, "Failed to read volume header");
+ }
++
++/*
++ * Return the fd and the device offset holding bref's media, following
++ * the kernel's hammer2_dio_key(): on a RAID6 array DATA/DIRENT live on
++ * disk bref->copyid at the raw per-disk offset; everything else
++ * (including RAID6 metadata) is located by offset like a multi-volume
++ * filesystem.
++ */
++int
++hammer2_get_bref_fd(const hammer2_blockref_t *bref, hammer2_off_t io_off,
++		    hammer2_off_t *devoffp)
++{
++	hammer2_volume_t *vol;
++
++	if (hammer2_raid6_ndisks &&
++	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
++	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
++		if (bref->copyid >= hammer2_raid6_ndisks)
++			return(-1);
++		vol = &fso.volumes[bref->copyid];
++		*devoffp = io_off;
++		return(vol->fd);
++	}
++	*devoffp = io_off - hammer2_get_volume_offset(io_off);
++	return(hammer2_get_volume_fd(io_off));
++}
++
++int
++hammer2_get_raid6_ndisks(void)
++{
++	return(hammer2_raid6_ndisks);
++}
 diff --git a/sbin/newfs_hammer2/mkfs_hammer2.c b/sbin/newfs_hammer2/mkfs_hammer2.c
 index 256f975e08..331d011600 100644
 --- a/sbin/newfs_hammer2/mkfs_hammer2.c
