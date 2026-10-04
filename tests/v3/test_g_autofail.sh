@@ -14,12 +14,11 @@ setup_fresh
 check_v3
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G1_DISK)" > /dev/null 2>&1
+fail_disk "$G1_DISK" "G1"
 sync; sync
 umount $MNTPT
 
 # Remount without disk G1_DISK — should succeed in degraded mode
-detach_disk "$G1_DISK"
 DEGRADED="$(degraded_spec $G1_DISK)@V3TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
     sha256 $MNTPT/ref_a > /var/tmp/g1_check.txt 2>&1
@@ -33,12 +32,6 @@ if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
 else
     result FAIL "G1: degraded remount failed"
 fi
-# Cleanup all disks
-i=0
-while [ "$i" -lt "$NDISKS" ]; do
-    detach_disk "$i"
-    i=$((i + 1))
-done
 
 # G2: fail-disk state persists across unmount/remount (voldata persisted)
 # Fail second-to-last disk so the index is always valid
@@ -47,7 +40,7 @@ setup_fresh
 check_v3
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G2_DISK)" > /dev/null 2>&1
+fail_disk "$G2_DISK" "G2"
 sync; sync
 
 umount $MNTPT
@@ -67,24 +60,26 @@ else
 fi
 teardown "G2"
 
-# G3: Degraded write while one disk is absent, verify correctness
+# G3: Degraded write while one disk is failed, resilver onto a wiped
+# disk, then verify both datasets cold and scrub.
 G3_DISK=1
 setup_fresh
 check_v3
 write_ref_data "before"
 
-hammer2 -s $MNTPT raid fail-disk "$(disk_dev $G3_DISK)" > /dev/null 2>&1
-detach_disk "$G3_DISK"
-write_ref_data "during"
-sync; sync
-
-# Bring disk back (fresh), resilver, then verify both datasets
-fresh_disk "$G3_DISK"
-hammer2 -s $MNTPT raid replace \
-    "$(disk_dev $G3_DISK)" "$(disk_dev $G3_DISK)" > /dev/null 2>&1
-
-verify_ref "G3: pre-failure data still correct" "before"
-verify_ref "G3: degraded-written data correct" "during"
+if fail_disk "$G3_DISK" "G3"; then
+    write_ref_data "during"
+    fresh_disk "$G3_DISK"
+    if hammer2 -s $MNTPT raid replace \
+            "$(disk_dev $G3_DISK)" "$(disk_dev $G3_DISK)" > /dev/null 2>&1 &&
+       remount; then
+        verify_ref "G3: pre-failure data correct after resilver (cold)" "before"
+        verify_ref "G3: degraded-written data correct after resilver (cold)" "during"
+        scrub_clean "G3"
+    else
+        result FAIL "G3: replace or remount failed"
+    fi
+fi
 teardown "G3"
 
 summary

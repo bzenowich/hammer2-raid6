@@ -53,19 +53,109 @@ degraded_spec() {
     echo "$spec"
 }
 
-# Detach disk $1 (index) — vbd disks stay present on the bus,
-# so the FS just stops talking to them via the failed flag.
-detach_disk() {
-    :
-}
-
-# Prepare disk $1 as a fresh replacement for resilver — zero the
-# first 64 MB (one HAMMER2 reserved-zone segment) to wipe the
-# header copies the kernel scans on attach.
+# Prepare disk $1 as a fresh replacement for resilver.  Zero the first
+# 512 MB: the reserved/header segment, the stripe data zone (from 68 MB)
+# and metadata extent 0 (168..372 MB on the 4 GB test disks).  Zeroing
+# only the header segment left every old column in place, so a resilver
+# that wrote nothing still read back correct data.
 fresh_disk() {
     local idx="$1"
-    dd if=/dev/zero of=/dev/vbd$((DISK_BASE + idx)) bs=65536 count=1024 \
+    dd if=/dev/zero of=$(disk_dev "$idx") bs=65536 count=8192 \
         2>/dev/null || true
+}
+
+# Overwrite $3 x 64 KB of disk $1 starting at 64 KB block $2 with
+# random data (unmounted-media corruption).
+corrupt_disk() {
+    dd if=/dev/urandom of=$(disk_dev "$1") bs=65536 count="$3" seek="$2" \
+        conv=notrunc 2>/dev/null
+}
+
+# Corrupt the stripe data zone of disk $1 (68 MB .. 168 MB).
+corrupt_data_zone() {
+    corrupt_disk "$1" 1088 1600
+}
+
+# fail_disk <idx> <label>: mark disk failed and verify the ioctl took
+# effect.  Records a FAIL and returns 1 otherwise, so a test never runs
+# its "degraded" checks against a healthy array.
+fail_disk() {
+    local idx="$1"
+    local label="$2"
+    if ! hammer2 -s $MNTPT raid fail-disk "$(disk_dev "$idx")" \
+            > /dev/null 2>&1; then
+        result FAIL "$label: fail-disk $idx returned error"
+        return 1
+    fi
+    if ! disk_state_is "$idx" FAILED; then
+        result FAIL "$label: disk $idx not FAILED after fail-disk"
+        return 1
+    fi
+    return 0
+}
+
+# disk_state_is <idx> <STATE>: per-disk state from `raid status`.
+disk_state_is() {
+    hammer2 -s $MNTPT raid status 2>/dev/null |
+        grep -q "^disk\[$1\]:[[:space:]]*$2"
+}
+
+# disk_counter <idx> <field>: cksum_err / healed / unrepairable.
+disk_counter() {
+    hammer2 -s $MNTPT raid status 2>/dev/null |
+        grep "^disk\[$1\]:" |
+        awk -v f="$2" '{ for (i = 1; i < NF; i++) if ($i == f) { print $(i+1); exit } }'
+}
+
+# remount [spec]: unmount and mount again so later reads come from the
+# media, not the buffer cache.  Reads made while the FS stays mounted
+# after fail-disk or a corrupting dd are served from cache and prove
+# nothing about reconstruction.  Default spec is the full array.
+remount() {
+    local spec="${1:-$PFSPATH}"
+    sync
+    umount $MNTPT || return 1
+    mount -t hammer2 "$spec" $MNTPT
+}
+
+# scrub_clean <label>: run `raid scrub` and require zero bad and zero
+# unrepairable brefs (the mdadm "check, mismatch_cnt == 0" analogue).
+scrub_clean() {
+    local label="$1"
+    local out=/var/tmp/v4_scrub.txt
+    hammer2 -s $MNTPT raid scrub > $out 2>&1
+    local rc=$?
+    local bad unrep done_
+    bad=$(awk '$1 == "brefs_bad:" { print $2 }' $out)
+    unrep=$(awk '$1 == "brefs_unrepairable:" { print $2 }' $out)
+    done_=$(awk '$1 == "brefs_done:" { print $2 }' $out)
+    if [ "$rc" = "0" ] && [ "${bad:-x}" = "0" ] && \
+       [ "${unrep:-x}" = "0" ] && [ "${done_:-0}" -gt 0 ]; then
+        result PASS "$label: scrub clean ($done_ brefs)"
+    else
+        result FAIL "$label: scrub rc=$rc done=$done_ bad=$bad unrep=$unrep"
+        sed 's/^/      /' $out
+    fi
+}
+
+# guarded <secs> <cmd...>: run cmd in the background and wait at most
+# <secs>.  Returns cmd's status, or 124 if it is still running (a
+# kernel hang leaves it in D state; it cannot be killed).  timeout(1)
+# is unusable on DragonFly master (sigaction(32) failure).
+guarded() {
+    local secs="$1"
+    shift
+    "$@" &
+    local pid=$! n=0
+    while kill -0 $pid 2>/dev/null; do
+        if [ "$n" -ge "$secs" ]; then
+            echo "  HANG: '$*' still running after ${secs}s" >&2
+            return 124
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    wait $pid
 }
 
 result() {
@@ -94,6 +184,20 @@ kmsg() {
         sleep 1
     done
     echo "kmsg: dmesg failed 10 times" >&2
+    return 1
+}
+
+# kmsg_clear: dmesg -c with the same retry.  A clear that loses the
+# ENOMEM race leaves the previous test's CHECK FAIL lines in the buffer
+# and the next teardown blames them on the wrong test.
+kmsg_clear() {
+    local i=0
+    while [ "$i" -lt 10 ]; do
+        dmesg -c > /dev/null 2>&1 && return 0
+        i=$((i + 1))
+        sleep 1
+    done
+    echo "kmsg_clear: dmesg -c failed 10 times" >&2
     return 1
 }
 
@@ -133,7 +237,7 @@ setup_fresh() {
         echo "  FATAL: mount failed in setup_fresh"
         exit 1
     fi
-    dmesg -c > /dev/null 2>&1
+    kmsg_clear
 }
 
 teardown() {
@@ -169,7 +273,9 @@ verify_ref() {
     local prefix="${2:-ref}"
     sha256 $MNTPT/${prefix}_a > /var/tmp/v4_check.txt 2>&1
     sha256 $MNTPT/${prefix}_b >> /var/tmp/v4_check.txt 2>&1
-    if diff -q /var/tmp/v4_${prefix}.txt /var/tmp/v4_check.txt \
+    if [ -s /var/tmp/v4_${prefix}.txt ] && \
+       ! grep -q "No such\|rror" /var/tmp/v4_check.txt && \
+       diff -q /var/tmp/v4_${prefix}.txt /var/tmp/v4_check.txt \
             > /dev/null 2>&1; then
         result PASS "$label"
     else

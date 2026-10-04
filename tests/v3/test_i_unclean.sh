@@ -1,15 +1,21 @@
 #!/bin/sh
-# Group I: Unclean unmount — power-loss simulation.
-# Verifies HAMMER2 journal replay (MEDIA recovery) restores consistent state.
+# Group I: Forced unmount.
+#
+# NOT a crash test.  `umount -f` on hammer2 still runs the full unmount
+# flush (hammer2_vfs_unmount syncs even with MNT_FORCE), so these cases
+# remount a cleanly-flushed filesystem.  They check that the forced
+# path loses nothing and that bulkfree reclaims space afterwards.  The
+# power-loss case needs the guest reset under writes, which only the
+# host can do: see crash_host.sh.
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
 
 kldstat -q -m hammer2 || kldload hammer2
 
-echo "=== Group I: Unclean Unmount (NDISKS=$NDISKS) ==="
+echo "=== Group I: Forced Unmount (NDISKS=$NDISKS) ==="
 
-# I1: Write data, simulate crash (forced unmount without sync), remount, verify
+# I1: Write data, forced unmount, remount, verify
 setup_fresh
 check_v3
 dd if=/dev/urandom of=$MNTPT/clean bs=65536 count=256 2>/dev/null
@@ -29,17 +35,17 @@ if mount -t hammer2 $PFSPATH $MNTPT; then
     if [ -f $MNTPT/clean ]; then
         sha256 $MNTPT/clean > /var/tmp/i1_check.txt 2>&1
         if diff -q /var/tmp/i1_ref.txt /var/tmp/i1_check.txt > /dev/null 2>&1; then
-            result PASS "I1: fsynced file intact after unclean unmount"
+            result PASS "I1: synced file intact after forced unmount"
         else
-            result FAIL "I1: fsynced file corrupted after unclean unmount"
+            result FAIL "I1: synced file corrupted after forced unmount"
         fi
     else
-        result FAIL "I1: fsynced file missing after unclean unmount"
+        result FAIL "I1: synced file missing after forced unmount"
     fi
     # No CHECK FAIL should appear from the recovery
     check_no_checkfail "I1"
 else
-    result FAIL "I1: remount failed after unclean unmount"
+    result FAIL "I1: remount failed after forced unmount"
 fi
 teardown "I1"
 
@@ -50,78 +56,61 @@ setup_fresh
 check_v3
 write_ref_data "ref"
 
-hammer2 -s $MNTPT raid fail-disk "$(disk_dev $I2_DISK)" > /dev/null 2>&1
-detach_disk "$I2_DISK"
+fail_disk "$I2_DISK" "I2"
 
 dd if=/dev/urandom of=$MNTPT/degraded_write bs=65536 count=64 2>/dev/null
 sync; sync
 
-# Simulate crash
+# Forced unmount
 umount -f $MNTPT 2>/dev/null || umount $MNTPT 2>/dev/null || true
 
 # Remount degraded (without I2_DISK)
 DEGRADED="$(degraded_spec $I2_DISK)@V3TEST"
 if mount -t hammer2 "$DEGRADED" $MNTPT 2>/dev/null; then
-    verify_ref "I2: pre-crash reference intact after degraded unclean unmount" "ref"
+    verify_ref "I2: reference intact after degraded forced unmount" "ref"
     check_no_checkfail "I2"
     umount $MNTPT
 else
-    result FAIL "I2: degraded remount failed after unclean unmount"
+    result FAIL "I2: degraded remount failed after forced unmount"
 fi
-# Cleanup all disks
-i=0
-while [ "$i" -lt "$NDISKS" ]; do
-    detach_disk "$i"
-    i=$((i + 1))
-done
 
-# I3: Crash + recover + bulkfree must reclaim orphan stripes (newplan §7
-# Phase 2 Exit: "bulkfree reclaims orphaned stripes").
-# Strategy: write data, sync, write more data (no sync), force-umount,
-# remount, run bulkfree, verify it completes without panic / CHECK FAIL
-# and reports freed bytes > 0 (otherwise the orphan-reclaim contract
-# isn't exercised).
+# I3: forced unmount, remount, delete, bulkfree, then the kept file
+# must verify cold and the array scrub clean.  Reclaim itself is not
+# measured here: bulkfree prints no totals and statfs on a v3 array
+# does not count data blocks (df shows 64 KB used after 8 MB written).
+# J1 proves freed space is reused safely.
 setup_fresh
 check_v3
 dd if=/dev/urandom of=$MNTPT/keep bs=65536 count=128 2>/dev/null
+sha256 $MNTPT/keep > /var/tmp/i3_keep.txt
 sync; sync
-
-# Write data that will be orphaned by the forced umount.
 dd if=/dev/urandom of=$MNTPT/orphan bs=65536 count=128 2>/dev/null
-# No sync — these writes may or may not be flushed; the bulkfree must
-# handle either case cleanly.
-
 umount -f $MNTPT 2>/dev/null || umount $MNTPT 2>/dev/null || true
 
 if mount -t hammer2 $PFSPATH $MNTPT; then
-    # Delete the orphan file so its blocks are definitely reclaimable.
     rm -f $MNTPT/orphan
     sync; sync
-
-    dmesg -c > /dev/null 2>&1
-    BF_OUT=/var/tmp/i3_bulkfree.out
-    if hammer2 bulkfree $MNTPT > "$BF_OUT" 2>&1; then
-        if check_no_checkfail "I3-bulkfree"; then
-            result PASS "I3: bulkfree completed after crash recovery"
-        fi
-        # Best-effort orphan-reclaim signal: any non-zero "freed" line.
-        if grep -qE "freed|reclaim" "$BF_OUT"; then
-            FREED=$(grep -iE "freed|reclaim" "$BF_OUT" | head -1)
-            echo "    bulkfree report: $FREED"
-        fi
+    kmsg_clear
+    if hammer2 bulkfree $MNTPT > /var/tmp/i3_bulkfree.out 2>&1; then
+        check_no_checkfail "I3-bulkfree" &&
+            result PASS "I3: bulkfree completed after forced unmount"
     else
-        result FAIL "I3: bulkfree failed after crash recovery (see $BF_OUT)"
+        result FAIL "I3: bulkfree failed (see /var/tmp/i3_bulkfree.out)"
     fi
-
-    # The kept file must still verify.
-    if [ -f $MNTPT/keep ]; then
-        result PASS "I3: pre-crash kept file present after bulkfree"
+    if remount; then
+        sha256 $MNTPT/keep > /var/tmp/i3_keep_check.txt 2>&1
+        if diff -q /var/tmp/i3_keep.txt /var/tmp/i3_keep_check.txt > /dev/null 2>&1; then
+            result PASS "I3: kept file content intact after bulkfree (cold)"
+        else
+            result FAIL "I3: kept file content changed after bulkfree"
+        fi
+        scrub_clean "I3"
     else
-        result FAIL "I3: pre-crash kept file lost"
+        result FAIL "I3: remount after bulkfree failed"
     fi
-    umount $MNTPT
 else
     result FAIL "I3: remount failed for bulkfree pass"
 fi
+teardown "I3"
 
 summary

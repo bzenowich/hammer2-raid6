@@ -52,7 +52,7 @@ dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=1088 \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT
-dmesg -c > /dev/null 2>&1
+kmsg_clear
 
 # THE test: read the file with NO scrub.  Self-heal must reconstruct
 # every corrupt column inline.
@@ -105,7 +105,7 @@ else
     result FAIL "L2: follow-up scrub bad=$L2_BAD unrep=$L2_UNREP rc=$L2_RC"
     cat /var/tmp/l2_scrub2.txt
 fi
-dmesg -c > /dev/null 2>&1
+kmsg_clear
 teardown "L1"
 
 # L3: metadata self-heal via mirror copies.  Create a wide directory
@@ -129,13 +129,13 @@ umount $MNTPT
 # mirror-failover heal the corruption must land on DISK 0's metadata
 # zone (extent 0 = 168..372 MB on the 4 GB test disks).  Skip the
 # first 4 MB of the extent to stay clear of the disk-0-only stripe
-# bitmap slots below it; corrupt 4 MB at 172 MB.
+# bitmap slots below it; corrupt the rest of it, 200 MB at 172 MB.
 MD_DEV=$(disk_dev 0)
 dd if=/dev/urandom of="$MD_DEV" bs=65536 count=3200 seek=2752 \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT
-dmesg -c > /dev/null 2>&1
+kmsg_clear
 
 FCOUNT=$(find $MNTPT/l3 2>/var/tmp/l3_find_err.txt | wc -l | tr -d ' ')
 CATFAIL=0
@@ -166,7 +166,7 @@ else
     result FAIL "L3: no metadata selfheal lines in dmesg"
     kmsg | tail -15
 fi
-dmesg -c > /dev/null 2>&1
+kmsg_clear
 teardown "L3"
 
 summary

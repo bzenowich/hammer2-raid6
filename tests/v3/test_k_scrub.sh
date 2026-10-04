@@ -1,7 +1,8 @@
 #!/bin/sh
 # Group K: Scrub (M3 — docs/zfs_compare.md item 3).
 #
-# K1 — clean array scrubs without finding corruption.
+# K1 — clean array scrubs without finding corruption, and without
+#      writing anything (raw data zones unchanged).
 # K2 — corrupt one disk's column via dd while unmounted, mount, scrub
 #      should detect (CHECK FAIL) and parity-repair every affected slot;
 #      post-scrub file content matches the pre-corruption reference.
@@ -29,8 +30,26 @@ dd if=/dev/urandom of=$MNTPT/k1 bs=65536 count=80 2>/dev/null
 sha256 $MNTPT/k1 > /var/tmp/k1_ref.txt
 sync; sync
 
+# Raw hash of every disk's stripe data zone before the scrub: a scrub
+# of a clean array must not write anything (mdadm's
+# 19repair-does-not-destroy).
+zone_hashes() {
+    local j=0
+    while [ "$j" -lt "$NDISKS" ]; do
+        dd if=$(disk_dev $j) bs=65536 skip=1088 count=1600 2>/dev/null | sha256
+        j=$((j + 1))
+    done
+}
+zone_hashes > /var/tmp/k1_raw_pre.txt
 hammer2 -s $MNTPT raid scrub > /var/tmp/k1_scrub.txt 2>&1
 K1_RC=$?
+sync
+zone_hashes > /var/tmp/k1_raw_post.txt
+if cmp -s /var/tmp/k1_raw_pre.txt /var/tmp/k1_raw_post.txt; then
+    result PASS "K1: scrub of clean array left media byte-identical"
+else
+    result FAIL "K1: scrub of clean array modified the media"
+fi
 K1_DONE=$(scrub_field brefs_done /var/tmp/k1_scrub.txt)
 K1_BAD=$(scrub_field brefs_bad /var/tmp/k1_scrub.txt)
 K1_REP=$(scrub_field brefs_repaired /var/tmp/k1_scrub.txt)
@@ -91,7 +110,7 @@ fi
 
 # Verify file integrity after scrub.  Drop dmesg-noise from the
 # corruption hits so teardown's CHECK FAIL guard doesn't flag K2.
-dmesg -c > /dev/null 2>&1
+kmsg_clear
 sha256 $MNTPT/k2 > /var/tmp/k2_check.txt 2>&1
 if diff -q /var/tmp/k2_ref.txt /var/tmp/k2_check.txt > /dev/null 2>&1; then
     result PASS "K2: post-scrub file content correct"

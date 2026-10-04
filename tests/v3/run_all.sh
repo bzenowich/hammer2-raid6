@@ -4,7 +4,7 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs all groups (A B C D F G I).
+#   If no groups are specified, runs all groups A..M (M last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #
 # Environment:
@@ -40,11 +40,19 @@ run_group() {
     if [ "${fail:-0}" != "0" ]; then
         SUITE_ERRORS="${SUITE_ERRORS}  $name: ${fail} failure(s)\n"
     fi
+    # A group that dies early (FATAL in setup_fresh, check_v3 skip with
+    # exit 77, a shell error) prints no summary line, and its earlier
+    # results never reach the totals.  Count that as a failure rather
+    # than letting the suite report success over a group that never ran.
+    if [ -z "$pass" ] || { [ "$RC" != "0" ] && [ "${fail:-0}" = "0" ]; }; then
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+        SUITE_ERRORS="${SUITE_ERRORS}  $name: aborted (exit $RC, no clean summary)\n"
+    fi
     return $RC
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L}"
+GROUPS="${*:-A B C D E F G H I J K L M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -60,7 +68,8 @@ for GROUP in $GROUPS; do
     J) run_group "Group J" "$SCRIPTDIR/test_j_packed_row.sh"   ;;
     K) run_group "Group K" "$SCRIPTDIR/test_k_scrub.sh"        ;;
     L) run_group "Group L" "$SCRIPTDIR/test_l_selfheal.sh"     ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L)" ;;
+    M) run_group "Group M" "$SCRIPTDIR/test_m_multi_corrupt.sh" ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M)" ;;
     esac
 done
 

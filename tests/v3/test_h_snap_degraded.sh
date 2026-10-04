@@ -54,7 +54,7 @@ else
     # Fail a disk (disk 2: stable data column for NDISKS>=4)
     H1_FAIL=2
     [ "$H1_FAIL" -ge "$NDISKS" ] && H1_FAIL=$((NDISKS - 1))
-    hammer2 -s $MNTPT raid fail-disk "$(disk_dev $H1_FAIL)" > /dev/null 2>&1
+    fail_disk "$H1_FAIL" "H1"
     sync; sync
 
     # Modify live tree under degraded
@@ -69,10 +69,24 @@ else
         result PASS "H1: live tree reflects degraded-mode rewrite"
     fi
 
+    # Cycle the live mount (disk absent) so neither read below can be
+    # served from the buffer cache, then check the live rewrite cold.
+    H1_SPEC="$(degraded_spec $H1_FAIL)"
+    if remount "${H1_SPEC}@V3TEST"; then
+        hash_of $MNTPT/payload > /var/tmp/h1_cold.txt
+        if diff -q /var/tmp/h1_post.txt /var/tmp/h1_cold.txt > /dev/null 2>&1; then
+            result PASS "H1: degraded-mode rewrite correct after remount"
+        else
+            result FAIL "H1: degraded-mode rewrite wrong after remount"
+        fi
+    else
+        result FAIL "H1: degraded remount failed"
+    fi
+
     # Mount the snapshot independently and verify pre-failure content.
     mkdir -p "$SNAP_MNT"
     snap_unmount_quiet
-    if mount -t hammer2 "${DEVSPEC}@${SNAP_LABEL}" "$SNAP_MNT" 2>/dev/null; then
+    if mount -t hammer2 "${H1_SPEC}@${SNAP_LABEL}" "$SNAP_MNT" 2>/dev/null; then
         if [ -f "$SNAP_MNT/payload" ]; then
             hash_of "$SNAP_MNT/payload" > /var/tmp/h1_snap_read.txt
             if diff -q /var/tmp/h1_pre.txt /var/tmp/h1_snap_read.txt \
@@ -104,7 +118,7 @@ sync; sync
 
 # Degrade BEFORE the snapshot
 H2_FAIL=1
-hammer2 -s $MNTPT raid fail-disk "$(disk_dev $H2_FAIL)" > /dev/null 2>&1
+fail_disk "$H2_FAIL" "H2"
 sync; sync
 
 H2_LABEL="h2snap"
