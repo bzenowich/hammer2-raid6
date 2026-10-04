@@ -1190,27 +1190,27 @@ struct hammer2_dev {
 	int		raid_failed[HAMMER2_MAX_VOLUMES]; /* failed disk tracking */
 	int		raid_nfailed;		/* count of failed disks */
 
-	/* RAIDZ2-native physical stripe bitmap (v3 format) */
+	/*
+	 * RAIDZ2-native space map (v3, docs/capacity.md).  The row
+	 * refcount is the persisted state: the number of live DATA/DIRENT
+	 * chains with a column in the row.  The bitmap bit is derived
+	 * (set iff refcount > 0) and is what the allocator scans.
+	 */
 	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
 	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
 	uint64_t	stripe_num_slots;	/* total slots covered */
 	uint64_t	stripe_cursor;		/* sequential allocator cursor */
-	uint64_t	stripe_generation;	/* bumped on every TXG flush */
-	int		stripe_bitmap_invalid;	/* 1 if on-disk header was bad */
-	int		stripe_refcount_invalid; /* 1 if persisted refcount bad/missing */
-	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk */
+	uint64_t	stripe_generation;	/* space map generation last written */
+	int		stripe_bitmap_invalid;	/* 1 if no valid space map copy */
+	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk + sm_dirty */
 	int		stripe_next_disk;	/* round-robin data disk counter */
 	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
 	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
 	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
-	/*
-	 * Per-row reference count: number of live DATA/DIRENT chains that
-	 * occupy a data-column slot in this row.  Bitmap bit is the union
-	 * (set iff refcount > 0).  In-memory only; rebuilt at mount from
-	 * the bitmap (and corrected by the H4-deep walker when the bitmap
-	 * is invalid).  6C uses this to allow multi-chain rows.
-	 */
-	uint8_t		*stripe_row_refcount;	/* num_slots bytes */
+	uint8_t		*stripe_row_refcount;	/* sm_npages * HAMMER2_SM_PAGE bytes */
+	uint32_t	sm_npages;		/* refcount pages per copy */
+	uint8_t		*sm_dirty;		/* per page: bit c = copy c stale */
+	uint32_t	*sm_crc[2];		/* per copy: CRC of each page on disk */
 
 	/*
 	 * Open-row tracking (6C): rows allocated during the current TXG
@@ -2104,14 +2104,12 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 			int *rootvolzone,
 			struct vnode **rootvoldevvp);
 hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
-void hammer2_raid6_bitmap_init(hammer2_dev_t *hmp);
-void hammer2_raid6_bitmap_read(hammer2_dev_t *hmp);
-void hammer2_raid6_bitmap_write(hammer2_dev_t *hmp);
-void hammer2_raid6_refcount_read(hammer2_dev_t *hmp);
-void hammer2_raid6_refcount_write(hammer2_dev_t *hmp);
+int  hammer2_raid6_sm_init(hammer2_dev_t *hmp);
+void hammer2_raid6_sm_destroy(hammer2_dev_t *hmp);
+void hammer2_raid6_sm_read(hammer2_dev_t *hmp);
+int  hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp);
+void hammer2_raid6_sm_dirty_all(hammer2_dev_t *hmp);
 int  hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
-int  hammer2_raid6_rebuild_row_refcount(hammer2_dev_t *hmp);
-void hammer2_raid6_row_refcount_sync(hammer2_dev_t *hmp);
 int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
 void hammer2_raid6_stripe_free(hammer2_dev_t *hmp,
 				const hammer2_blockref_t *bref);

@@ -286,7 +286,6 @@
 #define HAMMER2_ZONE_FREEMAP_06		31	/* normal freemap rotation */
 #define HAMMER2_ZONE_FREEMAP_07		36	/* normal freemap rotation */
 #define HAMMER2_ZONE_FREEMAP_END	41	/* (non-inclusive) */
-#define HAMMER2_ZONE_RAID6_BITMAP	41	/* RAIDZ2-native: physical stripe bitmap (zone slots 41-42) */
 
 #define HAMMER2_ZONE_UNUSED41		41
 #define HAMMER2_ZONE_UNUSED42		42
@@ -1191,99 +1190,45 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
 
 /*
- * v3 RAIDZ2-native stripe bitmap zone (zone 41 on disk 0).
- * Per docs/stripe_bitmap.md:
+ * v3 RAIDZ2-native space map (docs/capacity.md).
  *
- *   [page 0]       header  (4 KB)
- *   [page 1..N]    bitmap data (one bit per stripe slot)
- *   [page N+1]     footer  (4 KB)
+ * One byte per stripe slot: the number of live DATA/DIRENT chains in
+ * the slot's row.  A slot is free iff its count is zero.  Every disk
+ * carries two copies, A and B, at raid_config.rz_sm_off and
+ * rz_sm_off + rz_sm_copy.  Generation N is written to copy N & 1 and
+ * the volume header records the generation it commits (rz_sm_gen).
  *
- * header.generation == footer.generation + matching CRC detects torn
- * writes.  CRC stored as a single icrc32 in the low 4 bytes of crc[16];
- * remaining bytes are zero-padded reserve.
+ * One copy:
+ *
+ *   page 0          header, then one icrc32 per data page
+ *   pages 1..npages counts, HAMMER2_SM_PAGE_SLOTS slots per page
+ *
+ * Pages are HAMMER2_PBUFSIZE, the size of every other devvp buffer.
  */
-#define HAMMER2_STRIPE_BITMAP_PAGE	4096
-#define HAMMER2_STRIPE_BITMAP_VERSION	1
-#define HAMMER2_STRIPE_BITMAP_MAGIC	0x484D32535452424DULL /* "MBRTS2H\0" */
-#define HAMMER2_STRIPE_BITMAP_MAGIC_END	0x00484D32535452ULL   /* reversed */
+#define HAMMER2_SM_PAGE			HAMMER2_PBUFSIZE
+#define HAMMER2_SM_PAGE_SLOTS		HAMMER2_PBUFSIZE
+#define HAMMER2_SM_PAGE_RADIX		HAMMER2_PBUFRADIX
+#define HAMMER2_SM_MAGIC		0x48324d5053325248ULL /* "HR2SPM2H" */
+#define HAMMER2_SM_VERSION		1
+#define HAMMER2_SM_CRC_OFF		128
+#define HAMMER2_SM_MAX_PAGES		\
+	((HAMMER2_SM_PAGE - HAMMER2_SM_CRC_OFF) / sizeof(uint32_t))
 
-/*
- * Lowest stripe slot eligible for v3 DATA/DIRENT allocation.  Slots
- * below this reserve physical space at the start of every disk's data
- * area for HAMMER2 reserved zones (freemap rotations) that v3-era
- * metadata-via-freemap can still consume; v3 DATA must not collide
- * with those.
- */
-#define HAMMER2_STRIPE_RAID6_START		1024
-
-struct hammer2_stripe_bitmap_header {
-	uint64_t magic;			/* HAMMER2_STRIPE_BITMAP_MAGIC */
-	uint32_t version;		/* HAMMER2_STRIPE_BITMAP_VERSION */
-	uint32_t ndisks;		/* must match volhdr raid_config.ndisks */
-	uint64_t stripe_unit;		/* HAMMER2_PBUFSIZE */
-	uint64_t num_slots;		/* total slots covered by bitmap */
-	uint64_t slot_origin;		/* per-disk byte offset of slot 0 */
-	uint64_t cursor;		/* sequential allocator cursor */
-	uint64_t generation;		/* bumped on every TXG flush */
-	uint8_t  crc[16];		/* icrc32 of header+bitmap+footer */
-	uint8_t  pad[4040];
+struct hammer2_sm_header {
+	uint64_t magic;			/* HAMMER2_SM_MAGIC */
+	uint32_t version;		/* HAMMER2_SM_VERSION */
+	uint32_t ndisks;		/* raid_config.ndisks */
+	uint64_t stripe_unit;		/* raid_config.stripe_unit */
+	uint64_t num_slots;		/* raid_config.rz_num_slots */
+	uint64_t generation;		/* matches rz_sm_gen when committed */
+	uint64_t cursor;		/* allocator cursor */
+	uint32_t npages;		/* data pages that follow */
+	uint32_t copy;			/* 0 (A) or 1 (B) */
+	uint32_t hdr_crc;		/* header up to here + CRC table */
+	uint8_t	 pad[HAMMER2_SM_CRC_OFF - 60];
 } __packed;
 
-typedef struct hammer2_stripe_bitmap_header hammer2_stripe_bitmap_header_t;
-
-struct hammer2_stripe_bitmap_footer {
-	uint64_t magic_end;		/* HAMMER2_STRIPE_BITMAP_MAGIC_END */
-	uint64_t generation;		/* must match header.generation */
-	uint8_t  crc[16];		/* mirrors header.crc */
-	uint8_t  pad[4072];
-} __packed;
-
-typedef struct hammer2_stripe_bitmap_footer hammer2_stripe_bitmap_footer_t;
-
-/*
- * v3 RAIDZ2-native persisted row-refcount block (zone 41 on disk 0,
- * byte offset HAMMER2_PBUFSIZE within the zone — i.e. immediately
- * after the stripe bitmap's 64 KB block).
- *
- *   [page 0]       header  (4 KB)
- *   [page 1..N]    refcount data (one byte per stripe slot)
- *   [page N+1]     footer  (4 KB)
- *
- * Same torn-write-safe pattern as the bitmap: header.generation ==
- * footer.generation + matching CRC.  Mount loads this and skips the
- * O(metadata) chain-tree walk that rebuilds the in-memory refcount.
- * On torn write / corrupt header / missing zone (e.g. mkfs from
- * before the refcount block existed), mount falls back to the walker
- * and the next TXG flush writes a fresh refcount block — old
- * volumes upgrade transparently.
- */
-#define HAMMER2_STRIPE_REFCOUNT_OFFSET	((off_t)HAMMER2_PBUFSIZE)
-#define HAMMER2_STRIPE_REFCOUNT_PAGE	HAMMER2_STRIPE_BITMAP_PAGE
-#define HAMMER2_STRIPE_REFCOUNT_VERSION	1
-#define HAMMER2_STRIPE_REFCOUNT_MAGIC	0x484D32535452464DULL /* "MFRTS2H\0" */
-#define HAMMER2_STRIPE_REFCOUNT_MAGIC_END 0x00484D32535452FULL /* reversed */
-
-struct hammer2_stripe_refcount_header {
-	uint64_t magic;			/* HAMMER2_STRIPE_REFCOUNT_MAGIC */
-	uint32_t version;		/* HAMMER2_STRIPE_REFCOUNT_VERSION */
-	uint32_t ndisks;		/* must match volhdr raid_config.ndisks */
-	uint64_t stripe_unit;		/* HAMMER2_PBUFSIZE */
-	uint64_t num_slots;		/* total slots covered */
-	uint64_t generation;		/* bumped on every TXG flush */
-	uint8_t  crc[16];		/* icrc32 of header+refcount+footer */
-	uint8_t  pad[4048];
-} __packed;
-
-typedef struct hammer2_stripe_refcount_header hammer2_stripe_refcount_header_t;
-
-struct hammer2_stripe_refcount_footer {
-	uint64_t magic_end;		/* HAMMER2_STRIPE_REFCOUNT_MAGIC_END */
-	uint64_t generation;		/* must match header.generation */
-	uint8_t  crc[16];		/* mirrors header.crc */
-	uint8_t  pad[4072];
-} __packed;
-
-typedef struct hammer2_stripe_refcount_footer hammer2_stripe_refcount_footer_t;
+typedef struct hammer2_sm_header hammer2_sm_header_t;
 
 /*
  * v3 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
@@ -1294,13 +1239,10 @@ typedef struct hammer2_stripe_refcount_footer hammer2_stripe_refcount_footer_t;
  * byte offset on all N disks; no parity is required.
  *
  * Each `hammer2_md_extent` describes one contiguous LBA range on a
- * disk.  Extent 0 is laid down by `newfs_hammer2 --raid6` immediately
- * after the stripe bitmap zone (byte HAMMER2_ZONE_SEG64 * 42).
- * Additional extents can be added by an offline tool as the zone fills.
- *
- * The on-disk persistence of the extent table is the volume-header
- * addendum landing with Group J (docs/volhdr_quorum.md); until then
- * the table is computed deterministically at mount time.
+ * disk.  Extent 0 is laid down by `newfs_hammer2 -R 6` after the
+ * space map and the aux area (docs/capacity.md) and recorded in
+ * raid_config.  Additional extents can be added by an offline tool as
+ * the zone fills.
  */
 struct hammer2_md_extent {
 	uint64_t md_off;		/* per-disk byte offset of extent */
@@ -1310,8 +1252,6 @@ struct hammer2_md_extent {
 typedef struct hammer2_md_extent hammer2_md_extent_t;
 
 #define HAMMER2_MD_MAX_EXTENTS		8
-#define HAMMER2_MD_EXTENT0_OFF		\
-	((hammer2_off_t)(HAMMER2_ZONE_RAID6_BITMAP + 1) * HAMMER2_ZONE_SEG64)
 #define HAMMER2_MD_EXTENT0_MIN_SIZE	((hammer2_off_t)64 * 1024 * 1024)
 #define HAMMER2_MD_EXTENT0_PCT		5	/* 5% of per-disk LBA */
 
@@ -1338,10 +1278,24 @@ struct hammer2_raid_config {
 	uint32_t	md_reserved;
 	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];
 
-	uint8_t		reserved[256];	/* pad to 512 bytes total */
+
+	/*
+	 * Stripe layout (docs/capacity.md).  A v3 volume whose rz_layout
+	 * is not HAMMER2_RZ_LAYOUT predates it and must be re-made.
+	 */
+	uint32_t	rz_layout;	/* HAMMER2_RZ_LAYOUT */
+	uint32_t	rz_sm_pages;	/* data pages per space map copy */
+	uint64_t	rz_num_slots;	/* stripe slots per disk */
+	uint64_t	rz_sm_off;	/* per-disk offset of space map copy A */
+	uint64_t	rz_sm_copy;	/* bytes per copy; B follows A */
+	uint64_t	rz_sm_gen;	/* space map generation committed */
+
+	uint8_t		reserved[216];	/* pad to 512 bytes total */
 } __packed;
 
 typedef struct hammer2_raid_config hammer2_raid_config_t;
+
+#define HAMMER2_RZ_LAYOUT		2
 
 #define HAMMER2_VOLUME_ID_HBO	0x48414d3205172011LLU
 #define HAMMER2_VOLUME_ID_ABO	0x11201705324d4148LLU
@@ -1516,7 +1470,7 @@ typedef struct hammer2_volume_data hammer2_volume_data_t;
  *   bref.copyid   = physical disk index (0..ndisks-1)
  *   bref.data_off = per-disk physical byte offset | radix  (no disk_idx
  *                   bits — disk identity lives only in copyid).
- *   Stripe bitmap + hybrid metadata zone are in use.
+ *   Space map + hybrid metadata zone are in use.
  * (The dev-tree carried a brief split-numbering pass where 3 named the
  * v3-without-RAIDZ2 step and 4 named the RAIDZ2-native step.  Neither
  * format escaped the dev tree, so the numbering is collapsed back to 3.)

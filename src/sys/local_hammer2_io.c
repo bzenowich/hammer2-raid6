@@ -1941,8 +1941,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		 * v3 (RAIDZ2-native): iterate over all possible stripe slots
 		 * in the bitmap.  Only process allocated (bit-set) slots.
 		 */
-		num_stripes = (HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG64) /
-			      stripe_unit;
+		num_stripes = hmp->stripe_num_slots;
 	} else {
 		num_stripes = rc->array_size / ((uint64_t)ndata * stripe_unit);
 	}
@@ -2044,6 +2043,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		 */
 		const size_t MD_CHUNK = HAMMER2_PBUFSIZE;
 		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
+		hammer2_off_t md_end;
+		uint32_t nzones;
 		uint32_t ex;
 		int surv = -1;
 		int pass;
@@ -2066,10 +2067,34 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 			return ENXIO;
 		}
 
+		/*
+		 * Mirrored ranges: the metadata extents, then the reserved
+		 * segment of every 2 GB zone the extents reach, which holds
+		 * the freemap blocks for that zone.  The volume header at
+		 * the start of each segment was written by Phase 1.
+		 */
+		md_end = 0;
 		for (ex = 0; ex < hmp->md_nextents; ex++) {
-			hammer2_off_t mo = hmp->md_extents[ex].md_off;
-			hammer2_off_t ms = hmp->md_extents[ex].md_size;
+			if (md_end < hmp->md_extents[ex].md_off +
+				     hmp->md_extents[ex].md_size)
+				md_end = hmp->md_extents[ex].md_off +
+					 hmp->md_extents[ex].md_size;
+		}
+		nzones = (md_end + HAMMER2_ZONE_MASK64) / HAMMER2_ZONE_BYTES64;
+
+		for (ex = 0; ex < hmp->md_nextents + nzones; ex++) {
+			hammer2_off_t mo;
+			hammer2_off_t ms;
 			hammer2_off_t off;
+
+			if (ex < hmp->md_nextents) {
+				mo = hmp->md_extents[ex].md_off;
+				ms = hmp->md_extents[ex].md_size;
+			} else {
+				mo = (hammer2_off_t)(ex - hmp->md_nextents) *
+				     HAMMER2_ZONE_BYTES64 + HAMMER2_VOLUME_BYTES;
+				ms = HAMMER2_ZONE_SEG64 - HAMMER2_VOLUME_BYTES;
+			}
 
 			for (off = 0; off < ms; off += MD_CHUNK) {
 				size_t this_chunk =
@@ -2194,8 +2219,9 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 
 		/*
-		 * Slots that never hold a row (metadata zone, bitmap zone)
-		 * were copied by Phase A or are rewritten at sync; a parity
+		 * Slots that never hold a row (metadata zone, zone reserved
+		 * segments, space map) were copied by Phase A or are
+		 * rewritten at sync; a parity
 		 * "rebuild" there would overwrite them with garbage.
 		 */
 		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&

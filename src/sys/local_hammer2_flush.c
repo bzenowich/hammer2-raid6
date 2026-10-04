@@ -1507,6 +1507,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		struct buf *bp;
+		uint64_t sm_gen = 0;
 		int vol_error = 0;
 		int have_open_dev = 0;
 
@@ -1544,22 +1545,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 				 HAMMER2_CHAIN_VOLUMESYNC);
 
 		/*
-		 * Persist the physical stripe bitmap before the volume
-		 * header so the bitmap is durable before the header
-		 * that references the array state is written.
+		 * Write the space map before the volume headers and record
+		 * the generation they commit.  The cache flush ahead of
+		 * each header write makes it durable first.  raid_config
+		 * lies outside the sector CRCs; only the header CRC covers
+		 * it.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->stripe_bitmap) {
-			hammer2_raid6_bitmap_write(hmp);
-			/*
-			 * Persist the row refcount block right after the
-			 * bitmap.  Mount loads this and skips the
-			 * O(metadata) chain-tree walk.  On a fresh-upgrade
-			 * volume the header is absent and the walker takes
-			 * over — first flush after that writes the block.
-			 */
-			if (hmp->stripe_row_refcount)
-				hammer2_raid6_refcount_write(hmp);
+		if (hammer2_raid6_v3(hmp) && hmp->stripe_bitmap) {
+			vol_error = hammer2_raid6_sm_write(hmp, &sm_gen);
+			if (vol_error) {
+				fsync_error = vol_error;
+				goto skip_volhdr;
+			}
+			hmp->voldata.raid_config.rz_sm_gen = sm_gen;
+			hmp->volsync.raid_config.rz_sm_gen = sm_gen;
+			hmp->volsync.icrc_volheader =
+			    hammer2_icrc32((char *)&hmp->volsync +
+					   HAMMER2_VOLUME_ICRCVH_OFF,
+					   HAMMER2_VOLUME_ICRCVH_SIZE);
 		}
 
 		/*
@@ -1658,6 +1661,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 				fsync_error = vol_error;
 		}
 		hmp->volhdrno = j;
+		if (sm_gen && fsync_error == 0)
+			hmp->stripe_generation = sm_gen;
 skip_volhdr:
 		;
 	}

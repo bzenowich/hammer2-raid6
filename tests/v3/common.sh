@@ -53,9 +53,14 @@ degraded_spec() {
     echo "$spec"
 }
 
+# Layout of the 4 GB test disks (docs/capacity.md): reserved segment
+# 0..4 MB, space map 4..12 MB, aux 12..20 MB, metadata extent 0
+# 20..220 MB, stripe data from 220 MB (64 KB block 3520).
+DATA_BLK=3520
+
 # Prepare disk $1 as a fresh replacement for resilver.  Zero the first
-# 512 MB: the reserved/header segment, the stripe data zone (from 68 MB)
-# and metadata extent 0 (168..372 MB on the 4 GB test disks).  Zeroing
+# 512 MB: the reserved/header segment, the space map, metadata extent 0
+# and the start of the stripe data zone.  Zeroing
 # only the header segment left every old column in place, so a resilver
 # that wrote nothing still read back correct data.
 fresh_disk() {
@@ -71,9 +76,9 @@ corrupt_disk() {
         conv=notrunc 2>/dev/null
 }
 
-# Corrupt the stripe data zone of disk $1 (68 MB .. 168 MB).
+# Corrupt the first 100 MB of the stripe data zone of disk $1.
 corrupt_data_zone() {
-    corrupt_disk "$1" 1088 1600
+    corrupt_disk "$1" $DATA_BLK 1600
 }
 
 # fail_disk <idx> <label>: mark disk failed and verify the ioctl took

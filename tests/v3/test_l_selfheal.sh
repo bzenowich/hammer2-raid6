@@ -45,10 +45,10 @@ sha256 $MNTPT/l1 > /var/tmp/l1_ref.txt
 sync; sync
 umount $MNTPT
 
-# Corrupt 16 MB of stripe data on logical disk 1 at byte 68 MB (start of
-# the stripe data zone), same profile as K2.
+# Corrupt 16 MB of stripe data on logical disk 1 at the start of the
+# stripe data zone, same profile as K2.
 CORRUPT_DEV=$(disk_dev 1)
-dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=1088 \
+dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=$DATA_BLK \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT
@@ -127,11 +127,11 @@ umount $MNTPT
 # Metadata brefs carry copyid 0: the primary copy is always read from
 # disk 0, and disks 1..N-1 hold the mirror copies.  To exercise the
 # mirror-failover heal the corruption must land on DISK 0's metadata
-# zone (extent 0 = 168..372 MB on the 4 GB test disks).  Skip the
-# first 4 MB of the extent to stay clear of the disk-0-only stripe
-# bitmap slots below it; corrupt the rest of it, 200 MB at 172 MB.
+# zone (extent 0 = 20..220 MB on the 4 GB test disks).  Skip the
+# first 1 MB of the extent, where mkfs put the super-root; corrupt the
+# rest of it, 199 MB at 21 MB.
 MD_DEV=$(disk_dev 0)
-dd if=/dev/urandom of="$MD_DEV" bs=65536 count=3200 seek=2752 \
+dd if=/dev/urandom of="$MD_DEV" bs=65536 count=3184 seek=336 \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT

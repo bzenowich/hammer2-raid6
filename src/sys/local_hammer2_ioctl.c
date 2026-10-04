@@ -1649,6 +1649,12 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		atomic_add_int(&hmp->raid_nfailed, -1);
 	}
 
+	/*
+	 * The new disk holds no space map copy; have the next two
+	 * flushes write both copies whole.
+	 */
+	hammer2_raid6_sm_dirty_all(hmp);
+
 	/* Update on-disk RAID config disk state (both runtime and persisted) */
 	hmp->raid_config.disk_state[failed_disk_idx] =
 		HAMMER2_RAID6_DISK_ONLINE;

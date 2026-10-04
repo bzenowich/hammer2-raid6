@@ -56,6 +56,21 @@
 
 static uint64_t nowtime(void);
 static int blkrefary_cmp(const void *b1, const void *b2);
+static void format_raid6_space_map(hammer2_ondisk_t *fso,
+				   hammer2_volume_t *vol, char *buf);
+
+/*
+ * v3 RAID6 stripe layout, identical on every disk (docs/capacity.md).
+ * Computed by raid6_layout() once the volume sizes are known.
+ */
+static struct {
+	uint64_t	num_slots;	/* stripe slots per disk */
+	uint32_t	sm_pages;	/* space map data pages per copy */
+	hammer2_off_t	sm_off;		/* space map copy A */
+	hammer2_off_t	sm_copy;	/* bytes per copy */
+	hammer2_off_t	md_off;		/* metadata extent 0 */
+	hammer2_off_t	md_size;
+} Raid6;
 static void alloc_direct(hammer2_off_t *basep, hammer2_blockref_t *bref,
 				size_t bytes);
 
@@ -677,22 +692,22 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 		 * Initial seqno = 1; flush bumps it per TXG.
 		 */
 		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2) {
-			hammer2_off_t md_size;
-
 			rc->rz_txg_seq = 1;
 			bcopy(&opt->Hammer2_VolFSID, rc->rz_array_uuid,
 			    sizeof(rc->rz_array_uuid));
 			rc->rz_disk_id = (uint8_t)vol->id;
 			rc->rz_ndisks = (uint8_t)fso->nvolumes;
 
-			md_size = min_size * HAMMER2_MD_EXTENT0_PCT / 100;
-			if (md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
-				md_size = HAMMER2_MD_EXTENT0_MIN_SIZE;
-			if (md_size > min_size - HAMMER2_MD_EXTENT0_OFF)
-				md_size = min_size - HAMMER2_MD_EXTENT0_OFF;
 			rc->md_nextents = 1;
-			rc->md_extents[0].md_off = HAMMER2_MD_EXTENT0_OFF;
-			rc->md_extents[0].md_size = md_size;
+			rc->md_extents[0].md_off = Raid6.md_off;
+			rc->md_extents[0].md_size = Raid6.md_size;
+
+			rc->rz_layout = HAMMER2_RZ_LAYOUT;
+			rc->rz_num_slots = Raid6.num_slots;
+			rc->rz_sm_pages = Raid6.sm_pages;
+			rc->rz_sm_off = Raid6.sm_off;
+			rc->rz_sm_copy = Raid6.sm_copy;
+			rc->rz_sm_gen = 1;
 		}
 	}
 
@@ -743,127 +758,13 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	fsync(vol->fd);
 
 	/*
-	 * RAIDZ2-native (v3): write an empty but valid stripe bitmap to
-	 * zone slot 41 on every disk (each disk carries a copy).  Header+footer with generation 1 + CRC;
-	 * bitmap region all-zero (no stripes allocated).  The kernel reads
-	 * this at mount; without the header it would mark bitmap_invalid.
+	 * RAIDZ2-native (v3): write both space map copies, empty, to every
+	 * disk: copy A as generation 0 and copy B as generation 1, which
+	 * the volume header commits (rz_sm_gen = 1).
 	 */
 	if (opt->RaidType == 6 &&
-	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2) {
-		hammer2_stripe_bitmap_header_t *hdr;
-		hammer2_stripe_bitmap_footer_t *ftr;
-		uint8_t *bitmap;
-		uint64_t stripe_unit = HAMMER2_PBUFSIZE;
-		uint64_t max_stripes = (HAMMER2_ZONE_BYTES64 -
-		    HAMMER2_ZONE_SEG64) / stripe_unit;
-		size_t bitmap_pages = (size_t)(((max_stripes + 7) / 8 +
-		    HAMMER2_STRIPE_BITMAP_PAGE - 1) /
-		    HAMMER2_STRIPE_BITMAP_PAGE);
-		uint32_t crc;
-		hammer2_stripe_bitmap_header_t htmp;
-		hammer2_stripe_bitmap_footer_t ftmp;
-
-		if (bitmap_pages == 0)
-			bitmap_pages = 1;
-
-		bzero(buf, HAMMER2_PBUFSIZE);
-		hdr = (hammer2_stripe_bitmap_header_t *)buf;
-		bitmap = (uint8_t *)buf + HAMMER2_STRIPE_BITMAP_PAGE;
-		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)buf +
-		    HAMMER2_STRIPE_BITMAP_PAGE +
-		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
-
-		hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
-		hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
-		hdr->ndisks = (uint32_t)fso->nvolumes;
-		hdr->stripe_unit = stripe_unit;
-		hdr->num_slots = max_stripes;
-		hdr->slot_origin = HAMMER2_ZONE_SEG64;
-		hdr->cursor = HAMMER2_STRIPE_RAID6_START;
-		hdr->generation = 1;
-
-		ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
-		ftr->generation = 1;
-
-		htmp = *hdr;
-		ftmp = *ftr;
-		bzero(htmp.crc, sizeof(htmp.crc));
-		bzero(ftmp.crc, sizeof(ftmp.crc));
-		crc = hammer2_icrc32(&htmp, sizeof(htmp));
-		crc = hammer2_icrc32c(bitmap,
-		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE, crc);
-		crc = hammer2_icrc32c(&ftmp, sizeof(ftmp), crc);
-		bcopy(&crc, hdr->crc, sizeof(crc));
-		bcopy(&crc, ftr->crc, sizeof(crc));
-
-		n = pwrite(vol->fd, buf, HAMMER2_PBUFSIZE,
-			   (hammer2_off_t)HAMMER2_ZONE_RAID6_BITMAP *
-			   HAMMER2_ZONE_SEG);
-		if (n != HAMMER2_PBUFSIZE) {
-			perror("write (stripe bitmap zone)");
-			exit(1);
-		}
-
-		/*
-		 * Persisted row refcount block at offset HAMMER2_PBUFSIZE
-		 * within the same zone.  Empty (all-zero refcount) with a
-		 * valid header so the kernel can load it at first mount
-		 * without falling back to the walker.
-		 */
-		{
-			hammer2_stripe_refcount_header_t *rhdr;
-			hammer2_stripe_refcount_footer_t *rftr;
-			uint8_t *refcount;
-			size_t refcount_pages =
-			    (size_t)((max_stripes +
-			    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
-			    HAMMER2_STRIPE_REFCOUNT_PAGE);
-			hammer2_stripe_refcount_header_t rhtmp;
-			hammer2_stripe_refcount_footer_t rftmp;
-			uint32_t rcrc;
-
-			if (refcount_pages == 0)
-				refcount_pages = 1;
-
-			bzero(buf, HAMMER2_PBUFSIZE);
-			rhdr = (hammer2_stripe_refcount_header_t *)buf;
-			refcount = (uint8_t *)buf + HAMMER2_STRIPE_REFCOUNT_PAGE;
-			rftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)
-			    buf + HAMMER2_STRIPE_REFCOUNT_PAGE +
-			    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
-
-			rhdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
-			rhdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
-			rhdr->ndisks = (uint32_t)fso->nvolumes;
-			rhdr->stripe_unit = stripe_unit;
-			rhdr->num_slots = max_stripes;
-			rhdr->generation = 1;
-
-			rftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
-			rftr->generation = 1;
-
-			rhtmp = *rhdr;
-			rftmp = *rftr;
-			bzero(rhtmp.crc, sizeof(rhtmp.crc));
-			bzero(rftmp.crc, sizeof(rftmp.crc));
-			rcrc = hammer2_icrc32(&rhtmp, sizeof(rhtmp));
-			rcrc = hammer2_icrc32c(refcount,
-			    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE,
-			    rcrc);
-			rcrc = hammer2_icrc32c(&rftmp, sizeof(rftmp), rcrc);
-			bcopy(&rcrc, rhdr->crc, sizeof(rcrc));
-			bcopy(&rcrc, rftr->crc, sizeof(rcrc));
-
-			n = pwrite(vol->fd, buf, HAMMER2_PBUFSIZE,
-				   (hammer2_off_t)HAMMER2_ZONE_RAID6_BITMAP *
-				   HAMMER2_ZONE_SEG +
-				   HAMMER2_STRIPE_REFCOUNT_OFFSET);
-			if (n != HAMMER2_PBUFSIZE) {
-				perror("write (stripe refcount zone)");
-				exit(1);
-			}
-		}
-	}
+	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		format_raid6_space_map(fso, vol, buf);
 
 	/*
 	 * Cleanup
@@ -906,11 +807,111 @@ blkrefary_cmp(const void *b1, const void *b2)
 	return 0;
 }
 
+/*
+ * v3 RAID6 layout, per disk (docs/capacity.md):
+ *
+ *   [0, 4MB)	reserved segment of zone 0 (volume header, freemap)
+ *   boot area	space map copies A and B
+ *   aux area	minimum size
+ *   md_off	metadata extent 0, sroot/root inodes at its start
+ *   md_end..	data slots, skipping the reserved segment of each zone
+ *
+ * Stripe slot s covers [4MB + s * 64KB, +64KB).
+ */
+static void
+raid6_layout(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt)
+{
+	hammer2_off_t per_disk = fso->volumes[0].size;
+	uint64_t npages;
+
+	Raid6.num_slots = (per_disk - HAMMER2_ZONE_SEG64) / HAMMER2_PBUFSIZE;
+	npages = (Raid6.num_slots + HAMMER2_SM_PAGE_SLOTS - 1) /
+		 HAMMER2_SM_PAGE_SLOTS;
+	if (npages > HAMMER2_SM_MAX_PAGES)
+		errx(1, "RAID 6 disks of %s are too large for the space map",
+		     sizetostr(per_disk));
+	Raid6.sm_pages = (uint32_t)npages;
+	Raid6.sm_copy = (npages + 1) * HAMMER2_SM_PAGE;
+	Raid6.sm_off = HAMMER2_ZONE_SEG64;
+
+	opt->BootAreaSize = (2 * Raid6.sm_copy + HAMMER2_VOLUME_ALIGNMASK64) &
+			    ~HAMMER2_VOLUME_ALIGNMASK64;
+	opt->AuxAreaSize = HAMMER2_AUX_MIN_BYTES;
+
+	Raid6.md_off = HAMMER2_ZONE_SEG64 + opt->BootAreaSize +
+		       opt->AuxAreaSize;
+	Raid6.md_size = per_disk * HAMMER2_MD_EXTENT0_PCT / 100;
+	if (Raid6.md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
+		Raid6.md_size = HAMMER2_MD_EXTENT0_MIN_SIZE;
+	Raid6.md_size &= ~HAMMER2_VOLUME_ALIGNMASK64;
+	if (Raid6.md_off >= HAMMER2_FREEMAP_LEVEL1_SIZE ||
+	    Raid6.md_off + Raid6.md_size > per_disk)
+		errx(1, "RAID 6 disks of %s leave no room for the layout",
+		     sizetostr(per_disk));
+}
+
+/*
+ * Write one empty space map copy for generation `gen` to vol.
+ */
+static void
+format_raid6_sm_copy(hammer2_volume_t *vol, int ndisks, char *buf,
+		     uint64_t gen)
+{
+	hammer2_sm_header_t *hdr = (hammer2_sm_header_t *)buf;
+	hammer2_off_t base = Raid6.sm_off + (gen & 1) * Raid6.sm_copy;
+	uint32_t *crcs = (uint32_t *)(buf + HAMMER2_SM_CRC_OFF);
+	uint32_t zcrc;
+	uint32_t p;
+	ssize_t n;
+
+	bzero(buf, HAMMER2_SM_PAGE);
+	zcrc = hammer2_icrc32(buf, HAMMER2_SM_PAGE);
+	for (p = 0; p < Raid6.sm_pages; p++) {
+		n = pwrite(vol->fd, buf, HAMMER2_SM_PAGE,
+			   base + (1 + (hammer2_off_t)p) * HAMMER2_SM_PAGE);
+		if (n != HAMMER2_SM_PAGE) {
+			perror("write (space map)");
+			exit(1);
+		}
+	}
+
+	hdr->magic = HAMMER2_SM_MAGIC;
+	hdr->version = HAMMER2_SM_VERSION;
+	hdr->ndisks = (uint32_t)ndisks;
+	hdr->stripe_unit = HAMMER2_PBUFSIZE;
+	hdr->num_slots = Raid6.num_slots;
+	hdr->generation = gen;
+	hdr->cursor = 0;
+	hdr->npages = Raid6.sm_pages;
+	hdr->copy = (uint32_t)(gen & 1);
+	for (p = 0; p < Raid6.sm_pages; p++)
+		crcs[p] = zcrc;
+	hdr->hdr_crc = hammer2_icrc32(hdr,
+				      offsetof(hammer2_sm_header_t, hdr_crc));
+	hdr->hdr_crc = hammer2_icrc32c(buf + HAMMER2_SM_CRC_OFF,
+				       Raid6.sm_pages * sizeof(uint32_t),
+				       hdr->hdr_crc);
+	n = pwrite(vol->fd, buf, HAMMER2_SM_PAGE, base);
+	if (n != HAMMER2_SM_PAGE) {
+		perror("write (space map header)");
+		exit(1);
+	}
+}
+
+static void
+format_raid6_space_map(hammer2_ondisk_t *fso, hammer2_volume_t *vol, char *buf)
+{
+	format_raid6_sm_copy(vol, fso->nvolumes, buf, 0);
+	format_raid6_sm_copy(vol, fso->nvolumes, buf, 1);
+}
+
 void
 hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 {
 	hammer2_off_t resid = 0, reserved_size;
+	hammer2_off_t sizes[HAMMER2_MAX_VOLUMES];
 	hammer2_ondisk_t fso;
+	int fds[HAMMER2_MAX_VOLUMES];
 	int i;
 	char *vol_fsid = NULL;
 	char *sup_clid_name = NULL;
@@ -971,6 +972,16 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 				size = resid;
 		}
 
+		/*
+		 * RAID 6: every disk gets the smallest disk's size, a
+		 * multiple of the 2 GB zone so the zone reserved segments
+		 * fall at the same per-disk offsets on every disk.
+		 */
+		if (opt->RaidType == 6) {
+			fds[i] = fd;
+			sizes[i] = size;
+			continue;
+		}
 		if (i == fso.nvolumes - 1)
 			size &= ~HAMMER2_VOLUME_ALIGNMASK64;
 		else
@@ -985,10 +996,20 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	 * For RAID 6, adjust total_size to be the logical (usable) size.
 	 */
 	if (opt->RaidType == 6) {
-		hammer2_off_t min_size = fso.volumes[0].size;
+		hammer2_off_t min_size = sizes[0];
 		for (i = 1; i < fso.nvolumes; ++i) {
-			if (fso.volumes[i].size < min_size)
-				min_size = fso.volumes[i].size;
+			if (sizes[i] < min_size)
+				min_size = sizes[i];
+		}
+		min_size &= ~HAMMER2_ZONE_MASK64;
+		if (min_size == 0)
+			errx(1, "RAID 6 needs at least %s per disk",
+			     sizetostr(HAMMER2_ZONE_BYTES64));
+		for (i = 0; i < fso.nvolumes; ++i) {
+			hammer2_install_volume(&fso.volumes[i], fds[i], i,
+					       av[i], fso.total_size,
+					       min_size);
+			fso.total_size += min_size;
 		}
 		fso.total_size = (hammer2_off_t)(fso.nvolumes - 2) * min_size;
 
@@ -1022,6 +1043,8 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	 * Adjust options.
 	 */
 	adjust_options(&fso, opt);
+	if (opt->RaidType == 6)
+		raid6_layout(&fso, opt);
 
 	/*
 	 * We'll need to stuff this in the volume header soon.
@@ -1078,16 +1101,12 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
 	       (intmax_t)fso.free_size);
 	if (opt->RaidType == 6 &&
 	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2) {
-		hammer2_off_t per_disk = fso.volumes[0].size;
-		hammer2_off_t md_size = per_disk *
-		    HAMMER2_MD_EXTENT0_PCT / 100;
-		if (md_size < HAMMER2_MD_EXTENT0_MIN_SIZE)
-			md_size = HAMMER2_MD_EXTENT0_MIN_SIZE;
-		if (md_size > per_disk - HAMMER2_MD_EXTENT0_OFF)
-			md_size = per_disk - HAMMER2_MD_EXTENT0_OFF;
+		printf("space-map:        2 x %s @ %jd (%ju slots)\n",
+		       sizetostr(Raid6.sm_copy), (intmax_t)Raid6.sm_off,
+		       (uintmax_t)Raid6.num_slots);
 		printf("md-extent0:       %s (%jd bytes) @ %jd\n",
-		       sizetostr(md_size), (intmax_t)md_size,
-		       (intmax_t)HAMMER2_MD_EXTENT0_OFF);
+		       sizetostr(Raid6.md_size), (intmax_t)Raid6.md_size,
+		       (intmax_t)Raid6.md_off);
 	}
 	printf("vol-fsid:         %s\n", vol_fsid);
 	printf("sup-clid:         %s\n", sup_clid_name);

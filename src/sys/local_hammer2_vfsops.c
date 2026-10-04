@@ -1300,89 +1300,55 @@ next_hmp:
 			}
 
 			/*
-			 * Allocate and load the physical stripe bitmap.
-			 * Tracks which stripe slots are allocated so the
-			 * allocator never re-uses an in-use slot.
+			 * Load the metadata-zone extent table from voldata
+			 * (written by newfs_hammer2 -R 6).  The stripe
+			 * layout depends on it.
+			 */
+			if (hmp->voldata.raid_config.md_nextents > 0 &&
+			    hmp->voldata.raid_config.md_nextents <=
+			     HAMMER2_MD_MAX_EXTENTS) {
+				hmp->md_nextents =
+				    hmp->voldata.raid_config.md_nextents;
+				bcopy(hmp->voldata.raid_config.md_extents,
+				      hmp->md_extents,
+				      sizeof(hmp->md_extents));
+			}
+
+			/*
+			 * Load the space map (docs/capacity.md): the row
+			 * refcount the allocator works from.  A volume made
+			 * before the current stripe layout is refused.
 			 *
-			 * H4: bitmap_invalid (torn write, missing/corrupt
-			 * header, disk 0 absent) means we can't safely
-			 * allocate without risking reissue of live slots.
-			 * Refuse RW mount until a blockref-walk rebuild lands;
+			 * With no valid copy, rebuild it by walking the
+			 * blockref tree.  If that fails, refuse RW mount;
 			 * RO mount stays allowed for inspection/recovery.
 			 */
-			hammer2_raid6_bitmap_init(hmp);
-			hammer2_raid6_bitmap_read(hmp);
+			if (hammer2_raid6_sm_init(hmp)) {
+				hammer2_unmount_helper(mp, NULL, hmp);
+				lockmgr(&hammer2_mntlk, LK_RELEASE);
+				hammer2_vfs_unmount(mp, MNT_FORCE);
+				return EINVAL;
+			}
+			hammer2_raid6_sm_read(hmp);
 			if (hmp->stripe_bitmap_invalid) {
 				int rerr;
 
-				kprintf("hammer2: stripe bitmap invalid; "
+				kprintf("hammer2: space map invalid; "
 					"walking blockref tree to rebuild...\n");
 				rerr = hammer2_raid6_rebuild_stripe_bitmap(hmp);
 				if (rerr == 0) {
-					kprintf("hammer2: stripe bitmap "
+					kprintf("hammer2: space map "
 						"reconstructed from blockref "
 						"walk\n");
 					hmp->stripe_bitmap_invalid = 0;
 				} else if (!ronly) {
-					kprintf("hammer2: stripe bitmap "
+					kprintf("hammer2: space map "
 						"rebuild failed (err %d); "
 						"refusing RW mount\n", rerr);
 					hammer2_unmount_helper(mp, NULL, hmp);
 					lockmgr(&hammer2_mntlk, LK_RELEASE);
 					hammer2_vfs_unmount(mp, MNT_FORCE);
 					return EROFS;
-				}
-			}
-			/*
-			 * 6D: rebuild per-row refcount by walking the live
-			 * blockref tree.  Required because 6C packing can
-			 * place multiple chains in one row; the on-disk
-			 * bitmap is the union (one bit per row) and doesn't
-			 * carry per-chain counts.  Without an accurate
-			 * refcount, freeing one chain in a packed row could
-			 * clear the bitmap bit prematurely and let the
-			 * allocator reuse a slot whose other cols are
-			 * still live.
-			 *
-			 * Skipped when stripe_bitmap_invalid was just
-			 * rebuilt — that path's walker (record_bref) has
-			 * already populated refcount alongside the bitmap.
-			 */
-			if (!hmp->stripe_bitmap_invalid) {
-				/*
-				 * Try the persisted on-disk refcount first;
-				 * if the header / CRC are good, skip the
-				 * O(metadata) walker entirely.  On torn
-				 * write, missing block (fresh upgrade), or
-				 * CRC mismatch, fall back to the walker —
-				 * the next TXG flush re-persists.
-				 */
-				hammer2_raid6_refcount_read(hmp);
-				if (hmp->stripe_refcount_invalid) {
-					int rrerr =
-					    hammer2_raid6_rebuild_row_refcount(hmp);
-					if (rrerr && !ronly) {
-						kprintf("hammer2: row "
-							"refcount rebuild "
-							"failed (err %d); "
-							"refusing RW mount\n",
-							rrerr);
-						hammer2_unmount_helper(mp,
-							NULL, hmp);
-						lockmgr(&hammer2_mntlk,
-							LK_RELEASE);
-						hammer2_vfs_unmount(mp,
-							MNT_FORCE);
-						return EROFS;
-					}
-					kprintf("hammer2: stripe row "
-						"refcount rebuilt via "
-						"chain-tree walker\n");
-					hmp->stripe_refcount_invalid = 0;
-				} else {
-					kprintf("hammer2: stripe row "
-						"refcount loaded from "
-						"persisted on-disk block\n");
 				}
 			}
 			/* 6C: in-memory open-row tracker for packing. */
@@ -1396,35 +1362,6 @@ next_hmp:
 			 */
 			hammer2_io_repair_start(hmp);
 
-			/*
-			 * Load the metadata-zone extent table from voldata.
-			 * mkfs (--raid6) writes md_extents[0] at format time.
-			 * If older media has md_nextents == 0 we fall back to
-			 * the same deterministic default; this keeps in-place
-			 * upgrades from a pre-Group-J binary working.
-			 */
-			if (hmp->voldata.raid_config.md_nextents > 0 &&
-			    hmp->voldata.raid_config.md_nextents <=
-			     HAMMER2_MD_MAX_EXTENTS) {
-				hmp->md_nextents =
-				    hmp->voldata.raid_config.md_nextents;
-				bcopy(hmp->voldata.raid_config.md_extents,
-				      hmp->md_extents,
-				      sizeof(hmp->md_extents));
-			} else {
-				hammer2_off_t per_disk =
-				    hmp->voldata.volu_size;
-				hammer2_off_t size =
-				    per_disk * HAMMER2_MD_EXTENT0_PCT / 100;
-				if (size < HAMMER2_MD_EXTENT0_MIN_SIZE)
-					size = HAMMER2_MD_EXTENT0_MIN_SIZE;
-				if (size > per_disk - HAMMER2_MD_EXTENT0_OFF)
-					size = per_disk - HAMMER2_MD_EXTENT0_OFF;
-				hmp->md_nextents = 1;
-				hmp->md_extents[0].md_off =
-				    HAMMER2_MD_EXTENT0_OFF;
-				hmp->md_extents[0].md_size = size;
-			}
 		} else if (hmp->voldata.version >=
 			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
 			hmp->nvolumes = hmp->voldata.nvolumes;
@@ -2186,15 +2123,9 @@ again:
 	kmalloc_destroy_obj(&hmp->mio);
 	kmalloc_destroy(&hmp->mmsg);
 
-	if (hmp->stripe_bitmap) {
+	if (hmp->stripe_bitmap)
 		spin_uninit(&hmp->stripe_bitmap_spin);
-		kfree(hmp->stripe_bitmap, M_HAMMER2);
-		hmp->stripe_bitmap = NULL;
-	}
-	if (hmp->stripe_row_refcount) {
-		kfree(hmp->stripe_row_refcount, M_HAMMER2);
-		hmp->stripe_row_refcount = NULL;
-	}
+	hammer2_raid6_sm_destroy(hmp);
 	hammer2_raid6_open_rows_free(hmp);
 
 	kfree(hmp, M_HAMMER2);

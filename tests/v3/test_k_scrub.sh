@@ -36,7 +36,7 @@ sync; sync
 zone_hashes() {
     local j=0
     while [ "$j" -lt "$NDISKS" ]; do
-        dd if=$(disk_dev $j) bs=65536 skip=1088 count=1600 2>/dev/null | sha256
+        dd if=$(disk_dev $j) bs=65536 skip=$DATA_BLK count=1600 2>/dev/null | sha256
         j=$((j + 1))
     done
 }
@@ -66,9 +66,8 @@ teardown "K1"
 
 # K2: corrupt then scrub.  Choose disk index 1 (= /dev/vbd${DISK_BASE+1});
 # its data-column slots cycle through with period ndisks.  Stripe data
-# begins at HAMMER2_ZONE_SEG64 (4MB) + HAMMER2_STRIPE_RAID6_START (slot
-# 1024) * 64KB = 68 MB; corrupt 16 MB starting there to cover early
-# allocations of our reference file.
+# begins at DATA_BLK (common.sh); corrupt 16 MB starting there to cover
+# early allocations of our reference file.
 setup_fresh
 check_v3
 # 32 MB file = 256 rows; with NDISKS=4 / open_rows cap = 16, many
@@ -80,10 +79,10 @@ sha256 $MNTPT/k2 > /var/tmp/k2_ref.txt
 sync; sync
 umount $MNTPT
 
-# Corrupt 16 MB on logical disk 1 (= vbd$((DISK_BASE+1))) at byte 68 MB,
-# the start of the stripe data zone.
+# Corrupt 16 MB on logical disk 1 (= vbd$((DISK_BASE+1))) at the start
+# of the stripe data zone.
 CORRUPT_DEV=$(disk_dev 1)
-dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=1088 \
+dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=$DATA_BLK \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT
