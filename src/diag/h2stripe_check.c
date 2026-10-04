@@ -1,9 +1,9 @@
 /*
  * h2stripe_check - HAMMER2 RAIDZ2-native (format version 4) stripe checker.
  *
- * Opens a HAMMER2 RAID6 array from raw device paths, reads the physical stripe
- * bitmap from disk 0 at zone slot 41, and verifies parity consistency for every
- * allocated stripe slot.
+ * Opens a HAMMER2 RAID6 array from raw device paths, reads the space map
+ * (docs/capacity.md) committed by the newest volume header, and verifies
+ * parity consistency for every allocated stripe slot.
  *
  * For each allocated slot:
  *   - Reads all data columns from their respective disks
@@ -46,8 +46,13 @@
 #define HAMMER2_ZONE_SEG		(4ULL * 1024 * 1024)	/* 4 MB zone */
 #define HAMMER2_ZONE_BYTES64		(2ULL * 1024 * 1024 * 1024) /* 2 GB zone */
 
-/* Zone slot index where the physical stripe bitmap lives (disk 0 only) */
-#define HAMMER2_ZONE_RAID6_BITMAP	41
+/* Volume header copies: one at the start of each of the first 4 zones */
+#define HAMMER2_NUM_VOLHDRS		4
+
+/* Space map (docs/capacity.md) */
+#define HAMMER2_RZ_LAYOUT		2
+#define HAMMER2_SM_MAGIC		0x48324d5053325248ULL
+#define HAMMER2_SM_PAGE_SLOTS		HAMMER2_PBUFSIZE
 
 /* Volume header magic */
 #define HAMMER2_VOLUME_ID_HBO		0x48414d3205172011ULL
@@ -78,6 +83,7 @@
 /* Byte offset of version field in the volume header sector 0 */
 #define VOLHDR_VERSION_OFF	0x0030		/* uint32_t version */
 #define VOLHDR_MAGIC_OFF	0x0000		/* uint64_t magic */
+#define VOLHDR_MIRROR_TID_OFF	0x0078		/* uint64_t mirror_tid */
 
 /*
  * Sector 3 of the volume header (bytes 0x0600..0x07FF) holds
@@ -101,6 +107,18 @@
 #define RAIDCFG_FLAGS_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x04)	/* uint32_t */
 #define RAIDCFG_STRIPE_UNIT_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x08)	/* uint64_t */
 #define RAIDCFG_DISK_STATE_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x18)	/* uint8_t[64] */
+#define RAIDCFG_RZ_LAYOUT_OFF	0x0700		/* uint32_t */
+#define RAIDCFG_RZ_SM_PAGES_OFF	0x0704		/* uint32_t */
+#define RAIDCFG_RZ_NUM_SLOTS_OFF 0x0708		/* uint64_t */
+#define RAIDCFG_RZ_SM_OFF_OFF	0x0710		/* uint64_t */
+#define RAIDCFG_RZ_SM_COPY_OFF	0x0718		/* uint64_t */
+#define RAIDCFG_RZ_SM_GEN_OFF	0x0720		/* uint64_t */
+
+/* struct hammer2_sm_header, page 0 of a space map copy */
+#define SMHDR_MAGIC_OFF		0x00		/* uint64_t */
+#define SMHDR_NUM_SLOTS_OFF	0x18		/* uint64_t */
+#define SMHDR_GENERATION_OFF	0x20		/* uint64_t */
+#define SMHDR_NPAGES_OFF	0x30		/* uint32_t */
 
 /* -------------------------------------------------------------------------
  * GF(2^8) tables
@@ -206,31 +224,46 @@ disk_read(int disk, uint64_t off, void *buf, size_t len)
  *
  * Returns 0 on success, -1 on failure.
  */
+static uint8_t volhdr[HAMMER2_PBUFSIZE];
+
 static int
 read_volhdr(int *ndisks_out, int *ndata_out, uint64_t *stripe_unit_out)
 {
-	static uint8_t volhdr[HAMMER2_PBUFSIZE];
+	static uint8_t buf[HAMMER2_PBUFSIZE];
 	uint64_t magic;
+	uint64_t tid;
+	uint64_t best_tid = 0;
 	uint32_t version;
 	uint8_t  raid_type, nd, ndat;
 	uint64_t su;
+	int      best = -1;
 	int      i;
 
-	if (disk_read(0, 0, volhdr, HAMMER2_PBUFSIZE) < 0) {
-		fprintf(stderr, "Failed to read volume header from disk 0\n");
+	/*
+	 * Flushes rotate through the volume header copies; the one with
+	 * the highest mirror_tid is current.
+	 */
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; i++) {
+		if (fds[0] < 0 ||
+		    pread(fds[0], buf, HAMMER2_PBUFSIZE,
+			  (off_t)i * HAMMER2_ZONE_BYTES64) != HAMMER2_PBUFSIZE)
+			break;
+		memcpy(&magic, buf + VOLHDR_MAGIC_OFF, 8);
+		memcpy(&tid, buf + VOLHDR_MIRROR_TID_OFF, 8);
+		if (magic != HAMMER2_VOLUME_ID_HBO)
+			continue;
+		if (best < 0 || tid > best_tid) {
+			best = i;
+			best_tid = tid;
+			memcpy(volhdr, buf, HAMMER2_PBUFSIZE);
+		}
+	}
+	if (best < 0) {
+		fprintf(stderr, "No valid volume header on disk 0\n");
 		return -1;
 	}
 
-	memcpy(&magic,   volhdr + VOLHDR_MAGIC_OFF,   8);
 	memcpy(&version, volhdr + VOLHDR_VERSION_OFF,  4);
-
-	if (magic != HAMMER2_VOLUME_ID_HBO) {
-		fprintf(stderr,
-		    "Disk 0 volume magic mismatch: 0x%016llx (expected 0x%016llx)\n",
-		    (unsigned long long)magic,
-		    (unsigned long long)HAMMER2_VOLUME_ID_HBO);
-		return -1;
-	}
 
 	if (version < HAMMER2_VOL_VERSION_RAIDZ2) {
 		fprintf(stderr,
@@ -277,9 +310,9 @@ read_volhdr(int *ndisks_out, int *ndata_out, uint64_t *stripe_unit_out)
 	*ndata_out       = (int)ndat;
 	*stripe_unit_out = su;
 
-	printf("Volume header: version=%u, ndisks=%u, ndata=%u, "
+	printf("Volume header %d: version=%u, ndisks=%u, ndata=%u, "
 	    "stripe_unit=%llu bytes\n",
-	    version, nd, ndat, (unsigned long long)su);
+	    best, version, nd, ndat, (unsigned long long)su);
 
 	for (i = 0; i < nd; i++) {
 		const char *state_str;
@@ -301,51 +334,82 @@ read_volhdr(int *ndisks_out, int *ndata_out, uint64_t *stripe_unit_out)
 }
 
 /* -------------------------------------------------------------------------
- * Stripe bitmap
+ * Space map
  * ------------------------------------------------------------------------- */
 
 /*
- * Read the stripe bitmap from disk 0 zone slot HAMMER2_ZONE_RAID6_BITMAP.
- * The bitmap is stored in the first HAMMER2_PBUFSIZE bytes of that zone slot.
- * Bit S of byte S/8 is set if stripe slot S is allocated.
+ * Read the space map copy committed by the volume header (generation
+ * rz_sm_gen, copy rz_sm_gen & 1) from the first disk that has it.  Slot
+ * S is allocated when its refcount byte is non-zero.  Page CRCs are not
+ * checked: the kernel would have rebuilt a bad copy at mount.
  *
- * Returns an allocated bitmap buffer on success, NULL on failure.
- * *bitmap_bytes_out receives the number of valid bytes read.
+ * Returns a malloc'd refcount array (one byte per slot) or NULL.
  */
 static uint8_t *
-read_stripe_bitmap(uint64_t stripe_unit, size_t *bitmap_bytes_out)
+read_space_map(int ndisks, uint64_t *nslots_out)
 {
-	static uint8_t bitmap_buf[HAMMER2_PBUFSIZE];
-	uint64_t bitmap_off;
-	uint64_t usable;
-	uint64_t max_stripes;
-	size_t   bitmap_bytes;
+	uint8_t  *hdr;
+	uint8_t  *rc;
+	uint32_t layout, npages, hpages;
+	uint64_t nslots, sm_off, sm_copy, gen;
+	uint64_t magic, hgen, hslots;
+	uint64_t base;
+	uint32_t pg;
+	int      d;
 
-	bitmap_off = (uint64_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
+	memcpy(&layout, volhdr + RAIDCFG_RZ_LAYOUT_OFF, 4);
+	memcpy(&npages, volhdr + RAIDCFG_RZ_SM_PAGES_OFF, 4);
+	memcpy(&nslots, volhdr + RAIDCFG_RZ_NUM_SLOTS_OFF, 8);
+	memcpy(&sm_off, volhdr + RAIDCFG_RZ_SM_OFF_OFF, 8);
+	memcpy(&sm_copy, volhdr + RAIDCFG_RZ_SM_COPY_OFF, 8);
+	memcpy(&gen, volhdr + RAIDCFG_RZ_SM_GEN_OFF, 8);
 
-	if (disk_read(0, bitmap_off, bitmap_buf, HAMMER2_PBUFSIZE) < 0) {
-		fprintf(stderr,
-		    "Failed to read stripe bitmap from disk 0 "
-		    "@ zone slot %d (0x%llx)\n",
-		    HAMMER2_ZONE_RAID6_BITMAP,
-		    (unsigned long long)bitmap_off);
+	if (layout != HAMMER2_RZ_LAYOUT) {
+		fprintf(stderr, "stripe layout %u, this tool reads %u\n",
+		    layout, HAMMER2_RZ_LAYOUT);
 		return NULL;
 	}
-
-	/*
-	 * Compute how many stripe slots exist in the 2 GB zone window.
-	 * This matches hammer2_raid6_bitmap_init() in the kernel.
-	 */
-	usable      = HAMMER2_ZONE_BYTES64 - HAMMER2_ZONE_SEG;
-	max_stripes = usable / stripe_unit;
-	bitmap_bytes = (size_t)((max_stripes + 7) / 8);
-
-	/* Clamp to what fits in one PBUFSIZE block */
-	if (bitmap_bytes > HAMMER2_PBUFSIZE)
-		bitmap_bytes = HAMMER2_PBUFSIZE;
-
-	*bitmap_bytes_out = bitmap_bytes;
-	return bitmap_buf;
+	base = sm_off + (gen & 1) * sm_copy;
+	hdr = malloc(HAMMER2_PBUFSIZE);
+	rc = calloc(1, (size_t)npages * HAMMER2_SM_PAGE_SLOTS);
+	if (hdr == NULL || rc == NULL) {
+		fprintf(stderr, "malloc failed\n");
+		free(hdr);
+		free(rc);
+		return NULL;
+	}
+	for (d = 0; d < ndisks; d++) {
+		if (disk_state[d] != HAMMER2_RAID6_DISK_ONLINE ||
+		    disk_read(d, base, hdr, HAMMER2_PBUFSIZE) < 0)
+			continue;
+		memcpy(&magic, hdr + SMHDR_MAGIC_OFF, 8);
+		memcpy(&hslots, hdr + SMHDR_NUM_SLOTS_OFF, 8);
+		memcpy(&hgen, hdr + SMHDR_GENERATION_OFF, 8);
+		memcpy(&hpages, hdr + SMHDR_NPAGES_OFF, 4);
+		if (magic != HAMMER2_SM_MAGIC || hgen != gen ||
+		    hslots != nslots || hpages != npages)
+			continue;
+		for (pg = 0; pg < npages; pg++) {
+			if (disk_read(d, base + (pg + 1) * HAMMER2_PBUFSIZE,
+			    rc + (size_t)pg * HAMMER2_SM_PAGE_SLOTS,
+			    HAMMER2_PBUFSIZE) < 0)
+				break;
+		}
+		if (pg == npages)
+			break;
+	}
+	free(hdr);
+	if (d == ndisks) {
+		fprintf(stderr, "No disk has space map generation %llu "
+		    "(copy %llu @ 0x%llx)\n", (unsigned long long)gen,
+		    (unsigned long long)(gen & 1), (unsigned long long)base);
+		free(rc);
+		return NULL;
+	}
+	printf("Space map: generation %llu from disk%d, %llu slots\n",
+	    (unsigned long long)gen, d, (unsigned long long)nslots);
+	*nslots_out = nslots;
+	return rc;
 }
 
 /* -------------------------------------------------------------------------
@@ -451,8 +515,7 @@ main(int argc, char *argv[])
 {
 	int      ndisks, ndata;
 	uint64_t stripe_unit;
-	uint8_t *bitmap;
-	size_t   bitmap_bytes;
+	uint8_t *refcount;
 	uint64_t max_stripes;
 	uint64_t slot;
 
@@ -520,25 +583,18 @@ main(int argc, char *argv[])
 		goto out_fds;
 	}
 
-	/* Read stripe bitmap */
-	bitmap = read_stripe_bitmap(stripe_unit, &bitmap_bytes);
-	if (bitmap == NULL) {
+	/* Read the space map */
+	refcount = read_space_map(ndisks, &max_stripes);
+	if (refcount == NULL) {
 		ret = 1;
 		goto out_fds;
 	}
-
-	max_stripes = ((uint64_t)bitmap_bytes * 8);
-
-	printf("Stripe bitmap: %zu bytes, up to %llu slots\n",
-	    bitmap_bytes, (unsigned long long)max_stripes);
 
 	/* Count allocated slots for progress reporting */
 	{
 		uint64_t allocated = 0;
 		for (slot = 0; slot < max_stripes; slot++) {
-			int byte_idx = (int)(slot / 8);
-			int bit_idx  = (int)(slot % 8);
-			if (bitmap[byte_idx] & (1 << bit_idx))
+			if (refcount[slot] != 0)
 				allocated++;
 		}
 		printf("Allocated stripe slots: %llu\n\n",
@@ -575,15 +631,13 @@ main(int argc, char *argv[])
 	/* ------------------------------------------------------------------ */
 
 	for (slot = 0; slot < max_stripes; slot++) {
-		int    byte_idx = (int)(slot / 8);
-		int    bit_idx  = (int)(slot % 8);
 		int    p_disk, q_disk;
 		uint64_t phys_off;
 		int    n_failed_data = 0;
 		int    read_error    = 0;
 
 		/* Skip unallocated slots */
-		if (!(bitmap[byte_idx] & (1 << bit_idx)))
+		if (refcount[slot] == 0)
 			continue;
 
 		n_checked++;
@@ -797,6 +851,7 @@ out_bufs:
 	free(q_computed);
 	free(p_ondisk);
 	free(q_ondisk);
+	free(refcount);
 
 out_fds:
 	for (i = 0; i < ndisks_arg; i++) {
