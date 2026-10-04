@@ -2137,6 +2137,18 @@ void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
  * A disk takes writes if it is not failed, or if it is the disk an
  * online rebuild is filling.
  */
+/*
+ * v3 RAIDZ2-native array.  Live dedup is off here: a dedup'd bref would
+ * reference a stripe column without a row refcount, and the dedup heap
+ * keys on data_off alone, which does not name the disk (bref.copyid).
+ */
+static __inline int
+hammer2_raid6_v3(hammer2_dev_t *hmp)
+{
+	return (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+}
+
 static __inline int
 hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
 {

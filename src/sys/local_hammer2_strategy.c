@@ -1433,6 +1433,8 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 	 */
 	if (hammer2_dedup_enable == 0)
 		return;
+	if (hammer2_raid6_v3(chain->hmp))
+		return;
 	if (dio == NULL) {
 		dio = chain->dio;
 		if (dio == NULL)
@@ -1551,6 +1553,8 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
 	int i;
 
 	if (hammer2_dedup_enable == 0)
+		return 0;
+	if (hammer2_raid6_v3(hmp))
 		return 0;
 	data = *datap;
 	if (data == NULL)

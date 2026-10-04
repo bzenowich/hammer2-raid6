@@ -308,6 +308,22 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	return (error);
 }
 
+/*
+ * Return 1 if the 4MB segment at `base` lies wholly inside the
+ * iterator's hard bounds.  A level1 leaf covers 1GB, more than the v3
+ * metadata zone, so the leaf scan must check each segment; otherwise
+ * metadata spills into the stripe data area (disk 0's columns) once
+ * the zone's segments are used up.
+ */
+static __inline int
+hammer2_freemap_seg_inbounds(hammer2_fiterate_t *iter, hammer2_off_t base)
+{
+	if (iter->bmax == 0)
+		return 1;
+	return (base >= iter->bmin &&
+		base + HAMMER2_FREEMAP_LEVEL0_SIZE <= iter->bmax);
+}
+
 static int
 hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 			  hammer2_blockref_t *bref, int radix,
@@ -452,6 +468,9 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 
 			if (n >= HAMMER2_FREEMAP_COUNT) {
 				availchk = 0;
+			} else if (!hammer2_freemap_seg_inbounds(iter,
+					key + n * l0size)) {
+				availchk = 0;
 			} else if (bmap->avail) {
 				availchk = 1;
 			} else if (radix < HAMMER2_FREEMAP_BLOCK_RADIX &&
@@ -494,6 +513,9 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
 			n = start - count;
 			bmap = &chain->data->bmdata[n];
 			if (n < 0) {
+				availchk = 0;
+			} else if (!hammer2_freemap_seg_inbounds(iter,
+					key + n * l0size)) {
 				availchk = 0;
 			} else if (bmap->avail) {
 				availchk = 1;

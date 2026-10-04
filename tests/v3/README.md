@@ -80,5 +80,3 @@ wrong-array member at mount time.
 
 These tests fail because of kernel bugs, not test problems:
 
-- **crash_host.sh**: `r != NULL` assertion in
-  `hammer2_raid6_open_row_add_data` under the write+sync loop.
