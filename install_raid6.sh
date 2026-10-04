@@ -5,12 +5,17 @@
 # Usage:
 #   ./install_raid6.sh [patch|build|install|all]
 #
-# Requires: DragonFlyBSD with /usr/src populated (matching running kernel)
+# Requires: /usr/src = DragonFly master at the patch's base (48147b0412,
+# the flynas fork's arm64-base tag), and a running world and kernel built
+# from it -- the patch does not apply to, or build against, 6.4.x.
 # Must be run as root.
 #
-# IMPORTANT: hammer2.ko cannot be kldunload'd while the root filesystem uses
-# it.  After installing, a reboot is required for the new module to take effect.
-# Use `cp hammer2.ko /boot/kernel/hammer2.ko` to stage the module before reboot.
+# The module built here is a KMOD .ko: kldload accepts it, but the boot
+# loader rejects it ("file has no contents").  For a module that loads at
+# boot, use the kernel-tree build: make buildkernel/installkernel (or
+# ./deploy.sh install on the h2dev guest).  hammer2 must be a module, not
+# `options HAMMER2`, in the running kernel, and cannot be unloaded while a
+# hammer2 filesystem is mounted.
 #
 
 set -e
@@ -91,7 +96,7 @@ do_install() {
     echo "==> Installing HAMMER2 kernel module..."
     # Copy directly — make install may not handle kld path correctly on all setups
     cp "$SRCDIR/sys/vfs/hammer2/hammer2.ko" /boot/kernel/hammer2.ko
-    echo "    hammer2.ko -> /boot/kernel/hammer2.ko"
+    echo "    hammer2.ko -> /boot/kernel/hammer2.ko (kldload only, see NOTE)"
 
     echo "==> Installing newfs_hammer2..."
     # Use install(1), not cp — cp fails with "Text file busy" on running binaries
@@ -105,9 +110,10 @@ do_install() {
     echo ""
     echo "==> Installation complete"
     echo ""
-    echo "NOTE: hammer2.ko has been staged to /boot/kernel/hammer2.ko."
-    echo "      A reboot is required to activate the new kernel module"
-    echo "      (the root filesystem uses hammer2, so kldunload is not possible)."
+    echo "NOTE: kldunload hammer2 && kldload $SRCDIR/sys/vfs/hammer2/hammer2.ko"
+    echo "      activates it now (nothing hammer2 may be mounted).  The copy in"
+    echo "      /boot/kernel is a KMOD build the loader rejects at boot; rebuild"
+    echo "      the kernel (make buildkernel installkernel) for that."
     echo ""
     echo "After reboot, format a RAID 6 filesystem (minimum 4 disks):"
     echo "  newfs_hammer2 -R 6 -L DATA /dev/da0 /dev/da1 /dev/da2 /dev/da3"

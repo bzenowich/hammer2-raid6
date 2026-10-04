@@ -58,15 +58,19 @@ identity", see `harness/README.md`.
 
 ## Building the Kernel Module
 
+The guest runs DragonFly master (the overlay's base, 48147b0412) built from
+/usr/src with `KERNCONF=H2DEV` — X86_64_GENERIC minus `options HAMMER2`, so
+hammer2 is a loadable module. The 6.4.2 kernel is kept as /boot/kernel.old.
+
 ```sh
-# Build hammer2.ko (no full kernel recompile needed)
+# Inner loop: KMOD build + kldunload/kldload (no reboot, nothing hammer2 mounted)
+./deploy.sh fast
+
+# Loader-compatible module: quickkernel + reinstallkernel, then reboot or reload
+./deploy.sh install
+
+# KMOD build alone (kldload-able, but the loader rejects it at boot)
 ./dfly-exec.sh 'cd /usr/src/sys/vfs/hammer2 && make 2>&1 | tail -30'
-
-# Build with clean
-./dfly-exec.sh 'cd /usr/src/sys/vfs/hammer2 && make clean && make 2>&1 | tail -30'
-
-# Install the new module (requires reboot to take effect — root fs uses hammer2)
-./dfly-exec.sh 'cp /usr/src/sys/vfs/hammer2/hammer2.ko /boot/kernel/hammer2.ko'
 ```
 
 ## Building Userspace Tools
@@ -151,30 +155,25 @@ own. Anything mentioning 192.168.25.x is from the retired bridged setup.
 
 ## Generating a Patch
 
+The patch is the overlay in src/ applied to DragonFly master at the flynas
+fork's `arm64-base` tag (48147b0412), diffed on the host:
+
 ```sh
-# On the VM (from /usr/src):
-./dfly-exec.sh 'cd /usr/src && git diff > /tmp/raid6_tracked.patch'
-
-# Add new (untracked) files to the patch:
-./dfly-exec.sh 'cd /usr/src && git diff --no-index /dev/null sbin/hammer2/cmd_raid.c > /tmp/newfile_cmd_raid.patch'
-./dfly-exec.sh 'cd /usr/src && git diff --no-index /dev/null sys/vfs/hammer2/hammer2_raid6.c > /tmp/newfile_raid6c.patch'
-./dfly-exec.sh 'cd /usr/src && git diff --no-index /dev/null sys/vfs/hammer2/hammer2_raid6.h > /tmp/newfile_raid6h.patch'
-
-# Combine:
-./dfly-exec.sh 'cat /tmp/raid6_tracked.patch /tmp/newfile_cmd_raid.patch /tmp/newfile_raid6c.patch /tmp/newfile_raid6h.patch > /tmp/hammer2_raid6_full.patch'
-
-# Copy to local project:
-./scp.sh vm:/tmp/hammer2_raid6_full.patch ./hammer2_raid6.patch
+S=$(mktemp -d)
+git -C ../dragonfly worktree add --detach $S/base arm64-base
+bin/apply-overlay $S/base
+git -C $S/base add -N . && git -C $S/base diff > hammer2_raid6.patch
+git -C ../dragonfly worktree remove --force $S/base
 ```
 
 ## Applying a Patch (On VM)
 
-```sh
-# Test patch before applying:
-./dfly-exec.sh 'cd /usr/src && patch --check -p1 < /tmp/hammer2_raid6.patch'
+/usr/src on the guest is a git checkout of 48147b0412 (branch master-h2),
+so prefer `./deploy.sh sync`; the patch is for other trees at that base:
 
-# Apply:
-./dfly-exec.sh 'cd /usr/src && patch -p1 < /tmp/hammer2_raid6.patch'
+```sh
+./scp.sh hammer2_raid6.patch vm:/tmp/hammer2_raid6.patch
+./dfly-exec.sh 'cd /usr/src && git apply --check /tmp/hammer2_raid6.patch && git apply /tmp/hammer2_raid6.patch'
 ```
 
 ## Checking dmesg

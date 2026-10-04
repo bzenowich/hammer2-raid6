@@ -56,57 +56,60 @@ are from the prior LAN-bridged VM and no longer reach anything.
 
 ## Deploy Cycle
 
+The guest runs DragonFly master at the overlay's base (48147b0412, the
+flynas fork's `arm64-base`), built from `/usr/src` (a git checkout, branch
+`master-h2`) with `KERNCONF=H2DEV`: X86_64_GENERIC minus `options HAMMER2`,
+so hammer2 is a module.  The 6.4.2 kernel is `/boot/kernel.old`.
+A `pre-master` VM snapshot holds the old 6.4.2 guest, `master-base` the
+freshly upgraded one.  Rebuilding the world on the guest: `make -j2
+NO_ALTCOMPILER=yes buildworld`, and pass `NO_ALTCOMPILER=yes` to
+`installworld`/`upgrade` too — without it they try to install the gcc120
+that was never built and stop half way (which once left a new sshd without
+its `sshd-session`, refusing every connection).
+
 ```bash
-./deploy.sh fast      # sync + build + install + reload + tests
+./deploy.sh fast      # sync + build + reload + tests
                       # — NO reboot; requires no hammer2 fs mounted.
                       # Use this for the inner loop.
 ./deploy.sh all       # sync + build + install + tests (reboot after)
-./deploy.sh sync      # scp local_* to /usr/src/sys/vfs/hammer2/...
-                      # + idempotently patch /usr/src/sys/conf/files
-./deploy.sh build     # incrementally rebuild hammer2.ko in the
-                      # /usr/obj kernel-tree obj dir (loader-compatible)
+./deploy.sh sync      # bin/apply-overlay on the guest's /usr/src
+                      # + regenerate sys/config/H2DEV
+./deploy.sh build     # KMOD hammer2.ko in /usr/src/sys/vfs/hammer2
                       # + newfs_hammer2 + hammer2 userspace tools
-./deploy.sh install   # cp hammer2.ko /boot/kernel/ + install binaries
-./deploy.sh reload    # kldunload + kldload hammer2 (no reboot)
+./deploy.sh install   # quickkernel + reinstallkernel (loader-compatible
+                      # hammer2.ko in /boot/kernel) + install binaries
+./deploy.sh reload    # kldunload + kldload the KMOD hammer2.ko
 ./deploy.sh tests     # tar-pipe tests/ -> /root/hammer2-tests/
                       # + src/diag/ -> /root/h2diag/
 ```
 
 The `fast` action is the inner-loop workhorse: source edit → tested
-behaviour in ~20 seconds (vs ~20 min for a full kernel rebuild + reboot).
-The first build still needs a one-time `make nativekernel KERNCONF=H2DEV`
-on the VM to populate `/usr/obj/usr/src/sys/H2DEV/` — without it,
-`deploy.sh build` falls back to the KMOD .ko which the DragonFly loader
-rejects with `file has no contents`.
+behaviour in ~20 seconds.  `install` needs a prior
+`make -j2 KERNCONF=H2DEV buildkernel` on the guest to populate
+`/usr/obj/usr/src/sys/H2DEV/`; the KMOD .ko from `build` is rejected by
+the loader with `file has no contents`.
 
-Env: `DFLY_HOST` (default `h2dev`).
+Env: `KERNCONF` (default `H2DEV`), `DFLY_HOST` (default: the harness
+identity from `vmenv.sh`).
 
 ### File mapping (local → VM)
 
-| Local path | VM path |
-|---|---|
-| `src/sys/local_hammer2*.{c,h}` | `/usr/src/sys/vfs/hammer2/hammer2*.{c,h}` |
-| `src/sys/local_Makefile` | `/usr/src/sys/vfs/hammer2/Makefile` |
-| `src/sbin/local_mkfs_hammer2.{c,h}` | `/usr/src/sbin/newfs_hammer2/mkfs_hammer2.{c,h}` |
-| `src/sbin/local_newfs_hammer2.c` | `/usr/src/sbin/newfs_hammer2/newfs_hammer2.c` |
-| `src/sbin/local_cmd_debug.c` | `/usr/src/sbin/hammer2/cmd_debug.c` |
-| `src/sbin/local_hammer2_userspace.h` | `/usr/src/sbin/hammer2/hammer2_userspace.h` |
-| `tests/` | `/root/hammer2-tests/` |
-| `src/diag/` | `/root/h2diag/` |
-
-`deploy.sh sync` also appends `vfs/hammer2/hammer2_raid6.c optional
-hammer2` to `/usr/src/sys/conf/files` if not already there (idempotent).
-Both the kernel Makefile and the static-kernel build path need this
-file listed.
+`deploy.sh sync` runs `bin/apply-overlay /usr/src` on the guest, so the
+mapping is the same as for a local tree: `src/sys/local_*` →
+`sys/vfs/hammer2/`, `src/sbin/local_{mkfs,newfs}_*` →
+`sbin/newfs_hammer2/`, every other `src/sbin/local_*` → `sbin/hammer2/`
+(prefix stripped).  It also adds `vfs/hammer2/hammer2_raid6.c optional
+hammer2` to `sys/conf/files` and `SRCS+= cmd_raid.c` to the hammer2
+Makefile if missing.  `tests/` → `/root/hammer2-tests/`, `src/diag/` →
+`/root/h2diag/` (`deploy.sh tests`).
 
 ### Reboot after install
 
 `hammer2.ko` cannot be unloaded while a hammer2 filesystem is mounted.
-After `./deploy.sh install`, reboot:
+After `./deploy.sh install`, reboot (or `./deploy.sh reload`):
 
 ```bash
-ssh h2dev shutdown -r now
-until ssh -o ConnectTimeout=3 h2dev 'echo up' 2>/dev/null; do sleep 3; done
+./vmctl.sh reboot     # graceful, waits for SSH
 ```
 
 `make clean && make` is required when struct layouts change — old
