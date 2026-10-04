@@ -5563,7 +5563,11 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 		chain->dio,
 		(chain->dio ? chain->dio->bp : NULL));
 
-	if (chain->dio) {
+	/*
+	 * A RAID6 DIO for a column on a failed disk is served by
+	 * reconstruction and carries no buffer.
+	 */
+	if (chain->dio && chain->dio->bp) {
 		kprintf("bp_loff %016jx,%d bdata %p/%p",
 			(intmax_t)chain->dio->bp->b_loffset,
 			chain->dio->bp->b_bufsize,
