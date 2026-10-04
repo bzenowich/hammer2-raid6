@@ -127,6 +127,18 @@ teardown() {
     umount $MNTPT 2>/dev/null || umount -f $MNTPT 2>/dev/null || true
 }
 
+# data_slots — print "disk:data_off" for every DATA blockref on the array,
+# sorted and unique.  Reads the media with `hammer2 -q show`, whose quiet
+# lines are "data.N <data_off> <key>/<keybits> vol=<disk> ...": on a v3
+# RAID6 array vol= is bref.copyid, the disk holding the block, and
+# data_off is the per-disk offset with the size radix in its low 6 bits.
+# Run after sync; an empty result means the walk found no data at all.
+data_slots() {
+    hammer2 -q show $DEVSPEC 2>/dev/null |
+        awk '$1 ~ /^data\./ && $4 ~ /^vol=/ { sub(/^vol=/, "", $4); print $4 ":" $2 }' |
+        sort -u
+}
+
 write_ref_data() {
     local prefix="${1:-ref}"
     dd if=/dev/urandom of=$MNTPT/${prefix}_a bs=65536 count=128 2>/dev/null

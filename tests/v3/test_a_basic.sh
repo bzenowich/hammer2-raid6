@@ -51,25 +51,38 @@ else
 fi
 teardown "A2"
 
-# A3: Blockref encoding — copyid in [0..NDISKS-1], data_off 64KB-aligned
+# A3: Blockref encoding — every DATA blockref names a disk in
+# [0..NDISKS-1] (bref.copyid), sits at a 64 KB-aligned per-disk offset,
+# and no two blockrefs share a (disk, offset) slot.
 setup_fresh
 check_v3
 dd if=/dev/urandom of=$MNTPT/probe bs=65536 count=4 2>/dev/null
 sync; sync
-hammer2 -s $MNTPT show > /var/tmp/a3_show.txt 2>&1
-# Check: no DATA blockref with copyid outside [0, NDISKS-1]
-if grep -q "type=DATA" /var/tmp/a3_show.txt 2>/dev/null; then
-    bad_copyid=$(grep "type=DATA" /var/tmp/a3_show.txt |
-        awk '{ for(i=1;i<=NF;i++) if($i~/^copyid=/) print $i }' |
-        sed 's/copyid=//' |
-        awk -v n="$NDISKS" '$1 < 0 || $1 >= n { print $1 }')
-    if [ -z "$bad_copyid" ]; then
-        result PASS "A3: all DATA blockrefs have copyid in [0...$((NDISKS-1))]"
-    else
-        result FAIL "A3: DATA blockref copyid out of range: $bad_copyid"
+hammer2 -q show $DEVSPEC > /var/tmp/a3_show.txt 2>&1
+awk '$1 ~ /^data\./ && $4 ~ /^vol=/ { sub(/^vol=/, "", $4); print $4, $2 }' \
+    /var/tmp/a3_show.txt > /var/tmp/a3_data.txt
+ndata=$(wc -l < /var/tmp/a3_data.txt | tr -d ' ')
+bad=""
+while read disk off; do
+    if [ "$disk" -lt 0 ] || [ "$disk" -ge "$NDISKS" ]; then
+        bad="$bad disk=$disk"
     fi
+    # low 16 bits of data_off: offset bits must be 0, only the radix set
+    low=$((0x$(echo "$off" | cut -c13-16)))
+    if [ $((low & 0xffc0)) -ne 0 ]; then
+        bad="$bad off=$off"
+    fi
+done < /var/tmp/a3_data.txt
+dups=$(sort /var/tmp/a3_data.txt | uniq -d | wc -l | tr -d ' ')
+if [ "$ndata" -lt 4 ]; then
+    result FAIL "A3: hammer2 show found $ndata DATA blockrefs, expected 4"
+    head -5 /var/tmp/a3_show.txt
+elif [ -n "$bad" ]; then
+    result FAIL "A3: bad DATA blockref encoding:$bad"
+elif [ "$dups" != "0" ]; then
+    result FAIL "A3: $dups DATA slot(s) referenced twice"
 else
-    result PASS "A3: no DATA blockrefs (file too small; skip encoding check)"
+    result PASS "A3: $ndata DATA blockrefs: disk in [0...$((NDISKS-1))], 64 KB-aligned, distinct slots"
 fi
 teardown "A3"
 
@@ -79,18 +92,18 @@ check_v3
 # Write a file large enough to span multiple DIOs (8 x 64KB = 512 KB)
 dd if=/dev/urandom of=$MNTPT/cow_test bs=65536 count=8 2>/dev/null
 sync; sync
-hammer2 -s $MNTPT show 2>/dev/null |
-    grep "type=DATA" | awk '{ for(i=1;i<=NF;i++) if($i~/^data_off=/) print $i }' |
-    sort > /var/tmp/a4_before.txt
+data_slots > /var/tmp/a4_before.txt
 # Overwrite
 dd if=/dev/urandom of=$MNTPT/cow_test bs=65536 count=8 2>/dev/null
 sync; sync
-hammer2 -s $MNTPT show 2>/dev/null |
-    grep "type=DATA" | awk '{ for(i=1;i<=NF;i++) if($i~/^data_off=/) print $i }' |
-    sort > /var/tmp/a4_after.txt
+data_slots > /var/tmp/a4_after.txt
+nbefore=$(wc -l < /var/tmp/a4_before.txt | tr -d ' ')
+nafter=$(wc -l < /var/tmp/a4_after.txt | tr -d ' ')
 overlap=$(comm -12 /var/tmp/a4_before.txt /var/tmp/a4_after.txt | wc -l | tr -d ' ')
-if [ "$overlap" = "0" ]; then
-    result PASS "A4: COW — no stripe slot reused after overwrite"
+if [ "$nbefore" -lt 8 ] || [ "$nafter" -lt 8 ]; then
+    result FAIL "A4: hammer2 show found $nbefore/$nafter DATA blocks, expected 8 each"
+elif [ "$overlap" = "0" ]; then
+    result PASS "A4: COW — 8 blocks rewritten into fresh stripe slots"
 else
     result FAIL "A4: COW — $overlap stripe slot(s) reused (not fresh COW)"
 fi
