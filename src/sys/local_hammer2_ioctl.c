@@ -1132,6 +1132,7 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
 	hammer2_chain_t *vchain;
 	int error;
 	int didsnap;
+	int v3;
 
 	pmp = ip->pmp;
 	ip = pmp->iroot;
@@ -1149,6 +1150,15 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
 	error = lockmgr(&hmp->bflock, LK_EXCLUSIVE | LK_PCATCH);
 	if (error)
 		return error;
+
+	/*
+	 * v3: start recording stripe allocations before the sync, so a
+	 * slot allocated after it, and so missing from the snapshot, is
+	 * not taken as unreferenced.
+	 */
+	v3 = hammer2_raid6_v3(hmp) && hmp->stripe_bitmap != NULL;
+	if (v3)
+		hammer2_raid6_bf_begin(hmp);
 
 	/*
 	 * Sync all mounts related to the media
@@ -1213,6 +1223,8 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
 	error = hammer2_error_to_errno(error);
 
 failed:
+	if (v3)
+		hammer2_raid6_bf_end(hmp);
 	lockmgr(&hmp->bflock, LK_RELEASE);
 	return error;
 }

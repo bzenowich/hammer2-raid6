@@ -3,7 +3,7 @@
 Run on the h2dev guest from `/root/hammer2-tests/v3` (`./deploy.sh tests`
 syncs them):
 
-    sh run_all.sh            # groups A..M
+    sh run_all.sh            # groups A..N (M last)
     sh run_all.sh B D        # selected groups
 
 `crash_host.sh` runs on the **host** (it resets the guest):
@@ -24,10 +24,11 @@ Test disks are `/dev/vbd1..vbd4`; `vbd0` is the system disk.
 | F | COW invariant, parity correctness |
 | G | degraded mount, fail state persisted, degraded write + resilver |
 | H | snapshots across degraded states |
-| I | forced unmount (**not** a crash test, `umount -f` still flushes), bulkfree after it |
-| J | packed rows: delete siblings, bulkfree, reuse the freed slots, snapshot holds rows |
+| I | forced unmount (**not** a crash test, `umount -f` still flushes), bulkfree after it returns the space |
+| J | packed rows: delete siblings, bulkfree, write again, snapshot holds rows |
 | K | scrub: clean array is not modified, corruption detected and repaired, scrub under writes |
 | L | read-path self-heal, data and metadata |
+| N | capacity: fill past the old 2 GB-per-disk limit, two-pass bulkfree frees deleted space and it is reused, a snapshot survives the allocator wrapping the disk |
 | M | silent corruption in two columns (runs last: it can hang the kernel) |
 | crash_host.sh | power loss under a write+sync loop: every synced file must survive, scrub clean |
 

@@ -1660,16 +1660,15 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 					hammer2_pfs_memory_wakeup(
 						chain->pmp, -1);
 				}
-				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-				    hmp->voldata.version >=
-				    HAMMER2_VOL_VERSION_RAIDZ2 &&
-				    (chain->bref.type ==
-				     HAMMER2_BREF_TYPE_DATA ||
-				     chain->bref.type ==
-				     HAMMER2_BREF_TYPE_DIRENT)) {
-					hammer2_raid6_stripe_free(hmp,
-					    &chain->bref);
-				} else {
+				/*
+				 * v3 data slots are freed only by bulkfree
+				 * (docs/capacity.md, Freeing).
+				 */
+				if (!(hammer2_raid6_v3(hmp) &&
+				      (chain->bref.type ==
+				       HAMMER2_BREF_TYPE_DATA ||
+				       chain->bref.type ==
+				       HAMMER2_BREF_TYPE_DIRENT))) {
 					hammer2_freemap_adjust(hmp,
 					    &chain->bref,
 					    HAMMER2_FREEMAP_DORECOVER);
@@ -1678,24 +1677,13 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 						HAMMER2_CHAIN_DEDUPABLE);
 			} else {
 				/*
-				 * v3 COW: free prior stripe slot before
-				 * allocating a new one. hammer2_freemap_alloc
-				 * internally dispatches DATA/DIRENT on v3 to
-				 * hammer2_raid6_stripe_alloc; all other types
-				 * fall through to the freemap radix.
+				 * hammer2_freemap_alloc dispatches DATA/DIRENT
+				 * on v3 to hammer2_raid6_stripe_alloc; all
+				 * other types use the freemap radix.  The old
+				 * v3 slot is not freed here: a snapshot may
+				 * still reference it, so only bulkfree frees
+				 * data slots (docs/capacity.md, Freeing).
 				 */
-				if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-				    hmp->voldata.version >=
-				    HAMMER2_VOL_VERSION_RAIDZ2 &&
-				    (chain->bref.type ==
-				     HAMMER2_BREF_TYPE_DATA ||
-				     chain->bref.type ==
-				     HAMMER2_BREF_TYPE_DIRENT) &&
-				    (chain->bref.data_off &
-				     ~HAMMER2_OFF_MASK_RADIX) != 0) {
-					hammer2_raid6_stripe_free(hmp,
-					    &chain->bref);
-				}
 				error = hammer2_freemap_alloc(chain,
 				    chain->bytes);
 				atomic_clear_int(&chain->flags,

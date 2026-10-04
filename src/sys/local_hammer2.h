@@ -1213,6 +1213,18 @@ struct hammer2_dev {
 	uint32_t	*sm_crc[2];		/* per copy: CRC of each page on disk */
 
 	/*
+	 * v3 bulkfree (docs/capacity.md, Freeing).  Data slots are freed
+	 * only here: a slot with a live refcount that two consecutive
+	 * passes find unreferenced, and that was not allocated during
+	 * either, is freed by the second.  Each is 1 bit per slot.
+	 */
+	uint8_t		*stripe_bf_seen;	/* referenced in this pass's scan */
+	uint8_t		*stripe_bf_new;		/* allocated during this pass */
+	uint8_t		*stripe_bf_staged;	/* unreferenced in the last pass */
+	int		stripe_bf_active;	/* stripe_alloc sets stripe_bf_new */
+	int		stripe_bf_complete;	/* scan covered the whole tree */
+
+	/*
 	 * Open-row tracking (6C): rows allocated during the current TXG
 	 * that haven't sealed their P/Q yet.  The allocator packs chains
 	 * into existing open rows when possible (ZFS variable-width
@@ -2111,8 +2123,9 @@ int  hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp);
 void hammer2_raid6_sm_dirty_all(hammer2_dev_t *hmp);
 int  hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
 int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
-void hammer2_raid6_stripe_free(hammer2_dev_t *hmp,
-				const hammer2_blockref_t *bref);
+void hammer2_raid6_bf_begin(hammer2_dev_t *hmp);
+int  hammer2_raid6_bf_mark(hammer2_dev_t *hmp, const hammer2_blockref_t *bref);
+void hammer2_raid6_bf_end(hammer2_dev_t *hmp);
 
 /*
  * hammer2_raid6.c

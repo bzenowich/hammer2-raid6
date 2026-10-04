@@ -1,6 +1,6 @@
 # v3 capacity: full-disk stripe space
 
-**Status**: in progress (2026-10-04).
+**Status**: implemented (2026-10-04).
 **Replaces**: the zone-41 bitmap and refcount blocks in `stripe_bitmap.md`.
 
 ## Problem
@@ -17,6 +17,8 @@ Related defects found while mapping the layout:
    before the tree that still references it is committed. Once the
    allocator cursor wraps, the slot can be reused and overwritten before
    the new volume header lands; a crash then loses committed data.
+   Fixed with defect 7: bulkfree frees only what committed trees no
+   longer reference.
 2. **The persisted bitmap can run ahead of the tree.** It is written before
    the volume header, and the header does not say which bitmap generation
    it commits. A crash between the two leaves frees from an uncommitted
@@ -39,7 +41,8 @@ Related defects found while mapping the layout:
    chain). Deleting a file frees nothing; upstream bulkfree covers only
    the freemap, which on v3 tracks metadata. A COW of a block that a
    snapshot shares frees a slot the snapshot still references. Neither
-   showed while the cursor could not wrap. See "Freeing" below.
+   showed while the cursor could not wrap. Fixed: only bulkfree frees
+   data slots. See "Freeing" below.
 
 ## Layout (per disk, identical on every disk)
 
@@ -127,29 +130,52 @@ copies, so the next two flushes write both copies whole.
 
 **Consistency without locking:** the copy written for generation `N` may
 include allocations made after flush `N` started. After a crash those
-slots are leaked (refcount too high), never lost. Frees are safe because
-of deferral (below).
+slots are leaked (refcount too high), never lost. Frees come only from
+bulkfree (below), which never frees a slot a committed tree references.
 
 ## Freeing
 
-Two problems remain (defect 7). Deferring the COW free fixes the crash
-window but not snapshots: chain_modify cannot tell whether a snapshot
-shares the block. A snapshot-safe design frees data slots the HAMMER2 way,
-with a bulkfree pass over every PFS and snapshot that recomputes the
-refcounts and frees what nothing references, and drops the COW free. That
-also covers deletes. Pending a decision; the deferred-free design below is
-the interim plan if COW frees are kept.
+Data slots are freed only by bulkfree, as HAMMER2 frees everything else.
+Modifying or deleting a chain frees nothing: a snapshot may still
+reference the old block, and the tree that drops it may not be committed
+yet. (The COW free in `hammer2_chain_modify` was defect 7: once the
+cursor wrapped, a snapshot read back EIO.)
 
-### Deferred frees
+`hammer2 bulkfree` runs the upstream pass over a snapshot of the
+committed topology (`hammer2_chain_bulksnap`), which covers every PFS and
+snapshot. The scan callback hands each v3 DATA/DIRENT blockref to
+`hammer2_raid6_bf_mark`, which sets the slot in `stripe_bf_seen`; those
+blockrefs no longer reach the freemap.
 
-`hammer2_raid6_stripe_free` no longer changes the refcount. It queues the
-slot on the open free list. At the start of each volume flush the open list
-is closed; after that flush's volume header is written on every disk, the
-closed list is applied (refcount decrement, bitmap clear, page dirty).
-A free recorded during a flush waits for the next one.
+Flushes do not wait for frontend transactions, so a slot allocated just
+before the pass may be in no committed tree yet. Freeing is therefore
+two-stage, like the freemap's 11 -> 10 -> 00:
 
-Until then the slot cannot be allocated, so no committed tree's data is
-overwritten before a tree without it is durable.
+| slot | action |
+|---|---|
+| seen, or allocated during the pass (`stripe_bf_new`) | unstage |
+| seen, free in the map, not new | take back (refcount 1) |
+| unseen, refcount 0 | nothing |
+| unseen, in use, not staged | stage |
+| unseen, in use, staged | free (refcount 0, page dirty) |
+
+So a slot is freed by the second of two passes that both find it
+unreferenced. Each pass syncs first and holds `bflock`, so the two scans
+see different commits. Recording `stripe_bf_new` starts before that
+sync. The merge runs a page at a time under `stripe_bitmap_spin`.
+
+The merge runs only after a clean scan of a committed snapshot. A scan
+with any error (CRC errors included, since they hide a subtree) changes
+nothing, and neither does the live-topology scan the ioctl falls back to
+on ENOSPC: its frees could hit slots that the last committed tree still
+uses.
+
+The staged set is in memory; after a remount the first pass only
+stages. Freed refcounts reach disk with the next flush's space map; a
+crash before that leaks the slots until the next two passes.
+
+The refcount is now in use / not in use: nothing decrements it, so the
+packing count (defect 6) only matters for which value marks a slot used.
 
 ## Steps
 
@@ -157,6 +183,7 @@ overwritten before a tree without it is durable.
    resilver range and Phase A reserved segments. (Done.)
 2. Space map A/B with dirty pages, `rz_sm_gen`, load, full writes on
    replace and rebuild. (Done.)
-3. Freeing: deferred frees, or bulkfree (see Freeing).
-4. Tests: an array larger than 2 GB per disk filled past 2 GB; free/reuse
-   across a crash; statfs.
+3. Freeing: v3 bulkfree, COW free removed (see Freeing). (Done.)
+4. Tests: group N (fill past the old limit, two-pass reuse with statfs,
+   snapshot across allocator wrap), I3 measures reclaim,
+   `crash_host.sh` with `CRASH_CHURN=1` (reuse across a crash).

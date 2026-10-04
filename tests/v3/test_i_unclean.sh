@@ -74,11 +74,10 @@ else
     result FAIL "I2: degraded remount failed after forced unmount"
 fi
 
-# I3: forced unmount, remount, delete, bulkfree, then the kept file
-# must verify cold and the array scrub clean.  Reclaim itself is not
-# measured here: bulkfree prints no totals and statfs on a v3 array
-# does not count data blocks (df shows 64 KB used after 8 MB written).
-# J1 proves freed space is reused safely.
+# I3: forced unmount, remount, delete, bulkfree twice (the second pass
+# frees what both found unreferenced): df must show the orphan's space
+# back, the kept file must verify cold and the array scrub clean.
+# J1 and N prove freed space is reused safely.
 setup_fresh
 check_v3
 dd if=/dev/urandom of=$MNTPT/keep bs=65536 count=128 2>/dev/null
@@ -91,11 +90,20 @@ if mount -t hammer2 $PFSPATH $MNTPT; then
     rm -f $MNTPT/orphan
     sync; sync
     kmsg_clear
-    if hammer2 bulkfree $MNTPT > /var/tmp/i3_bulkfree.out 2>&1; then
+    used0=$(df -k $MNTPT | awk 'NR == 2 { print $3 }')
+    if hammer2 bulkfree $MNTPT > /var/tmp/i3_bulkfree.out 2>&1 &&
+       hammer2 bulkfree $MNTPT >> /var/tmp/i3_bulkfree.out 2>&1; then
         check_no_checkfail "I3-bulkfree" &&
             result PASS "I3: bulkfree completed after forced unmount"
     else
         result FAIL "I3: bulkfree failed (see /var/tmp/i3_bulkfree.out)"
+    fi
+    sleep 2     # statfs recounts used slots at most once a second
+    used1=$(df -k $MNTPT | awk 'NR == 2 { print $3 }')
+    if [ "$((used0 - used1))" -ge 4096 ]; then
+        result PASS "I3: bulkfree returned the orphan's space (used ${used0}K -> ${used1}K)"
+    else
+        result FAIL "I3: bulkfree did not return the orphan's space (used ${used0}K -> ${used1}K)"
     fi
     if remount; then
         sha256 $MNTPT/keep > /var/tmp/i3_keep_check.txt 2>&1

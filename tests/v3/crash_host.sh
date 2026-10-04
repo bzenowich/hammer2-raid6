@@ -15,6 +15,15 @@
 #      have no CHECK FAIL.  Files written after the last log line may be
 #      missing or short; they only have to read without error.
 #
+# CRASH_CHURN=1 tests freeing and reuse across the crash: the array is
+# first filled to within ~768 MB of full (64 MB files p*, logged), and
+# the writer writes 1-32 MB files, deletes the file 8 behind (logging
+# "del <name>" before the rm, so it is never checked again) and runs
+# `hammer2 bulkfree` every 4 files.  The allocator soon wraps into rows
+# bulkfree freed, so the crash lands while freed rows are being reused;
+# the prefill and every logged, undeleted file must still verify.
+# CRASH_AFTER defaults to 180 s in this mode.
+#
 # Usage (from hammer2-raid6/): sh tests/v3/crash_host.sh
 # Needs ./ssh.sh and bin/qmp.  Rounds: CRASH_ROUNDS (default 1).
 # A guest reboot takes 1-10 min.
@@ -24,10 +33,19 @@ GSH="$REPO/ssh.sh"
 QMP="$REPO/bin/qmp"
 T=/root/hammer2-tests/v3
 LOG=/var/tmp/crash_log.txt
-CRASH_AFTER="${CRASH_AFTER:-20}"
+CRASH_CHURN="${CRASH_CHURN:-}"
+if [ -n "$CRASH_CHURN" ]; then
+    CRASH_AFTER="${CRASH_AFTER:-180}"
+else
+    CRASH_AFTER="${CRASH_AFTER:-20}"
+fi
 CRASH_ROUNDS="${CRASH_ROUNDS:-1}"
 CRASH_FAIL="${CRASH_FAIL:-}"
 FAILS=0
+# The module deploy.sh builds.  A reset guest boots without hammer2
+# loaded, and a bare `kldload hammer2` would take /boot/kernel's copy,
+# which only `deploy.sh install` updates.
+KO=/usr/src/sys/vfs/hammer2/hammer2.ko
 
 wait_guest() {
     local n=0
@@ -42,16 +60,37 @@ wait_guest() {
 
 round=1
 while [ "$round" -le "$CRASH_ROUNDS" ]; do
-    echo "=== crash round $round (after ${CRASH_AFTER}s, fail='${CRASH_FAIL}') ==="
-    "$GSH" "cd $T && . ./common.sh && kldstat -q -m hammer2 || kldload hammer2;
+    echo "=== crash round $round (after ${CRASH_AFTER}s, fail='${CRASH_FAIL}', churn='${CRASH_CHURN}') ==="
+    "$GSH" "cd $T && . ./common.sh && kldstat -q -m hammer2 || kldload $KO;
         cd $T && . ./common.sh && setup_fresh && rm -f $LOG && touch $LOG && sync &&
         if [ -n '$CRASH_FAIL' ]; then
             hammer2 -s \$MNTPT raid fail-disk \$(disk_dev $CRASH_FAIL) || exit 1
         fi &&
-        daemon -f sh -c 'i=0; while :; do
-            dd if=/dev/urandom of=/mnt/v3test/c\$i bs=65536 count=\$((i % 32 + 1)) 2>/dev/null;
-            h=\$(sha256 -q /mnt/v3test/c\$i); sync;
-            echo \"c\$i \$h\" >> $LOG; fsync $LOG; i=\$((i + 1)); done'" ||
+        if [ -n '$CRASH_CHURN' ]; then
+            dd if=/dev/urandom of=/var/tmp/crash_chunk bs=1m count=64 2>/dev/null &&
+            ph=\$(sha256 -q /var/tmp/crash_chunk) &&
+            np=\$(( (\$(df -m \$MNTPT | awk 'NR == 2 { print \$4 }') - 768) / 64 )) &&
+            k=0 && while [ \$k -lt \$np ]; do
+                cp /var/tmp/crash_chunk \$MNTPT/p\$k || exit 1; k=\$((k + 1)); done &&
+            sync && k=0 && while [ \$k -lt \$np ]; do
+                echo \"p\$k \$ph\" >> $LOG; k=\$((k + 1)); done && fsync $LOG &&
+            echo \"  prefilled \$np x 64 MB\" &&
+            daemon -f sh -c 'i=0; while :; do
+                dd if=/dev/urandom of=/mnt/v3test/c\$i bs=1m count=\$((i % 32 + 1)) 2>/dev/null;
+                h=\$(sha256 -q /mnt/v3test/c\$i); sync;
+                echo \"c\$i \$h\" >> $LOG; fsync $LOG;
+                if [ \$i -ge 8 ]; then
+                    echo \"del c\$((i - 8))\" >> $LOG; fsync $LOG;
+                    rm -f /mnt/v3test/c\$((i - 8)); sync;
+                fi;
+                [ \$((i % 4)) = 3 ] && hammer2 bulkfree /mnt/v3test > /dev/null 2>&1;
+                i=\$((i + 1)); done'
+        else
+            daemon -f sh -c 'i=0; while :; do
+                dd if=/dev/urandom of=/mnt/v3test/c\$i bs=65536 count=\$((i % 32 + 1)) 2>/dev/null;
+                h=\$(sha256 -q /mnt/v3test/c\$i); sync;
+                echo \"c\$i \$h\" >> $LOG; fsync $LOG; i=\$((i + 1)); done'
+        fi" ||
         { echo "FATAL: guest setup failed"; exit 1; }
     sleep "$CRASH_AFTER"
     # The writer must still be making progress, or the "crash" below is
@@ -74,14 +113,16 @@ while [ "$round" -le "$CRASH_ROUNDS" ]; do
     sleep 30
     wait_guest
 
-    "$GSH" "cd $T && . ./common.sh && (kldstat -q -m hammer2 || kldload hammer2) &&
+    "$GSH" "cd $T && . ./common.sh && (kldstat -q -m hammer2 || kldload $KO) &&
         kmsg_clear; mkdir -p \$MNTPT;
         if ! mount -t hammer2 \$PFSPATH \$MNTPT; then echo '  FAIL: mount after crash'; exit 1; fi;
         n=0; bad=0;
+        awk '\$1 == \"del\" { delete h[\$2]; next } { h[\$1] = \$2 }
+            END { for (f in h) print f, h[f] }' $LOG > /var/tmp/crash_live.txt;
         while read f h; do
             n=\$((n + 1));
             [ \"\$(sha256 -q \$MNTPT/\$f 2>/dev/null)\" = \"\$h\" ] || { bad=\$((bad + 1)); echo \"    lost: \$f\"; };
-        done < $LOG;
+        done < /var/tmp/crash_live.txt;
         if [ \$n -gt 0 ] && [ \$bad = 0 ]; then result PASS \"all \$n logged (synced) files intact\";
         else result FAIL \"\$bad of \$n logged files lost or wrong\"; fi;
         for f in \$MNTPT/c*; do cat \$f > /dev/null 2>&1 || result FAIL \"unlogged file \$f unreadable\"; done;

@@ -1261,8 +1261,13 @@ hammer2_raid6_sm_touch(hammer2_dev_t *hmp, uint64_t slot)
  * bref).  6C packing depends on this — under-counting would let the
  * allocator reuse a slot that still has live cols.
  */
+/*
+ * The space map slot of a v3 DATA/DIRENT blockref.  Returns 0 for any
+ * other blockref.
+ */
 static int
-hammer2_raid6_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+hammer2_raid6_bref_slot(hammer2_dev_t *hmp, const hammer2_blockref_t *bref,
+			uint64_t *slotp)
 {
 	hammer2_off_t phys_off;
 	uint64_t slot;
@@ -1270,15 +1275,23 @@ hammer2_raid6_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 	if (bref->type != HAMMER2_BREF_TYPE_DATA &&
 	    bref->type != HAMMER2_BREF_TYPE_DIRENT)
 		return 0;
-	if ((bref->data_off & ~HAMMER2_OFF_MASK_RADIX) == 0)
-		return 0;
-
 	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return 0;
 	slot = (phys_off - HAMMER2_ZONE_SEG64) /
 	    hmp->raid_config.stripe_unit;
 	if (slot >= hmp->stripe_num_slots)
+		return 0;
+	*slotp = slot;
+	return 1;
+}
+
+static int
+hammer2_raid6_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+{
+	uint64_t slot;
+
+	if (!hammer2_raid6_bref_slot(hmp, bref, &slot))
 		return 0;
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
@@ -1386,6 +1399,14 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 				 M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->sm_crc[1] = kmalloc((size_t)npages * sizeof(uint32_t),
 				 M_HAMMER2, M_WAITOK | M_ZERO);
+	hmp->stripe_bf_seen = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
+				      M_WAITOK | M_ZERO);
+	hmp->stripe_bf_new = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
+				     M_WAITOK | M_ZERO);
+	hmp->stripe_bf_staged = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
+					M_WAITOK | M_ZERO);
+	hmp->stripe_bf_active = 0;
+	hmp->stripe_bf_complete = 0;
 	hmp->stripe_cursor = 0;
 	hmp->stripe_generation = hmp->voldata.raid_config.rz_sm_gen;
 	hmp->stripe_bitmap_invalid = 0;
@@ -1397,8 +1418,16 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 void
 hammer2_raid6_sm_destroy(hammer2_dev_t *hmp)
 {
+	uint8_t **bfp[] = { &hmp->stripe_bf_seen, &hmp->stripe_bf_new,
+			    &hmp->stripe_bf_staged };
 	int c;
 
+	for (c = 0; c < 3; c++) {
+		if (*bfp[c]) {
+			kfree(*bfp[c], M_HAMMER2);
+			*bfp[c] = NULL;
+		}
+	}
 	if (hmp->stripe_bitmap) {
 		kfree(hmp->stripe_bitmap, M_HAMMER2);
 		hmp->stripe_bitmap = NULL;
@@ -2190,6 +2219,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			if (hmp->stripe_row_refcount[slot] < 0xff)
 				hmp->stripe_row_refcount[slot]++;
 			hammer2_raid6_sm_touch(hmp, slot);
+			if (hmp->stripe_bf_active)
+				setbit(hmp->stripe_bf_new, slot);
 			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 			kfree(newrow, M_HAMMER2);
 			prc_radix = 0;
@@ -2230,6 +2261,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
 			hmp->stripe_row_refcount[slot] = 1;
 			hammer2_raid6_sm_touch(hmp, slot);
+			if (hmp->stripe_bf_active)
+				setbit(hmp->stripe_bf_new, slot);
 			hmp->stripe_cursor = slot + 1;
 			goto found;
 		}
@@ -2296,42 +2329,124 @@ have_disk:
 }
 
 /*
- * Free a physical stripe slot for a RAIDZ2-native (v3) data column.
- * Clears the stripe bitmap bit for the slot encoded in bref->data_off.
+ * v3 bulkfree (docs/capacity.md, Freeing).
+ *
+ * Data slots are never freed when a chain is modified or deleted: a
+ * snapshot may still reference the old block, and the tree that drops
+ * it may not be committed yet.  Instead the bulkfree ioctl scans a
+ * snapshot of the committed topology, every PFS and snapshot included,
+ * and hammer2_raid6_bf_mark() records each data slot it references.
+ *
+ * Flushes do not wait for frontend transactions, so a slot allocated
+ * just before the pass may be in no committed tree yet.  Freeing is
+ * therefore two-stage, as in the freemap: a slot that a pass finds
+ * unreferenced is staged, and freed by the next pass if that one finds
+ * it unreferenced too.  A slot allocated while a pass runs
+ * (stripe_bf_new) is kept and unstaged.  The bulkfree ioctl syncs
+ * before every pass, so the two scans see different commits.
+ *
+ * The staged set is in memory only; after a remount the first pass
+ * stages again.
  */
 void
-hammer2_raid6_stripe_free(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+hammer2_raid6_bf_begin(hammer2_dev_t *hmp)
 {
-	hammer2_raid_config_t *rc = &hmp->raid_config;
-	uint64_t stripe_unit = rc->stripe_unit;
-	hammer2_off_t phys_off;
+	bzero(hmp->stripe_bf_seen, hmp->stripe_bitmap_size);
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	bzero(hmp->stripe_bf_new, hmp->stripe_bitmap_size);
+	hmp->stripe_bf_active = 1;
+	hmp->stripe_bf_complete = 0;
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+}
+
+/*
+ * Scan callback: record a referenced data slot and return 1, or return
+ * 0 if the blockref is not a v3 data slot.  Only the scan writes
+ * stripe_bf_seen.
+ */
+int
+hammer2_raid6_bf_mark(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+{
 	uint64_t slot;
 
-	/*
-	 * v3 encoding: data_off carries phys_off|radix only.  Mask off the
-	 * radix bits; copyid (disk_idx) is irrelevant for the bitmap lookup
-	 * since the bitmap is per-row, not per-(disk,row).
-	 */
-	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
-	if (phys_off < HAMMER2_ZONE_SEG64)
-		return; /* metadata block, not a stripe slot */
+	if (!hammer2_raid6_bref_slot(hmp, bref, &slot))
+		return 0;
+	setbit(hmp->stripe_bf_seen, slot);
+	return 1;
+}
 
-	slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
-	if (slot >= hmp->stripe_num_slots)
-		return; /* out of range */
+/*
+ * End a pass.  If the scan covered the whole committed tree
+ * (stripe_bf_complete, set by hammer2_bulkfree_pass), apply it to the
+ * space map one page at a time.
+ */
+void
+hammer2_raid6_bf_end(hammer2_dev_t *hmp)
+{
+	uint64_t nslots = hmp->stripe_num_slots;
+	uint64_t base;
+	uint64_t slot;
+	uint64_t end;
+	long nfreed = 0;
+	long nstaged = 0;
+	long nfixed = 0;
 
-	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	/*
-	 * Per-row refcount: only clear the bitmap bit when the row's last
-	 * live data chain has been freed.  A saturated count stays put
-	 * (the row leaks rather than being freed under a live chain).
-	 */
-	if (hmp->stripe_row_refcount[slot] > 0 &&
-	    hmp->stripe_row_refcount[slot] < 0xff) {
-		hmp->stripe_row_refcount[slot]--;
-		hammer2_raid6_sm_touch(hmp, slot);
+	if (hmp->stripe_bf_complete == 0) {
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		hmp->stripe_bf_active = 0;
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		kprintf("hammer2: v3 bulkfree: scan incomplete, "
+			"space map unchanged\n");
+		return;
 	}
-	if (hmp->stripe_row_refcount[slot] == 0)
-		hmp->stripe_bitmap[slot / 8] &= ~(uint8_t)(1 << (slot % 8));
+
+	for (base = 0; base < nslots; base += HAMMER2_SM_PAGE_SLOTS) {
+		end = base + HAMMER2_SM_PAGE_SLOTS;
+		if (end > nslots)
+			end = nslots;
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		for (slot = base; slot < end; slot++) {
+			uint8_t *rc = &hmp->stripe_row_refcount[slot];
+
+			if (isset(hmp->stripe_bf_seen, slot) ||
+			    isset(hmp->stripe_bf_new, slot)) {
+				clrbit(hmp->stripe_bf_staged, slot);
+				/*
+				 * Referenced by the committed tree but
+				 * free in the map: take it back.
+				 */
+				if (*rc == 0 &&
+				    isclr(hmp->stripe_bf_new, slot) &&
+				    hammer2_raid6_slot_is_data(hmp, slot)) {
+					*rc = 1;
+					setbit(hmp->stripe_bitmap, slot);
+					hammer2_raid6_sm_touch(hmp, slot);
+					++nfixed;
+				}
+				continue;
+			}
+			if (*rc == 0) {
+				clrbit(hmp->stripe_bf_staged, slot);
+				continue;
+			}
+			if (isset(hmp->stripe_bf_staged, slot)) {
+				*rc = 0;
+				clrbit(hmp->stripe_bitmap, slot);
+				clrbit(hmp->stripe_bf_staged, slot);
+				hammer2_raid6_sm_touch(hmp, slot);
+				++nfreed;
+			} else {
+				setbit(hmp->stripe_bf_staged, slot);
+				++nstaged;
+			}
+		}
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	}
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	hmp->stripe_bf_active = 0;
+	hmp->stripe_used_ticks = 0;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+
+	kprintf("hammer2: v3 bulkfree: %ld rows freed, %ld staged, "
+		"%ld reclaimed\n", nfreed, nstaged, nfixed);
 }

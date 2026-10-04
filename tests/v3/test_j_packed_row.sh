@@ -2,13 +2,15 @@
 # Group J: 6C/6D packed-row tests.
 # Exercises the variable-width-stripe wins specific to v3:
 #   J1  Multi-file write packs N chains per row.  Delete every other
-#       file, bulkfree (rm alone frees nothing — space is only returned
-#       by bulkfree), then write new files so the freed slots are
-#       reallocated next to the surviving siblings.  Survivors and new
-#       files must verify cold and the array must scrub clean.
-#   J2  Snapshot + delete the live copies + bulkfree + new writes: the
-#       snapshot still references the rows, so bulkfree must not hand
-#       them out again; the snapshot must read intact cold.
+#       file, bulkfree twice (rm alone frees nothing — space is only
+#       returned by bulkfree, and a row is freed by the second of two
+#       passes that find it unreferenced), then write new files.  A row
+#       still holds a survivor, so it must not be freed.  Survivors and
+#       new files must verify cold and the array must scrub clean.
+#   J2  Snapshot + delete the live copies + bulkfree twice + new
+#       writes: the snapshot still references the rows, so bulkfree
+#       must not hand them out again; the snapshot must read intact
+#       cold.
 
 # Fill freed space with fresh data and record hashes: fill_new <prefix> <n>
 fill_new() {
@@ -35,8 +37,10 @@ check_new() {
     fi
 }
 
+# bulkfree_ok <label>: two passes, so unreferenced rows are freed.
 bulkfree_ok() {
-    if hammer2 bulkfree $MNTPT > /var/tmp/j_bulkfree.txt 2>&1; then
+    if hammer2 bulkfree $MNTPT > /var/tmp/j_bulkfree.txt 2>&1 &&
+       hammer2 bulkfree $MNTPT >> /var/tmp/j_bulkfree.txt 2>&1; then
         return 0
     fi
     result FAIL "$1: bulkfree failed"
