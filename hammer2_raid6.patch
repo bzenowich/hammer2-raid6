@@ -713,7 +713,7 @@ index 79214c8060..d86c3abf39 100644
 +	return(hammer2_raid6_ndisks);
 +}
 diff --git a/sbin/newfs_hammer2/mkfs_hammer2.c b/sbin/newfs_hammer2/mkfs_hammer2.c
-index 256f975e08..331d011600 100644
+index 256f975e08..1bf221dd46 100644
 --- a/sbin/newfs_hammer2/mkfs_hammer2.c
 +++ b/sbin/newfs_hammer2/mkfs_hammer2.c
 @@ -59,6 +59,51 @@ static int blkrefary_cmp(const void *b1, const void *b2);
@@ -924,19 +924,18 @@ index 256f975e08..331d011600 100644
  	voldata->fsid = opt->Hammer2_VolFSID;
  	voldata->fstype = opt->Hammer2_FSType;
  
-@@ -627,6 +742,130 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
+@@ -627,6 +742,129 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
  	}
  	fsync(vol->fd);
  
 +	/*
 +	 * RAIDZ2-native (v3): write an empty but valid stripe bitmap to
-+	 * zone slot 41 on disk 0.  Header+footer with generation 1 + CRC;
++	 * zone slot 41 on every disk (each disk carries a copy).  Header+footer with generation 1 + CRC;
 +	 * bitmap region all-zero (no stripes allocated).  The kernel reads
 +	 * this at mount; without the header it would mark bitmap_invalid.
 +	 */
 +	if (opt->RaidType == 6 &&
-+	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-+	    vol->id == HAMMER2_ROOT_VOLUME) {
++	    opt->Hammer2Version >= HAMMER2_VOL_VERSION_RAIDZ2) {
 +		hammer2_stripe_bitmap_header_t *hdr;
 +		hammer2_stripe_bitmap_footer_t *ftr;
 +		uint8_t *bitmap;
@@ -1055,7 +1054,7 @@ index 256f975e08..331d011600 100644
  	/*
  	 * Cleanup
  	 */
-@@ -743,6 +982,26 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
+@@ -743,6 +981,26 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
  		fso.total_size += size;
  	}
  
@@ -1082,7 +1081,7 @@ index 256f975e08..331d011600 100644
  	/*
  	 * Verify volumes constructed above.
  	 */
-@@ -751,6 +1010,13 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
+@@ -751,6 +1009,13 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
  		printf("Volume %-15s size %s\n", vol->path,
  		       sizetostr(vol->size));
  	}
@@ -1096,7 +1095,7 @@ index 256f975e08..331d011600 100644
  	hammer2_verify_volumes(&fso, NULL);
  
  	/*
-@@ -811,6 +1077,19 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
+@@ -811,6 +1076,19 @@ hammer2_mkfs(int ac, char **av, hammer2_mkfs_options_t *opt)
  	printf("free-size:        %s (%jd bytes)\n",
  	       sizetostr(fso.free_size),
  	       (intmax_t)fso.free_size);
@@ -1233,7 +1232,7 @@ index 9c5abb19e3..346ffb5fee 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729d5d..115d99cd3c 100644
+index a29c729d5d..7c53db4896 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -279,10 +279,10 @@ struct hammer2_io {
@@ -1249,7 +1248,7 @@ index a29c729d5d..115d99cd3c 100644
  #endif
  	uint64_t	dedup_valid;	/* valid for dedup operation */
  	uint64_t	dedup_alloc;	/* allocated / de-dupable */
-@@ -1122,6 +1122,30 @@ typedef struct hammer2_volume hammer2_volume_t;
+@@ -1122,6 +1122,31 @@ typedef struct hammer2_volume hammer2_volume_t;
   * many PFSs and those PFSs might combine together in various ways to form
   * the set of available clusters.
   */
@@ -1274,13 +1273,14 @@ index a29c729d5d..115d99cd3c 100644
 +	int		n_alloc;	/* popcount(alloc_mask) */
 +	int		ndata;		/* cached rc->ndata */
 +	size_t		bytes;		/* cached stripe_unit */
++	uint32_t	dropped_mask;	/* cols putblk did not write (disk failed) */
 +	void		*col_data[HAMMER2_MAX_VOLUMES];
 +};
 +
  struct hammer2_dev {
  	struct vnode	*devvp;		/* device vnode for root volume */
  	int		ronly;		/* read-only mount */
-@@ -1158,6 +1182,106 @@ struct hammer2_dev {
+@@ -1158,6 +1183,125 @@ struct hammer2_dev {
  
  	hammer2_devvp_list_t devvpl;	/* list of device vnodes including *devvp */
  	hammer2_volume_t volumes[HAMMER2_MAX_VOLUMES]; /* list of volumes */
@@ -1301,6 +1301,9 @@ index a29c729d5d..115d99cd3c 100644
 +	int		stripe_refcount_invalid; /* 1 if persisted refcount bad/missing */
 +	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk */
 +	int		stripe_next_disk;	/* round-robin data disk counter */
++	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
++	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
++	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
 +	/*
 +	 * Per-row reference count: number of live DATA/DIRENT chains that
 +	 * occupy a data-column slot in this row.  Bitmap bit is the union
@@ -1346,6 +1349,22 @@ index a29c729d5d..115d99cd3c 100644
 +	volatile int	resilver_running;	/* 1 while resilver active */
 +	int		resilver_disk_idx;	/* disk being resilvered (-1=none) */
 +
++	/*
++	 * Online rebuild.  While rebuild_active, writes also go to
++	 * rebuild_disk although raid_failed[] stays set (reads and the
++	 * allocator still treat it as failed), so blocks written during
++	 * the resilver are complete on the new disk.  Writers that may
++	 * touch the new disk hold rebuild_lk shared across their I/O; the
++	 * resilver holds it exclusive while it copies one slot or one
++	 * metadata chunk, so neither overwrites the other with stale
++	 * data.  rebuild_done marks slots a writer sealed during the
++	 * rebuild; the resilver skips them.
++	 */
++	struct lock	rebuild_lk;
++	volatile int	rebuild_active;
++	int		rebuild_disk;
++	uint8_t		*rebuild_done;		/* 1 bit per stripe slot */
++
 +	/* RAID6 scrub progress (M3 — written by scrub, read by status ioctl) */
 +	volatile uint64_t scrub_brefs_done;	/* DATA/DIRENT brefs visited */
 +	volatile uint64_t scrub_brefs_bad;	/* CHECK FAIL count */
@@ -1387,7 +1406,7 @@ index a29c729d5d..115d99cd3c 100644
  };
  
  typedef struct hammer2_dev hammer2_dev_t;
-@@ -1642,15 +1766,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -1642,15 +1786,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
  				u_int bytes);
  int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
@@ -1413,7 +1432,7 @@ index a29c729d5d..115d99cd3c 100644
  hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  				int lsize HAMMER2_IO_DEBUG_ARGS);
  void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
-@@ -1663,8 +1793,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1663,8 +1813,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  
  #ifndef HAMMER2_IO_DEBUG
  
@@ -1424,7 +1443,7 @@ index a29c729d5d..115d99cd3c 100644
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
  	_hammer2_io_getquick((hmp), (lbase), (lsize))
  #define hammer2_io_putblk(diop)						\
-@@ -1682,13 +1812,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1682,13 +1832,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio))
  
@@ -1442,7 +1461,7 @@ index a29c729d5d..115d99cd3c 100644
  	__FILE__, __LINE__)
  
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
-@@ -1710,8 +1840,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1710,8 +1860,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio), __FILE__, __LINE__)
  
@@ -1453,7 +1472,7 @@ index a29c729d5d..115d99cd3c 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1954,6 +2084,127 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -1954,6 +2104,161 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  			int *rootvolzone,
  			struct vnode **rootvoldevvp);
  hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
@@ -1484,6 +1503,33 @@ index a29c729d5d..115d99cd3c 100644
 +		hammer2_off_t per_disk_off, void *data, size_t bytes);
 +int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 +		hammer2_off_t per_disk_off, void *buf, size_t bytes);
++int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
++		const void *data, int bytes);
++void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
++		struct vnode *devvp);
++
++/*
++ * A disk takes writes if it is not failed, or if it is the disk an
++ * online rebuild is filling.
++ */
++/*
++ * v3 RAIDZ2-native array.  Live dedup is off here: a dedup'd bref would
++ * reference a stripe column without a row refcount, and the dedup heap
++ * keys on data_off alone, which does not name the disk (bref.copyid).
++ */
++static __inline int
++hammer2_raid6_v3(hammer2_dev_t *hmp)
++{
++	return (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
++		hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
++}
++
++static __inline int
++hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
++{
++	return (!hmp->raid_failed[disk_idx] ||
++		(hmp->rebuild_active && hmp->rebuild_disk == disk_idx));
++}
 +
 +/*
 + * One data column in a v3 RAIDZ2-native row.  Used to drive
@@ -1516,11 +1562,18 @@ index a29c729d5d..115d99cd3c 100644
 +		hammer2_off_t *phys_off_out, int *disk_idx_out);
 +void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 +		hammer2_off_t phys_off, int disk_idx,
-+		void *data /* takes ownership */, size_t bytes);
++		void *data /* takes ownership */, size_t bytes, int dropped);
 +void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
++int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
++void hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
++		hammer2_off_t *freep);
 +int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 +		hammer2_off_t logical_off, int data_disk_idx,
 +		void *buf, size_t bytes, int is_physical);
++int hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
++		hammer2_off_t logical_off, int data_disk_idx,
++		void *buf, size_t bytes, int is_physical,
++		int extra_disk, void *extra_buf);
 +int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 +		int failed_disk_idx, struct vnode *new_devvp);
 +int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
@@ -1582,7 +1635,7 @@ index a29c729d5d..115d99cd3c 100644
  /*
   * More complex inlines
 diff --git a/sys/vfs/hammer2/hammer2_chain.c b/sys/vfs/hammer2/hammer2_chain.c
-index 256422e097..a1fdacf67e 100644
+index 256422e097..d728f4c6ee 100644
 --- a/sys/vfs/hammer2/hammer2_chain.c
 +++ b/sys/vfs/hammer2/hammer2_chain.c
 @@ -85,6 +85,14 @@ static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *chain,
@@ -1808,7 +1861,20 @@ index 256422e097..a1fdacf67e 100644
  
  	/*
  	 * Debugging
-@@ -5514,6 +5614,172 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
+@@ -5463,7 +5563,11 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
+ 		chain->dio,
+ 		(chain->dio ? chain->dio->bp : NULL));
+ 
+-	if (chain->dio) {
++	/*
++	 * A RAID6 DIO for a column on a failed disk is served by
++	 * reconstruction and carries no buffer.
++	 */
++	if (chain->dio && chain->dio->bp) {
+ 		kprintf("bp_loff %016jx,%d bdata %p/%p",
+ 			(intmax_t)chain->dio->bp->b_loffset,
+ 			chain->dio->bp->b_bufsize,
+@@ -5514,6 +5618,240 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
  	//print_backtrace(-1);
  }
  
@@ -1858,6 +1924,92 @@ index 256422e097..a1fdacf67e 100644
 +}
 +
 +/*
++ * Parity self-heal of a DATA/DIRENT block whose CHECK failed.
++ *
++ * First reconstruct the column with only disk_idx erased (skipped when
++ * disk_idx is failed: the degraded read already did exactly that).  A
++ * second column in the row can be silently corrupt too, so if that
++ * does not verify, retry with each other live column erased as well;
++ * RAID6 recovers any two erasures.  A verifying result fixes bdata,
++ * and the repair kthread rewrites disk_idx (unless it is failed) and
++ * the second bad column.
++ *
++ * Returns 0 if healed, else HAMMER2_ERROR_CHECK.
++ */
++static int
++hammer2_chain_selfheal_parity(hammer2_chain_t *chain, void *bdata,
++			      int disk_idx)
++{
++	hammer2_dev_t *hmp = chain->hmp;
++	hammer2_blockref_t *bref = &chain->bref;
++	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
++	hammer2_off_t lbase = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
++	hammer2_off_t phys = lbase & HAMMER2_RAID6_PHYS_MASK;
++	hammer2_off_t col_base = phys & ~(hammer2_off_t)(stripe_unit - 1);
++	size_t off = (size_t)(phys - col_base);
++	int target_failed = hmp->raid_failed[disk_idx];
++	char *recon;
++	char *extra;
++	int error;
++	int e;
++
++	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++	if (!target_failed) {
++		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
++						       recon,
++						       (size_t)stripe_unit, 1);
++		if (error == 0 &&
++		    hammer2_bref_check_match(bref, recon + off,
++					     chain->bytes)) {
++			bcopy(recon + off, bdata, chain->bytes);
++			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
++			krateprintf(&krate_h2heal,
++			    "hammer2: selfheal: read-path repair data_off "
++			    "%016jx disk %d (parity reconstruction)\n",
++			    (uintmax_t)bref->data_off, disk_idx);
++			/* ownership of recon passes to the repair queue */
++			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
++			    (int)stripe_unit, 0, (int)stripe_unit, recon);
++			return 0;
++		}
++	}
++
++	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++	for (e = 0; e < hmp->raid_config.ndisks; e++) {
++		if (e == disk_idx || hmp->raid_failed[e])
++			continue;
++		error = hammer2_io_raid6_read_degraded_x(hmp, lbase, disk_idx,
++		    recon, (size_t)stripe_unit, 1, e, extra);
++		if (error || !hammer2_bref_check_match(bref, recon + off,
++						       chain->bytes))
++			continue;
++
++		bcopy(recon + off, bdata, chain->bytes);
++		atomic_add_64(&hmp->raid_cksum_errors[e], 1);
++		atomic_add_64(&hmp->raid_cksum_healed[e], 1);
++		if (!target_failed)
++			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
++		krateprintf(&krate_h2heal,
++		    "hammer2: selfheal: read-path repair data_off %016jx "
++		    "disk %d (dual reconstruction, disk %d also bad)\n",
++		    (uintmax_t)bref->data_off, disk_idx, e);
++		/* ownership of the buffers passes to the repair queue */
++		hammer2_io_repair_enqueue(hmp, e, col_base,
++		    (int)stripe_unit, 0, (int)stripe_unit, extra);
++		if (target_failed) {
++			kfree(recon, M_HAMMER2);
++		} else {
++			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
++			    (int)stripe_unit, 0, (int)stripe_unit, recon);
++		}
++		return 0;
++	}
++	kfree(extra, M_HAMMER2);
++	kfree(recon, M_HAMMER2);
++	return HAMMER2_ERROR_CHECK;
++}
++
++/*
 + * Read-path self-heal (bitrot.md §7.4 bullet 1 — the ZFS behavior).
 + *
 + * Called when hammer2_chain_testcheck() fails on data read from an
@@ -1900,10 +2052,18 @@ index 256422e097..a1fdacf67e 100644
 +		return HAMMER2_ERROR_CHECK;
 +	if (hmp->raid_failed[disk_idx]) {
 +		/*
-+		 * The read was already served by degraded reconstruction;
-+		 * a CHECK failure here means the redundancy itself is bad.
-+		 * Nothing further to try inline.
++		 * The read was already served by degraded reconstruction,
++		 * so another column of the row is bad as well.  For data,
++		 * find it with a second erasure (the counters go to that
++		 * disk).  Metadata on a failed disk came from a mirror
++		 * copy that was already checked; nothing more to try.
 +		 */
++		if ((bref->type == HAMMER2_BREF_TYPE_DATA ||
++		     bref->type == HAMMER2_BREF_TYPE_DIRENT) &&
++		    hammer2_chain_selfheal_parity(chain, bdata,
++						  disk_idx) == 0) {
++			return 0;
++		}
 +		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
 +		atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx], 1);
 +		return HAMMER2_ERROR_CHECK;
@@ -1915,35 +2075,9 @@ index 256422e097..a1fdacf67e 100644
 +	switch (bref->type) {
 +	case HAMMER2_BREF_TYPE_DATA:
 +	case HAMMER2_BREF_TYPE_DIRENT:
-+	    {
-+		uint64_t stripe_unit = hmp->raid_config.stripe_unit;
-+		hammer2_off_t phys = lbase & HAMMER2_RAID6_PHYS_MASK;
-+		hammer2_off_t col_base = phys &
-+		    ~(hammer2_off_t)(stripe_unit - 1);
-+		size_t off = (size_t)(phys - col_base);
-+		char *recon;
-+
-+		recon = kmalloc((size_t)stripe_unit, M_HAMMER2,
-+				M_WAITOK | M_ZERO);
-+		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
-+						       recon,
-+						       (size_t)stripe_unit, 1);
-+		if (error == 0 &&
-+		    hammer2_bref_check_match(bref, recon + off, chain->bytes)) {
-+			bcopy(recon + off, bdata, chain->bytes);
-+			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
-+			krateprintf(&krate_h2heal,
-+			    "hammer2: selfheal: read-path repair data_off "
-+			    "%016jx disk %d (parity reconstruction)\n",
-+			    (uintmax_t)bref->data_off, disk_idx);
-+			/* ownership of recon passes to the repair queue */
-+			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
-+			    (int)stripe_unit, 0, (int)stripe_unit, recon);
++		if (hammer2_chain_selfheal_parity(chain, bdata, disk_idx) == 0)
 +			return 0;
-+		}
-+		kfree(recon, M_HAMMER2);
 +		break;
-+	    }
 +	case HAMMER2_BREF_TYPE_INODE:
 +	case HAMMER2_BREF_TYPE_INDIRECT:
 +	case HAMMER2_BREF_TYPE_FREEMAP_NODE:
@@ -2474,7 +2608,7 @@ index 21134ab4e4..bfe673c22c 100644
  	if (flush_error)
  		total_error = flush_error;
 diff --git a/sys/vfs/hammer2/hammer2_freemap.c b/sys/vfs/hammer2/hammer2_freemap.c
-index 4b3656be5d..1f5ec92579 100644
+index 4b3656be5d..c3c4de0617 100644
 --- a/sys/vfs/hammer2/hammer2_freemap.c
 +++ b/sys/vfs/hammer2/hammer2_freemap.c
 @@ -45,6 +45,8 @@
@@ -2539,7 +2673,50 @@ index 4b3656be5d..1f5ec92579 100644
  	/*
  	 * Make sure bpref is in-bounds.  It's ok if bpref covers a zone's
  	 * reserved area, the try code will iterate past it.
-@@ -751,7 +790,7 @@ hammer2_bmap_alloc(hammer2_dev_t *hmp, hammer2_bmap_data_t *bmap,
+@@ -269,6 +308,22 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
+ 	return (error);
+ }
+ 
++/*
++ * Return 1 if the 4MB segment at `base` lies wholly inside the
++ * iterator's hard bounds.  A level1 leaf covers 1GB, more than the v3
++ * metadata zone, so the leaf scan must check each segment; otherwise
++ * metadata spills into the stripe data area (disk 0's columns) once
++ * the zone's segments are used up.
++ */
++static __inline int
++hammer2_freemap_seg_inbounds(hammer2_fiterate_t *iter, hammer2_off_t base)
++{
++	if (iter->bmax == 0)
++		return 1;
++	return (base >= iter->bmin &&
++		base + HAMMER2_FREEMAP_LEVEL0_SIZE <= iter->bmax);
++}
++
+ static int
+ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
+ 			  hammer2_blockref_t *bref, int radix,
+@@ -413,6 +468,9 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
+ 
+ 			if (n >= HAMMER2_FREEMAP_COUNT) {
+ 				availchk = 0;
++			} else if (!hammer2_freemap_seg_inbounds(iter,
++					key + n * l0size)) {
++				availchk = 0;
+ 			} else if (bmap->avail) {
+ 				availchk = 1;
+ 			} else if (radix < HAMMER2_FREEMAP_BLOCK_RADIX &&
+@@ -456,6 +514,9 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp,
+ 			bmap = &chain->data->bmdata[n];
+ 			if (n < 0) {
+ 				availchk = 0;
++			} else if (!hammer2_freemap_seg_inbounds(iter,
++					key + n * l0size)) {
++				availchk = 0;
+ 			} else if (bmap->avail) {
+ 				availchk = 1;
+ 			} else if (radix < HAMMER2_FREEMAP_BLOCK_RADIX &&
+@@ -751,7 +812,7 @@ hammer2_bmap_alloc(hammer2_dev_t *hmp, hammer2_bmap_data_t *bmap,
  
  			hammer2_io_newnz(hmp, class >> 8,
  					(*basep + (offset & ~pmask)) |
@@ -2548,7 +2725,7 @@ index 4b3656be5d..1f5ec92579 100644
  			hammer2_io_putblk(&dio);
  		}
  	}
-@@ -914,11 +953,12 @@ hammer2_freemap_iterate(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
+@@ -914,11 +975,12 @@ hammer2_freemap_iterate(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
  			hammer2_fiterate_t *iter)
  {
  	hammer2_dev_t *hmp = (*parentp)->hmp;
@@ -2564,7 +2741,7 @@ index 4b3656be5d..1f5ec92579 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24efaf..7f2942e78a 100644
+index 31be24efaf..5a350106cd 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,9 @@
@@ -2996,7 +3173,7 @@ index 31be24efaf..7f2942e78a 100644
  	/*
  	 * Clear INPROG and WAITING, set GOOD wake up anyone waiting.
  	 */
-@@ -460,13 +744,79 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -460,13 +744,81 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  	bp = dio->bp;
  	dio->bp = NULL;
  
@@ -3009,6 +3186,7 @@ index 31be24efaf..7f2942e78a 100644
 +			char *raid6_data = NULL;
 +			char *md_mirror_data = NULL;
 +			int rz_meta = 0;
++			int dropped;
 +
  			dio_write_stats_update(dio, bp);
  
@@ -3073,11 +3251,12 @@ index 31be24efaf..7f2942e78a 100644
 +					brelse(bp);
 +				bp = NULL;
 +			}
++			dropped = (bp == NULL);	/* primary not written */
 +
  			/*
  			 * Allows dirty buffers to accumulate and
  			 * possibly be canceled (e.g. by a 'rm'),
-@@ -482,27 +832,83 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -482,27 +834,85 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  			 * write.  This typically occurs in the write-behind
  			 * case when writing to large files.
  			 */
@@ -3149,7 +3328,7 @@ index 31be24efaf..7f2942e78a 100644
 +				    pbase & HAMMER2_RAID6_PHYS_MASK;
 +				hammer2_raid6_open_row_add_data(hmp,
 +				    phys_off, dio->disk_idx,
-+				    raid6_data, psize);
++				    raid6_data, psize, dropped);
 +				raid6_data = NULL;
 +			}
 +
@@ -3159,12 +3338,14 @@ index 31be24efaf..7f2942e78a 100644
 +			 * cluster_write / bawrite to dio->devvp), replicate
 +			 * the same payload synchronously to every surviving
 +			 * sibling disk at the same per-disk byte offset.
-+			 * skip_disk_idx avoids re-writing to the primary.
++			 * skip_disk_idx avoids re-writing to the primary,
++			 * unless the primary was skipped above (failed, or
++			 * being rebuilt and so wanting the copy).
 +			 */
 +			if (rz_meta && md_mirror_data) {
 +				hammer2_off_t per_disk_off = pbase - dio->dbase;
 +				hammer2_io_metadata_mirror_write(hmp,
-+				    dio->disk_idx, per_disk_off,
++				    dropped ? -1 : dio->disk_idx, per_disk_off,
 +				    md_mirror_data, psize);
 +				kfree(md_mirror_data, M_HAMMER2);
 +				md_mirror_data = NULL;
@@ -3178,7 +3359,7 @@ index 31be24efaf..7f2942e78a 100644
  		}
  	} else if (bp) {
  		/*
-@@ -511,6 +917,11 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -511,6 +921,11 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		brelse(bp);
  	}
  
@@ -3190,7 +3371,7 @@ index 31be24efaf..7f2942e78a 100644
  	/*
  	 * Update iofree_count before disposing of the dio
  	 */
-@@ -557,41 +968,55 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
+@@ -557,41 +972,55 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
  	struct buf *bp;
  	int off;
  
@@ -3254,7 +3435,7 @@ index 31be24efaf..7f2942e78a 100644
  #ifdef HAMMER2_IO_DEBUG
  	if ((dio = *diop) != NULL) {
  #if 0
-@@ -610,7 +1035,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
+@@ -610,7 +1039,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  	hammer2_io_t *dio;
  
  	dio = _hammer2_io_getblk(hmp, 0, lbase, lsize,
@@ -3264,7 +3445,7 @@ index 31be24efaf..7f2942e78a 100644
  	return dio;
  }
  
-@@ -691,7 +1117,7 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -691,7 +1121,7 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
  	int lsize;
  	int isgood;
  
@@ -3273,7 +3454,7 @@ index 31be24efaf..7f2942e78a 100644
  	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
  		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
  	else
-@@ -707,6 +1133,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -707,6 +1137,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
   * a modified chain is destroyed or by the bulkfree code.  No buffer
   * is needed for this operation.  If the DIO no longer exists it is
   * equivalent to the bits not being set.
@@ -3286,7 +3467,7 @@ index 31be24efaf..7f2942e78a 100644
   */
  void
  hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
-@@ -720,7 +1152,7 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -720,7 +1156,7 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  		return;
  	if (btype != HAMMER2_BREF_TYPE_DATA)
  		return;
@@ -3295,7 +3476,7 @@ index 31be24efaf..7f2942e78a 100644
  	if (dio) {
  		if (data_off < dio->pbase ||
  		    (data_off & ~HAMMER2_OFF_MASK_RADIX) + bytes >
-@@ -747,7 +1179,7 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
+@@ -747,7 +1183,7 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
  	int isgood;
  
  	dio = hammer2_io_alloc(hmp, data_off, HAMMER2_BREF_TYPE_DATA,
@@ -3304,7 +3485,7 @@ index 31be24efaf..7f2942e78a 100644
  	if (dio) {
  		KASSERT((dio->dedup_alloc &
  			  hammer2_dedup_mask(dio, data_off, bytes)) == 0,
-@@ -764,7 +1196,7 @@ static
+@@ -764,7 +1200,7 @@ static
  void
  dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
  {
@@ -3313,7 +3494,7 @@ index 31be24efaf..7f2942e78a 100644
  		return;
  	hammer2_adjwritecounter(dio->btype, dio->psize);
  }
-@@ -772,6 +1204,8 @@ dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
+@@ -772,6 +1208,8 @@ dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
  void
  hammer2_io_bkvasync(hammer2_io_t *dio)
  {
@@ -3322,7 +3503,7 @@ index 31be24efaf..7f2942e78a 100644
  	KKASSERT(dio->bp != NULL);
  	bkvasync(dio->bp);
  }
-@@ -786,6 +1220,1274 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,6 +1224,1457 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -3574,6 +3755,111 @@ index 31be24efaf..7f2942e78a 100644
 +}
 +
 +/*
++ * Read a sibling column or mirror copy into dst for reconstruction.
++ *
++ * The caller may hold the buffer for its own column locked (self-heal
++ * runs under the DIO buf), and another thread healing a block in the
++ * same row holds that sibling's buffer while it waits for ours.  A
++ * blocking getblk here deadlocks the two (ABBA).  Take the cached
++ * buffer only if it is free; when another thread holds it, read the
++ * media directly through a pbuf instead.  The rows read here are
++ * committed, so the media copy is current.
++ */
++static int
++hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
++			      void *dst, int bytes)
++{
++	struct buf *bp;
++	int error;
++
++	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT, 0);
++	if (bp) {
++		error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
++		if (error == 0) {
++			bkvasync(bp);
++			bcopy(bp->b_data, dst, bytes);
++		}
++		brelse(bp);
++		return error;
++	}
++
++	bp = getpbuf_mem(NULL);
++	KKASSERT(bytes <= bp->b_bufsize);
++	bp->b_cmd = BUF_CMD_READ;
++	bp->b_bcount = bytes;
++	bp->b_resid = bytes;
++	bp->b_bio1.bio_offset = off;
++	bp->b_bio1.bio_done = biodone_sync;
++	bp->b_bio1.bio_flags |= BIO_SYNC;
++	vn_strategy(devvp, &bp->b_bio1);
++	error = biowait(&bp->b_bio1, "h2sib");
++	if (error == 0)
++		bcopy(bp->b_data, dst, bytes);
++	relpbuf(bp, NULL);
++	return error;
++}
++
++/*
++ * Write a column to a disk being rebuilt.  Callers hold rebuild_lk,
++ * which the resilver takes exclusive, so this must never wait on a
++ * buffer: a thread holding that buffer through a DIO can itself be
++ * queued for rebuild_lk.  Take the cached buffer only if it is free,
++ * otherwise write the media directly through a pbuf.  The holder's
++ * copy is of the same block, so the cache does not go stale.
++ */
++int
++hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
++			      const void *data, int bytes)
++{
++	struct buf *bp;
++	int error;
++
++	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
++	if (bp) {
++		bkvasync(bp);
++		bcopy(data, bp->b_data, bytes);
++		return bwrite(bp);
++	}
++
++	bp = getpbuf_mem(NULL);
++	KKASSERT(bytes <= bp->b_bufsize);
++	bcopy(data, bp->b_data, bytes);
++	bp->b_cmd = BUF_CMD_WRITE;
++	bp->b_bcount = bytes;
++	bp->b_resid = bytes;
++	bp->b_bio1.bio_offset = off;
++	bp->b_bio1.bio_done = biodone_sync;
++	bp->b_bio1.bio_flags |= BIO_SYNC;
++	vn_strategy(devvp, &bp->b_bio1);
++	error = biowait(&bp->b_bio1, "h2rbw");
++	relpbuf(bp, NULL);
++	return error;
++}
++
++/*
++ * Point the cached DIOs of one disk at a new device vnode (disk
++ * replacement).  A DIO keeps the devvp it was created with.
++ */
++void
++hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
++			 struct vnode *devvp)
++{
++	hammer2_io_hash_t *hash;
++	hammer2_io_t *dio;
++	int i;
++
++	for (i = 0; i < HAMMER2_IOHASH_SIZE; ++i) {
++		hash = &hmp->iohash[i];
++		hammer2_spin_ex(&hash->spin);
++		for (dio = hash->base; dio; dio = dio->next) {
++			if (dio->disk_idx == disk_idx)
++				dio->devvp = devvp;
++		}
++		hammer2_spin_unex(&hash->spin);
++	}
++}
++
++/*
 + * Metadata mirror check-aware failover (bitrot.md §7.4 bullet 2, and
 + * metadata_zone.md "Read path": on CHECK FAIL, try disk 1, disk 2, ...
 + * until a copy verifies).
@@ -3592,7 +3878,7 @@ index 31be24efaf..7f2942e78a 100644
 +				void *bdata, size_t bytes)
 +{
 +	hammer2_volume_t *vol;
-+	struct buf *bp;
++	char *copy;
 +	char *patch;
 +	int i;
 +	int error;
@@ -3600,6 +3886,7 @@ index 31be24efaf..7f2942e78a 100644
 +	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 +	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 +
++	copy = kmalloc(psize, M_HAMMER2, M_WAITOK);
 +	for (i = 0; i < hmp->raid_config.ndisks; i++) {
 +		if (i == bad_disk_idx)
 +			continue;
@@ -3610,28 +3897,23 @@ index 31be24efaf..7f2942e78a 100644
 +		    !vol->dev->open)
 +			continue;
 +
-+		bp = NULL;
 +		error = hammer2_inject_eio(i);
 +		if (error == 0)
-+			error = bread(vol->dev->devvp, dev_pbase, psize, &bp);
-+		if (error || bp == NULL) {
-+			if (bp)
-+				brelse(bp);
++			error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
++			    dev_pbase, copy, psize);
++		if (error)
 +			continue;
-+		}
-+		bkvasync(bp);
-+		if (hammer2_bref_check_match(bref,
-+		    (char *)bp->b_data + off, bytes)) {
-+			bcopy((char *)bp->b_data + off, bdata, bytes);
-+			brelse(bp);
++		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
++			bcopy(copy + off, bdata, bytes);
++			kfree(copy, M_HAMMER2);
 +			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 +			bcopy(bdata, patch, bytes);
 +			hammer2_io_repair_enqueue(hmp, bad_disk_idx,
 +			    dev_pbase, psize, off, (int)bytes, patch);
 +			return 0;
 +		}
-+		brelse(bp);
 +	}
++	kfree(copy, M_HAMMER2);
 +	return EIO;
 +}
 +
@@ -3650,6 +3932,26 @@ index 31be24efaf..7f2942e78a 100644
 +			       int data_disk_idx, void *buf, size_t bytes,
 +			       int is_physical)
 +{
++	return hammer2_io_raid6_read_degraded_x(hmp, logical_off,
++	    data_disk_idx, buf, bytes, is_physical, -1, NULL);
++}
++
++/*
++ * As hammer2_io_raid6_read_degraded, also treating extra_disk's column
++ * as an erasure (-1 for none).  A column that reads without error can
++ * still be silently corrupt; when a reconstruction fails its CHECK,
++ * the caller retries with each other column erased in turn.  With
++ * extra_buf non-NULL, the reconstructed extra column is copied there
++ * so the caller can repair it.  Fails with EIO when the erasures
++ * exceed what P and Q can recover.
++ */
++int
++hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
++				 hammer2_off_t logical_off,
++				 int data_disk_idx, void *buf, size_t bytes,
++				 int is_physical, int extra_disk,
++				 void *extra_buf)
++{
 +	hammer2_raid_config_t *rc = &hmp->raid_config;
 +	int ndisks = rc->ndisks;
 +	int ndata = rc->ndata;
@@ -3657,15 +3959,17 @@ index 31be24efaf..7f2942e78a 100644
 +	int p_disk, q_disk;
 +	int target_col;
 +	int phys_disk, di, col;
++	int extra_col = -1;
++	int nerased = 0;
 +	hammer2_off_t phys_off;
 +	void *ptrs[HAMMER2_MAX_VOLUMES];
 +	void *col_bufs[HAMMER2_MAX_VOLUMES];
 +	hammer2_volume_t *vol;
-+	struct buf *bp;
 +	int error = 0;
 +	int fail_data_a = -1, fail_data_b = -1;
 +	int fail_p = 0, fail_q = 0;
 +
++	bzero(ptrs, sizeof(ptrs));
 +	bzero(col_bufs, sizeof(col_bufs));
 +
 +	KKASSERT(bytes == stripe_unit);
@@ -3726,11 +4030,15 @@ index 31be24efaf..7f2942e78a 100644
 +						M_WAITOK | M_ZERO);
 +			ptrs[col] = col_bufs[col];
 +
-+			if (phys_disk == data_disk_idx) {
++			if (phys_disk == extra_disk)
++				extra_col = col;
++			if (phys_disk == data_disk_idx ||
++			    phys_disk == extra_disk) {
 +				/*
-+				 * This is the column being reconstructed.
++				 * A column being reconstructed.
 +				 * Leave the buffer zeroed and mark failed.
 +				 */
++				++nerased;
 +				if (col < ndata) {
 +					if (fail_data_a == -1)
 +						fail_data_a = col;
@@ -3745,6 +4053,7 @@ index 31be24efaf..7f2942e78a 100644
 +			}
 +
 +			if (hmp->raid_failed[phys_disk]) {
++				++nerased;
 +				if (col < ndata) {
 +					if (fail_data_a == -1)
 +						fail_data_a = col;
@@ -3759,20 +4068,13 @@ index 31be24efaf..7f2942e78a 100644
 +			}
 +
 +			vol = &hmp->volumes[phys_disk];
-+			bp = NULL;
 +			lerror = hammer2_inject_eio(phys_disk);
 +			if (lerror == 0)
-+				lerror = breadnx(vol->dev->devvp, phys_off,
-+						 stripe_unit, 0, NULL, NULL,
-+						 0, &bp);
-+			if (lerror == 0 && bp) {
-+				bkvasync(bp);
-+				bcopy(bp->b_data, col_bufs[col], stripe_unit);
-+				brelse(bp);
-+			} else {
++				lerror = hammer2_io_raid6_read_sibling(
++				    vol->dev->devvp, phys_off,
++				    col_bufs[col], (int)stripe_unit);
++			if (lerror) {
 +				int injected = hammer2_inject_eio(phys_disk);
-+				if (bp)
-+					brelse(bp);
 +				if (!injected) {
 +					int aerr =
 +					    hammer2_raid6_auto_fail_disk(
@@ -3782,6 +4084,7 @@ index 31be24efaf..7f2942e78a 100644
 +						break;
 +					}
 +				}
++				++nerased;
 +				if (col < ndata) {
 +					if (fail_data_a == -1)
 +						fail_data_a = col;
@@ -3810,6 +4113,10 @@ index 31be24efaf..7f2942e78a 100644
 +	/* Perform recovery */
 +	if (error)
 +		goto read_degraded_done;
++	if (nerased > 2) {
++		error = EIO;
++		goto read_degraded_done;
++	}
 +	error = 0;
 +	if (fail_data_a != -1) {
 +		if (fail_data_b != -1) {
@@ -3849,8 +4156,18 @@ index 31be24efaf..7f2942e78a 100644
 +	}
 +
 +	/* If target_col failed and reconstruction was impossible, return error */
++	/*
++	 * Every data column is now valid.  An erased P or Q column is
++	 * still zero (the recovery above only rebuilds data), so
++	 * regenerate both before handing out a parity column.
++	 */
++	if (error == 0 && (fail_p || fail_q))
++		hammer2_raid6_gen_syndrome(ndisks, stripe_unit, ptrs);
++
 +	if (error == 0) {
 +		bcopy(ptrs[target_col], buf, stripe_unit);
++		if (extra_buf && extra_col >= 0)
++			bcopy(ptrs[extra_col], extra_buf, stripe_unit);
 +	}
 +read_degraded_done:
 +	/* Free temporary buffers */
@@ -3934,6 +4251,7 @@ index 31be24efaf..7f2942e78a 100644
 +		}
 +		if (surv < 0) {
 +			kprintf("hammer2: resilver: no surviving disks\n");
++			hmp->resilver_running = 0;
 +			return ENXIO;
 +		}
 +		vol = &hmp->volumes[surv];
@@ -3953,15 +4271,16 @@ index 31be24efaf..7f2942e78a 100644
 +					bkvasync(wbp);
 +					bcopy(bp->b_data, wbp->b_data,
 +					      HAMMER2_VOLUME_BYTES);
-+					/* Patch the copy for the target disk */
++					/*
++					 * Patch the copy for the target disk.
++					 * It stays FAILED until the resilver
++					 * completes and the replace ioctl
++					 * syncs ONLINE headers; a crash in
++					 * between leaves it failed.
++					 */
 +					voldata = (hammer2_volume_data_t *)
 +					    wbp->b_data;
 +					voldata->volu_id = failed_disk_idx;
-+					voldata->raid_config.disk_state[
-+					    failed_disk_idx] =
-+					    HAMMER2_RAID6_DISK_ONLINE;
-+					voldata->raid_config.flags &=
-+					    ~HAMMER2_RAID6_FLAG_DEGRADED;
 +					/* Recompute CRCs: ICRC0 first (covers
 +					 * volu_id), then ICRCVH (covers all,
 +					 * including updated ICRC0). */
@@ -4010,6 +4329,8 @@ index 31be24efaf..7f2942e78a 100644
 +		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
 +		uint32_t ex;
 +		int surv = -1;
++		int pass;
++		int prim;
 +
 +		for (i = 0; i < ndisks; i++) {
 +			if (i != failed_disk_idx && !hmp->raid_failed[i] &&
@@ -4027,7 +4348,6 @@ index 31be24efaf..7f2942e78a 100644
 +			hmp->resilver_running = 0;
 +			return ENXIO;
 +		}
-+		vol = &hmp->volumes[surv];
 +
 +		for (ex = 0; ex < hmp->md_nextents; ex++) {
 +			hammer2_off_t mo = hmp->md_extents[ex].md_off;
@@ -4049,39 +4369,70 @@ index 31be24efaf..7f2942e78a 100644
 +				if (this_chunk > MD_CHUNK)
 +					this_chunk = MD_CHUNK;
 +
-+				bp = NULL;
-+				lerror = hammer2_inject_eio(surv);
-+				if (lerror == 0)
-+					lerror = bread(vol->dev->devvp,
-+					    (off_t)(mo + off),
-+					    (int)this_chunk, &bp);
-+				if (lerror || bp == NULL) {
-+					if (bp)
-+						brelse(bp);
++				/*
++				 * Every survivor holds a mirror copy; on a
++				 * read error try the next one.  Mirror copies
++				 * are written synchronously, so read those
++				 * first (pass 0): the primary's newest copy
++				 * may still be a delayed write held by a DIO,
++				 * and read_sibling then reads the media.
++				 *
++				 * Exclusive rebuild_lk keeps a concurrent
++				 * mirror write from landing between our read
++				 * and our write to the new disk.
++				 */
++				prim = -1;	/* as hammer2_get_volume() */
++				for (i = 0; i < hmp->nvolumes; i++) {
++					vol = &hmp->volumes[i];
++					if (mo + off >= vol->offset &&
++					    mo + off < vol->offset + vol->size) {
++						prim = i;
++						break;
++					}
++				}
++				lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
++				lerror = EIO;
++				for (pass = 0; pass < 2 && lerror; pass++) {
++				    for (i = surv; i < ndisks; i++) {
++					if (i == failed_disk_idx ||
++					    hmp->raid_failed[i] ||
++					    hmp->volumes[i].dev == NULL ||
++					    hmp->volumes[i].dev->devvp == NULL ||
++					    !hmp->volumes[i].dev->open)
++						continue;
++					if ((pass == 0) == (i == prim))
++						continue;
++					vol = &hmp->volumes[i];
++					lerror = hammer2_inject_eio(i);
++					if (lerror == 0)
++						lerror =
++						 hammer2_io_raid6_read_sibling(
++						    vol->dev->devvp,
++						    (off_t)(mo + off), md_buf,
++						    (int)this_chunk);
++					if (lerror == 0)
++						break;
++				    }
++				}
++				if (lerror) {
++					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +					kprintf("hammer2: resilver Phase A: "
 +						"read err %d at off %jx "
-+						"(disk %d)\n",
-+						lerror, (intmax_t)(mo + off),
-+						surv);
++						"on every survivor\n",
++						lerror, (intmax_t)(mo + off));
 +					kfree(md_buf, M_HAMMER2);
 +					hmp->resilver_running = 0;
 +					return EIO;
 +				}
-+				bkvasync(bp);
-+				bcopy(bp->b_data, md_buf, this_chunk);
-+				brelse(bp);
 +
-+				wbp = getblk(new_devvp, (off_t)(mo + off),
-+				    (int)this_chunk, GETBLK_KVABIO, 0);
-+				if (wbp) {
-+					bkvasync(wbp);
-+					bcopy(md_buf, wbp->b_data, this_chunk);
-+					lerror = bwrite(wbp);
-+					if (lerror) {
-+						kfree(md_buf, M_HAMMER2);
-+						hmp->resilver_running = 0;
-+						return lerror;
-+					}
++				lerror = hammer2_io_raid6_write_nowait(
++				    new_devvp, (off_t)(mo + off), md_buf,
++				    (int)this_chunk);
++				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++				if (lerror) {
++					kfree(md_buf, M_HAMMER2);
++					hmp->resilver_running = 0;
++					return lerror;
 +				}
 +				if ((off >> 22) % 16 == 0)
 +					lwkt_yield();
@@ -4099,12 +4450,11 @@ index 31be24efaf..7f2942e78a 100644
 +	/*
 +	 * Phase 3: Rebuild each stripe.
 +	 *
-+	 * Flush all pending writes first so that parity on surviving disks
-+	 * is up-to-date before we read it.  Under v3 COW, concurrent writes
-+	 * land in freshly-allocated stripe slots whose data column may or
-+	 * may not be on the replacement disk — if it is, the write itself
-+	 * goes there directly; if not, the resilver doesn't care.  No
-+	 * second-pass tracking is needed (newplan.md §5.9).
++	 * Flush all pending writes first so that the rows sealed before
++	 * the rebuild started are on media before we read them.  Rows
++	 * sealed since then wrote the new disk's column themselves (the
++	 * replace ioctl set rebuild_active before calling us) and are
++	 * marked in rebuild_done.
 +	 */
 +	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 +
@@ -4126,7 +4476,33 @@ index 31be24efaf..7f2942e78a 100644
 +				continue;
 +		}
 +
++		/*
++		 * Slots that never hold a row (metadata zone, bitmap zone)
++		 * were copied by Phase A or are rewritten at sync; a parity
++		 * "rebuild" there would overwrite them with garbage.
++		 */
++		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
++		    !hammer2_raid6_slot_is_data(hmp, stripe_num))
++			continue;
++
 +		phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
++
++		/*
++		 * Exclusive rebuild_lk holds off seals, the only writers
++		 * of a sealed slot's parity, until our copy is on the new
++		 * disk; a seal that follows rewrites the new disk's column
++		 * itself.  A slot already sealed during the rebuild is
++		 * done: copying it from media could read a data column
++		 * that is still a delayed write.
++		 */
++		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
++		if (hmp->rebuild_done != NULL &&
++		    stripe_num / 8 < hmp->stripe_bitmap_size &&
++		    (hmp->rebuild_done[stripe_num / 8] &
++		     (1 << (stripe_num % 8)))) {
++			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++			continue;
++		}
 +
 +		/* Left-symmetric P and Q disk positions */
 +		p_disk = (int)(stripe_num % ndisks);
@@ -4166,43 +4542,35 @@ index 31be24efaf..7f2942e78a 100644
 +				continue; /* second failed disk, treat as 0 */
 +
 +			vol = &hmp->volumes[phys_disk];
-+			bp = NULL;
 +			lerror = hammer2_inject_eio(phys_disk);
 +			if (lerror == 0)
-+				lerror = breadnx(vol->dev->devvp, phys_off,
-+						 stripe_unit, 0, NULL, NULL,
-+						 0, &bp);
-+			if (lerror == 0 && bp) {
-+				bkvasync(bp);
-+				bcopy(bp->b_data, col_bufs[col], stripe_unit);
-+				brelse(bp);
-+			} else {
++				lerror = hammer2_io_raid6_read_sibling(
++				    vol->dev->devvp, phys_off,
++				    col_bufs[col], (int)stripe_unit);
++			if (lerror) {
 +				int injected = hammer2_inject_eio(phys_disk);
-+				if (bp)
-+					brelse(bp);
-+				if (injected) {
-+					/* injection: surface as clean EIO, no auto-fail */
++				/*
++				 * The unreadable column is a second
++				 * erasure for this stripe, which P+Q
++				 * still recover.  A third is fatal.
++				 * Injected EIO does not auto-fail the
++				 * disk so the test stays repeatable.
++				 */
++				if (other_failed_col >= 0 ||
++				    (!injected &&
++				     hammer2_raid6_auto_fail_disk(hmp,
++							phys_disk))) {
++					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +					error = EIO;
-+					kprintf("hammer2: resilver stripe %llu: "
-+						"injected EIO on disk %d\n",
-+						(unsigned long long)stripe_num,
-+						phys_disk);
++					kprintf("hammer2: resilver stripe"
++						" %llu: unrecoverable"
++						" I/O error on disk %d\n",
++						(unsigned long long)
++						stripe_num, phys_disk);
 +					goto resilver_done;
 +				}
-+				{
-+					int aerr = hammer2_raid6_auto_fail_disk(
-+							hmp, phys_disk);
-+					if (aerr) {
-+						error = EIO;
-+						kprintf("hammer2: resilver stripe"
-+							" %llu: unrecoverable"
-+							" I/O error on disk %d\n",
-+							(unsigned long long)
-+							stripe_num, phys_disk);
-+						goto resilver_done;
-+					}
-+				}
-+				/* disk now in raid_failed[]; treated as zeros */
++				bzero(col_bufs[col], stripe_unit);
++				other_failed_col = col;
 +			}
 +		}
 +
@@ -4220,15 +4588,11 @@ index 31be24efaf..7f2942e78a 100644
 +		}
 +
 +		/* Write reconstructed column to the new device */
-+		wbp = getblk(new_devvp, phys_off, stripe_unit,
-+			     GETBLK_KVABIO, 0);
-+		if (wbp) {
-+			bkvasync(wbp);
-+			bcopy(ptrs[failed_col], wbp->b_data, stripe_unit);
-+			lerror = bwrite(wbp);
-+			if (lerror && !error)
-+				error = lerror;
-+		}
++		lerror = hammer2_io_raid6_write_nowait(new_devvp, phys_off,
++		    ptrs[failed_col], (int)stripe_unit);
++		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++		if (lerror && !error)
++			error = lerror;
 +
 +		/* Update progress and yield every 256 stripes */
 +		if ((stripe_num & 255) == 255) {
@@ -4598,7 +4962,7 @@ index 31be24efaf..7f2942e78a 100644
  hammer2_io_hashv(hammer2_dev_t *hmp, hammer2_off_t pbase)
  {
 diff --git a/sys/vfs/hammer2/hammer2_ioctl.c b/sys/vfs/hammer2/hammer2_ioctl.c
-index 5644f4e13b..3bf2d1e9bc 100644
+index 5644f4e13b..7b4afb1879 100644
 --- a/sys/vfs/hammer2/hammer2_ioctl.c
 +++ b/sys/vfs/hammer2/hammer2_ioctl.c
 @@ -41,8 +41,10 @@
@@ -4670,7 +5034,7 @@ index 5644f4e13b..3bf2d1e9bc 100644
  	if (mode) {
  		kprintf("hammer2: WARNING: Emergency mode enabled\n");
  		atomic_set_int(&pmp->flags, HAMMER2_PMPF_EMERG);
-@@ -1452,3 +1491,369 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
+@@ -1452,3 +1491,409 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
  
  	return error;
  }
@@ -4687,7 +5051,9 @@ index 5644f4e13b..3bf2d1e9bc 100644
 +{
 +	hammer2_ioc_raid_replace_t *rr = data;
 +	hammer2_dev_t *hmp;
++	hammer2_devvp_t *dev;
 +	struct vnode *new_devvp = NULL;
++	struct vnode *old_devvp;
 +	struct nlookupdata nd;
 +	int failed_disk_idx = -1;
 +	int error;
@@ -4746,13 +5112,62 @@ index 5644f4e13b..3bf2d1e9bc 100644
 +		return error;
 +	}
 +
++	/*
++	 * Install the new device before the resilver so that writes made
++	 * while it runs reach it (hammer2_raid6_disk_writable).  The disk
++	 * stays failed for reads and allocation until the resilver is done.
++	 * Taking rebuild_lk exclusive waits out writers that already
++	 * decided to skip this disk.
++	 */
++	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
++	if (!hmp->raid_failed[failed_disk_idx] || hmp->rebuild_active) {
++		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++		kprintf("hammer2: raid replace: disk %d %s\n", failed_disk_idx,
++			hmp->rebuild_active ? "another rebuild is running" :
++			"is not failed (fail-disk it first)");
++		vn_lock(new_devvp, LK_EXCLUSIVE | LK_RETRY);
++		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
++		vn_unlock(new_devvp);
++		vrele(new_devvp);
++		return EBUSY;
++	}
++	dev = hmp->volumes[failed_disk_idx].dev;
++	old_devvp = dev->devvp;
++	if (dev->open) {
++		/* failed but never closed (auto-fail): release it now */
++		vn_lock(old_devvp, LK_EXCLUSIVE | LK_RETRY);
++		VOP_CLOSE(old_devvp, FREAD | FWRITE, NULL);
++		vn_unlock(old_devvp);
++		dev->open = 0;
++	}
++	if (hmp->stripe_bitmap_size)
++		hmp->rebuild_done = kmalloc(hmp->stripe_bitmap_size,
++					    M_HAMMER2, M_WAITOK | M_ZERO);
++	dev->devvp = new_devvp;
++	dev->open = 1;
++	hammer2_io_retarget_disk(hmp, failed_disk_idx, new_devvp);
++	hmp->rebuild_disk = failed_disk_idx;
++	hmp->rebuild_active = 1;
++	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++
 +	kprintf("hammer2: RAID6 resilver disk %d (%s) -> %s\n",
 +		failed_disk_idx, rr->old_dev, rr->new_dev);
 +
 +	/* Run the resilver (this may take a long time) */
 +	error = hammer2_io_raid6_resilver(hmp, ip->pmp, failed_disk_idx, new_devvp);
++
++	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
++	hmp->rebuild_active = 0;
++	if (hmp->rebuild_done) {
++		kfree(hmp->rebuild_done, M_HAMMER2);
++		hmp->rebuild_done = NULL;
++	}
 +	if (error) {
 +		kprintf("hammer2: resilver failed: %d\n", error);
++		dev->devvp = old_devvp;
++		dev->open = 0;
++		hammer2_io_retarget_disk(hmp, failed_disk_idx, old_devvp);
++		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +		/*
 +		 * VOP_CLOSE on a devfs spec vnode expects the vnode locked
 +		 * exclusively (devfs_spec_close → vn_lock → upgrade panics
@@ -4766,30 +5181,14 @@ index 5644f4e13b..3bf2d1e9bc 100644
 +	}
 +
 +	/*
-+	 * Atomically swap the volume entry to point at the new device.
-+	 * Update the in-memory RAID state.
++	 * The new disk is complete.  Bring it online; this is under
++	 * rebuild_lk so no seal sees it half-way.
 +	 */
 +	hammer2_voldata_lock(hmp);
 +
-+	/* Close old device if it is still open (may be failed/gone) */
-+	if (hmp->volumes[failed_disk_idx].dev->open) {
-+		vn_lock(hmp->volumes[failed_disk_idx].dev->devvp,
-+			LK_EXCLUSIVE | LK_RETRY);
-+		VOP_CLOSE(hmp->volumes[failed_disk_idx].dev->devvp,
-+			  FREAD | FWRITE, NULL);
-+		vn_unlock(hmp->volumes[failed_disk_idx].dev->devvp);
-+		hmp->volumes[failed_disk_idx].dev->open = 0;
-+	}
-+
-+	hmp->volumes[failed_disk_idx].dev->devvp = new_devvp;
-+	if (hmp->volumes[failed_disk_idx].dev->path) {
-+		kfree(hmp->volumes[failed_disk_idx].dev->path, M_HAMMER2);
-+	}
-+	hmp->volumes[failed_disk_idx].dev->path =
-+		kstrdup(rr->new_dev, M_HAMMER2);
-+	hmp->volumes[failed_disk_idx].dev->open = 1;
-+
-+	/* Update DIO devvp for any cached DIOs on old device (best-effort) */
++	if (dev->path)
++		kfree(dev->path, M_HAMMER2);
++	dev->path = kstrdup(rr->new_dev, M_HAMMER2);
 +
 +	/* Clear failure state */
 +	if (hmp->raid_failed[failed_disk_idx]) {
@@ -4809,6 +5208,11 @@ index 5644f4e13b..3bf2d1e9bc 100644
 +	hammer2_voldata_modify(hmp);
 +
 +	hammer2_voldata_unlock(hmp);
++	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++
++	/* The mount's reference to the old vnode; ours moves to dev. */
++	if (old_devvp)
++		vrele(old_devvp);
 +
 +	/* Flush the updated config to all disks */
 +	hammer2_vfs_sync(ip->pmp->mp, MNT_WAIT);
@@ -5137,7 +5541,7 @@ index 20e92bb308..7071fda67e 100644
  
  #endif /* !_VFS_HAMMER2_IOCTL_H_ */
 diff --git a/sys/vfs/hammer2/hammer2_ondisk.c b/sys/vfs/hammer2/hammer2_ondisk.c
-index 85a9d08a51..75e651d07e 100644
+index 85a9d08a51..acf3fbd6b1 100644
 --- a/sys/vfs/hammer2/hammer2_ondisk.c
 +++ b/sys/vfs/hammer2/hammer2_ondisk.c
 @@ -46,6 +46,10 @@
@@ -5323,7 +5727,24 @@ index 85a9d08a51..75e651d07e 100644
  		e->devvp = NULL;
  		/* path */
  		KKASSERT(e->path);
-@@ -264,11 +376,12 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes,
+@@ -245,8 +357,14 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes,
+ 	int i;
+ 	uuid_t uuid;
+ 
+-	/* check volume header */
+-	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME) {
++	/*
++	 * check volume header.  A v3 RAID6 array adopts the header with
++	 * the newest rz_txg_seq, which belongs to whichever disk that is
++	 * (disk 0 may be failed or absent), so it has no root volume id.
++	 */
++	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME &&
++	    !(rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
++	      rootvoldata->raid_config.raid_type == HAMMER2_RAID_TYPE_RAID6)) {
+ 		hprintf("volume id %d must be %d\n", rootvoldata->volu_id,
+ 			HAMMER2_ROOT_VOLUME);
+ 		return EINVAL;
+@@ -264,11 +382,12 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes,
  		if (vol->id == -1)
  			continue;
  		path = vol->dev->path;
@@ -5341,7 +5762,7 @@ index 85a9d08a51..75e651d07e 100644
  		if (vol->offset == (hammer2_off_t)-1) {
  			hprintf("%s has bad offset 0x%016jx\n", path,
  				(intmax_t)vol->offset);
-@@ -462,6 +575,82 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
+@@ -462,6 +581,81 @@ hammer2_verify_volumes_2(const hammer2_volume_t *volumes,
  	return 0;
  }
  
@@ -5396,10 +5817,9 @@ index 85a9d08a51..75e651d07e 100644
 +			(intmax_t)rc->stripe_unit, HAMMER2_PBUFSIZE);
 +		return EINVAL;
 +	}
-+	if (rootvoldata->volu_id != HAMMER2_ROOT_VOLUME &&
-+	    nvolumes == rc->ndisks) {
-+		hprintf("volume id %d must be %d\n",
-+			rootvoldata->volu_id, HAMMER2_ROOT_VOLUME);
++	if (rootvoldata->volu_id >= rc->ndisks) {
++		hprintf("root volume id %d exceeds ndisks %d\n",
++			rootvoldata->volu_id, rc->ndisks);
 +		return EINVAL;
 +	}
 +
@@ -5424,7 +5844,7 @@ index 85a9d08a51..75e651d07e 100644
  static int
  hammer2_verify_volumes(const hammer2_volume_t *volumes,
  		       const hammer2_volume_data_t *rootvoldata)
-@@ -472,7 +661,9 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
+@@ -472,7 +666,9 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
  	if (error)
  		return error;
  
@@ -5435,7 +5855,7 @@ index 85a9d08a51..75e651d07e 100644
  		return hammer2_verify_volumes_2(volumes, rootvoldata);
  	else
  		return hammer2_verify_volumes_1(volumes, rootvoldata);
-@@ -597,6 +788,16 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -597,6 +793,16 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  	const char *path;
  	uuid_t fsid, fstype;
  	int i, zone, error = 0, version = -1, nvolumes = 0;
@@ -5452,7 +5872,7 @@ index 85a9d08a51..75e651d07e 100644
  
  	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
  		vol = &volumes[i];
-@@ -611,14 +812,52 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -611,14 +817,52 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  	bzero(&fstype, sizeof(fstype));
  	bzero(rootvoldata, sizeof(*rootvoldata));
  
@@ -5506,7 +5926,7 @@ index 85a9d08a51..75e651d07e 100644
  			hprintf("failed to read %s's volume header\n", path);
  			error = -error;
  			goto done;
-@@ -677,22 +916,254 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -677,22 +921,275 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  			error = EINVAL;
  			goto done;
  		}
@@ -5624,7 +6044,8 @@ index 85a9d08a51..75e651d07e 100644
 +	     HAMMER2_RAID_TYPE_RAID6) {
 +		const hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
 +		uint32_t ndisks = rrc->ndisks;
-+		uint32_t majority = (ndisks / 2) + 1;
++		uint32_t electorate = 0;
++		uint32_t majority;
 +		uint64_t target = rrc->rz_txg_seq;
 +		uint64_t fallback = target;
 +		uint32_t at_target;
@@ -5634,6 +6055,23 @@ index 85a9d08a51..75e651d07e 100644
 +		    (hammer2_j2_rollback_max > 0 ?
 +		     hammer2_j2_rollback_max : 8);
 +		int j;
++
++		/*
++		 * Disks the newest header marks FAILED stopped receiving
++		 * header writes when they failed, so their seqs lag by
++		 * design.  They do not vote.  The rest must reach a
++		 * majority of themselves and at least ndisks - 2 (the
++		 * disks needed to read the data at all).
++		 */
++		for (j = 0; j < (int)ndisks && j < HAMMER2_MAX_VOLUMES; j++) {
++			if (rrc->disk_state[j] == HAMMER2_RAID6_DISK_FAILED)
++				disk_seen[j] = 0;
++			else
++				electorate++;
++		}
++		majority = electorate / 2 + 1;
++		if (majority < ndisks - 2)
++			majority = ndisks - 2;
 +
 +		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
 +			if (!disk_seen[j])
@@ -5702,6 +6140,9 @@ index 85a9d08a51..75e651d07e 100644
 +				if (voldata->version <
 +				    HAMMER2_VOL_VERSION_RAIDZ2)
 +					continue;
++				if (voldata->volu_id < HAMMER2_MAX_VOLUMES &&
++				    !disk_seen[voldata->volu_id])
++					continue;
 +				if (voldata->raid_config.rz_txg_seq ==
 +				    fallback) {
 +					bcopy(voldata, rootvoldata,
@@ -5762,7 +6203,7 @@ index 85a9d08a51..75e651d07e 100644
  done:
  	if (!error) {
  		if (!rootvoldata->version) {
-@@ -738,3 +1209,1119 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
+@@ -738,3 +1235,1279 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
  
  	return ret;
  }
@@ -6010,14 +6451,31 @@ index 85a9d08a51..75e651d07e 100644
 +}
 +
 +/*
-+ * Read and verify the on-disk stripe bitmap from zone slot
-+ * HAMMER2_ZONE_RAID6_BITMAP on disk 0.  On any header/footer/CRC
-+ * mismatch (or read failure), mark the bitmap invalid; the caller
-+ * keeps the in-memory zero bitmap and logs a warning.  A blockref-walk
-+ * reconstruction (newplan.md §5.9, stripe_bitmap.md "mount-time
-+ * verify") is a Phase 2 TODO; until it lands a torn bitmap risks
-+ * re-allocating live slots, so the mount path treats invalid as
-+ * fatal for RW mounts.
++ * The stripe bitmap and the row refcount block live in zone slot
++ * HAMMER2_ZONE_RAID6_BITMAP on every disk.  The allocator skips that
++ * zone on all disks, so each disk carries a full copy.  Return the
++ * device for disk i when it can hold a current copy: present, open
++ * and not failed.  A failed disk stops receiving copies, so its copy
++ * is stale and must not be loaded.
++ */
++static struct vnode *
++hammer2_raid6_bitmap_devvp(hammer2_dev_t *hmp, int i)
++{
++	hammer2_devvp_t *e = hmp->volumes[i].dev;
++
++	if (e == NULL || e->devvp == NULL || !e->open)
++		return NULL;
++	if (hmp->raid_failed[i])
++		return NULL;
++	return e->devvp;
++}
++
++/*
++ * Read and verify the on-disk stripe bitmap.  Every live disk carries
++ * a copy (arrays made before the copies were mirrored have one on disk
++ * 0 only); the valid copy with the highest generation wins.  If no
++ * copy passes the header/footer/CRC checks, mark the bitmap invalid;
++ * the mount path then rebuilds it with a blockref walk.
 + */
 +void
 +hammer2_raid6_bitmap_read(hammer2_dev_t *hmp)
@@ -6031,66 +6489,75 @@ index 85a9d08a51..75e651d07e 100644
 +	size_t bitmap_pages = hmp->stripe_bitmap_size /
 +	    HAMMER2_STRIPE_BITMAP_PAGE;
 +	uint32_t hdr_crc, ftr_crc, want_crc;
++	int found = 0;
 +	int error;
-+
-+	devvp = hmp->volumes[0].dev->devvp;
-+	if (devvp == NULL || !hmp->volumes[0].dev->open) {
-+		hmp->stripe_bitmap_invalid = 1;
-+		return;
-+	}
++	int i;
 +
 +	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
 +
-+	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
-+	if (error || bp == NULL) {
-+		if (bp)
++	for (i = 0; i < hmp->nvolumes; i++) {
++		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
++		if (devvp == NULL)
++			continue;
++
++		error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
++		if (error || bp == NULL) {
++			if (bp)
++				brelse(bp);
++			kprintf("hammer2: stripe bitmap read I/O error %d "
++				"on disk %d\n", error, i);
++			continue;
++		}
++
++		hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
++		bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
++		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_BITMAP_PAGE +
++		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
++
++		if (hdr->magic != HAMMER2_STRIPE_BITMAP_MAGIC ||
++		    hdr->version != HAMMER2_STRIPE_BITMAP_VERSION ||
++		    hdr->ndisks != hmp->raid_config.ndisks ||
++		    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
++		    ftr->magic_end != HAMMER2_STRIPE_BITMAP_MAGIC_END ||
++		    ftr->generation != hdr->generation) {
++			/* quiet: no copy here (array predates mirroring) */
 +			brelse(bp);
-+		kprintf("hammer2: stripe bitmap read I/O error %d; "
-+			"bitmap invalid\n", error);
-+		hmp->stripe_bitmap_invalid = 1;
-+		return;
++			continue;
++		}
++
++		bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
++		bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
++		want_crc = hammer2_stripe_bitmap_crc(hdr, bitmap,
++						     bitmap_pages, ftr);
++		if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
++			kprintf("hammer2: stripe bitmap CRC mismatch on "
++				"disk %d (hdr %08x ftr %08x want %08x)\n",
++				i, hdr_crc, ftr_crc, want_crc);
++			brelse(bp);
++			continue;
++		}
++
++		if (!found || hdr->generation > hmp->stripe_generation) {
++			bcopy(bitmap, hmp->stripe_bitmap,
++			      hmp->stripe_bitmap_size);
++			hmp->stripe_cursor = hdr->cursor;
++			hmp->stripe_generation = hdr->generation;
++			found = 1;
++		}
++		brelse(bp);
 +	}
 +
-+	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
-+	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
-+	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
-+	    HAMMER2_STRIPE_BITMAP_PAGE +
-+	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
-+
-+	if (hdr->magic != HAMMER2_STRIPE_BITMAP_MAGIC ||
-+	    hdr->version != HAMMER2_STRIPE_BITMAP_VERSION ||
-+	    hdr->ndisks != hmp->raid_config.ndisks ||
-+	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
-+	    ftr->magic_end != HAMMER2_STRIPE_BITMAP_MAGIC_END ||
-+	    ftr->generation != hdr->generation) {
-+		kprintf("hammer2: stripe bitmap header/footer mismatch; "
++	if (!found) {
++		kprintf("hammer2: no valid stripe bitmap copy; "
 +			"bitmap invalid\n");
 +		hmp->stripe_bitmap_invalid = 1;
-+		brelse(bp);
-+		return;
 +	}
-+
-+	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
-+	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
-+	want_crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
-+	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
-+		kprintf("hammer2: stripe bitmap CRC mismatch "
-+			"(hdr %08x ftr %08x want %08x); bitmap invalid\n",
-+			hdr_crc, ftr_crc, want_crc);
-+		hmp->stripe_bitmap_invalid = 1;
-+		brelse(bp);
-+		return;
-+	}
-+
-+	bcopy(bitmap, hmp->stripe_bitmap, hmp->stripe_bitmap_size);
-+	hmp->stripe_cursor = hdr->cursor;
-+	hmp->stripe_generation = hdr->generation;
-+	brelse(bp);
 +}
 +
 +/*
-+ * Write the in-memory stripe bitmap to disk zone slot
-+ * HAMMER2_ZONE_RAID6_BITMAP on disk 0, synchronously.
++ * Write the in-memory stripe bitmap to zone slot
++ * HAMMER2_ZONE_RAID6_BITMAP on every live disk, synchronously.
 + * Bumps the generation, computes a fresh CRC, and writes
 + * header + bitmap + footer as one buffer.  Called from the TXG commit
 + * path before the volume header write so the bitmap is durable before
@@ -6108,51 +6575,55 @@ index 85a9d08a51..75e651d07e 100644
 +	size_t bitmap_pages = hmp->stripe_bitmap_size /
 +	    HAMMER2_STRIPE_BITMAP_PAGE;
 +	uint32_t crc;
-+
-+	devvp = hmp->volumes[0].dev->devvp;
-+	if (devvp == NULL || !hmp->volumes[0].dev->open)
-+		return;
++	int i;
 +
 +	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG;
-+
-+	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
-+	if (bp == NULL) {
-+		kprintf("hammer2_raid6_bitmap_write: getblk failed\n");
-+		return;
-+	}
-+	bkvasync(bp);
-+	bzero(bp->b_data, HAMMER2_PBUFSIZE);
-+
-+	hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
-+	bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
-+	ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
-+	    HAMMER2_STRIPE_BITMAP_PAGE +
-+	    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
-+
 +	hmp->stripe_generation++;
-+	hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
-+	hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
-+	hdr->ndisks = hmp->raid_config.ndisks;
-+	hdr->stripe_unit = hmp->raid_config.stripe_unit;
-+	hdr->num_slots = hmp->stripe_num_slots;
-+	hdr->slot_origin = HAMMER2_ZONE_SEG64;
-+	hdr->cursor = hmp->stripe_cursor;
-+	hdr->generation = hmp->stripe_generation;
 +
-+	ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
-+	ftr->generation = hmp->stripe_generation;
++	for (i = 0; i < hmp->nvolumes; i++) {
++		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
++		if (devvp == NULL)
++			continue;
 +
-+	bcopy(hmp->stripe_bitmap, bitmap, hmp->stripe_bitmap_size);
++		bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
++		if (bp == NULL) {
++			kprintf("hammer2_raid6_bitmap_write: getblk failed "
++				"on disk %d\n", i);
++			continue;
++		}
++		bkvasync(bp);
++		bzero(bp->b_data, HAMMER2_PBUFSIZE);
 +
-+	crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
-+	bcopy(&crc, hdr->crc, sizeof(crc));
-+	bcopy(&crc, ftr->crc, sizeof(crc));
++		hdr = (hammer2_stripe_bitmap_header_t *)bp->b_data;
++		bitmap = (uint8_t *)bp->b_data + HAMMER2_STRIPE_BITMAP_PAGE;
++		ftr = (hammer2_stripe_bitmap_footer_t *)((uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_BITMAP_PAGE +
++		    bitmap_pages * HAMMER2_STRIPE_BITMAP_PAGE);
 +
-+	bwrite(bp);
++		hdr->magic = HAMMER2_STRIPE_BITMAP_MAGIC;
++		hdr->version = HAMMER2_STRIPE_BITMAP_VERSION;
++		hdr->ndisks = hmp->raid_config.ndisks;
++		hdr->stripe_unit = hmp->raid_config.stripe_unit;
++		hdr->num_slots = hmp->stripe_num_slots;
++		hdr->slot_origin = HAMMER2_ZONE_SEG64;
++		hdr->cursor = hmp->stripe_cursor;
++		hdr->generation = hmp->stripe_generation;
++
++		ftr->magic_end = HAMMER2_STRIPE_BITMAP_MAGIC_END;
++		ftr->generation = hmp->stripe_generation;
++
++		bcopy(hmp->stripe_bitmap, bitmap, hmp->stripe_bitmap_size);
++
++		crc = hammer2_stripe_bitmap_crc(hdr, bitmap, bitmap_pages, ftr);
++		bcopy(&crc, hdr->crc, sizeof(crc));
++		bcopy(&crc, ftr->crc, sizeof(crc));
++
++		bwrite(bp);
++	}
 +}
 +
 +/*
-+ * Persisted row-refcount block (zone 41 on disk 0, byte offset
++ * Persisted row-refcount block (zone 41 on every live disk, byte offset
 + * HAMMER2_STRIPE_REFCOUNT_OFFSET within the zone — i.e. 64 KB past
 + * the stripe bitmap block).  See hammer2_disk.h for layout.  Saves
 + * the O(metadata) chain-tree walk that hammer2_raid6_rebuild_row_refcount
@@ -6188,6 +6659,12 @@ index 85a9d08a51..75e651d07e 100644
 +	return c;
 +}
 +
++/*
++ * Load the persisted row refcount.  Only a copy whose generation
++ * matches the stripe bitmap just loaded is used; any other copy
++ * (crash between the two writes, stale disk) leaves the refcount
++ * invalid and the mount path runs the walker.
++ */
 +void
 +hammer2_raid6_refcount_read(hammer2_dev_t *hmp)
 +{
@@ -6200,11 +6677,11 @@ index 85a9d08a51..75e651d07e 100644
 +	size_t refcount_pages;
 +	uint32_t hdr_crc, ftr_crc, want_crc;
 +	int error;
++	int i;
 +
-+	if (hmp->stripe_row_refcount == NULL) {
-+		hmp->stripe_refcount_invalid = 1;
++	hmp->stripe_refcount_invalid = 1;
++	if (hmp->stripe_row_refcount == NULL)
 +		return;
-+	}
 +
 +	refcount_pages = (size_t)((hmp->stripe_num_slots +
 +	    HAMMER2_STRIPE_REFCOUNT_PAGE - 1) /
@@ -6215,66 +6692,67 @@ index 85a9d08a51..75e651d07e 100644
 +		kprintf("hammer2: refcount pages %zu exceeds max %d; "
 +			"refcount invalid\n", refcount_pages,
 +			(int)HAMMER2_STRIPE_REFCOUNT_PAGES_MAX);
-+		hmp->stripe_refcount_invalid = 1;
-+		return;
-+	}
-+
-+	devvp = hmp->volumes[0].dev->devvp;
-+	if (devvp == NULL || !hmp->volumes[0].dev->open) {
-+		hmp->stripe_refcount_invalid = 1;
 +		return;
 +	}
 +
 +	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
 +	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
-+	error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
-+	if (error || bp == NULL) {
-+		if (bp)
-+			brelse(bp);
-+		hmp->stripe_refcount_invalid = 1;
-+		return;
-+	}
 +
-+	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
-+	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
-+	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
-+	    HAMMER2_STRIPE_REFCOUNT_PAGE +
-+	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
++	for (i = 0; i < hmp->nvolumes; i++) {
++		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
++		if (devvp == NULL)
++			continue;
 +
-+	if (hdr->magic != HAMMER2_STRIPE_REFCOUNT_MAGIC ||
-+	    hdr->version != HAMMER2_STRIPE_REFCOUNT_VERSION ||
-+	    hdr->ndisks != hmp->raid_config.ndisks ||
-+	    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
-+	    hdr->num_slots != hmp->stripe_num_slots ||
-+	    ftr->magic_end != HAMMER2_STRIPE_REFCOUNT_MAGIC_END ||
-+	    ftr->generation != hdr->generation) {
++		error = bread(devvp, pbase, HAMMER2_PBUFSIZE, &bp);
++		if (error || bp == NULL) {
++			if (bp)
++				brelse(bp);
++			continue;
++		}
++
++		hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
++		refcount = (uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_REFCOUNT_PAGE;
++		ftr = (hammer2_stripe_refcount_footer_t *)
++		    ((uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_REFCOUNT_PAGE +
++		    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
++
 +		/*
-+		 * Quiet on missing block (fresh upgrade from a volume
-+		 * mkfs'd before this format existed); the walker will
-+		 * rebuild and the next flush persists.
++		 * Quiet on a missing block (fresh upgrade, or an array
++		 * that predates mirroring); the walker rebuilds and the
++		 * next flush persists.
 +		 */
-+		hmp->stripe_refcount_invalid = 1;
++		if (hdr->magic != HAMMER2_STRIPE_REFCOUNT_MAGIC ||
++		    hdr->version != HAMMER2_STRIPE_REFCOUNT_VERSION ||
++		    hdr->ndisks != hmp->raid_config.ndisks ||
++		    hdr->stripe_unit != hmp->raid_config.stripe_unit ||
++		    hdr->num_slots != hmp->stripe_num_slots ||
++		    ftr->magic_end != HAMMER2_STRIPE_REFCOUNT_MAGIC_END ||
++		    ftr->generation != hdr->generation ||
++		    hdr->generation != hmp->stripe_generation) {
++			brelse(bp);
++			continue;
++		}
++
++		bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
++		bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
++		want_crc = hammer2_stripe_refcount_crc(hdr, refcount,
++						       refcount_pages, ftr);
++		if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
++			kprintf("hammer2: refcount CRC mismatch on disk %d "
++				"(hdr %08x ftr %08x want %08x)\n",
++				i, hdr_crc, ftr_crc, want_crc);
++			brelse(bp);
++			continue;
++		}
++
++		bcopy(refcount, hmp->stripe_row_refcount,
++		    (size_t)hmp->stripe_num_slots);
++		hmp->stripe_refcount_invalid = 0;
 +		brelse(bp);
 +		return;
 +	}
-+
-+	bcopy(hdr->crc, &hdr_crc, sizeof(hdr_crc));
-+	bcopy(ftr->crc, &ftr_crc, sizeof(ftr_crc));
-+	want_crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages,
-+					       ftr);
-+	if (hdr_crc != ftr_crc || hdr_crc != want_crc) {
-+		kprintf("hammer2: refcount CRC mismatch "
-+			"(hdr %08x ftr %08x want %08x); falling back to walker\n",
-+			hdr_crc, ftr_crc, want_crc);
-+		hmp->stripe_refcount_invalid = 1;
-+		brelse(bp);
-+		return;
-+	}
-+
-+	bcopy(refcount, hmp->stripe_row_refcount,
-+	    (size_t)hmp->stripe_num_slots);
-+	hmp->stripe_refcount_invalid = 0;
-+	brelse(bp);
 +}
 +
 +void
@@ -6288,6 +6766,7 @@ index 85a9d08a51..75e651d07e 100644
 +	uint8_t *refcount;
 +	size_t refcount_pages;
 +	uint32_t crc;
++	int i;
 +
 +	if (hmp->stripe_row_refcount == NULL)
 +		return;
@@ -6300,45 +6779,51 @@ index 85a9d08a51..75e651d07e 100644
 +	if (refcount_pages > HAMMER2_STRIPE_REFCOUNT_PAGES_MAX)
 +		return;
 +
-+	devvp = hmp->volumes[0].dev->devvp;
-+	if (devvp == NULL || !hmp->volumes[0].dev->open)
-+		return;
-+
 +	pbase = (off_t)HAMMER2_ZONE_RAID6_BITMAP * HAMMER2_ZONE_SEG +
 +	    HAMMER2_STRIPE_REFCOUNT_OFFSET;
 +
-+	bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
-+	if (bp == NULL) {
-+		kprintf("hammer2_raid6_refcount_write: getblk failed\n");
-+		return;
++	for (i = 0; i < hmp->nvolumes; i++) {
++		devvp = hammer2_raid6_bitmap_devvp(hmp, i);
++		if (devvp == NULL)
++			continue;
++
++		bp = getblk(devvp, pbase, HAMMER2_PBUFSIZE, GETBLK_KVABIO, 0);
++		if (bp == NULL) {
++			kprintf("hammer2_raid6_refcount_write: getblk failed "
++				"on disk %d\n", i);
++			continue;
++		}
++		bkvasync(bp);
++		bzero(bp->b_data, HAMMER2_PBUFSIZE);
++
++		hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
++		refcount = (uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_REFCOUNT_PAGE;
++		ftr = (hammer2_stripe_refcount_footer_t *)
++		    ((uint8_t *)bp->b_data +
++		    HAMMER2_STRIPE_REFCOUNT_PAGE +
++		    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
++
++		hdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
++		hdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
++		hdr->ndisks = hmp->raid_config.ndisks;
++		hdr->stripe_unit = hmp->raid_config.stripe_unit;
++		hdr->num_slots = hmp->stripe_num_slots;
++		hdr->generation = hmp->stripe_generation;
++
++		ftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
++		ftr->generation = hmp->stripe_generation;
++
++		bcopy(hmp->stripe_row_refcount, refcount,
++		    (size_t)hmp->stripe_num_slots);
++
++		crc = hammer2_stripe_refcount_crc(hdr, refcount,
++						  refcount_pages, ftr);
++		bcopy(&crc, hdr->crc, sizeof(crc));
++		bcopy(&crc, ftr->crc, sizeof(crc));
++
++		bwrite(bp);
 +	}
-+	bkvasync(bp);
-+	bzero(bp->b_data, HAMMER2_PBUFSIZE);
-+
-+	hdr = (hammer2_stripe_refcount_header_t *)bp->b_data;
-+	refcount = (uint8_t *)bp->b_data + HAMMER2_STRIPE_REFCOUNT_PAGE;
-+	ftr = (hammer2_stripe_refcount_footer_t *)((uint8_t *)bp->b_data +
-+	    HAMMER2_STRIPE_REFCOUNT_PAGE +
-+	    refcount_pages * HAMMER2_STRIPE_REFCOUNT_PAGE);
-+
-+	hdr->magic = HAMMER2_STRIPE_REFCOUNT_MAGIC;
-+	hdr->version = HAMMER2_STRIPE_REFCOUNT_VERSION;
-+	hdr->ndisks = hmp->raid_config.ndisks;
-+	hdr->stripe_unit = hmp->raid_config.stripe_unit;
-+	hdr->num_slots = hmp->stripe_num_slots;
-+	hdr->generation = hmp->stripe_generation;
-+
-+	ftr->magic_end = HAMMER2_STRIPE_REFCOUNT_MAGIC_END;
-+	ftr->generation = hmp->stripe_generation;
-+
-+	bcopy(hmp->stripe_row_refcount, refcount,
-+	    (size_t)hmp->stripe_num_slots);
-+
-+	crc = hammer2_stripe_refcount_crc(hdr, refcount, refcount_pages, ftr);
-+	bcopy(&crc, hdr->crc, sizeof(crc));
-+	bcopy(&crc, ftr->crc, sizeof(crc));
-+
-+	bwrite(bp);
 +}
 +
 +/*
@@ -6401,8 +6886,11 @@ index 85a9d08a51..75e651d07e 100644
 +{
 +	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
 +	void *to_free[HAMMER2_MAX_VOLUMES];
++	void *zbuf = NULL;
 +	hammer2_off_t phys_off;
++	uint64_t row_id;
 +	uint32_t alloc_mask_snap;
++	uint32_t dropped_snap;
 +	size_t bytes;
 +	int ncols = 0;
 +	int p_disk_snap, q_disk_snap;
@@ -6425,11 +6913,26 @@ index 85a9d08a51..75e651d07e 100644
 +	phys_off = r->phys_off;
 +	bytes = r->bytes;
 +	alloc_mask_snap = r->alloc_mask;
++	dropped_snap = r->dropped_mask;
++	row_id = r->row_id;
 +	p_disk_snap = r->p_disk;
 +	q_disk_snap = r->q_disk;
 +	TAILQ_REMOVE(&hmp->open_rows, r, entry);
 +	hmp->open_rows_count--;
 +	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
++
++	/*
++	 * Hold off the resilver's copy of this slot while we write it,
++	 * and tell it the slot is done if a rebuild is running: this seal
++	 * writes every column of the rebuilding disk.
++	 */
++	lockmgr(&hmp->rebuild_lk, LK_SHARED);
++	if (hmp->rebuild_active && hmp->rebuild_done &&
++	    row_id / 8 < hmp->stripe_bitmap_size) {
++		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
++		hmp->rebuild_done[row_id / 8] |= (uint8_t)(1 << (row_id % 8));
++		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
++	}
 +
 +	if (ncols > 0) {
 +		/*
@@ -6452,11 +6955,21 @@ index 85a9d08a51..75e651d07e 100644
 +				continue;
 +			if (alloc_mask_snap & (1U << d))
 +				continue;
-+			if (hmp->raid_failed[d])
++			if (!hammer2_raid6_disk_writable(hmp, d))
 +				continue;
 +			if (hmp->volumes[d].dev == NULL ||
 +			    hmp->volumes[d].dev->devvp == NULL)
 +				continue;
++			if (hmp->raid_failed[d]) {
++				/* rebuilding disk: never wait on its bufs */
++				if (zbuf == NULL)
++					zbuf = kmalloc(bytes, M_HAMMER2,
++						       M_WAITOK | M_ZERO);
++				(void)hammer2_io_raid6_write_nowait(
++				    hmp->volumes[d].dev->devvp, phys_off,
++				    zbuf, (int)bytes);
++				continue;
++			}
 +			zbp = getblk(hmp->volumes[d].dev->devvp, phys_off,
 +				     (int)bytes, GETBLK_KVABIO, 0);
 +			if (zbp == NULL)
@@ -6467,12 +6980,34 @@ index 85a9d08a51..75e651d07e 100644
 +			(void)werr;
 +		}
 +
++		/*
++		 * putblk skips the data column of a failed disk.  Write it
++		 * here if that disk now takes writes: it is being rebuilt,
++		 * or it came back online since the putblk.
++		 */
++		for (i = 0; i < ncols; i++) {
++			d = cols[i].disk_idx;
++			if ((dropped_snap & (1U << d)) == 0)
++				continue;
++			if (!hammer2_raid6_disk_writable(hmp, d))
++				continue;
++			if (hmp->volumes[d].dev == NULL ||
++			    hmp->volumes[d].dev->devvp == NULL)
++				continue;
++			(void)hammer2_io_raid6_write_nowait(
++			    hmp->volumes[d].dev->devvp, phys_off,
++			    cols[i].data, (int)bytes);
++		}
++
 +		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 +						 ncols, bytes);
 +	}
++	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +
 +	for (i = 0; i < ncols; i++)
 +		kfree(to_free[i], M_HAMMER2);
++	if (zbuf)
++		kfree(zbuf, M_HAMMER2);
 +	kfree(r, M_HAMMER2);
 +
 +	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
@@ -6572,7 +7107,8 @@ index 85a9d08a51..75e651d07e 100644
 + */
 +void
 +hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
-+				int disk_idx, void *data, size_t bytes)
++				int disk_idx, void *data, size_t bytes,
++				int dropped)
 +{
 +	struct hammer2_open_row *r;
 +	void *to_free = NULL;
@@ -6611,6 +7147,10 @@ index 85a9d08a51..75e651d07e 100644
 +		r->col_data[disk_idx] = NULL;
 +	}
 +	r->col_data[disk_idx] = data;
++	if (dropped)
++		r->dropped_mask |= 1U << disk_idx;
++	else
++		r->dropped_mask &= ~(1U << disk_idx);
 +
 +	/* Seal immediately if the row is full and every alloc'd col has data. */
 +	complete = 1;
@@ -6652,6 +7192,99 @@ index 85a9d08a51..75e651d07e 100644
 +	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL)
 +		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 +	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
++}
++
++/*
++ * Return 1 if stripe slot `slot` may hold a parity row.  Slots in the
++ * reserved zones and in metadata-zone extents (metadata_zone.md) hold
++ * per-disk or mirrored data instead: the allocator never places a row
++ * there, and the resilver must not rebuild one there from parity.
++ */
++int
++hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot)
++{
++	uint64_t stripe_unit = hmp->raid_config.stripe_unit;
++	hammer2_off_t off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
++	uint64_t zone = off / HAMMER2_ZONE_SEG64;
++	uint32_t ex;
++
++	if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
++	    zone <= HAMMER2_ZONE_FREEMAP_07 &&
++	    (zone % HAMMER2_ZONE_FREEMAP_INC) == HAMMER2_ZONE_FREEMAP_00)
++		return 0;
++	if (zone == HAMMER2_ZONE_RAID6_BITMAP)
++		return 0;
++	for (ex = 0; ex < hmp->md_nextents; ex++) {
++		hammer2_off_t mo = hmp->md_extents[ex].md_off;
++		hammer2_off_t ms = hmp->md_extents[ex].md_size;
++		if (off + stripe_unit > mo && off < mo + ms)
++			return 0;
++	}
++	return 1;
++}
++
++/*
++ * Usable size and free space of a v3 array for statfs.  The freemap only
++ * covers metadata on v3 (data rows live in the stripe bitmap), and it
++ * spans the raw size of every disk, so allocator_size/free mean nothing
++ * to the user.  Report the rows (ndata columns each) plus the metadata
++ * zone, counted once because it is mirrored.  A partly packed row counts
++ * as full, so free space is never overstated.
++ */
++void
++hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
++		    hammer2_off_t *freep)
++{
++	hammer2_off_t row_bytes;
++	hammer2_off_t md_size = 0;
++	hammer2_off_t md_used;
++	uint64_t slot;
++	uint64_t used;
++	uint32_t ex;
++	size_t i;
++
++	row_bytes = hmp->raid_config.stripe_unit * hmp->raid_config.ndata;
++	for (ex = 0; ex < hmp->md_nextents; ex++)
++		md_size += hmp->md_extents[ex].md_size;
++
++	if (hmp->stripe_bitmap == NULL) {
++		*totalp = md_size;
++		*freep = 0;
++		return;
++	}
++	if (hmp->stripe_data_slots == 0) {
++		for (slot = 0; slot < hmp->stripe_num_slots; slot++) {
++			if (hammer2_raid6_slot_is_data(hmp, slot))
++				++hmp->stripe_data_slots;
++		}
++	}
++
++	/*
++	 * Counting is unlocked; a racing allocation only makes the figure
++	 * slightly stale.  Recount at most once a second.
++	 */
++	if (hmp->stripe_used_ticks == 0 ||
++	    (u_int)(ticks - hmp->stripe_used_ticks) >= (u_int)hz) {
++		used = 0;
++		for (i = 0; i < hmp->stripe_bitmap_size; i++)
++			used += bitcount32(hmp->stripe_bitmap[i]);
++		hmp->stripe_used_slots = used;
++		hmp->stripe_used_ticks = ticks ? ticks : 1;
++	}
++	used = hmp->stripe_used_slots;
++	if (used > hmp->stripe_data_slots)
++		used = hmp->stripe_data_slots;
++
++	/*
++	 * Every freemap allocation on v3 is metadata.
++	 */
++	md_used = hmp->voldata.allocator_size - hmp->voldata.allocator_free;
++	if (md_used > md_size)
++		md_used = md_size;
++
++	*totalp = hmp->stripe_data_slots * row_bytes + md_size;
++	*freep = (hmp->stripe_data_slots - used) * row_bytes +
++		 (md_size - md_used);
 +}
 +
 +/*
@@ -6714,11 +7347,6 @@ index 85a9d08a51..75e651d07e 100644
 +	slot = start;
 +
 +	for (;;) {
-+		uint64_t zone;
-+		hammer2_off_t cand_off;
-+		uint32_t ex;
-+		int in_md_zone = 0;
-+
 +		if (slot >= max_stripes) {
 +			if (wrapped)
 +				break;
@@ -6731,34 +7359,7 @@ index 85a9d08a51..75e651d07e 100644
 +		if (wrapped && slot >= start)
 +			break;
 +
-+		cand_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
-+		zone = cand_off / HAMMER2_ZONE_SEG64;
-+		if (zone >= HAMMER2_ZONE_FREEMAP_00 &&
-+		    zone <= HAMMER2_ZONE_FREEMAP_07 &&
-+		    (zone % HAMMER2_ZONE_FREEMAP_INC) ==
-+		     HAMMER2_ZONE_FREEMAP_00) {
-+			slot++;
-+			continue;
-+		}
-+		if (zone == HAMMER2_ZONE_RAID6_BITMAP) {
-+			slot++;
-+			continue;
-+		}
-+		/*
-+		 * Skip slots whose per-disk physical offset falls inside any
-+		 * metadata-zone extent (metadata_zone.md).  Without this,
-+		 * stripe data would overlap the mirrored metadata area.
-+		 */
-+		for (ex = 0; ex < hmp->md_nextents; ex++) {
-+			hammer2_off_t mo = hmp->md_extents[ex].md_off;
-+			hammer2_off_t ms = hmp->md_extents[ex].md_size;
-+			if (cand_off + stripe_unit > mo &&
-+			    cand_off < mo + ms) {
-+				in_md_zone = 1;
-+				break;
-+			}
-+		}
-+		if (in_md_zone) {
++		if (!hammer2_raid6_slot_is_data(hmp, slot)) {
 +			slot++;
 +			continue;
 +		}
@@ -6884,10 +7485,10 @@ index 85a9d08a51..75e651d07e 100644
 +}
 diff --git a/sys/vfs/hammer2/hammer2_raid6.c b/sys/vfs/hammer2/hammer2_raid6.c
 new file mode 100644
-index 0000000000..9cb1ecf390
+index 0000000000..3b3d9fd3e5
 --- /dev/null
 +++ b/sys/vfs/hammer2/hammer2_raid6.c
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,653 @@
 +/*
 + * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
 + *
@@ -7276,6 +7877,7 @@ index 0000000000..9cb1ecf390
 +	int p_disk, q_disk;
 +	hammer2_volume_t *vol;
 +	struct buf *pbp = NULL, *qbp = NULL;
++	uint8_t *p_mem = NULL, *q_mem = NULL;
 +	uint8_t *p_dst = NULL;
 +	uint8_t *q_dst = NULL;
 +	int error = 0;
@@ -7291,9 +7893,15 @@ index 0000000000..9cb1ecf390
 +
 +	/*
 +	 * Allocate the P column buffer up-front and accumulate XOR into it.
-+	 * Skip the disk entirely if it's failed.
++	 * Skip the disk entirely if it's failed.  A disk being rebuilt
++	 * gets its column through a private buffer and a non-blocking
++	 * write (the caller holds rebuild_lk; see seal_row).
 +	 */
-+	if (!hmp->raid_failed[p_disk]) {
++	if (hammer2_raid6_disk_writable(hmp, p_disk) &&
++	    hmp->raid_failed[p_disk]) {
++		p_mem = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++		p_dst = p_mem;
++	} else if (!hmp->raid_failed[p_disk]) {
 +		vol = &hmp->volumes[p_disk];
 +		pbp = getblk(vol->dev->devvp, phys_off,
 +			     stripe_unit, GETBLK_KVABIO, 0);
@@ -7304,7 +7912,11 @@ index 0000000000..9cb1ecf390
 +		}
 +	}
 +
-+	if (!hmp->raid_failed[q_disk]) {
++	if (hammer2_raid6_disk_writable(hmp, q_disk) &&
++	    hmp->raid_failed[q_disk]) {
++		q_mem = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++		q_dst = q_mem;
++	} else if (!hmp->raid_failed[q_disk]) {
 +		vol = &hmp->volumes[q_disk];
 +		qbp = getblk(vol->dev->devvp, phys_off,
 +			     stripe_unit, GETBLK_KVABIO, 0);
@@ -7361,6 +7973,22 @@ index 0000000000..9cb1ecf390
 +		if (e && !error)
 +			error = e;
 +	}
++	if (p_mem) {
++		int e = hammer2_io_raid6_write_nowait(
++		    hmp->volumes[p_disk].dev->devvp, phys_off,
++		    p_mem, (int)stripe_unit);
++		if (e && !error)
++			error = e;
++		kfree(p_mem, M_HAMMER2);
++	}
++	if (q_mem) {
++		int e = hammer2_io_raid6_write_nowait(
++		    hmp->volumes[q_disk].dev->devvp, phys_off,
++		    q_mem, (int)stripe_unit);
++		if (e && !error)
++			error = e;
++		kfree(q_mem, M_HAMMER2);
++	}
 +
 +	return error;
 +}
@@ -7393,6 +8021,10 @@ index 0000000000..9cb1ecf390
 + * already issued the primary bdwrite/bwrite to it through the buffer
 + * cache).  Pass -1 to mirror to every healthy disk.
 + *
++ * A disk being rebuilt gets the copy too, written without waiting on
++ * its buffers, under rebuild_lk so the resilver's metadata copy does
++ * not overwrite it with an older one.
++ *
 + * Returns 0 if at least one disk write succeeded; EIO if every other
 + * disk was either failed or had an I/O error.
 + */
@@ -7411,15 +8043,23 @@ index 0000000000..9cb1ecf390
 +	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 +	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 +
++	lockmgr(&hmp->rebuild_lk, LK_SHARED);
 +	for (i = 0; i < hmp->raid_config.ndisks; i++) {
 +		if (i == skip_disk_idx)
 +			continue;
-+		if (hmp->raid_failed[i])
++		if (!hammer2_raid6_disk_writable(hmp, i))
 +			continue;
 +		vol = &hmp->volumes[i];
 +		if (vol->dev == NULL || vol->dev->devvp == NULL ||
 +		    !vol->dev->open)
 +			continue;
++
++		if (hmp->raid_failed[i]) {
++			/* rebuilding; its result does not count */
++			(void)hammer2_io_raid6_write_nowait(vol->dev->devvp,
++			    per_disk_off, data, (int)bytes);
++			continue;
++		}
 +
 +		bp = getblk(vol->dev->devvp, per_disk_off, bytes,
 +			    GETBLK_KVABIO, 0);
@@ -7437,6 +8077,7 @@ index 0000000000..9cb1ecf390
 +				aerr = hammer2_raid6_auto_fail_disk(hmp, i);
 +				if (aerr) {
 +					/* triple-failure or already-fatal */
++					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +					return aerr;
 +				}
 +				continue;
@@ -7445,6 +8086,7 @@ index 0000000000..9cb1ecf390
 +		ok++;
 +		wrote_any = 1;
 +	}
++	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +
 +	if (skip_disk_idx >= 0)
 +		return ok ? 0 : (last_err ? last_err : EIO);
@@ -7623,7 +8265,7 @@ index 0000000000..5b2576b684
 +
 +#endif /* !_VFS_HAMMER2_RAID6_H_ */
 diff --git a/sys/vfs/hammer2/hammer2_strategy.c b/sys/vfs/hammer2/hammer2_strategy.c
-index 32367cc24c..c37190d0c9 100644
+index 32367cc24c..6a9d0d875e 100644
 --- a/sys/vfs/hammer2/hammer2_strategy.c
 +++ b/sys/vfs/hammer2/hammer2_strategy.c
 @@ -1112,7 +1112,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
@@ -7644,8 +8286,26 @@ index 32367cc24c..c37190d0c9 100644
  		if (error) {
  			hammer2_io_bqrelse(&dio);
  			kprintf("hammer2: WRITE PATH: "
+@@ -1433,6 +1433,8 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
+ 	 */
+ 	if (hammer2_dedup_enable == 0)
+ 		return;
++	if (hammer2_raid6_v3(chain->hmp))
++		return;
+ 	if (dio == NULL) {
+ 		dio = chain->dio;
+ 		if (dio == NULL)
+@@ -1552,6 +1554,8 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
+ 
+ 	if (hammer2_dedup_enable == 0)
+ 		return 0;
++	if (hammer2_raid6_v3(hmp))
++		return 0;
+ 	data = *datap;
+ 	if (data == NULL)
+ 		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467c9d..48fc269cda 100644
+index 98c8467c9d..04c99a5b8b 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -48,6 +48,7 @@
@@ -7732,7 +8392,15 @@ index 98c8467c9d..48fc269cda 100644
  				error = vfs_mountedon(devvp);
  				if (error) {
  					kprintf("hammer2_mount: %s mounted %d\n",
-@@ -1224,7 +1258,174 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1181,6 +1215,7 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+ 		lockinit(&hmp->vollk, "h2vol", 0, 0);
+ 		lockinit(&hmp->bulklk, "h2bulk", 0, 0);
+ 		lockinit(&hmp->bflock, "h2bflk", 0, 0);
++		lockinit(&hmp->rebuild_lk, "h2rbld", 0, 0);
+ 
+ 		/*
+ 		 * vchain setup. vchain.data is embedded.
+@@ -1224,7 +1259,174 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		 * Must use hmp instead of volume header for these two
  		 * in order to handle volume versions transparently.
  		 */
@@ -7891,7 +8559,7 @@ index 98c8467c9d..48fc269cda 100644
 +				      sizeof(hmp->md_extents));
 +			} else {
 +				hammer2_off_t per_disk =
-+				    hmp->volumes[0].size;
++				    hmp->voldata.volu_size;
 +				hammer2_off_t size =
 +				    per_disk * HAMMER2_MD_EXTENT0_PCT / 100;
 +				if (size < HAMMER2_MD_EXTENT0_MIN_SIZE)
@@ -7908,7 +8576,7 @@ index 98c8467c9d..48fc269cda 100644
  			hmp->nvolumes = hmp->voldata.nvolumes;
  			hmp->total_size = hmp->voldata.total_size;
  		} else {
-@@ -1244,6 +1445,46 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1244,6 +1446,46 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		KKASSERT(TAILQ_EMPTY(&devvpl));
  		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
  
@@ -7955,7 +8623,7 @@ index 98c8467c9d..48fc269cda 100644
  		/*
  		 * Really important to get these right or the flush and
  		 * teardown code will get confused.
-@@ -1462,6 +1703,18 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1462,6 +1704,18 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	pmp->ronly = ronly;
  	pmp->hflags = info.hflags;
  	mp->mnt_flag |= MNT_LOCAL;
@@ -7974,7 +8642,42 @@ index 98c8467c9d..48fc269cda 100644
  	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;   /* all entry pts are SMP */
  	mp->mnt_kern_flag |= MNTK_THR_SYNC;     /* new vsyncscan semantics */
  
-@@ -1650,9 +1903,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1580,6 +1834,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+ 	hammer2_volume_t *vol;
+ 	struct vnode *devvp;
+ 	int i, ronly_save, error, result = 0;
++	int recovered = 0;
+ 
+ 	pmp = MPTOPMP(mp);
+ 	ronly_save = pmp->ronly;
+@@ -1593,13 +1848,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+ 
+ 	for (i = 0; i < hmp->nvolumes; ++i) {
+ 		vol = &hmp->volumes[i];
++		/* RAID6: a failed or absent disk is not reopened */
++		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
++		    !vol->dev->open)
++			continue;
+ 		devvp = vol->dev->devvp;
+ 		KKASSERT(devvp);
+ 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+ 		VOP_OPEN(devvp, FREAD | FWRITE, FSCRED, NULL);
+ 		vn_unlock(devvp);
+ 		error = 0;
+-		if (vol->id == HAMMER2_ROOT_VOLUME) {
++		/*
++		 * Run recovery once.  RAID6 has no root volume to wait
++		 * for (disk 0 may be failed), so the first live disk
++		 * does.
++		 */
++		if (!recovered &&
++		    (vol->id == HAMMER2_ROOT_VOLUME ||
++		     hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)) {
++			recovered = 1;
+ 			error = hammer2_recovery(hmp);
+ 			if (error == 0)
+ 				error |= hammer2_fixup_pfses(hmp);
+@@ -1650,9 +1917,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	else
  		flags = 0;
  	if (pmp->iroot) {
@@ -7998,7 +8701,7 @@ index 98c8467c9d..48fc269cda 100644
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
-@@ -1777,6 +2044,14 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+@@ -1777,6 +2058,14 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
  	hammer2_iocom_uninit(hmp);
  
  	hammer2_bulkfree_uninit(hmp);
@@ -8013,7 +8716,7 @@ index 98c8467c9d..48fc269cda 100644
  	hammer2_pfsfree_scan(hmp, 0);
  
  	/*
-@@ -1896,6 +2171,18 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+@@ -1896,6 +2185,18 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
  	kmalloc_destroy_obj(&hmp->mchain);
  	kmalloc_destroy_obj(&hmp->mio);
  	kmalloc_destroy(&hmp->mmsg);
@@ -8032,3 +8735,81 @@ index 98c8467c9d..48fc269cda 100644
  	kfree(hmp, M_HAMMER2);
  }
  
+@@ -2040,6 +2341,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+ 	hammer2_dev_t *hmp;
+ 	hammer2_blockref_t bref;
+ 	struct statfs tmp;
++	hammer2_off_t space_total;
++	hammer2_off_t space_free;
++	hammer2_off_t space_rsv;
+ 	int i;
+ 
+ 	/*
+@@ -2060,17 +2364,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+ 
+ 		tmp.f_files = bref.embed.stats.inode_count;
+ 		tmp.f_ffree = 0;
+-		tmp.f_blocks = hmp->voldata.allocator_size /
+-			       mp->mnt_vstat.f_bsize;
+-		tmp.f_bfree = hmp->voldata.allocator_free /
+-			      mp->mnt_vstat.f_bsize;
++		if (hammer2_raid6_v3(hmp)) {
++			hammer2_raid6_space(hmp, &space_total, &space_free);
++			space_rsv = space_total / 20;
++		} else {
++			space_total = hmp->voldata.allocator_size;
++			space_free = hmp->voldata.allocator_free;
++			space_rsv = hmp->free_reserved;
++		}
++		tmp.f_blocks = space_total / mp->mnt_vstat.f_bsize;
++		tmp.f_bfree = space_free / mp->mnt_vstat.f_bsize;
+ 		tmp.f_bavail = tmp.f_bfree;
+ 
+ 		if (cred && cred->cr_uid != 0) {
+ 			uint64_t adj;
+ 
+ 			/* 5% */
+-			adj = hmp->free_reserved / mp->mnt_vstat.f_bsize;
++			adj = space_rsv / mp->mnt_vstat.f_bsize;
+ 			tmp.f_blocks -= adj;
+ 			tmp.f_bfree -= adj;
+ 			tmp.f_bavail -= adj;
+@@ -2095,6 +2405,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+ 	hammer2_dev_t *hmp;
+ 	hammer2_blockref_t bref;
+ 	struct statvfs tmp;
++	hammer2_off_t space_total;
++	hammer2_off_t space_free;
++	hammer2_off_t space_rsv;
+ 	int i;
+ 
+ 	/*
+@@ -2114,17 +2427,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+ 
+ 		tmp.f_files = bref.embed.stats.inode_count;
+ 		tmp.f_ffree = 0;
+-		tmp.f_blocks = hmp->voldata.allocator_size /
+-			       mp->mnt_vstat.f_bsize;
+-		tmp.f_bfree = hmp->voldata.allocator_free /
+-			      mp->mnt_vstat.f_bsize;
++		if (hammer2_raid6_v3(hmp)) {
++			hammer2_raid6_space(hmp, &space_total, &space_free);
++			space_rsv = space_total / 20;
++		} else {
++			space_total = hmp->voldata.allocator_size;
++			space_free = hmp->voldata.allocator_free;
++			space_rsv = hmp->free_reserved;
++		}
++		tmp.f_blocks = space_total / mp->mnt_vstat.f_bsize;
++		tmp.f_bfree = space_free / mp->mnt_vstat.f_bsize;
+ 		tmp.f_bavail = tmp.f_bfree;
+ 
+ 		if (cred && cred->cr_uid != 0) {
+ 			uint64_t adj;
+ 
+ 			/* 5% */
+-			adj = hmp->free_reserved / mp->mnt_vstat.f_bsize;
++			adj = space_rsv / mp->mnt_vstat.f_bsize;
+ 			tmp.f_blocks -= adj;
+ 			tmp.f_bfree -= adj;
+ 			tmp.f_bavail -= adj;
