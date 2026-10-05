@@ -1279,7 +1279,7 @@ index 9c5abb19e3..346ffb5fee 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729d5d..e651847309 100644
+index a29c729d5d..a95ea645ff 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -279,10 +279,10 @@ struct hammer2_io {
@@ -1543,7 +1543,7 @@ index a29c729d5d..e651847309 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1954,6 +2128,161 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -1954,6 +2128,163 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  			int *rootvolzone,
  			struct vnode **rootvoldevvp);
  hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
@@ -1569,6 +1569,8 @@ index a29c729d5d..e651847309 100644
 +		int faila, void **ptrs);
 +void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 +		int faila, int failb, void **ptrs);
++int hammer2_bwrite_start(struct buf *bp);
++int hammer2_bwrite_wait(struct buf *bp);
 +int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 +		hammer2_off_t per_disk_off, void *data, size_t bytes);
 +int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
@@ -2426,7 +2428,7 @@ index 7bd08e7017..2c0f5bc0b2 100644
  #define HAMMER2_NUM_VOLHDRS		4
  
 diff --git a/sys/vfs/hammer2/hammer2_flush.c b/sys/vfs/hammer2/hammer2_flush.c
-index 21134ab4e4..ba438b5dad 100644
+index 21134ab4e4..d6e8779e02 100644
 --- a/sys/vfs/hammer2/hammer2_flush.c
 +++ b/sys/vfs/hammer2/hammer2_flush.c
 @@ -818,6 +818,17 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
@@ -2447,7 +2449,41 @@ index 21134ab4e4..ba438b5dad 100644
  			/*
  			 * The volume header is flushed manually by the
  			 * syncer, not here.  All we do here is adjust the
-@@ -1301,7 +1312,9 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1275,6 +1286,33 @@ hammer2_flush_recurse(hammer2_chain_t *child, void *data)
+ 	return (0);
+ }
+ 
++/*
++ * Does devvp hold a dirty buffer whose last write failed?  An unlocked
++ * peek at b_flags; a stale answer only puts the failure off to the next
++ * sync.
++ */
++static int
++hammer2_devvp_write_errors_cb(struct buf *bp, void *data)
++{
++	if (bp->b_flags & B_ERROR) {
++		*(int *)data = 1;
++		return -1;
++	}
++	return 0;
++}
++
++static int
++hammer2_devvp_write_errors(struct vnode *devvp)
++{
++	int found = 0;
++
++	lwkt_gettoken(&devvp->v_token);
++	RB_SCAN(buf_rb_tree, &devvp->v_rbdirty_tree, NULL,
++		hammer2_devvp_write_errors_cb, &found);
++	lwkt_reltoken(&devvp->v_token);
++	return found;
++}
++
+ /*
+  * flush helper (backend threaded)
+  *
+@@ -1301,7 +1339,9 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  	int flush_error = 0;
  	int fsync_error = 0;
  	int total_error = 0;
@@ -2457,7 +2493,7 @@ index 21134ab4e4..ba438b5dad 100644
  	int xflags;
  	int ispfsroot = 0;
  
-@@ -1453,6 +1466,16 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1453,6 +1493,16 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  	hammer2_chain_unlock(&hmp->vchain);
  	hammer2_chain_drop(&hmp->vchain);
  
@@ -2474,7 +2510,7 @@ index 21134ab4e4..ba438b5dad 100644
  	/*
  	 * We can't safely flush the volume header until we have
  	 * flushed any device buffers which have built up.
-@@ -1462,13 +1485,40 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1462,13 +1512,70 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  	TAILQ_FOREACH(e, &hmp->devvpl, entry) {
  		devvp = e->devvp;
  		KKASSERT(devvp);
@@ -2484,6 +2520,43 @@ index 21134ab4e4..ba438b5dad 100644
 +		 */
 +		if (!e->open)
 +			continue;
++		di = -1;
++		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
++			for (di = 0; di < hmp->nvolumes; di++) {
++				if (hmp->volumes[di].dev == e)
++					break;
++			}
++			if (di == hmp->nvolumes)
++				di = -1;
++		}
++
++		/*
++		 * A RAID6 member's data columns are delayed writes, and a
++		 * failed async write only re-dirties its buffer (B_ERROR)
++		 * for the buf daemon to retry, forever if the disk was
++		 * pulled.  Fail such a member now, without first waiting
++		 * for VOP_FSYNC's passes to give up, and drop the dirty
++		 * buffers of a failed member that is not being rebuilt:
++		 * its columns are rewritten by the resilver.
++		 */
++		if (di >= 0 && !hmp->raid_failed[di] &&
++		    hammer2_devvp_write_errors(devvp)) {
++			kprintf("hammer2: RAID6 disk %d: async write failed\n",
++				di);
++			error = hammer2_raid6_write_failed(hmp, di, EIO);
++			if (error) {
++				if (fsync_error == 0)
++					fsync_error = error;
++				continue;
++			}
++		}
++		if (di >= 0 && !hammer2_raid6_disk_writable(hmp, di)) {
++			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
++			vinvalbuf(devvp, 0, 0, 0);
++			vn_unlock(devvp);
++			continue;
++		}
++
  		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
 -		fsync_error = VOP_FSYNC(devvp, MNT_WAIT, 0);
 +		error = VOP_FSYNC(devvp, MNT_WAIT, 0);
@@ -2493,7 +2566,7 @@ index 21134ab4e4..ba438b5dad 100644
  			kprintf("hammer2: sync error fsync=%d h2flush=0x%04x dev=%s\n",
 -				fsync_error, flush_error, e->path);
 +				error, flush_error, e->path);
-+		}
+ 		}
 +		if (error == 0)
 +			continue;
 +
@@ -2504,21 +2577,14 @@ index 21134ab4e4..ba438b5dad 100644
 +		 * instead, so the headers still go to the healthy members;
 +		 * only a failure beyond redundancy blocks them.
 +		 */
-+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-+			for (di = 0; di < hmp->nvolumes; di++) {
-+				if (hmp->volumes[di].dev == e)
-+					break;
-+			}
-+			if (di < hmp->nvolumes)
-+				error = hammer2_raid6_write_failed(hmp, di,
-+								   error);
- 		}
++		if (di >= 0)
++			error = hammer2_raid6_write_failed(hmp, di, error);
 +		if (error && fsync_error == 0)
 +			fsync_error = error;
  	}
  
  	/*
-@@ -1480,26 +1530,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1480,26 +1587,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  	if (fsync_error == 0 && flush_error == 0 &&
  	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
  		struct buf *bp;
@@ -2557,7 +2623,7 @@ index 21134ab4e4..ba438b5dad 100644
  		 */
  		j = hmp->volhdrno + 1;
  		if (j < 0)
-@@ -1515,16 +1563,131 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1515,16 +1620,131 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  			kprintf("sync volhdr %d %jd\n",
  				j, (intmax_t)hmp->volsync.volu_size);
  		}
@@ -5724,7 +5790,7 @@ index 20e92bb308..7071fda67e 100644
  
  #endif /* !_VFS_HAMMER2_IOCTL_H_ */
 diff --git a/sys/vfs/hammer2/hammer2_ondisk.c b/sys/vfs/hammer2/hammer2_ondisk.c
-index 85a9d08a51..bc35e601df 100644
+index 85a9d08a51..e5f78f4c38 100644
 --- a/sys/vfs/hammer2/hammer2_ondisk.c
 +++ b/sys/vfs/hammer2/hammer2_ondisk.c
 @@ -46,6 +46,10 @@
@@ -6386,7 +6452,7 @@ index 85a9d08a51..bc35e601df 100644
  done:
  	if (!error) {
  		if (!rootvoldata->version) {
-@@ -738,3 +1235,1331 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
+@@ -738,3 +1235,1345 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
  
  	return ret;
  }
@@ -6910,7 +6976,10 @@ index 85a9d08a51..bc35e601df 100644
 +		     int ncols, size_t bytes)
 +{
 +	void *zbuf = NULL;
++	struct buf *zbps[HAMMER2_MAX_VOLUMES];
 +	int ndisks = hmp->raid_config.ndisks;
++	int nz = 0;
++	int zdisk[HAMMER2_MAX_VOLUMES];
 +	int d, i;
 +
 +	/*
@@ -6937,7 +7006,9 @@ index 85a9d08a51..bc35e601df 100644
 +		 * for the *written* columns.  Only fires for data disks NOT
 +		 * in alloc_mask — disks that are reserved but whose chain
 +		 * has not yet putblk'd will receive their bytes through the
-+		 * chain's own bp.bdwrite path.
++		 * chain's own bp.bdwrite path.  They are written in
++		 * parallel with each other and with P/Q, and waited for
++		 * before the seal returns.
 +		 */
 +		for (d = 0; d < ndisks; d++) {
 +			struct buf *zbp;
@@ -6972,9 +7043,10 @@ index 85a9d08a51..bc35e601df 100644
 +			bkvasync(zbp);
 +			bzero(zbp->b_data, bytes);
 +			/* a column left non-zero makes P/Q wrong for it */
-+			werr = bwrite(zbp);
-+			if (werr)
-+				hammer2_raid6_write_failed(hmp, d, werr);
++			if (hammer2_bwrite_start(zbp)) {
++				zdisk[nz] = d;
++				zbps[nz++] = zbp;
++			}
 +		}
 +
 +		/*
@@ -7007,6 +7079,14 @@ index 85a9d08a51..bc35e601df 100644
 +		 */
 +		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 +						 ncols, bytes);
++
++		for (i = 0; i < nz; i++) {
++			int werr = hammer2_bwrite_wait(zbps[i]);
++
++			if (werr)
++				hammer2_raid6_write_failed(hmp, zdisk[i],
++							   werr);
++		}
 +	}
 +	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 +	if (zbuf)
@@ -7720,10 +7800,10 @@ index 85a9d08a51..bc35e601df 100644
 +}
 diff --git a/sys/vfs/hammer2/hammer2_raid6.c b/sys/vfs/hammer2/hammer2_raid6.c
 new file mode 100644
-index 0000000000..5563f6d5e3
+index 0000000000..9f40e2c4ea
 --- /dev/null
 +++ b/sys/vfs/hammer2/hammer2_raid6.c
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,714 @@
 +/*
 + * Copyright (c) 2024 The DragonFly Project.  All rights reserved.
 + *
@@ -8075,6 +8155,42 @@ index 0000000000..5563f6d5e3
 +}
 +
 +/*
++ * bwrite() in two halves, so that the writes of a row's P and Q columns,
++ * or of a metadata block's mirror copies, are all in flight at once
++ * instead of one disk after another.  The buffers stay in the buffer
++ * cache (other readers of those device offsets see the new data).
++ * Returns 0 if the buffer was B_INVAL and released without a write.
++ */
++int
++hammer2_bwrite_start(struct buf *bp)
++{
++	if (bp->b_flags & B_INVAL) {
++		brelse(bp);
++		return 0;
++	}
++	bp->b_flags &= ~(B_ERROR | B_EINTR);
++	bp->b_flags |= B_CACHE;
++	bp->b_cmd = BUF_CMD_WRITE;
++	bp->b_error = 0;
++	bp->b_bio1.bio_done = biodone_sync;
++	bp->b_bio1.bio_flags |= BIO_SYNC;
++	vfs_busy_pages(bp->b_vp, bp);
++	bsetrunningbufspace(bp, bp->b_bufsize);
++	vn_strategy(bp->b_vp, &bp->b_bio1);
++	return 1;
++}
++
++int
++hammer2_bwrite_wait(struct buf *bp)
++{
++	int error;
++
++	error = biowait(&bp->b_bio1, "h2bww");
++	brelse(bp);
++	return error;
++}
++
++/*
 + * RAIDZ2-native (v3) parity write: compute P and Q from scratch over a
 + * row of data columns and write all parity columns.
 + *
@@ -8200,18 +8316,11 @@ index 0000000000..5563f6d5e3
 +		}
 +	}
 +
-+	if (pbp) {
-+		int e = bwrite(pbp);
-+		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
-+		    !error)
-+			error = e;
-+	}
-+	if (qbp) {
-+		int e = bwrite(qbp);
-+		if (e && (e = hammer2_raid6_write_failed(hmp, q_disk, e)) &&
-+		    !error)
-+			error = e;
-+	}
++	/* P and Q go out together; the rebuild-target copies below too. */
++	if (pbp && !hammer2_bwrite_start(pbp))
++		pbp = NULL;
++	if (qbp && !hammer2_bwrite_start(qbp))
++		qbp = NULL;
 +	if (p_mem) {
 +		int e = hammer2_io_raid6_write_nowait(
 +		    hmp->volumes[p_disk].dev->devvp, phys_off,
@@ -8227,6 +8336,18 @@ index 0000000000..5563f6d5e3
 +		if (e)
 +			hammer2_raid6_write_failed(hmp, q_disk, e);
 +		kfree(q_mem, M_HAMMER2);
++	}
++	if (pbp) {
++		int e = hammer2_bwrite_wait(pbp);
++		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
++		    !error)
++			error = e;
++	}
++	if (qbp) {
++		int e = hammer2_bwrite_wait(qbp);
++		if (e && (e = hammer2_raid6_write_failed(hmp, q_disk, e)) &&
++		    !error)
++			error = e;
 +	}
 +
 +	return error;
@@ -8260,9 +8381,10 @@ index 0000000000..5563f6d5e3
 + * already issued the primary bdwrite/bwrite to it through the buffer
 + * cache).  Pass -1 to mirror to every healthy disk.
 + *
-+ * A disk being rebuilt gets the copy too, written without waiting on
-+ * its buffers, under rebuild_lk so the resilver's metadata copy does
-+ * not overwrite it with an older one.
++ * The copies are written in parallel: every healthy disk's write is
++ * started, then all are waited for.  A disk being rebuilt gets the copy
++ * too, written without waiting on its buffers, under rebuild_lk so the
++ * resilver's metadata copy does not overwrite it with an older one.
 + *
 + * Returns 0 if at least one disk write succeeded; EIO if every other
 + * disk was either failed or had an I/O error.
@@ -8274,16 +8396,19 @@ index 0000000000..5563f6d5e3
 +{
 +	hammer2_volume_t *vol;
 +	struct buf *bp;
++	struct buf *bps[HAMMER2_MAX_VOLUMES];
 +	int i;
 +	int ok = 0;
 +	int last_err = 0;
 +	int wrote_any = 0;
++	int fatal = 0;
 +
 +	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 +	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 +
 +	lockmgr(&hmp->rebuild_lk, LK_SHARED);
 +	for (i = 0; i < hmp->raid_config.ndisks; i++) {
++		bps[i] = NULL;
 +		if (i == skip_disk_idx)
 +			continue;
 +		if (!hammer2_raid6_disk_writable(hmp, i))
@@ -8310,24 +8435,34 @@ index 0000000000..5563f6d5e3
 +		}
 +		bkvasync(bp);
 +		bcopy(data, bp->b_data, bytes);
-+		{
-+			int e = bwrite(bp);
-+			if (e) {
-+				int aerr;
-+				last_err = e;
-+				aerr = hammer2_raid6_auto_fail_disk(hmp, i);
-+				if (aerr) {
-+					/* triple-failure or already-fatal */
-+					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-+					return aerr;
-+				}
-+				continue;
-+			}
++		if (hammer2_bwrite_start(bp)) {
++			bps[i] = bp;
++		} else {
++			ok++;		/* B_INVAL: as bwrite() */
++			wrote_any = 1;
++		}
++	}
++	for (i = 0; i < hmp->raid_config.ndisks; i++) {
++		int e;
++
++		if (bps[i] == NULL)
++			continue;
++		e = hammer2_bwrite_wait(bps[i]);
++		if (e) {
++			int aerr;
++
++			last_err = e;
++			aerr = hammer2_raid6_auto_fail_disk(hmp, i);
++			if (aerr && !fatal)
++				fatal = aerr;	/* triple-failure */
++			continue;
 +		}
 +		ok++;
 +		wrote_any = 1;
 +	}
 +	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
++	if (fatal)
++		return fatal;
 +
 +	if (skip_disk_idx >= 0)
 +		return ok ? 0 : (last_err ? last_err : EIO);

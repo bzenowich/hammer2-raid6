@@ -1755,7 +1755,10 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		     int ncols, size_t bytes)
 {
 	void *zbuf = NULL;
+	struct buf *zbps[HAMMER2_MAX_VOLUMES];
 	int ndisks = hmp->raid_config.ndisks;
+	int nz = 0;
+	int zdisk[HAMMER2_MAX_VOLUMES];
 	int d, i;
 
 	/*
@@ -1782,7 +1785,9 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		 * for the *written* columns.  Only fires for data disks NOT
 		 * in alloc_mask — disks that are reserved but whose chain
 		 * has not yet putblk'd will receive their bytes through the
-		 * chain's own bp.bdwrite path.
+		 * chain's own bp.bdwrite path.  They are written in
+		 * parallel with each other and with P/Q, and waited for
+		 * before the seal returns.
 		 */
 		for (d = 0; d < ndisks; d++) {
 			struct buf *zbp;
@@ -1817,9 +1822,10 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			bkvasync(zbp);
 			bzero(zbp->b_data, bytes);
 			/* a column left non-zero makes P/Q wrong for it */
-			werr = bwrite(zbp);
-			if (werr)
-				hammer2_raid6_write_failed(hmp, d, werr);
+			if (hammer2_bwrite_start(zbp)) {
+				zdisk[nz] = d;
+				zbps[nz++] = zbp;
+			}
 		}
 
 		/*
@@ -1852,6 +1858,14 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		 */
 		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 						 ncols, bytes);
+
+		for (i = 0; i < nz; i++) {
+			int werr = hammer2_bwrite_wait(zbps[i]);
+
+			if (werr)
+				hammer2_raid6_write_failed(hmp, zdisk[i],
+							   werr);
+		}
 	}
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 	if (zbuf)

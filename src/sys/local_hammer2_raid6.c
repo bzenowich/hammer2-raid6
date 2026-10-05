@@ -349,6 +349,42 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 }
 
 /*
+ * bwrite() in two halves, so that the writes of a row's P and Q columns,
+ * or of a metadata block's mirror copies, are all in flight at once
+ * instead of one disk after another.  The buffers stay in the buffer
+ * cache (other readers of those device offsets see the new data).
+ * Returns 0 if the buffer was B_INVAL and released without a write.
+ */
+int
+hammer2_bwrite_start(struct buf *bp)
+{
+	if (bp->b_flags & B_INVAL) {
+		brelse(bp);
+		return 0;
+	}
+	bp->b_flags &= ~(B_ERROR | B_EINTR);
+	bp->b_flags |= B_CACHE;
+	bp->b_cmd = BUF_CMD_WRITE;
+	bp->b_error = 0;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vfs_busy_pages(bp->b_vp, bp);
+	bsetrunningbufspace(bp, bp->b_bufsize);
+	vn_strategy(bp->b_vp, &bp->b_bio1);
+	return 1;
+}
+
+int
+hammer2_bwrite_wait(struct buf *bp)
+{
+	int error;
+
+	error = biowait(&bp->b_bio1, "h2bww");
+	brelse(bp);
+	return error;
+}
+
+/*
  * RAIDZ2-native (v3) parity write: compute P and Q from scratch over a
  * row of data columns and write all parity columns.
  *
@@ -474,18 +510,11 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		}
 	}
 
-	if (pbp) {
-		int e = bwrite(pbp);
-		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
-		    !error)
-			error = e;
-	}
-	if (qbp) {
-		int e = bwrite(qbp);
-		if (e && (e = hammer2_raid6_write_failed(hmp, q_disk, e)) &&
-		    !error)
-			error = e;
-	}
+	/* P and Q go out together; the rebuild-target copies below too. */
+	if (pbp && !hammer2_bwrite_start(pbp))
+		pbp = NULL;
+	if (qbp && !hammer2_bwrite_start(qbp))
+		qbp = NULL;
 	if (p_mem) {
 		int e = hammer2_io_raid6_write_nowait(
 		    hmp->volumes[p_disk].dev->devvp, phys_off,
@@ -501,6 +530,18 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		if (e)
 			hammer2_raid6_write_failed(hmp, q_disk, e);
 		kfree(q_mem, M_HAMMER2);
+	}
+	if (pbp) {
+		int e = hammer2_bwrite_wait(pbp);
+		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
+		    !error)
+			error = e;
+	}
+	if (qbp) {
+		int e = hammer2_bwrite_wait(qbp);
+		if (e && (e = hammer2_raid6_write_failed(hmp, q_disk, e)) &&
+		    !error)
+			error = e;
 	}
 
 	return error;
@@ -534,9 +575,10 @@ hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
  * already issued the primary bdwrite/bwrite to it through the buffer
  * cache).  Pass -1 to mirror to every healthy disk.
  *
- * A disk being rebuilt gets the copy too, written without waiting on
- * its buffers, under rebuild_lk so the resilver's metadata copy does
- * not overwrite it with an older one.
+ * The copies are written in parallel: every healthy disk's write is
+ * started, then all are waited for.  A disk being rebuilt gets the copy
+ * too, written without waiting on its buffers, under rebuild_lk so the
+ * resilver's metadata copy does not overwrite it with an older one.
  *
  * Returns 0 if at least one disk write succeeded; EIO if every other
  * disk was either failed or had an I/O error.
@@ -548,16 +590,19 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 {
 	hammer2_volume_t *vol;
 	struct buf *bp;
+	struct buf *bps[HAMMER2_MAX_VOLUMES];
 	int i;
 	int ok = 0;
 	int last_err = 0;
 	int wrote_any = 0;
+	int fatal = 0;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 
 	lockmgr(&hmp->rebuild_lk, LK_SHARED);
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+		bps[i] = NULL;
 		if (i == skip_disk_idx)
 			continue;
 		if (!hammer2_raid6_disk_writable(hmp, i))
@@ -584,24 +629,34 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		}
 		bkvasync(bp);
 		bcopy(data, bp->b_data, bytes);
-		{
-			int e = bwrite(bp);
-			if (e) {
-				int aerr;
-				last_err = e;
-				aerr = hammer2_raid6_auto_fail_disk(hmp, i);
-				if (aerr) {
-					/* triple-failure or already-fatal */
-					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-					return aerr;
-				}
-				continue;
-			}
+		if (hammer2_bwrite_start(bp)) {
+			bps[i] = bp;
+		} else {
+			ok++;		/* B_INVAL: as bwrite() */
+			wrote_any = 1;
+		}
+	}
+	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+		int e;
+
+		if (bps[i] == NULL)
+			continue;
+		e = hammer2_bwrite_wait(bps[i]);
+		if (e) {
+			int aerr;
+
+			last_err = e;
+			aerr = hammer2_raid6_auto_fail_disk(hmp, i);
+			if (aerr && !fatal)
+				fatal = aerr;	/* triple-failure */
+			continue;
 		}
 		ok++;
 		wrote_any = 1;
 	}
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	if (fatal)
+		return fatal;
 
 	if (skip_disk_idx >= 0)
 		return ok ? 0 : (last_err ? last_err : EIO);

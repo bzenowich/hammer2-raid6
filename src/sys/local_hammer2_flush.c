@@ -1287,6 +1287,33 @@ done:
 }
 
 /*
+ * Does devvp hold a dirty buffer whose last write failed?  An unlocked
+ * peek at b_flags; a stale answer only puts the failure off to the next
+ * sync.
+ */
+static int
+hammer2_devvp_write_errors_cb(struct buf *bp, void *data)
+{
+	if (bp->b_flags & B_ERROR) {
+		*(int *)data = 1;
+		return -1;
+	}
+	return 0;
+}
+
+static int
+hammer2_devvp_write_errors(struct vnode *devvp)
+{
+	int found = 0;
+
+	lwkt_gettoken(&devvp->v_token);
+	RB_SCAN(buf_rb_tree, &devvp->v_rbdirty_tree, NULL,
+		hammer2_devvp_write_errors_cb, &found);
+	lwkt_reltoken(&devvp->v_token);
+	return found;
+}
+
+/*
  * flush helper (backend threaded)
  *
  * Flushes chain topology for the specified inode.
@@ -1491,6 +1518,43 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 */
 		if (!e->open)
 			continue;
+		di = -1;
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+			for (di = 0; di < hmp->nvolumes; di++) {
+				if (hmp->volumes[di].dev == e)
+					break;
+			}
+			if (di == hmp->nvolumes)
+				di = -1;
+		}
+
+		/*
+		 * A RAID6 member's data columns are delayed writes, and a
+		 * failed async write only re-dirties its buffer (B_ERROR)
+		 * for the buf daemon to retry, forever if the disk was
+		 * pulled.  Fail such a member now, without first waiting
+		 * for VOP_FSYNC's passes to give up, and drop the dirty
+		 * buffers of a failed member that is not being rebuilt:
+		 * its columns are rewritten by the resilver.
+		 */
+		if (di >= 0 && !hmp->raid_failed[di] &&
+		    hammer2_devvp_write_errors(devvp)) {
+			kprintf("hammer2: RAID6 disk %d: async write failed\n",
+				di);
+			error = hammer2_raid6_write_failed(hmp, di, EIO);
+			if (error) {
+				if (fsync_error == 0)
+					fsync_error = error;
+				continue;
+			}
+		}
+		if (di >= 0 && !hammer2_raid6_disk_writable(hmp, di)) {
+			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+			vinvalbuf(devvp, 0, 0, 0);
+			vn_unlock(devvp);
+			continue;
+		}
+
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
 		error = VOP_FSYNC(devvp, MNT_WAIT, 0);
 		vn_unlock(devvp);
@@ -1508,15 +1572,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * instead, so the headers still go to the healthy members;
 		 * only a failure beyond redundancy blocks them.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-			for (di = 0; di < hmp->nvolumes; di++) {
-				if (hmp->volumes[di].dev == e)
-					break;
-			}
-			if (di < hmp->nvolumes)
-				error = hammer2_raid6_write_failed(hmp, di,
-								   error);
-		}
+		if (di >= 0)
+			error = hammer2_raid6_write_failed(hmp, di, error);
 		if (error && fsync_error == 0)
 			fsync_error = error;
 	}
