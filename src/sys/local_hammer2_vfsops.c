@@ -47,8 +47,14 @@
 #include <sys/lock.h>
 #include <sys/file.h>
 
+#include <sys/diskslice.h>
+
 #include "hammer2.h"
 #include "hammer2_raid6.h"
+
+#ifndef DIOCGFLUSHCAP
+#define	DIOCGFLUSHCAP		_IOR('d', 137, int)	/* 0: flushes dropped */
+#endif
 
 TAILQ_HEAD(hammer2_mntlist, hammer2_dev);
 static struct hammer2_mntlist hammer2_mntlist;
@@ -918,6 +924,55 @@ again:
 }
 
 /*
+ * Warn about members whose cache flushes do not reach the media.
+ *
+ * Every volume header write is preceded by a BUF_CMD_FLUSH that makes
+ * the blocks it references durable.  A disk driver that drops flushes
+ * (da with DA_Q_NO_SYNC_CACHE, e.g. a USB bridge that rejects
+ * SYNCHRONIZE CACHE) completes them without effect, so a power loss can
+ * leave a durable header pointing at blocks still in the drive cache.
+ * da learns that from the first rejected flush, so send one to each
+ * member before asking with DIOCGFLUSHCAP.  Drivers without the ioctl
+ * are assumed to flush.
+ */
+static void
+hammer2_check_flush_capability(hammer2_devvp_list_t *devvpl)
+{
+	hammer2_devvp_t *e;
+	struct buf *bp;
+	int cap;
+	int bad = 0;
+
+	TAILQ_FOREACH(e, devvpl, entry) {
+		if (!e->open || e->devvp == NULL)
+			continue;
+		bp = getpbuf(NULL);
+		bp->b_bio1.bio_offset = 0;
+		bp->b_bufsize = 0;
+		bp->b_bcount = 0;
+		bp->b_cmd = BUF_CMD_FLUSH;
+		bp->b_bio1.bio_done = biodone_sync;
+		bp->b_bio1.bio_flags |= BIO_SYNC;
+		vn_strategy(e->devvp, &bp->b_bio1);
+		if (biowait(&bp->b_bio1, "h2fcap"))
+			kprintf("hammer2: %s: cache flush failed\n", e->path);
+		relpbuf(bp, NULL);
+
+		if (VOP_IOCTL(e->devvp, DIOCGFLUSHCAP, (void *)&cap, 0,
+			      curthread->td_ucred, NULL) == 0 && cap == 0) {
+			kprintf("hammer2: WARNING: %s cannot flush its write "
+				"cache\n", e->path);
+			++bad;
+		}
+	}
+	if (bad) {
+		kprintf("hammer2: WARNING: %d device(s) drop cache flushes; "
+			"a power loss can lose or corrupt recently written "
+			"data on them\n", bad);
+	}
+}
+
+/*
  * Mount or remount HAMMER2 fileystem from physical media
  *
  *	mountroot
@@ -1199,6 +1254,9 @@ next_hmp:
 			hammer2_vfs_unmount(mp, MNT_FORCE);
 			return EINVAL;
 		}
+
+		if (!ronly)
+			hammer2_check_flush_capability(&devvpl);
 
 		ksnprintf(hmp->devrepname, sizeof(hmp->devrepname), "%s", devstr);
 		hmp->ronly = ronly;
