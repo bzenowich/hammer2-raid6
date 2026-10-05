@@ -371,7 +371,9 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  * outran completions).  Async P/Q is a follow-up perf task gated on
  * runningbufspace throttling.
  *
- * Returns 0 on success, EIO on I/O error.
+ * A failed P or Q write goes to hammer2_raid6_write_failed(), which
+ * auto-fails that member.  Returns 0 if the row is written or degraded
+ * within redundancy, ENXIO if a failure exceeded it.
  */
 int
 hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
@@ -474,28 +476,30 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 
 	if (pbp) {
 		int e = bwrite(pbp);
-		if (e && !error)
+		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
+		    !error)
 			error = e;
 	}
 	if (qbp) {
 		int e = bwrite(qbp);
-		if (e && !error)
+		if (e && (e = hammer2_raid6_write_failed(hmp, q_disk, e)) &&
+		    !error)
 			error = e;
 	}
 	if (p_mem) {
 		int e = hammer2_io_raid6_write_nowait(
 		    hmp->volumes[p_disk].dev->devvp, phys_off,
 		    p_mem, (int)stripe_unit);
-		if (e && !error)
-			error = e;
+		if (e)
+			hammer2_raid6_write_failed(hmp, p_disk, e);
 		kfree(p_mem, M_HAMMER2);
 	}
 	if (q_mem) {
 		int e = hammer2_io_raid6_write_nowait(
 		    hmp->volumes[q_disk].dev->devvp, phys_off,
 		    q_mem, (int)stripe_unit);
-		if (e && !error)
-			error = e;
+		if (e)
+			hammer2_raid6_write_failed(hmp, q_disk, e);
 		kfree(q_mem, M_HAMMER2);
 	}
 
@@ -564,9 +568,11 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 			continue;
 
 		if (hmp->raid_failed[i]) {
-			/* rebuilding; its result does not count */
-			(void)hammer2_io_raid6_write_nowait(vol->dev->devvp,
+			/* rebuilding; its result does not count here */
+			int e = hammer2_io_raid6_write_nowait(vol->dev->devvp,
 			    per_disk_off, data, (int)bytes);
+			if (e)
+				hammer2_raid6_write_failed(hmp, i, e);
 			continue;
 		}
 

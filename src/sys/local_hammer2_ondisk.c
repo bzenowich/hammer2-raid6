@@ -1802,9 +1802,12 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 				if (zbuf == NULL)
 					zbuf = kmalloc(bytes, M_HAMMER2,
 						       M_WAITOK | M_ZERO);
-				(void)hammer2_io_raid6_write_nowait(
+				werr = hammer2_io_raid6_write_nowait(
 				    hmp->volumes[d].dev->devvp, phys_off,
 				    zbuf, (int)bytes);
+				if (werr)
+					hammer2_raid6_write_failed(hmp, d,
+								   werr);
 				continue;
 			}
 			zbp = getblk(hmp->volumes[d].dev->devvp, phys_off,
@@ -1813,8 +1816,10 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 				continue;
 			bkvasync(zbp);
 			bzero(zbp->b_data, bytes);
+			/* a column left non-zero makes P/Q wrong for it */
 			werr = bwrite(zbp);
-			(void)werr;
+			if (werr)
+				hammer2_raid6_write_failed(hmp, d, werr);
 		}
 
 		/*
@@ -1823,6 +1828,8 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		 * or it came back online since the putblk.
 		 */
 		for (i = 0; i < ncols; i++) {
+			int werr;
+
 			d = cols[i].disk_idx;
 			if ((dropped & (1U << d)) == 0)
 				continue;
@@ -1831,11 +1838,18 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			if (hmp->volumes[d].dev == NULL ||
 			    hmp->volumes[d].dev->devvp == NULL)
 				continue;
-			(void)hammer2_io_raid6_write_nowait(
+			werr = hammer2_io_raid6_write_nowait(
 			    hmp->volumes[d].dev->devvp, phys_off,
 			    cols[i].data, (int)bytes);
+			if (werr)
+				hammer2_raid6_write_failed(hmp, d, werr);
 		}
 
+		/*
+		 * write_row auto-fails a member whose P/Q write fails; an
+		 * error back means redundancy is exhausted, which
+		 * auto_fail_disk has already reported.
+		 */
 		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
 						 ncols, bytes);
 	}

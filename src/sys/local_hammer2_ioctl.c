@@ -1612,6 +1612,7 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	dev->open = 1;
 	hammer2_io_retarget_disk(hmp, failed_disk_idx, new_devvp);
 	hmp->rebuild_disk = failed_disk_idx;
+	hmp->rebuild_werror = 0;
 	hmp->rebuild_active = 1;
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 
@@ -1623,6 +1624,9 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 
 	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
 	hmp->rebuild_active = 0;
+	/* writers hold rebuild_lk shared, so rebuild_werror is final */
+	if (error == 0 && hmp->rebuild_werror)
+		error = hmp->rebuild_werror;
 	if (hmp->rebuild_done) {
 		kfree(hmp->rebuild_done, M_HAMMER2);
 		hmp->rebuild_done = NULL;

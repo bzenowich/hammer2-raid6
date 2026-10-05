@@ -1285,6 +1285,7 @@ struct hammer2_dev {
 	struct lock	rebuild_lk;
 	volatile int	rebuild_active;
 	int		rebuild_disk;
+	int		rebuild_werror;	/* write to rebuild_disk failed */
 	uint8_t		*rebuild_done;		/* 1 bit per stripe slot */
 
 	/* RAID6 scrub progress (M3 — written by scrub, read by status ioctl) */
@@ -2228,6 +2229,7 @@ int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
+int hammer2_raid6_write_failed(hammer2_dev_t *hmp, int disk_idx, int error);
 
 /*
  * Read-path self-heal repair queue (bitrot.md §7.4).

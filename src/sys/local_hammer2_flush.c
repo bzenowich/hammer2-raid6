@@ -1312,7 +1312,9 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	int flush_error = 0;
 	int fsync_error = 0;
 	int total_error = 0;
+	int error;
 	int j;
+	int di;
 	int xflags;
 	int ispfsroot = 0;
 
@@ -1490,12 +1492,33 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		if (!e->open)
 			continue;
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-		fsync_error = VOP_FSYNC(devvp, MNT_WAIT, 0);
+		error = VOP_FSYNC(devvp, MNT_WAIT, 0);
 		vn_unlock(devvp);
-		if (fsync_error || flush_error) {
+		if (error || flush_error) {
 			kprintf("hammer2: sync error fsync=%d h2flush=0x%04x dev=%s\n",
-				fsync_error, flush_error, e->path);
+				error, flush_error, e->path);
 		}
+		if (error == 0)
+			continue;
+
+		/*
+		 * Any member that failed to sync blocks the volume header
+		 * below, which would otherwise commit blocks that never
+		 * reached that disk.  A RAID6 member is auto-failed
+		 * instead, so the headers still go to the healthy members;
+		 * only a failure beyond redundancy blocks them.
+		 */
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+			for (di = 0; di < hmp->nvolumes; di++) {
+				if (hmp->volumes[di].dev == e)
+					break;
+			}
+			if (di < hmp->nvolumes)
+				error = hammer2_raid6_write_failed(hmp, di,
+								   error);
+		}
+		if (error && fsync_error == 0)
+			fsync_error = error;
 	}
 
 	/*

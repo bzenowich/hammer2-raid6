@@ -1267,6 +1267,31 @@ hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 }
 
 /*
+ * A RAID6 write to disk_idx returned error.  A healthy member is
+ * auto-failed, so its stale column stops counting as redundancy.  The
+ * disk being resilvered is already failed; the failure is recorded in
+ * rebuild_werror instead and fails the resilver, which would otherwise
+ * bring the disk online with a hole.
+ *
+ * Returns hammer2_raid6_auto_fail_disk()'s result (ENXIO past two
+ * failed disks), else 0.
+ */
+int
+hammer2_raid6_write_failed(hammer2_dev_t *hmp, int disk_idx, int error)
+{
+	if (hmp->raid_failed[disk_idx]) {
+		if (hmp->rebuild_active && hmp->rebuild_disk == disk_idx &&
+		    hmp->rebuild_werror == 0) {
+			kprintf("hammer2: RAID6 write error %d on resilvering "
+				"disk %d\n", error, disk_idx);
+			hmp->rebuild_werror = error;
+		}
+		return 0;
+	}
+	return hammer2_raid6_auto_fail_disk(hmp, disk_idx);
+}
+
+/*
  * Read-path self-heal repair queue (bitrot.md §7.4).
  *
  * The reader that detects a CHECK failure still holds the DIO buf
