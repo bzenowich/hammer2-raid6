@@ -52,6 +52,25 @@ uint8_t hammer2_gf_log[256];		/* discrete logarithm base 2 */
 uint8_t hammer2_gf_inv[256];		/* multiplicative inverse */
 uint8_t hammer2_gf_mul_table[256][256];	/* full multiplication table */
 
+#ifdef __aarch64__
+#include <sys/sysctl.h>
+#include <machine/md_var.h>
+
+#define HAMMER2_RAID6_SIMD_STEP	64
+
+void hammer2_raid6_xor_neon(uint8_t *dst, const uint8_t *src, size_t bytes);
+void hammer2_raid6_mul_neon(uint8_t *dst, const uint8_t *src, size_t bytes,
+			    const uint8_t *tbl);
+void hammer2_raid6_mulacc_neon(uint8_t *dst, const uint8_t *src,
+			       size_t bytes, const uint8_t *tbl);
+
+int hammer2_raid6_simd = 1;
+static void hammer2_raid6_simd_selftest(void);
+SYSCTL_DECL(_vfs_hammer2);
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_simd, CTLFLAG_RW,
+	   &hammer2_raid6_simd, 0, "RAID6 parity uses NEON");
+#endif
+
 /*
  * Initialize all GF(2^8) lookup tables.
  * Must be called once at module load time.
@@ -106,7 +125,142 @@ hammer2_raid6_init(void)
 				hammer2_gf_exp[log_sum];
 		}
 	}
+#ifdef __aarch64__
+	hammer2_raid6_simd_selftest();
+#endif
 }
+
+/*
+ * Block primitives.  All parity math runs a column at a time on these:
+ * dst ^= src, and dst = c * src or dst ^= c * src in GF(2^8).  On arm64
+ * the bulk goes to the NEON loops in hammer2_raid6_neon.S, 64 bytes a
+ * step, with the multiply done as two 16-entry table lookups (the
+ * products of c with the low and the high nibble).  The kernel is built
+ * without FP/SIMD, so each call brackets the NEON part with
+ * kernel_fpu_begin()/kernel_fpu_end().  vfs.hammer2.raid6_simd=0 forces
+ * the C loops.
+ */
+void
+hammer2_raid6_xor(void *dstp, const void *srcp, size_t bytes)
+{
+	uint8_t *dst = dstp;
+	const uint8_t *src = srcp;
+	size_t i;
+
+#ifdef __aarch64__
+	if (hammer2_raid6_simd && bytes >= HAMMER2_RAID6_SIMD_STEP) {
+		size_t n = bytes & ~(size_t)(HAMMER2_RAID6_SIMD_STEP - 1);
+
+		kernel_fpu_begin();
+		hammer2_raid6_xor_neon(dst, src, n);
+		kernel_fpu_end();
+		dst += n;
+		src += n;
+		bytes -= n;
+	}
+#endif
+	if ((((uintptr_t)dst | (uintptr_t)src | bytes) & 7) == 0) {
+		for (i = 0; i < bytes; i += 8)
+			*(uint64_t *)(dst + i) ^= *(const uint64_t *)(src + i);
+	} else {
+		for (i = 0; i < bytes; i++)
+			dst[i] ^= src[i];
+	}
+}
+
+/*
+ * dst = c * src (acc == 0) or dst ^= c * src (acc != 0).  dst may be
+ * src.
+ */
+void
+hammer2_raid6_mul(void *dstp, const void *srcp, size_t bytes, uint8_t c,
+		  int acc)
+{
+	uint8_t *dst = dstp;
+	const uint8_t *src = srcp;
+	const uint8_t *t = hammer2_gf_mul_table[c];
+	size_t i;
+
+	if (c == 1) {
+		if (acc)
+			hammer2_raid6_xor(dst, src, bytes);
+		else if (dst != src)
+			bcopy(src, dst, bytes);
+		return;
+	}
+#ifdef __aarch64__
+	if (hammer2_raid6_simd && bytes >= HAMMER2_RAID6_SIMD_STEP) {
+		size_t n = bytes & ~(size_t)(HAMMER2_RAID6_SIMD_STEP - 1);
+		uint8_t tbl[32] __aligned(16);
+
+		for (i = 0; i < 16; i++) {
+			tbl[i] = t[i];
+			tbl[16 + i] = t[i << 4];
+		}
+		kernel_fpu_begin();
+		if (acc)
+			hammer2_raid6_mulacc_neon(dst, src, n, tbl);
+		else
+			hammer2_raid6_mul_neon(dst, src, n, tbl);
+		kernel_fpu_end();
+		dst += n;
+		src += n;
+		bytes -= n;
+	}
+#endif
+	if (acc) {
+		for (i = 0; i < bytes; i++)
+			dst[i] ^= t[src[i]];
+	} else {
+		for (i = 0; i < bytes; i++)
+			dst[i] = t[src[i]];
+	}
+}
+
+#ifdef __aarch64__
+/*
+ * Check the NEON loops against the C ones for every multiplier, with a
+ * tail the C loop finishes.  A mismatch turns them off.
+ */
+static void
+hammer2_raid6_simd_selftest(void)
+{
+	enum { N = 2 * HAMMER2_RAID6_SIMD_STEP + 7 };
+	uint8_t *src, *ref, *dst;
+	int c, i, acc, simd;
+
+	src = kmalloc(3 * N, M_TEMP, M_WAITOK);
+	ref = src + N;
+	dst = ref + N;
+	for (i = 0; i < N; i++)
+		src[i] = (uint8_t)(i * 167 + 13);
+	simd = hammer2_raid6_simd;
+	for (c = 0; c < 256 && simd; c++) {
+		for (acc = 0; acc < 3 && simd; acc++) {
+			for (i = 0; i < N; i++)
+				ref[i] = dst[i] = (uint8_t)(i ^ c);
+			hammer2_raid6_simd = 0;
+			if (acc == 2)
+				hammer2_raid6_xor(ref, src, N);
+			else
+				hammer2_raid6_mul(ref, src, N, c, acc);
+			hammer2_raid6_simd = 1;
+			if (acc == 2)
+				hammer2_raid6_xor(dst, src, N);
+			else
+				hammer2_raid6_mul(dst, src, N, c, acc);
+			if (bcmp(ref, dst, N) != 0) {
+				kprintf("hammer2: RAID6 NEON self-test failed "
+					"(c=%d, %s), using C\n", c,
+					acc == 2 ? "xor" : acc ? "mulacc" : "mul");
+				simd = 0;
+			}
+		}
+	}
+	hammer2_raid6_simd = simd;
+	kfree(src, M_TEMP);
+}
+#endif
 
 /*
  * Generate P and Q syndromes for the given disk array.
@@ -117,8 +271,9 @@ hammer2_raid6_init(void)
  *
  * P = data[0] ^ data[1] ^ ... ^ data[ndata-1]
  * Q = data[0]*2^0 ^ data[1]*2^1 ^ ... ^ data[ndata-1]*2^(ndata-1)
- *   simplified using Horner's method (evaluate from highest to lowest):
- * Q = (...((data[ndata-1] * 2) ^ data[ndata-2]) * 2 ^ ...) * 2 ^ data[0]
+ *
+ * Column by column: P and Q start as copies of data[0], and each further
+ * column is XORed into P and multiplied into Q.
  */
 void
 hammer2_raid6_gen_syndrome(int ndisks, size_t bytes, void **ptrs)
@@ -126,19 +281,13 @@ hammer2_raid6_gen_syndrome(int ndisks, size_t bytes, void **ptrs)
 	int ndata = ndisks - 2;
 	uint8_t *p = ptrs[ndisks - 2];
 	uint8_t *q = ptrs[ndisks - 1];
-	size_t d;
 	int z;
 
-	for (d = 0; d < bytes; d++) {
-		uint8_t pv = 0;
-		uint8_t qv = 0;
-		for (z = 0; z < ndata; z++) {
-			uint8_t c = ((uint8_t **)ptrs)[z][d];
-			pv ^= c;
-			qv ^= hammer2_gf_mul(hammer2_gf_exp[z], c);
-		}
-		p[d] = pv;
-		q[d] = qv;
+	bcopy(ptrs[0], p, bytes);
+	bcopy(ptrs[0], q, bytes);		/* 2^0 = 1 */
+	for (z = 1; z < ndata; z++) {
+		hammer2_raid6_xor(p, ptrs[z], bytes);
+		hammer2_raid6_mul(q, ptrs[z], bytes, hammer2_gf_exp[z], 1);
 	}
 }
 
@@ -176,7 +325,6 @@ hammer2_raid6_2data_recov(int ndisks, size_t bytes,
 	uint8_t *q = ptrs[ndisks - 1];
 	uint8_t *dpa, *dpb;
 	uint8_t coeff_a, coeff_b, coeff_diff_inv;
-	size_t d;
 	int z;
 
 	dpa = ptrs[faila];
@@ -187,41 +335,30 @@ hammer2_raid6_2data_recov(int ndisks, size_t bytes,
 	coeff_b = hammer2_gf_exp[failb];		/* 2^failb */
 	coeff_diff_inv = hammer2_gf_inv[coeff_a ^ coeff_b]; /* 1/(2^a ^ 2^b) */
 
-	for (d = 0; d < bytes; d++) {
-		uint8_t Pxy, Qxy, B, A;
-
-		/*
-		 * Compute Pxy = P ^ XOR of all surviving data disks.
-		 * This equals data[faila] ^ data[failb].
-		 */
-		Pxy = p[d];
-		for (z = 0; z < ndata; z++) {
-			if (z != faila && z != failb)
-				Pxy ^= ((uint8_t *)ptrs[z])[d];
-		}
-
-		/*
-		 * Compute Qxy = Q ^ syndrome of all surviving data disks.
-		 * This equals data[faila]*2^faila ^ data[failb]*2^failb.
-		 */
-		Qxy = q[d];
-		for (z = 0; z < ndata; z++) {
-			if (z != faila && z != failb)
-				Qxy ^= hammer2_gf_mul(hammer2_gf_exp[z],
-						       ((uint8_t *)ptrs[z])[d]);
-		}
-
-		/*
-		 * Solve: B = (Pxy * 2^faila ^ Qxy) / (2^faila ^ 2^failb)
-		 *        A = Pxy ^ B
-		 */
-		B = hammer2_gf_mul(hammer2_gf_mul(Pxy, coeff_a) ^ Qxy,
-				   coeff_diff_inv);
-		A = Pxy ^ B;
-
-		dpa[d] = A;
-		dpb[d] = B;
+	/*
+	 * The failed columns serve as scratch.  dpa = Pxy = P ^ XOR of
+	 * the surviving data, which equals data[faila] ^ data[failb].
+	 * dpb = Qxy = Q ^ syndrome of the surviving data, which equals
+	 * data[faila]*2^faila ^ data[failb]*2^failb.
+	 */
+	bcopy(p, dpa, bytes);
+	bcopy(q, dpb, bytes);
+	for (z = 0; z < ndata; z++) {
+		if (z == faila || z == failb)
+			continue;
+		hammer2_raid6_xor(dpa, ptrs[z], bytes);
+		hammer2_raid6_mul(dpb, ptrs[z], bytes, hammer2_gf_exp[z], 1);
 	}
+
+	/*
+	 * Solve: B = (Pxy * 2^faila ^ Qxy) / (2^faila ^ 2^failb)
+	 *          = Qxy * inv ^ Pxy * (2^faila * inv)
+	 *        A = Pxy ^ B
+	 */
+	hammer2_raid6_mul(dpb, dpb, bytes, coeff_diff_inv, 0);
+	hammer2_raid6_mul(dpb, dpa, bytes,
+			  hammer2_gf_mul(coeff_a, coeff_diff_inv), 1);
+	hammer2_raid6_xor(dpa, dpb, bytes);
 }
 
 /*
@@ -244,35 +381,26 @@ hammer2_raid6_datap_recov(int ndisks, size_t bytes, int faila, void **ptrs)
 	uint8_t *p = ptrs[ndisks - 2];
 	uint8_t *q = ptrs[ndisks - 1];
 	uint8_t *dpa;
-	uint8_t coeff_inv;
-	size_t d;
 	int z;
 
 	dpa = ptrs[faila];
-	coeff_inv = hammer2_gf_inv[hammer2_gf_exp[faila]]; /* 1/2^faila */
 
-	for (d = 0; d < bytes; d++) {
-		uint8_t Qx;
-
-		/* Compute Qx = Q ^ syndrome of surviving disks */
-		Qx = q[d];
-		for (z = 0; z < ndata; z++) {
-			if (z != faila)
-				Qx ^= hammer2_gf_mul(hammer2_gf_exp[z],
-						      ((uint8_t *)ptrs[z])[d]);
-		}
-
-		/* data[faila] = Qx / 2^faila */
-		dpa[d] = hammer2_gf_mul(Qx, coeff_inv);
+	/* dpa = Qx = Q ^ syndrome of the surviving disks */
+	bcopy(q, dpa, bytes);
+	for (z = 0; z < ndata; z++) {
+		if (z != faila)
+			hammer2_raid6_mul(dpa, ptrs[z], bytes,
+					  hammer2_gf_exp[z], 1);
 	}
+
+	/* data[faila] = Qx / 2^faila */
+	hammer2_raid6_mul(dpa, dpa, bytes,
+			  hammer2_gf_inv[hammer2_gf_exp[faila]], 0);
 
 	/* Recompute P from all data disks */
-	for (d = 0; d < bytes; d++) {
-		uint8_t pv = 0;
-		for (z = 0; z < ndata; z++)
-			pv ^= ((uint8_t *)ptrs[z])[d];
-		p[d] = pv;
-	}
+	bcopy(ptrs[0], p, bytes);
+	for (z = 1; z < ndata; z++)
+		hammer2_raid6_xor(p, ptrs[z], bytes);
 }
 
 /*
@@ -318,18 +446,13 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 			 *
 			 * data[faila] = P ^ XOR(surviving data)
 			 */
-			uint8_t *p = ptrs[ndisks - 2];
 			uint8_t *dpa = ptrs[faila];
-			size_t d;
 			int z;
 
-			for (d = 0; d < bytes; d++) {
-				uint8_t val = p[d];
-				for (z = 0; z < ndata; z++) {
-					if (z != faila)
-						val ^= ((uint8_t *)ptrs[z])[d];
-				}
-				dpa[d] = val;
+			bcopy(ptrs[ndisks - 2], dpa, bytes);
+			for (z = 0; z < ndata; z++) {
+				if (z != faila)
+					hammer2_raid6_xor(dpa, ptrs[z], bytes);
 			}
 			/* Regenerate Q */
 			hammer2_raid6_gen_syndrome(ndisks, bytes, ptrs);
@@ -487,9 +610,7 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	for (c = 0; c < ncols; c++) {
 		const hammer2_row_col_t *col = &cols[c];
 		uint8_t *src = (uint8_t *)col->data;
-		uint8_t coeff;
 		int my_col = 0;
-		size_t i;
 
 		KKASSERT(col->disk_idx != p_disk &&
 			 col->disk_idx != q_disk);
@@ -499,14 +620,11 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 				my_col++;
 		}
 
-		if (p_dst) {
-			for (i = 0; i < stripe_unit; i++)
-				p_dst[i] ^= src[i];
-		}
+		if (p_dst)
+			hammer2_raid6_xor(p_dst, src, stripe_unit);
 		if (q_dst) {
-			coeff = hammer2_gf_exp[my_col % 255];
-			for (i = 0; i < stripe_unit; i++)
-				q_dst[i] ^= hammer2_gf_mul(coeff, src[i]);
+			hammer2_raid6_mul(q_dst, src, stripe_unit,
+					  hammer2_gf_exp[my_col % 255], 1);
 		}
 	}
 

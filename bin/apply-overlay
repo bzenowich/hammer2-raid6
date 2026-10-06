@@ -31,6 +31,11 @@ if ! grep -q '^vfs/hammer2/hammer2_raid6\.c' "$F"; then
     mv "$F.new" "$F"
 fi
 
+F="$D/sys/platform/arm64/conf/files"
+if [ -f "$F" ] && ! grep -q '^vfs/hammer2/hammer2_raid6_neon\.S' "$F"; then
+    printf 'vfs/hammer2/hammer2_raid6_neon.S\toptional hammer2\n' >> "$F"
+fi
+
 M="$D/sbin/hammer2/Makefile"
 if ! grep -q 'cmd_raid\.c' "$M"; then
     awk '/^\.include[[:space:]]*<bsd\.prog\.mk>/ && !done {

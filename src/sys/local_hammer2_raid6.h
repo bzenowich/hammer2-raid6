@@ -67,6 +67,10 @@ extern uint8_t hammer2_gf_log[256];
 extern uint8_t hammer2_gf_inv[256];
 extern uint8_t hammer2_gf_mul_table[256][256];
 
+void hammer2_raid6_xor(void *dst, const void *src, size_t bytes);
+void hammer2_raid6_mul(void *dst, const void *src, size_t bytes, uint8_t c,
+		       int acc);
+
 /*
  * Inline GF(2^8) multiply by 2 (generator).
  */

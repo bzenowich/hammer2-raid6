@@ -21,6 +21,9 @@ SRCS+=	hammer2_ioctl.c hammer2_msgops.c hammer2_subr.c hammer2_bulkfree.c
 SRCS+=  hammer2_lz4.c hammer2_io.c hammer2_iocom.c hammer2_admin.c
 SRCS+=	hammer2_synchro.c
 SRCS+=	hammer2_raid6.c
+.if ${MACHINE_ARCH} == "aarch64"
+SRCS+=	hammer2_raid6_neon.S
+.endif
 SRCS+=  hammer2_zlib_adler32.c hammer2_zlib_deflate.c
 SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
 SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
