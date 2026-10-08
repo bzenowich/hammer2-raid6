@@ -13,10 +13,13 @@
 # NDISKS: number of disks to use (default 4, supports 4-6).
 # DISK_PREFIX: device name prefix (default /dev/vbd).  On real hardware,
 # e.g. the Pi's USB disks: DISK_PREFIX=/dev/da DISK_BASE=0.
+# DISK_SUFFIX: appended after the disk number (default none), to test on
+# slices of big disks: DISK_SUFFIX=s1 uses /dev/da0s1 ...
 
 NDISKS="${NDISKS:-4}"
 DISK_BASE="${DISK_BASE:-1}"
 DISK_PREFIX="${DISK_PREFIX:-/dev/vbd}"
+DISK_SUFFIX="${DISK_SUFFIX:-}"
 MNTPT=/mnt/v3test
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
 
@@ -25,7 +28,7 @@ DEVS=""
 DEVSPEC=""
 i=0
 while [ "$i" -lt "$NDISKS" ]; do
-    dev="${DISK_PREFIX}$((DISK_BASE + i))"
+    dev="${DISK_PREFIX}$((DISK_BASE + i))${DISK_SUFFIX}"
     # Never newfs a disk something has mounted (the system disk, say).
     if mount | grep -v "@V3TEST " | grep -q "^${dev}[^0-9]"; then
         echo "common.sh: ${dev} is mounted; refusing to use it" >&2
@@ -43,7 +46,7 @@ PFSPATH="${DEVSPEC}@V3TEST"
 
 # Return the device path for disk index $1 (logical 0..NDISKS-1)
 disk_dev() {
-    echo "${DISK_PREFIX}$((DISK_BASE + $1))"
+    echo "${DISK_PREFIX}$((DISK_BASE + $1))${DISK_SUFFIX}"
 }
 
 # Build a DEVSPEC with disk index $1 excluded (for degraded mount)
@@ -61,20 +64,39 @@ degraded_spec() {
     echo "$spec"
 }
 
-# Layout of the 4 GB test disks (docs/capacity.md): reserved segment
-# 0..4 MB, space map 4..12 MB, aux 12..20 MB, metadata extent 0
-# 20..220 MB, stripe data from 220 MB (64 KB block 3520).
-DATA_BLK=3520
+# Per-disk layout (docs/capacity.md): reserved segment 0..4 MB, space
+# map, aux, metadata extent 0, then stripe data.  Where each zone falls
+# depends on the disk size (on the 4 GB vbd disks metadata is 20..220 MB
+# and data starts at 220 MB; on a 240 GB disk data starts near 12 GB),
+# so setup_fresh reads it from newfs_hammer2's output into these, in
+# 64 KB blocks:
+#   MD_BLK    start of metadata extent 0
+#   DATA_BLK  start of the stripe data zone (end of the extent)
+MD_BLK=
+DATA_BLK=
 
-# Prepare disk $1 as a fresh replacement for resilver.  Zero the first
-# 512 MB: the reserved/header segment, the space map, metadata extent 0
-# and the start of the stripe data zone.  Zeroing
-# only the header segment left every old column in place, so a resilver
-# that wrote nothing still read back correct data.
+# layout_from_newfs <file>: set MD_BLK and DATA_BLK from the
+# "md-extent0: <size> (<bytes> bytes) @ <offset>" line of newfs output.
+layout_from_newfs() {
+    local bytes off
+    set -- $(awk '$1 == "md-extent0:" { sub(/^\(/, "", $3); print $3, $6 }' "$1")
+    bytes="$1"; off="$2"
+    if [ -z "$bytes" ] || [ -z "$off" ]; then
+        return 1
+    fi
+    MD_BLK=$((off / 65536))
+    DATA_BLK=$(((off + bytes) / 65536))
+}
+
+# Prepare disk $1 as a fresh replacement for resilver.  Zero everything
+# up to the stripe data zone (the reserved/header segment, the space
+# map, metadata extent 0) and the first 292 MB of the data zone.
+# Zeroing only the header segment left every old column in place, so a
+# resilver that wrote nothing still read back correct data.
 fresh_disk() {
     local idx="$1"
-    dd if=/dev/zero of=$(disk_dev "$idx") bs=65536 count=8192 \
-        2>/dev/null || true
+    dd if=/dev/zero of=$(disk_dev "$idx") bs=65536 \
+        count=$((DATA_BLK + 4672)) 2>/dev/null || true
 }
 
 # Overwrite $3 x 64 KB of disk $1 starting at 64 KB block $2 with
@@ -232,7 +254,8 @@ setup_fresh() {
     local attempt=0
     while [ "$attempt" -lt 5 ]; do
         # shellcheck disable=SC2086
-        if newfs_hammer2 -R 6 -L V3TEST $DEVS > /dev/null 2>&1; then
+        if newfs_hammer2 -R 6 -L V3TEST $DEVS > /var/tmp/v4_newfs.txt 2>&1
+        then
             newfs_ok=1
             break
         fi
@@ -243,6 +266,10 @@ setup_fresh() {
         echo "  FATAL: newfs_hammer2 failed after 5 attempts in setup_fresh"
         # shellcheck disable=SC2086
         newfs_hammer2 -R 6 -L V3TEST $DEVS 2>&1 | head -5
+        exit 1
+    fi
+    if ! layout_from_newfs /var/tmp/v4_newfs.txt; then
+        echo "  FATAL: no md-extent0 line in newfs_hammer2 output"
         exit 1
     fi
     mkdir -p $MNTPT

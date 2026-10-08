@@ -15,7 +15,7 @@ export NDISKS
 
 SCRIPTDIR=$(dirname "$0")
 
-echo "v3 RAIDZ2-native test suite: NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd} substrate)"
+echo "v3 RAIDZ2-native test suite: NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -77,7 +77,7 @@ done
 echo ""
 echo "========================================="
 echo "  v3 RAIDZ2-native Integration Test Suite"
-echo "  NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd} substrate)"
+echo "  NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
 echo "========================================="
 if [ -n "$SUITE_ERRORS" ]; then

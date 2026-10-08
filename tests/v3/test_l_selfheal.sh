@@ -127,11 +127,12 @@ umount $MNTPT
 # Metadata brefs carry copyid 0: the primary copy is always read from
 # disk 0, and disks 1..N-1 hold the mirror copies.  To exercise the
 # mirror-failover heal the corruption must land on DISK 0's metadata
-# zone (extent 0 = 20..220 MB on the 4 GB test disks).  Skip the
-# first 1 MB of the extent, where mkfs put the super-root; corrupt the
-# rest of it, 199 MB at 21 MB.
+# zone (extent 0, MD_BLK..DATA_BLK from common.sh; 20..220 MB on the
+# 4 GB test disks).  Skip the first 1 MB of the extent, where mkfs put
+# the super-root; corrupt the rest of it.
 MD_DEV=$(disk_dev 0)
-dd if=/dev/urandom of="$MD_DEV" bs=65536 count=3184 seek=336 \
+dd if=/dev/urandom of="$MD_DEV" bs=65536 count=$((DATA_BLK - MD_BLK - 16)) \
+    seek=$((MD_BLK + 16)) \
     conv=notrunc 2>/dev/null
 
 mount -t hammer2 $PFSPATH $MNTPT
