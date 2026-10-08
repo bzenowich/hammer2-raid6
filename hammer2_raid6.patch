@@ -1255,7 +1255,7 @@ index 58bd413b0e..48cef2a651 100644
  	exit(1);
  }
 diff --git a/sys/conf/files b/sys/conf/files
-index aa9602eb61..55c2807a13 100644
+index ffe7591ad5..2c16f3f1bf 100644
 --- a/sys/conf/files
 +++ b/sys/conf/files
 @@ -2044,6 +2044,7 @@ vfs/hammer2/hammer2_msgops.c	optional hammer2
@@ -2431,7 +2431,7 @@ index 7bd08e7017..2c0f5bc0b2 100644
  #define HAMMER2_NUM_VOLHDRS		4
  
 diff --git a/sys/vfs/hammer2/hammer2_flush.c b/sys/vfs/hammer2/hammer2_flush.c
-index 21134ab4e4..d6e8779e02 100644
+index 21134ab4e4..1c7096c77c 100644
 --- a/sys/vfs/hammer2/hammer2_flush.c
 +++ b/sys/vfs/hammer2/hammer2_flush.c
 @@ -818,6 +818,17 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
@@ -2587,13 +2587,16 @@ index 21134ab4e4..d6e8779e02 100644
  	}
  
  	/*
-@@ -1480,26 +1587,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1480,26 +1587,27 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  	if (fsync_error == 0 && flush_error == 0 &&
  	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
  		struct buf *bp;
++		struct buf *fbp[HAMMER2_MAX_VOLUMES];
 +		uint64_t sm_gen = 0;
  		int vol_error = 0;
 +		int have_open_dev = 0;
++		int nfbp = 0;
++		int k;
  
  		/*
 -		 * Synchronize the disk before flushing the volume
@@ -2626,7 +2629,7 @@ index 21134ab4e4..d6e8779e02 100644
  		 */
  		j = hmp->volhdrno + 1;
  		if (j < 0)
-@@ -1515,16 +1620,131 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
+@@ -1515,16 +1623,158 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
  			kprintf("sync volhdr %d %jd\n",
  				j, (intmax_t)hmp->volsync.volu_size);
  		}
@@ -2752,6 +2755,33 @@ index 21134ab4e4..d6e8779e02 100644
 +				}
 +			}
 +			vol_error = bwrite(bp);
++			if (vol_error) {
++				fsync_error = vol_error;
++				continue;
++			}
++
++			/*
++			 * Flush the header itself, or sync() returns while
++			 * it sits in the drive's write cache and a power
++			 * loss brings back the previous header, losing what
++			 * this sync committed.  Waited for below, so the
++			 * flush overlaps the next member's header.
++			 */
++			if (nfbp < HAMMER2_MAX_VOLUMES) {
++				bp = getpbuf(NULL);
++				bp->b_bio1.bio_offset = 0;
++				bp->b_bufsize = 0;
++				bp->b_bcount = 0;
++				bp->b_cmd = BUF_CMD_FLUSH;
++				bp->b_bio1.bio_done = biodone_sync;
++				bp->b_bio1.bio_flags |= BIO_SYNC;
++				vn_strategy(e->devvp, &bp->b_bio1);
++				fbp[nfbp++] = bp;
++			}
++		}
++		for (k = 0; k < nfbp; k++) {
++			vol_error = biowait(&fbp[k]->b_bio1, "h2volf");
++			relpbuf(fbp[k], NULL);
 +			if (vol_error)
 +				fsync_error = vol_error;
 +		}
