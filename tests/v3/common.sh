@@ -11,9 +11,12 @@
 # harness puts test disks at vbd0 (no current launch-dfly config does).
 #
 # NDISKS: number of disks to use (default 4, supports 4-6).
+# DISK_PREFIX: device name prefix (default /dev/vbd).  On real hardware,
+# e.g. the Pi's USB disks: DISK_PREFIX=/dev/da DISK_BASE=0.
 
 NDISKS="${NDISKS:-4}"
 DISK_BASE="${DISK_BASE:-1}"
+DISK_PREFIX="${DISK_PREFIX:-/dev/vbd}"
 MNTPT=/mnt/v3test
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
 
@@ -22,7 +25,12 @@ DEVS=""
 DEVSPEC=""
 i=0
 while [ "$i" -lt "$NDISKS" ]; do
-    dev="/dev/vbd$((DISK_BASE + i))"
+    dev="${DISK_PREFIX}$((DISK_BASE + i))"
+    # Never newfs a disk something has mounted (the system disk, say).
+    if mount | grep -v "@V3TEST " | grep -q "^${dev}[^0-9]"; then
+        echo "common.sh: ${dev} is mounted; refusing to use it" >&2
+        exit 1
+    fi
     DEVS="${DEVS} ${dev}"
     if [ -z "$DEVSPEC" ]; then
         DEVSPEC="${dev}"
@@ -35,7 +43,7 @@ PFSPATH="${DEVSPEC}@V3TEST"
 
 # Return the device path for disk index $1 (logical 0..NDISKS-1)
 disk_dev() {
-    echo "/dev/vbd$((DISK_BASE + $1))"
+    echo "${DISK_PREFIX}$((DISK_BASE + $1))"
 }
 
 # Build a DEVSPEC with disk index $1 excluded (for degraded mount)

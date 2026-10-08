@@ -1587,9 +1587,12 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		struct buf *bp;
+		struct buf *fbp[HAMMER2_MAX_VOLUMES];
 		uint64_t sm_gen = 0;
 		int vol_error = 0;
 		int have_open_dev = 0;
+		int nfbp = 0;
+		int k;
 
 		/*
 		 * Check that at least one device is open.
@@ -1737,6 +1740,33 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 				}
 			}
 			vol_error = bwrite(bp);
+			if (vol_error) {
+				fsync_error = vol_error;
+				continue;
+			}
+
+			/*
+			 * Flush the header itself, or sync() returns while
+			 * it sits in the drive's write cache and a power
+			 * loss brings back the previous header, losing what
+			 * this sync committed.  Waited for below, so the
+			 * flush overlaps the next member's header.
+			 */
+			if (nfbp < HAMMER2_MAX_VOLUMES) {
+				bp = getpbuf(NULL);
+				bp->b_bio1.bio_offset = 0;
+				bp->b_bufsize = 0;
+				bp->b_bcount = 0;
+				bp->b_cmd = BUF_CMD_FLUSH;
+				bp->b_bio1.bio_done = biodone_sync;
+				bp->b_bio1.bio_flags |= BIO_SYNC;
+				vn_strategy(e->devvp, &bp->b_bio1);
+				fbp[nfbp++] = bp;
+			}
+		}
+		for (k = 0; k < nfbp; k++) {
+			vol_error = biowait(&fbp[k]->b_bio1, "h2volf");
+			relpbuf(fbp[k], NULL);
 			if (vol_error)
 				fsync_error = vol_error;
 		}
