@@ -1506,24 +1506,44 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
  * buffer only if it is free; when another thread holds it, read the
  * media directly through a pbuf instead.  The rows read here are
  * committed, so the media copy is current.
+ *
+ * nocache is for streaming passes (resilver) that touch each block
+ * once: a block that was not already cached is dropped after the read,
+ * its pages freed rather than left on the inactive queue.  A block
+ * that was cached stays cached.
  */
 static int
-hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
-			      void *dst, int bytes)
+hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
+			       void *dst, int bytes, int nocache)
 {
 	struct buf *bp;
 	int error;
 
 	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT, 0);
-	if (bp) {
-		error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
-		if (error == 0) {
-			bkvasync(bp);
-			bcopy(bp->b_data, dst, bytes);
-		}
-		brelse(bp);
-		return error;
+	if (bp == NULL)
+		return EWOULDBLOCK;
+	if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
+		bp->b_flags |= B_RELBUF | B_DIRECT;
+	error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
+	if (error == 0) {
+		bkvasync(bp);
+		bcopy(bp->b_data, dst, bytes);
 	}
+	brelse(bp);
+	return error;
+}
+
+static int
+hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
+			      void *dst, int bytes, int nocache)
+{
+	struct buf *bp;
+	int error;
+
+	error = hammer2_io_raid6_read_bufcache(devvp, off, dst, bytes,
+					       nocache);
+	if (error != EWOULDBLOCK)
+		return error;
 
 	bp = getpbuf_mem(NULL);
 	KKASSERT(bytes <= bp->b_bufsize);
@@ -1549,15 +1569,17 @@ hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
  * otherwise write the media directly through a pbuf.  The holder's
  * copy is of the same block, so the cache does not go stale.
  */
-int
-hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
-			      const void *data, int bytes)
+static int
+hammer2_io_raid6_write_flags(struct vnode *devvp, off_t off,
+			     const void *data, int bytes, int nocache)
 {
 	struct buf *bp;
 	int error;
 
 	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
 	if (bp) {
+		if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
+			bp->b_flags |= B_RELBUF | B_DIRECT;
 		bkvasync(bp);
 		bcopy(data, bp->b_data, bytes);
 		return bwrite(bp);
@@ -1576,6 +1598,25 @@ hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
 	error = biowait(&bp->b_bio1, "h2rbw");
 	relpbuf(bp, NULL);
 	return error;
+}
+
+int
+hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
+			      const void *data, int bytes)
+{
+	return hammer2_io_raid6_write_flags(devvp, off, data, bytes, 0);
+}
+
+/*
+ * write_nowait for the resilver, which writes each block of the new
+ * disk once: the written block is not kept cached unless it already
+ * was.  See read_sibling.
+ */
+static int
+hammer2_io_raid6_write_stream(struct vnode *devvp, off_t off,
+			      const void *data, int bytes)
+{
+	return hammer2_io_raid6_write_flags(devvp, off, data, bytes, 1);
 }
 
 /*
@@ -1642,7 +1683,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		error = hammer2_inject_eio(i);
 		if (error == 0)
 			error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
-			    dev_pbase, copy, psize);
+			    dev_pbase, copy, psize, 0);
 		if (error)
 			continue;
 		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
@@ -1814,7 +1855,7 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 			if (lerror == 0)
 				lerror = hammer2_io_raid6_read_sibling(
 				    vol->dev->devvp, phys_off,
-				    col_bufs[col], (int)stripe_unit);
+				    col_bufs[col], (int)stripe_unit, 0);
 			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
 				if (!injected) {
@@ -2176,7 +2217,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 						 hammer2_io_raid6_read_sibling(
 						    vol->dev->devvp,
 						    (off_t)(mo + off), md_buf,
-						    (int)this_chunk);
+						    (int)this_chunk, 1);
 					if (lerror == 0)
 						break;
 				    }
@@ -2192,7 +2233,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					return EIO;
 				}
 
-				lerror = hammer2_io_raid6_write_nowait(
+				lerror = hammer2_io_raid6_write_stream(
 				    new_devvp, (off_t)(mo + off), md_buf,
 				    (int)this_chunk);
 				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
@@ -2314,7 +2355,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 			if (lerror == 0)
 				lerror = hammer2_io_raid6_read_sibling(
 				    vol->dev->devvp, phys_off,
-				    col_bufs[col], (int)stripe_unit);
+				    col_bufs[col], (int)stripe_unit, 1);
 			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
 				/*
@@ -2356,7 +2397,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 
 		/* Write reconstructed column to the new device */
-		lerror = hammer2_io_raid6_write_nowait(new_devvp, phys_off,
+		lerror = hammer2_io_raid6_write_stream(new_devvp, phys_off,
 		    ptrs[failed_col], (int)stripe_unit);
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 		if (lerror && !error)
@@ -2411,6 +2452,7 @@ struct hammer2_scrub_ctx {
 	uint64_t	bad;
 	uint64_t	repaired;
 	uint64_t	unrepairable;
+	char		*rbuf;		/* HAMMER2_PBUFSIZE, uncached reads */
 };
 
 /*
@@ -2460,12 +2502,39 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	stripe_unit = hmp->raid_config.stripe_unit;
 
 	/*
-	 * Read via the normal DIO path so the disk holding bref->copyid is
-	 * the one we verify.  Failed-disk reads transparently reconstruct
-	 * (via read_degraded inside hammer2_io_bread), so a chain whose
-	 * primary disk is missing will pass scrub against the surviving
-	 * P/Q — no false positives in degraded mode.
+	 * The scrub reads every live block once, so it must not leave
+	 * them all in the buffer cache.  On a healthy disk, read the
+	 * primary column through the buffer cache key the DIO would use
+	 * (so a cached or delayed-write copy is seen), dropping the
+	 * buffer afterwards unless it was already cached.  v3 DATA/DIRENT
+	 * live at the same byte offset on disk bref->copyid.
+	 *
+	 * Anything else (failed disk, injected or real read error, the
+	 * buffer busy in a DIO) goes through the normal DIO path, which
+	 * fails the disk on a read error and transparently reconstructs
+	 * from P/Q, so a chain whose primary disk is missing passes scrub
+	 * against the surviving parity: no false positives in degraded
+	 * mode.
 	 */
+	bdata = NULL;
+	if (disk_idx >= 0 && disk_idx < hmp->nvolumes &&
+	    !hmp->raid_failed[disk_idx] &&
+	    hammer2_inject_eio(disk_idx) == 0 &&
+	    hmp->volumes[disk_idx].dev != NULL &&
+	    hmp->volumes[disk_idx].dev->devvp != NULL &&
+	    hmp->volumes[disk_idx].dev->open &&
+	    hammer2_io_raid6_read_bufcache(
+	     hmp->volumes[disk_idx].dev->devvp,
+	     (off_t)(lbase & ~HAMMER2_PBUFMASK64), ctx->rbuf,
+	     HAMMER2_PBUFSIZE, 1) == 0) {
+		bdata = ctx->rbuf + (lbase & HAMMER2_PBUFMASK64);
+	}
+	if (bdata && hammer2_scrub_check_match(bref, bdata, lsize)) {
+		ctx->done++;
+		return 0;
+	}
+
+	/* A mismatch above is rechecked through the DIO before repair. */
 	error = hammer2_io_bread(hmp, bref->type, bref->data_off, lsize,
 				 &dio, bref);
 	if (error || dio == NULL) {
@@ -2525,6 +2594,8 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 			wbp = getblk(devvp, pbase, (int)stripe_unit,
 				     GETBLK_KVABIO, 0);
 			if (wbp) {
+				if ((wbp->b_flags & (B_CACHE | B_DELWRI)) == 0)
+					wbp->b_flags |= B_RELBUF | B_DIRECT;
 				bkvasync(wbp);
 				bcopy(recon, wbp->b_data, (size_t)stripe_unit);
 				werr = bwrite(wbp);
@@ -2689,6 +2760,7 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 
 	bzero(&ctx, sizeof(ctx));
 	ctx.hmp = hmp;
+	ctx.rbuf = kmalloc(HAMMER2_PBUFSIZE, M_HAMMER2, M_WAITOK);
 
 	hmp->scrub_brefs_done = 0;
 	hmp->scrub_brefs_bad = 0;
@@ -2707,6 +2779,7 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	vsnap = hammer2_chain_bulksnap(hmp);
 	error = hammer2_scrub_walk(&ctx, vsnap);
 	hammer2_chain_bulkdrop(vsnap);
+	kfree(ctx.rbuf, M_HAMMER2);
 
 	hmp->scrub_brefs_done = ctx.done;
 	hmp->scrub_brefs_bad = ctx.bad;
