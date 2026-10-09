@@ -1886,6 +1886,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
 	return result;
 }
 
+/*
+ * See hammer2_vfs_unmount().  raid_abort is cleared again once the
+ * ioctls have drained: the device may stay mounted through another PFS.
+ */
+static void
+hammer2_vfs_unmount_raid_abort(hammer2_pfs_t *pmp)
+{
+	hammer2_dev_t *hmp;
+	int i;
+
+	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+		hmp = pmp->pfs_hmps[i];
+		if (hmp == NULL || hmp->raid_ioctls == 0)
+			continue;
+		kprintf("hammer2: forced unmount: stopping resilver/scrub\n");
+		hmp->raid_abort = 1;
+		while (hmp->raid_ioctls) {
+			tsleep(__DEVOLATILE(void *, &hmp->raid_ioctls), 0,
+			       "h2rabt", hz / 10);
+		}
+		hmp->raid_abort = 0;
+	}
+}
+
 static
 int
 hammer2_vfs_unmount(struct mount *mp, int mntflags)
@@ -1898,6 +1922,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
 
 	if (pmp == NULL)
 		return(0);
+
+	/*
+	 * A forced unmount (e.g. at shutdown) does not wait for ioctls in
+	 * progress.  Stop a running resilver or scrub and wait for its
+	 * ioctl to return before the vnodes and devices go away under it.
+	 * A non-forced unmount fails with EBUSY on the ioctl's open vnode
+	 * instead.  Done before hammer2_mntlk: the resilver syncs the pmp.
+	 */
+	if (mntflags & MNT_FORCE)
+		hammer2_vfs_unmount_raid_abort(pmp);
 
 	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
 

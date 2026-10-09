@@ -1297,6 +1297,16 @@ struct hammer2_dev {
 	int		scrub_error;		/* last scrub error (0 = none) */
 
 	/*
+	 * Forced unmount (e.g. at shutdown) does not wait for ioctls.
+	 * raid_ioctls counts replace/scrub ioctls in flight; the unmount
+	 * sets raid_abort, which makes a running resilver or scrub return
+	 * EINTR, and waits for raid_ioctls to drain before the devices
+	 * are torn down.
+	 */
+	volatile int	raid_abort;
+	volatile int	raid_ioctls;
+
+	/*
 	 * RAID6 read-path self-heal (bitrot.md §7.4 bullet 1).
 	 *
 	 * When hammer2_chain_testcheck() fails on a read from an ONLINE

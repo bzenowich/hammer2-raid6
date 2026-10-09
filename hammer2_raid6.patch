@@ -1291,7 +1291,7 @@ index 9c5abb19e3..45e7278e40 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729d5d..a95ea645ff 100644
+index a29c729d5d..c22e29409c 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -279,10 +279,10 @@ struct hammer2_io {
@@ -1349,7 +1349,7 @@ index a29c729d5d..a95ea645ff 100644
  struct hammer2_dev {
  	struct vnode	*devvp;		/* device vnode for root volume */
  	int		ronly;		/* read-only mount */
-@@ -1158,6 +1193,139 @@ struct hammer2_dev {
+@@ -1158,6 +1193,149 @@ struct hammer2_dev {
  
  	hammer2_devvp_list_t devvpl;	/* list of device vnodes including *devvp */
  	hammer2_volume_t volumes[HAMMER2_MAX_VOLUMES]; /* list of volumes */
@@ -1457,6 +1457,16 @@ index a29c729d5d..a95ea645ff 100644
 +	int		scrub_error;		/* last scrub error (0 = none) */
 +
 +	/*
++	 * Forced unmount (e.g. at shutdown) does not wait for ioctls.
++	 * raid_ioctls counts replace/scrub ioctls in flight; the unmount
++	 * sets raid_abort, which makes a running resilver or scrub return
++	 * EINTR, and waits for raid_ioctls to drain before the devices
++	 * are torn down.
++	 */
++	volatile int	raid_abort;
++	volatile int	raid_ioctls;
++
++	/*
 +	 * RAID6 read-path self-heal (bitrot.md §7.4 bullet 1).
 +	 *
 +	 * When hammer2_chain_testcheck() fails on a read from an ONLINE
@@ -1489,7 +1499,7 @@ index a29c729d5d..a95ea645ff 100644
  };
  
  typedef struct hammer2_dev hammer2_dev_t;
-@@ -1642,15 +1810,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -1642,15 +1820,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
  				u_int bytes);
  int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
@@ -1515,7 +1525,7 @@ index a29c729d5d..a95ea645ff 100644
  hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  				int lsize HAMMER2_IO_DEBUG_ARGS);
  void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
-@@ -1663,8 +1837,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1663,8 +1847,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  
  #ifndef HAMMER2_IO_DEBUG
  
@@ -1526,7 +1536,7 @@ index a29c729d5d..a95ea645ff 100644
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
  	_hammer2_io_getquick((hmp), (lbase), (lsize))
  #define hammer2_io_putblk(diop)						\
-@@ -1682,13 +1856,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1682,13 +1866,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio))
  
@@ -1544,7 +1554,7 @@ index a29c729d5d..a95ea645ff 100644
  	__FILE__, __LINE__)
  
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
-@@ -1710,8 +1884,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1710,8 +1894,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio), __FILE__, __LINE__)
  
@@ -1555,7 +1565,7 @@ index a29c729d5d..a95ea645ff 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1954,6 +2128,163 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+@@ -1954,6 +2138,163 @@ int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
  			int *rootvolzone,
  			struct vnode **rootvoldevvp);
  hammer2_volume_t *hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset);
@@ -2938,7 +2948,7 @@ index 4b3656be5d..c3c4de0617 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24efaf..c90c3bb365 100644
+index 31be24efaf..457130c453 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,9 @@
@@ -3700,7 +3710,7 @@ index 31be24efaf..c90c3bb365 100644
  	KKASSERT(dio->bp != NULL);
  	bkvasync(dio->bp);
  }
-@@ -786,6 +1224,1581 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,6 +1224,1599 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -4646,6 +4656,13 @@ index 31be24efaf..c90c3bb365 100644
 +				size_t this_chunk =
 +				    (size_t)((ms - off > MD_CHUNK) ?
 +					     MD_CHUNK : (ms - off));
++
++				/* forced unmount (hammer2_vfs_unmount) */
++				if (hmp->raid_abort) {
++					kfree(md_buf, M_HAMMER2);
++					hmp->resilver_running = 0;
++					return EINTR;
++				}
 +				/*
 +				 * dscheck rejects non-sector-aligned bcount.
 +				 * The trailing partial chunk of a non-aligned
@@ -4747,6 +4764,12 @@ index 31be24efaf..c90c3bb365 100644
 +	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 +
 +	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
++		/* forced unmount (hammer2_vfs_unmount) */
++		if (hmp->raid_abort) {
++			error = EINTR;
++			break;
++		}
++
 +		/*
 +		 * v3 (RAIDZ2-native): skip unallocated stripe slots.
 +		 * Bitmap lives in hmp->stripe_bitmap.  Gated by sysctl
@@ -5153,6 +5176,11 @@ index 31be24efaf..c90c3bb365 100644
 +	}
 +
 +	for (;;) {
++		/* forced unmount (hammer2_vfs_unmount) */
++		if (ctx->hmp->raid_abort) {
++			error = EINTR;
++			break;
++		}
 +		e = hammer2_chain_scan(parent, &chain, &bref, &first,
 +				       HAMMER2_LOOKUP_NODATA |
 +				       HAMMER2_LOOKUP_SHARED);
@@ -5283,7 +5311,7 @@ index 31be24efaf..c90c3bb365 100644
  hammer2_io_hashv(hammer2_dev_t *hmp, hammer2_off_t pbase)
  {
 diff --git a/sys/vfs/hammer2/hammer2_ioctl.c b/sys/vfs/hammer2/hammer2_ioctl.c
-index 5644f4e13b..cbec41cdb6 100644
+index 5644f4e13b..40e6448d7a 100644
 --- a/sys/vfs/hammer2/hammer2_ioctl.c
 +++ b/sys/vfs/hammer2/hammer2_ioctl.c
 @@ -41,8 +41,10 @@
@@ -5297,7 +5325,7 @@ index 5644f4e13b..cbec41cdb6 100644
  
  static int hammer2_ioctl_version_get(hammer2_inode_t *ip, void *data);
  static int hammer2_ioctl_recluster(hammer2_inode_t *ip, void *data);
-@@ -69,6 +71,11 @@ static int hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data,
+@@ -69,6 +71,13 @@ static int hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data,
  static int hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data);
  static int hammer2_ioctl_destroy(hammer2_inode_t *ip, void *data);
  static int hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data);
@@ -5305,17 +5333,20 @@ index 5644f4e13b..cbec41cdb6 100644
 +static int hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data);
 +static int hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data);
 +static int hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data);
++static int hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
++			int (*func)(hammer2_inode_t *, void *));
 +static int hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data);
  
  int
  hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
-@@ -166,6 +173,26 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
+@@ -166,6 +175,28 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
  		if (error == 0)
  			error = hammer2_ioctl_volume_list(ip, data);
  		break;
 +	case HAMMER2IOC_RAID_REPLACE:
 +		if (error == 0)
-+			error = hammer2_ioctl_raid_replace(ip, data);
++			error = hammer2_ioctl_raid_long(ip, data,
++			    hammer2_ioctl_raid_replace);
 +		break;
 +	case HAMMER2IOC_RAID_FAIL_DISK:
 +		if (error == 0)
@@ -5327,7 +5358,8 @@ index 5644f4e13b..cbec41cdb6 100644
 +		break;
 +	case HAMMER2IOC_RAID_SCRUB:
 +		if (error == 0)
-+			error = hammer2_ioctl_raid_scrub(ip, data);
++			error = hammer2_ioctl_raid_long(ip, data,
++			    hammer2_ioctl_raid_scrub);
 +		break;
 +	case HAMMER2IOC_RAID_SCRUB_STATUS:
 +		/* No privilege required — read-only status query */
@@ -5336,7 +5368,7 @@ index 5644f4e13b..cbec41cdb6 100644
  	case FIOSEEKDATA:
  	case FIOSEEKHOLE:
  		if (error == 0)
-@@ -1056,6 +1083,18 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
+@@ -1056,6 +1087,18 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
  	int i;
  
  	pmp = ip->pmp;
@@ -5355,7 +5387,7 @@ index 5644f4e13b..cbec41cdb6 100644
  	if (mode) {
  		kprintf("hammer2: WARNING: Emergency mode enabled\n");
  		atomic_set_int(&pmp->flags, HAMMER2_PMPF_EMERG);
-@@ -1093,6 +1132,7 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
+@@ -1093,6 +1136,7 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
  	hammer2_chain_t *vchain;
  	int error;
  	int didsnap;
@@ -5363,7 +5395,7 @@ index 5644f4e13b..cbec41cdb6 100644
  
  	pmp = ip->pmp;
  	ip = pmp->iroot;
-@@ -1111,6 +1151,15 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
+@@ -1111,6 +1155,15 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
  	if (error)
  		return error;
  
@@ -5379,7 +5411,7 @@ index 5644f4e13b..cbec41cdb6 100644
  	/*
  	 * Sync all mounts related to the media
  	 */
-@@ -1174,6 +1223,8 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
+@@ -1174,6 +1227,8 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
  	error = hammer2_error_to_errno(error);
  
  failed:
@@ -5388,10 +5420,36 @@ index 5644f4e13b..cbec41cdb6 100644
  	lockmgr(&hmp->bflock, LK_RELEASE);
  	return error;
  }
-@@ -1452,3 +1503,419 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
+@@ -1452,3 +1507,445 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
  
  	return error;
  }
++
++/*
++ * Run a long RAID ioctl (replace, scrub) counted in hmp->raid_ioctls so
++ * a forced unmount can stop it and wait for it before closing the
++ * devices (see hammer2_vfs_unmount).
++ */
++static int
++hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
++			int (*func)(hammer2_inode_t *, void *))
++{
++	hammer2_dev_t *hmp;
++	int error;
++
++	hmp = ip->pmp->pfs_hmps[0];
++	if (hmp == NULL)
++		return EINVAL;
++	atomic_add_int((volatile u_int *)&hmp->raid_ioctls, 1);
++	if (hmp->raid_abort)
++		error = EINTR;
++	else
++		error = func(ip, data);
++	if (atomic_fetchadd_int((volatile u_int *)&hmp->raid_ioctls,
++	    -1) == 1)
++		wakeup(__DEVOLATILE(void *, &hmp->raid_ioctls));
++	return error;
++}
 +
 +/*
 + * RAID 6 disk replacement (online resilver).
@@ -9042,7 +9100,7 @@ index 32367cc24c..6a9d0d875e 100644
  	if (data == NULL)
  		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467c9d..c499890a49 100644
+index 98c8467c9d..126ad50998 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -47,7 +47,14 @@
@@ -9424,7 +9482,55 @@ index 98c8467c9d..c499890a49 100644
  			error = hammer2_recovery(hmp);
  			if (error == 0)
  				error |= hammer2_fixup_pfses(hmp);
-@@ -1650,9 +1912,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1624,6 +1886,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+ 	return result;
+ }
+ 
++/*
++ * See hammer2_vfs_unmount().  raid_abort is cleared again once the
++ * ioctls have drained: the device may stay mounted through another PFS.
++ */
++static void
++hammer2_vfs_unmount_raid_abort(hammer2_pfs_t *pmp)
++{
++	hammer2_dev_t *hmp;
++	int i;
++
++	for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
++		hmp = pmp->pfs_hmps[i];
++		if (hmp == NULL || hmp->raid_ioctls == 0)
++			continue;
++		kprintf("hammer2: forced unmount: stopping resilver/scrub\n");
++		hmp->raid_abort = 1;
++		while (hmp->raid_ioctls) {
++			tsleep(__DEVOLATILE(void *, &hmp->raid_ioctls), 0,
++			       "h2rabt", hz / 10);
++		}
++		hmp->raid_abort = 0;
++	}
++}
++
+ static
+ int
+ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1637,6 +1923,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+ 	if (pmp == NULL)
+ 		return(0);
+ 
++	/*
++	 * A forced unmount (e.g. at shutdown) does not wait for ioctls in
++	 * progress.  Stop a running resilver or scrub and wait for its
++	 * ioctl to return before the vnodes and devices go away under it.
++	 * A non-forced unmount fails with EBUSY on the ioctl's open vnode
++	 * instead.  Done before hammer2_mntlk: the resilver syncs the pmp.
++	 */
++	if (mntflags & MNT_FORCE)
++		hammer2_vfs_unmount_raid_abort(pmp);
++
+ 	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
+ 
+ 	/*
+@@ -1650,9 +1946,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	else
  		flags = 0;
  	if (pmp->iroot) {
@@ -9448,7 +9554,7 @@ index 98c8467c9d..c499890a49 100644
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
-@@ -1777,6 +2053,14 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+@@ -1777,6 +2087,14 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
  	hammer2_iocom_uninit(hmp);
  
  	hammer2_bulkfree_uninit(hmp);
@@ -9463,7 +9569,7 @@ index 98c8467c9d..c499890a49 100644
  	hammer2_pfsfree_scan(hmp, 0);
  
  	/*
-@@ -1896,6 +2180,12 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
+@@ -1896,6 +2214,12 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
  	kmalloc_destroy_obj(&hmp->mchain);
  	kmalloc_destroy_obj(&hmp->mio);
  	kmalloc_destroy(&hmp->mmsg);
@@ -9476,7 +9582,7 @@ index 98c8467c9d..c499890a49 100644
  	kfree(hmp, M_HAMMER2);
  }
  
-@@ -2040,6 +2330,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2040,6 +2364,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statfs tmp;
@@ -9486,7 +9592,7 @@ index 98c8467c9d..c499890a49 100644
  	int i;
  
  	/*
-@@ -2060,17 +2353,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2060,17 +2387,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -9515,7 +9621,7 @@ index 98c8467c9d..c499890a49 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2095,6 +2394,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2095,6 +2428,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statvfs tmp;
@@ -9525,7 +9631,7 @@ index 98c8467c9d..c499890a49 100644
  	int i;
  
  	/*
-@@ -2114,17 +2416,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2114,17 +2450,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;

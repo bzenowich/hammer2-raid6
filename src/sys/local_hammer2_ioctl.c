@@ -75,6 +75,8 @@ static int hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data);
+static int hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
+			int (*func)(hammer2_inode_t *, void *));
 static int hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data);
 
 int
@@ -175,7 +177,8 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 		break;
 	case HAMMER2IOC_RAID_REPLACE:
 		if (error == 0)
-			error = hammer2_ioctl_raid_replace(ip, data);
+			error = hammer2_ioctl_raid_long(ip, data,
+			    hammer2_ioctl_raid_replace);
 		break;
 	case HAMMER2IOC_RAID_FAIL_DISK:
 		if (error == 0)
@@ -187,7 +190,8 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 		break;
 	case HAMMER2IOC_RAID_SCRUB:
 		if (error == 0)
-			error = hammer2_ioctl_raid_scrub(ip, data);
+			error = hammer2_ioctl_raid_long(ip, data,
+			    hammer2_ioctl_raid_scrub);
 		break;
 	case HAMMER2IOC_RAID_SCRUB_STATUS:
 		/* No privilege required — read-only status query */
@@ -1501,6 +1505,32 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
 failed:
 	hammer2_voldata_unlock(hmp);
 
+	return error;
+}
+
+/*
+ * Run a long RAID ioctl (replace, scrub) counted in hmp->raid_ioctls so
+ * a forced unmount can stop it and wait for it before closing the
+ * devices (see hammer2_vfs_unmount).
+ */
+static int
+hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
+			int (*func)(hammer2_inode_t *, void *))
+{
+	hammer2_dev_t *hmp;
+	int error;
+
+	hmp = ip->pmp->pfs_hmps[0];
+	if (hmp == NULL)
+		return EINVAL;
+	atomic_add_int((volatile u_int *)&hmp->raid_ioctls, 1);
+	if (hmp->raid_abort)
+		error = EINTR;
+	else
+		error = func(ip, data);
+	if (atomic_fetchadd_int((volatile u_int *)&hmp->raid_ioctls,
+	    -1) == 1)
+		wakeup(__DEVOLATILE(void *, &hmp->raid_ioctls));
 	return error;
 }
 

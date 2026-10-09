@@ -2166,6 +2166,13 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				size_t this_chunk =
 				    (size_t)((ms - off > MD_CHUNK) ?
 					     MD_CHUNK : (ms - off));
+
+				/* forced unmount (hammer2_vfs_unmount) */
+				if (hmp->raid_abort) {
+					kfree(md_buf, M_HAMMER2);
+					hmp->resilver_running = 0;
+					return EINTR;
+				}
 				/*
 				 * dscheck rejects non-sector-aligned bcount.
 				 * The trailing partial chunk of a non-aligned
@@ -2267,6 +2274,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
 	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
+		/* forced unmount (hammer2_vfs_unmount) */
+		if (hmp->raid_abort) {
+			error = EINTR;
+			break;
+		}
+
 		/*
 		 * v3 (RAIDZ2-native): skip unallocated stripe slots.
 		 * Bitmap lives in hmp->stripe_bitmap.  Gated by sysctl
@@ -2673,6 +2686,11 @@ hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 	}
 
 	for (;;) {
+		/* forced unmount (hammer2_vfs_unmount) */
+		if (ctx->hmp->raid_abort) {
+			error = EINTR;
+			break;
+		}
 		e = hammer2_chain_scan(parent, &chain, &bref, &first,
 				       HAMMER2_LOOKUP_NODATA |
 				       HAMMER2_LOOKUP_SHARED);
