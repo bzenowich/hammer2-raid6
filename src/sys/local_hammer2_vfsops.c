@@ -242,6 +242,8 @@ static eventhandler_tag hammer2_gone_tag;
 #endif
 static int hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 				struct ucred *cred);
+static int hammer2_vfs_mount_spec(struct mount *mp, char *path, caddr_t data,
+				struct ucred *cred, char *devstr);
 static int hammer2_remount(hammer2_dev_t *, struct mount *, char *,
 				struct ucred *);
 static int hammer2_recovery(hammer2_dev_t *hmp);
@@ -1119,6 +1121,48 @@ int
 hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 		  struct ucred *cred)
 {
+	char *devstr;
+	int error;
+
+	/*
+	 * A multi-disk spec can be longer than MNAMELEN (four
+	 * /dev/serno paths are), so it gets a buffer of its own.
+	 */
+	devstr = kmalloc(MAXPATHLEN, M_HAMMER2, M_WAITOK | M_ZERO);
+	error = hammer2_vfs_mount_spec(mp, path, data, cred, devstr);
+	kfree(devstr, M_HAMMER2);
+
+	return error;
+}
+
+/*
+ * f_mntfromname is MNAMELEN; a spec that does not fit is shown as
+ * its first device, the count of the others, and the label.
+ */
+static void
+hammer2_set_mntfromname(struct mount *mp, const char *devstr,
+			const char *label)
+{
+	char *name = mp->mnt_stat.f_mntfromname;
+	const char *p;
+	int others = 0;
+	int n;
+
+	for (p = devstr; *p; ++p) {
+		if (*p == ':')
+			++others;
+	}
+	p = strchr(devstr, ':');
+	n = p ? (int)(p - devstr) : (int)strlen(devstr);
+	ksnprintf(name, MNAMELEN, "%.*s:+%d@%s", n, devstr, others, label);
+	if (strlen(name) == MNAMELEN - 1)
+		ksnprintf(name, MNAMELEN, "%.*s", n, devstr);
+}
+
+static int
+hammer2_vfs_mount_spec(struct mount *mp, char *path, caddr_t data,
+		       struct ucred *cred, char *devstr)
+{
 	struct hammer2_mount_info info;
 	hammer2_pfs_t *pmp;
 	hammer2_pfs_t *spmp;
@@ -1133,7 +1177,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 	hammer2_devvp_list_t devvpl;
 	hammer2_devvp_t *e, *e_tmp;
 	struct file *fp;
-	char devstr[MNAMELEN];
 	size_t size;
 	size_t done;
 	char *label;
@@ -1187,12 +1230,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 		 * Root mount
 		 */
 		info.cluster_fd = -1;
-		ksnprintf(devstr, sizeof(devstr), "%s",
+		ksnprintf(devstr, MAXPATHLEN, "%s",
 			  mp->mnt_stat.f_mntfromname);
 		done = strlen(devstr) + 1;
 		kprintf("hammer2_mount: root devstr=\"%s\"\n", devstr);
 	} else {
-		error = copyinstr(info.volume, devstr, MNAMELEN - 1, &done);
+		error = copyinstr(info.volume, devstr, MAXPATHLEN - 1, &done);
 		if (error)
 			return (error);
 		kprintf("hammer2_mount: devstr=\"%s\"\n", devstr);
@@ -1864,7 +1907,10 @@ next_hmp:
 	vfs_add_vnodeops(mp, &hammer2_spec_vops, &mp->mnt_vn_spec_ops);
 	vfs_add_vnodeops(mp, &hammer2_fifo_vops, &mp->mnt_vn_fifo_ops);
 
-	if (path) {
+	if (path && done > MNAMELEN) {
+		bzero(mp->mnt_stat.f_mntfromname, MNAMELEN);
+		hammer2_set_mntfromname(mp, devstr, label);
+	} else if (path) {
 		copyinstr(info.volume, mp->mnt_stat.f_mntfromname,
 			  MNAMELEN - 1, &size);
 		bzero(mp->mnt_stat.f_mntfromname + size, MNAMELEN - size);
