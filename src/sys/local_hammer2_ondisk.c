@@ -994,9 +994,18 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		if (voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 		    voldata->raid_config.raid_type ==
 		     HAMMER2_RAID_TYPE_RAID6) {
+			/*
+			 * On a tie prefer the lowest disk id, so the
+			 * choice does not depend on the order of the
+			 * mount spec.  Older newfs_hammer2 wrote the
+			 * sroot blockset only into disk 0's header.
+			 */
 			if (*rootvoldevvp == NULL ||
 			    voldata->raid_config.rz_txg_seq >
-			     rootvoldata->raid_config.rz_txg_seq) {
+			     rootvoldata->raid_config.rz_txg_seq ||
+			    (voldata->raid_config.rz_txg_seq ==
+			      rootvoldata->raid_config.rz_txg_seq &&
+			     voldata->volu_id < rootvoldata->volu_id)) {
 				bcopy(voldata, rootvoldata,
 				      sizeof(*rootvoldata));
 				*rootvolzone = zone;
