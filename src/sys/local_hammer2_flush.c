@@ -1700,6 +1700,11 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			 *                            (validated at mount in
 			 *                            hammer2_init_volumes_3;
 			 *                            mismatch = remount EINVAL)
+			 *   volu_size            — the disk's own size, which a
+			 *                            mixed-size multi-volume fs
+			 *                            needs: the root's size here
+			 *                            fails the next mount with
+			 *                            "exceeds device size"
 			 *
 			 * After mutating either field the SECT0 + volheader
 			 * CRCs must be recomputed or the loader will reject the
@@ -1716,6 +1721,15 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 					int dirty = 0;
 					if (vd->volu_id != vi) {
 						vd->volu_id = vi;
+						dirty = 1;
+					}
+					if (hmp->volumes[vi].size != 0 &&
+					    hmp->volumes[vi].size !=
+					     (hammer2_off_t)-1 &&
+					    vd->volu_size !=
+					     hmp->volumes[vi].size) {
+						vd->volu_size =
+						    hmp->volumes[vi].size;
 						dirty = 1;
 					}
 					if (hmp->voldata.version >=
