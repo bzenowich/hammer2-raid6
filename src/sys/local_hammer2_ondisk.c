@@ -45,6 +45,8 @@
 #include <sys/objcache.h>
 #include <sys/lock.h>
 
+#include <vm/vm_object.h>
+
 #include "hammer2.h"
 #include "hammer2_raid6.h"
 
@@ -299,6 +301,14 @@ hammer2_init_devvp(const char *blkdevs, int rootmount,
 					break;
 				}
 				dummy_vp->v_type = VCHR;
+				/*
+				 * getblk() needs a VM object, which a real
+				 * device vnode gets at open.  Buffers here
+				 * are only reconstruction scratch and are
+				 * never dirtied (putblk brelse's them).
+				 */
+				vinitvmio(dummy_vp, IDX_TO_OFF(INT_MAX),
+					  PAGE_SIZE, -1);
 				vx_unlock(dummy_vp);
 				e = kmalloc(sizeof(*e), M_HAMMER2,
 					    M_WAITOK | M_ZERO);

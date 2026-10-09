@@ -199,6 +199,17 @@ argument), plus the new device path (for "what to resilver onto") as
 independent arguments. The new device must be opened, verified as blank or
 belonging to a different array, before the resilver begins.
 
+**Status (2026-10-09)**: `replace` matches the old path by name against the
+stored path, so it no longer needs to open it. The common case, the same
+disk unplugged and plugged back in, now keeps its name when the kernel
+provides the `disk_gone` event (FlyNAS fork `775bcc60f9`). The member is
+failed and its vnode closed as soon as the device goes away, which lets CAM
+free the da unit. The disk returns as the same `daN` and
+`raid replace /dev/daNs1 /dev/daNs1` resilvers it. This was verified on the
+Pi over UAS: idle, mid-write, and through an unmount and degraded remount.
+On stock DragonFly the code compiles out (`#ifdef DISK_GONE`), and a pulled
+disk keeps its unit until unmount.
+
 ---
 
 ### 5. BUF_CMD_FLUSH Now Issues a Real Disk Flush
@@ -361,7 +372,7 @@ computed by the freemap.
 | 1 | EIO on surviving disk → silent wrong reconstruction | **Data loss** | **Fixed** (auto-fail) |
 | 2 | Drive naming instability across reboots | **Data loss** | **Largely resolved** (volu_id assignment + bounds check; UUID deferred) |
 | 3 | Volume header only written to disk 0 | **Data loss** | **Already implemented** |
-| 4 | Hot-swap device identity (API mismatch) | Operational | Deferred |
+| 4 | Hot-swap device identity (API mismatch) | Operational | **Same-disk replug fixed** (disk_gone); new-node replace by old path name |
 | 5 | BUF_CMD_FLUSH sequential + function rename | Performance | Deferred |
 | 6 | Synchronous degraded writes slow on HDDs | Performance | Deferred |
 | 7 | Healthy-mode bawrite is now genuinely parallel | Improvement | None needed |

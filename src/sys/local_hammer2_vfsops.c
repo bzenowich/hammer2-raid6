@@ -48,6 +48,8 @@
 #include <sys/file.h>
 
 #include <sys/diskslice.h>
+#include <sys/disk.h>
+#include <sys/taskqueue.h>
 
 #include "hammer2.h"
 #include "hammer2_raid6.h"
@@ -223,6 +225,21 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
 
 static int hammer2_vfs_init(struct vfsconf *conf);
 static int hammer2_vfs_uninit(struct vfsconf *vfsp);
+#ifdef DISK_GONE
+static void hammer2_disk_gone(void *arg, struct disk *dp);
+static void hammer2_disk_gone_task(void *arg, int pending);
+
+struct hammer2_gone {
+	TAILQ_ENTRY(hammer2_gone) entry;
+	struct disk	*dp;
+};
+
+static TAILQ_HEAD(, hammer2_gone) hammer2_gone_list =
+	TAILQ_HEAD_INITIALIZER(hammer2_gone_list);
+static struct spinlock hammer2_gone_spin;
+static struct task hammer2_gone_task;
+static eventhandler_tag hammer2_gone_tag;
+#endif
 static int hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 				struct ucred *cred);
 static int hammer2_remount(hammer2_dev_t *, struct mount *, char *,
@@ -384,6 +401,13 @@ hammer2_vfs_init(struct vfsconf *conf)
 
 	hammer2_raid6_init();
 
+#ifdef DISK_GONE
+	spin_init(&hammer2_gone_spin, "h2gone");
+	TASK_INIT(&hammer2_gone_task, 0, hammer2_disk_gone_task, NULL);
+	hammer2_gone_tag = EVENTHANDLER_REGISTER(disk_gone, hammer2_disk_gone,
+						 NULL, EVENTHANDLER_PRI_ANY);
+#endif
+
 	return (error);
 }
 
@@ -391,11 +415,109 @@ static
 int
 hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
 {
+#ifdef DISK_GONE
+	EVENTHANDLER_DEREGISTER(disk_gone, hammer2_gone_tag);
+	taskqueue_drain(taskqueue_thread[0], &hammer2_gone_task);
+#endif
 	objcache_destroy(cache_buffer_read);
 	objcache_destroy(cache_buffer_write);
 	objcache_destroy(cache_xops);
 	return 0;
 }
+
+#ifdef DISK_GONE
+/*
+ * A RAID6 member whose device went away (unplugged) is failed and closed
+ * right away, not when an I/O to it next errors out, which an idle array
+ * may never do.  The close lets the driver free the device, so that a
+ * replugged disk comes back under its old name and can be replaced onto
+ * that path.
+ *
+ * The disk_gone handler runs on the disk thread, where the close must not
+ * happen (see disk_gone_fn); a task does the work.
+ */
+static void
+hammer2_disk_gone(void *arg __unused, struct disk *dp)
+{
+	struct hammer2_gone *g;
+
+	g = kmalloc(sizeof(*g), M_HAMMER2, M_WAITOK | M_ZERO);
+	g->dp = dp;
+	spin_lock(&hammer2_gone_spin);
+	TAILQ_INSERT_TAIL(&hammer2_gone_list, g, entry);
+	spin_unlock(&hammer2_gone_spin);
+	taskqueue_enqueue(taskqueue_thread[0], &hammer2_gone_task);
+}
+
+/*
+ * dp is only compared, never dereferenced: it may be destroyed by now,
+ * but not while a member still has it open, so a match is the real disk.
+ */
+static void
+hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
+{
+	hammer2_devvp_t *dev;
+	struct vnode *devvp;
+	int i;
+
+	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return;
+	for (i = 0; i < hmp->nvolumes; ++i) {
+		dev = hmp->volumes[i].dev;
+		if (dev == NULL || dev->open == 0)
+			continue;
+		devvp = dev->devvp;
+		if (devvp == NULL || devvp->v_rdev == NULL ||
+		    devvp->v_rdev->si_disk != dp)
+			continue;
+
+		/* A third failure is left alone: the array is lost anyway */
+		if (hammer2_raid6_auto_fail_disk(hmp, i) != 0 ||
+		    hmp->raid_failed[i] == 0)
+			continue;
+
+		/* As in raid replace: wait out writers to the disk */
+		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		if (hmp->rebuild_active && hmp->rebuild_disk == i) {
+			/* its writes fail, and with them the resilver */
+			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			kprintf("hammer2: RAID6 disk %d (%s) is gone while "
+				"resilvering\n", i, dev->path);
+			continue;
+		}
+		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+		vinvalbuf(devvp, 0, 0, 0);
+		VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
+		vn_unlock(devvp);
+		dev->open = 0;
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		kprintf("hammer2: RAID6 disk %d (%s) is gone; failed and "
+			"closed\n", i, dev->path);
+	}
+}
+
+static void
+hammer2_disk_gone_task(void *arg __unused, int pending __unused)
+{
+	struct hammer2_gone *g;
+	hammer2_dev_t *hmp;
+
+	for (;;) {
+		spin_lock(&hammer2_gone_spin);
+		g = TAILQ_FIRST(&hammer2_gone_list);
+		if (g)
+			TAILQ_REMOVE(&hammer2_gone_list, g, entry);
+		spin_unlock(&hammer2_gone_spin);
+		if (g == NULL)
+			break;
+		lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
+		TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry)
+			hammer2_disk_gone_hmp(hmp, g->dp);
+		lockmgr(&hammer2_mntlk, LK_RELEASE);
+		kfree(g, M_HAMMER2);
+	}
+}
+#endif /* DISK_GONE */
 
 /*
  * Core PFS allocator.  Used to allocate or reference the pmp structure
