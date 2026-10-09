@@ -1312,6 +1312,13 @@ hammer2_vfs_mount_spec(struct mount *mp, char *path, caddr_t data,
 		TAILQ_FOREACH(hmp_tmp, &hammer2_mntlist, mntentry) {
 			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
 				int devvp_found = 0;
+				/*
+				 * An absent disk of a degraded mount has a
+				 * dummy vnode that no device can match.
+				 */
+				if (e_tmp->devvp == NULL ||
+				    e_tmp->devvp->v_rdev == NULL)
+					continue;
 				TAILQ_FOREACH(e, &devvpl, entry) {
 					/* Skip absent devices (dummy vnodes) */
 					if (e->devvp->v_rdev == NULL)

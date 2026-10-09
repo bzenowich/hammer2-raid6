@@ -2132,7 +2132,7 @@ int hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
 int hammer2_init_devvp(const char *blkdevs, int rootmount,
 			hammer2_devvp_list_t *devvpl);
 void hammer2_cleanup_devvp(hammer2_devvp_list_t *devvpl);
-int hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+int hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 			hammer2_volume_t *volumes,
 			hammer2_volume_data_t *rootvoldata,
 			int *rootvolzone,

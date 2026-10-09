@@ -226,6 +226,40 @@ hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 	return 0;
 }
 
+/*
+ * Append a placeholder entry for an absent device of a multi-device
+ * mount.  It gets a dummy vnode so the buffer cache has a valid anchor
+ * for degraded I/O paths (getblk/brelse); dead vnode ops make any
+ * accidental I/O return an error.
+ */
+static hammer2_devvp_t *
+hammer2_add_absent_devvp(hammer2_devvp_list_t *devvpl, const char *path)
+{
+	hammer2_devvp_t *e;
+	struct vnode *dummy_vp;
+
+	if (getspecialvnode(VT_NON, NULL, &dead_vnode_vops_p, &dummy_vp,
+			    0, 0)) {
+		hprintf("cannot allocate dummy vnode for %s\n", path);
+		return NULL;
+	}
+	dummy_vp->v_type = VCHR;
+	/*
+	 * getblk() needs a VM object, which a real device vnode gets at
+	 * open.  Buffers here are only reconstruction scratch and are
+	 * never dirtied (putblk brelse's them).
+	 */
+	vinitvmio(dummy_vp, IDX_TO_OFF(INT_MAX), PAGE_SIZE, -1);
+	vx_unlock(dummy_vp);
+	e = kmalloc(sizeof(*e), M_HAMMER2, M_WAITOK | M_ZERO);
+	e->devvp = dummy_vp;
+	e->path = kstrdup(path, M_HAMMER2);
+	e->open = 0;
+	TAILQ_INSERT_TAIL(devvpl, e, entry);
+
+	return e;
+}
+
 int
 hammer2_init_devvp(const char *blkdevs, int rootmount,
 		   hammer2_devvp_list_t *devvpl)
@@ -283,39 +317,11 @@ hammer2_init_devvp(const char *blkdevs, int rootmount,
 			 * fail immediately.
 			 */
 			if (*p != '\0' || !TAILQ_EMPTY(devvpl)) {
-				struct vnode *dummy_vp;
-
 				hprintf("device %s not found (%d), "
 					"will attempt degraded mount\n",
 					path, error);
-				/*
-				 * Create a dummy vnode so the buffer cache
-				 * has a valid anchor for degraded I/O paths
-				 * (getblk/brelse).  Uses dead vnode ops so
-				 * any accidental I/O returns an error.
-				 */
-				if (getspecialvnode(VT_NON, NULL,
-				    &dead_vnode_vops_p, &dummy_vp, 0, 0)) {
-					hprintf("cannot allocate dummy "
-						"vnode for %s\n", path);
+				if (hammer2_add_absent_devvp(devvpl, path) == NULL)
 					break;
-				}
-				dummy_vp->v_type = VCHR;
-				/*
-				 * getblk() needs a VM object, which a real
-				 * device vnode gets at open.  Buffers here
-				 * are only reconstruction scratch and are
-				 * never dirtied (putblk brelse's them).
-				 */
-				vinitvmio(dummy_vp, IDX_TO_OFF(INT_MAX),
-					  PAGE_SIZE, -1);
-				vx_unlock(dummy_vp);
-				e = kmalloc(sizeof(*e), M_HAMMER2,
-					    M_WAITOK | M_ZERO);
-				e->devvp = dummy_vp;
-				e->path = kstrdup(path, M_HAMMER2);
-				e->open = 0;
-				TAILQ_INSERT_TAIL(devvpl, e, entry);
 				error = 0;
 				continue;
 			}
@@ -790,7 +796,7 @@ hammer2_print_uuid_mismatch(uuid_t *uuid1, uuid_t *uuid2, const char *id)
 }
 
 int
-hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
+hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 		     hammer2_volume_t *volumes,
 		     hammer2_volume_data_t *rootvoldata,
 		     int *rootvolzone,
@@ -1187,15 +1193,27 @@ hammer2_init_volumes(struct mount *mp, const hammer2_devvp_list_t *devvpl,
 		int slot;
 
 		e = TAILQ_FIRST(devvpl);
-		for (slot = 0; slot < rc->ndisks && e != NULL; slot++) {
+		for (slot = 0; slot < rc->ndisks; slot++) {
 			vol = &volumes[slot];
 			if (vol->id != -1)
 				continue;
-			/* Find next unavailable entry */
+			/*
+			 * Find the next unavailable entry.  A disk left
+			 * out of the mount spec has none; give it a
+			 * placeholder so its slot still maps its offsets.
+			 */
 			while (e != NULL && e->devvp != NULL && e->open)
 				e = TAILQ_NEXT(e, entry);
-			if (e == NULL)
-				break;
+			if (e == NULL) {
+				hprintf("RAID6 disk %d not in the mount "
+					"spec\n", slot);
+				e = hammer2_add_absent_devvp(devvpl,
+							     "(missing)");
+				if (e == NULL) {
+					error = ENOMEM;
+					break;
+				}
+			}
 			vol->dev = e;
 			vol->id = slot;
 			/*
