@@ -726,6 +726,29 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 	voldata->sroot_blockset = sroot_blockset;
 	voldata->mirror_tid = 16;	/* all blockref mirror TIDs set to 16 */
 	voldata->freemap_tid = 16;	/* all blockref mirror TIDs set to 16 */
+
+	/*
+	 * RAID6 (v3): every disk carries the root volume's header, as the
+	 * kernel's flush writes it, with only the per-disk fields changed.
+	 * All disks start at the same rz_txg_seq, so mount may adopt any
+	 * of them as rootvoldata; a disk without the sroot blockset would
+	 * leave a fresh array unmountable unless disk 0 came first.
+	 */
+	if (opt->RaidType == 6 &&
+	    voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+		static hammer2_volume_data_t rootvol;
+
+		if (vol->id == HAMMER2_ROOT_VOLUME) {
+			rootvol = *voldata;
+		} else {
+			assert(rootvol.magic == HAMMER2_VOLUME_ID_HBO);
+			*voldata = rootvol;
+			voldata->volu_id = vol->id;
+			voldata->volu_size = vol->size;
+			voldata->raid_config.rz_disk_id = (uint8_t)vol->id;
+		}
+	}
+
 	voldata->icrc_sects[HAMMER2_VOL_ICRC_SECT1] =
 			hammer2_icrc32((char *)voldata + HAMMER2_VOLUME_ICRC1_OFF,
 				       HAMMER2_VOLUME_ICRC1_SIZE);
