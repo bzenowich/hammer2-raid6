@@ -1655,9 +1655,33 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * every sync, so remounting from any disk picks up
 		 * the latest state.
 		 */
+		/*
+		 * Shared rebuild_lk, as for any writer to a member: a disk
+		 * that goes away is failed and its buffers thrown out under
+		 * the exclusive lock (hammer2_disk_gone_hmp), and a buffer
+		 * getblk() makes here meanwhile panics vinvalbuf().
+		 */
+		lockmgr(&hmp->rebuild_lk, LK_SHARED);
 		TAILQ_FOREACH(e, &hmp->devvpl, entry) {
 			if (!e->open || e->devvp == NULL)
 				continue;
+
+			/*
+			 * Not to a failed member that is not being rebuilt:
+			 * a pulled USB disk takes the da retries (minutes)
+			 * to fail each command, and every sync would wait
+			 * that out.  Its header is stale anyway, and the
+			 * resilver writes it.
+			 */
+			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+				for (di = 0; di < hmp->nvolumes; di++) {
+					if (hmp->volumes[di].dev == e)
+						break;
+				}
+				if (di < hmp->nvolumes &&
+				    !hammer2_raid6_disk_writable(hmp, di))
+					continue;
+			}
 
 			/*
 			 * Synchronize the disk before flushing the
@@ -1784,6 +1808,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			if (vol_error)
 				fsync_error = vol_error;
 		}
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 		hmp->volhdrno = j;
 		if (sm_gen && fsync_error == 0)
 			hmp->stripe_generation = sm_gen;
