@@ -409,9 +409,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			}
 			switch(op) {
 			case HAMMER2_DOP_NEW:
-				if (dio->pbase ==
-				    (lbase & ~HAMMER2_OFF_MASK_RADIX) &&
-				    dio->psize == lsize)
+				if (dio->psize == lsize)
 					bzero(preempt_data, dio->psize);
 				else
 					bzero(hammer2_io_data(dio, lbase),
@@ -430,8 +428,15 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		goto io_done;
 	}
 
-	if (dio->pbase == (lbase & ~HAMMER2_OFF_MASK_RADIX) &&
-	    dio->psize == lsize) {
+	/*
+	 * Whole-buffer access.  Don't compare lbase with dio->pbase: a v3
+	 * DATA/DIRENT dio's pbase carries the disk index in its top bits
+	 * (hammer2_dio_key), so the test failed for every disk but 0 and
+	 * each new block there was read from disk before being zeroed.
+	 * hammer2_io_alloc() asserts lbase+lsize lies in one psize block,
+	 * so lsize == psize means the whole buffer.
+	 */
+	if (dio->psize == lsize) {
 		switch(op) {
 		case HAMMER2_DOP_NEW:
 		case HAMMER2_DOP_NEWNZ:
