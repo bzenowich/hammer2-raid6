@@ -1139,6 +1139,22 @@ typedef struct hammer2_volume hammer2_volume_t;
  * as zero.  It stays on the list (closed to packing, its column data
  * kept) and is sealed again, fully, when the last column arrives.
  */
+/*
+ * A metadata mirror copy waiting for the next sync (see
+ * hammer2_io_metadata_mirror_defer).  data is a kmalloc'd copy owned by
+ * the entry.
+ */
+struct hammer2_mirror_pend {
+	TAILQ_ENTRY(hammer2_mirror_pend) entry;
+	hammer2_off_t	off;			/* per-disk byte offset */
+	int		bytes;
+	int		primary;		/* disk holding the primary, or -1 */
+	char		*data;
+};
+
+#define HAMMER2_MIRROR_HASH	64
+#define HAMMER2_MIRROR_MAXPEND	256	/* 16 MB of 64 KB blocks */
+
 struct hammer2_open_row {
 	TAILQ_ENTRY(hammer2_open_row) entry;
 	hammer2_off_t	phys_off;	/* per-disk byte offset for this row */
@@ -1260,6 +1276,18 @@ struct hammer2_dev {
 	long		open_rows_count;	/* current entry count (diag) */
 	long		open_rows_high;		/* peak entry count (diag) */
 	uint32_t	open_rows_sealgen;	/* seal_all pass counter */
+
+	/*
+	 * Deferred metadata mirror copies (v3), one entry per block.
+	 * mirror_spin protects the table and mirror_inflight, the entry the
+	 * flusher is writing (still visible to mirror reads); mirror_flush_lk
+	 * serializes flushers.
+	 */
+	hammer2_spin_t	mirror_spin;
+	struct lock	mirror_flush_lk;
+	TAILQ_HEAD(, hammer2_mirror_pend) mirror_pend[HAMMER2_MIRROR_HASH];
+	struct hammer2_mirror_pend *mirror_inflight;
+	int		mirror_pend_count;
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
 	uint32_t	md_nextents;
@@ -2164,6 +2192,9 @@ int hammer2_bwrite_start(struct buf *bp);
 int hammer2_bwrite_wait(struct buf *bp);
 int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
+void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
+		hammer2_off_t per_disk_off, char *data, int bytes);
+void hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
 int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,

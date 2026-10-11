@@ -782,6 +782,144 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 }
 
 /*
+ * Deferred metadata mirror copies.
+ *
+ * The inode, directory and freemap blocks of a busy TXG are released
+ * dirty over and over, and each release used to write the whole 64 KB
+ * block to every sibling disk at once (bdwrite of the primary coalesces,
+ * the mirrors did not).  putblk now hands the copy here instead; a later
+ * release of the same block replaces it, and the sync writes each block
+ * once, before the VOP_FSYNC drain and the volume header, so the copies
+ * are on the disks (though not flushed from their caches) no later than
+ * before.  hammer2_io_metadata_mirror_read() looks here first, so a
+ * failover read never sees an older copy.
+ *
+ * Invariant: a block the flush has committed is not queued again until
+ * the next TXG.  The flush drains the queue after hammer2_flush() has
+ * released every dirty dio of the TXG (the sync runs it after the chain
+ * flush), and a chain whose flush cleared MODIFIED is copied on write by
+ * the next hammer2_chain_modify() (v3 always sets newmod).  That covers
+ * FREEMAP_LEAF/NODE too: hammer2_freemap_alloc() gives them a new offset
+ * from hammer2_freemap_reserve(), which rotates through the 8 reserved
+ * copies on every COW.  So a copy queued after the drain belongs to a
+ * block of the next TXG, and a copy replaced in the queue is a rewrite
+ * within one TXG.
+ */
+static __inline int
+hammer2_mirror_hash(hammer2_off_t off)
+{
+	return ((off >> 16) & (HAMMER2_MIRROR_HASH - 1));
+}
+
+static struct hammer2_mirror_pend *
+hammer2_mirror_find_locked(hammer2_dev_t *hmp, hammer2_off_t off)
+{
+	struct hammer2_mirror_pend *mp;
+
+	TAILQ_FOREACH(mp, &hmp->mirror_pend[hammer2_mirror_hash(off)], entry) {
+		if (mp->off == off)
+			return mp;
+	}
+	return NULL;
+}
+
+/*
+ * Queue the mirror copy of a metadata block.  Takes ownership of data
+ * (kmalloc'd, M_HAMMER2, bytes long).  primary is the disk that holds
+ * the block's own copy, or -1.
+ */
+void
+hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
+				 hammer2_off_t per_disk_off, char *data,
+				 int bytes)
+{
+	struct hammer2_mirror_pend *mp;
+	struct hammer2_mirror_pend *nmp;
+	char *odata = NULL;
+	int count;
+
+	nmp = kmalloc(sizeof(*nmp), M_HAMMER2, M_WAITOK | M_ZERO);
+	hammer2_spin_ex(&hmp->mirror_spin);
+	mp = hammer2_mirror_find_locked(hmp, per_disk_off);
+	if (mp) {
+		odata = mp->data;
+		mp->data = data;
+		mp->bytes = bytes;
+		mp->primary = primary;
+	} else {
+		mp = nmp;
+		nmp = NULL;
+		mp->off = per_disk_off;
+		mp->bytes = bytes;
+		mp->primary = primary;
+		mp->data = data;
+		TAILQ_INSERT_TAIL(&hmp->mirror_pend[
+		    hammer2_mirror_hash(per_disk_off)], mp, entry);
+		++hmp->mirror_pend_count;
+	}
+	count = hmp->mirror_pend_count;
+	hammer2_spin_unex(&hmp->mirror_spin);
+	if (nmp)
+		kfree(nmp, M_HAMMER2);
+	if (odata)
+		kfree(odata, M_HAMMER2);
+
+	if (count > HAMMER2_MIRROR_MAXPEND)
+		hammer2_io_metadata_mirror_flush(hmp);
+}
+
+/*
+ * Write every queued mirror copy.  Entries stay visible to mirror reads
+ * until written.  A block queued again while the flush runs is written
+ * by the next one (it belongs to a later TXG).
+ */
+void
+hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
+{
+	struct hammer2_mirror_pend *mp;
+	int budget;
+	int h;
+
+	if (hmp->mirror_pend_count == 0)
+		return;
+	lockmgr(&hmp->mirror_flush_lk, LK_EXCLUSIVE);
+	budget = hmp->mirror_pend_count + HAMMER2_MIRROR_MAXPEND;
+	while (budget-- > 0) {
+		hammer2_spin_ex(&hmp->mirror_spin);
+		mp = NULL;
+		for (h = 0; h < HAMMER2_MIRROR_HASH; ++h) {
+			mp = TAILQ_FIRST(&hmp->mirror_pend[h]);
+			if (mp)
+				break;
+		}
+		if (mp) {
+			TAILQ_REMOVE(&hmp->mirror_pend[h], mp, entry);
+			--hmp->mirror_pend_count;
+			hmp->mirror_inflight = mp;
+		}
+		hammer2_spin_unex(&hmp->mirror_spin);
+		if (mp == NULL)
+			break;
+
+		/*
+		 * A primary that is down (failed before the release, or
+		 * since) has no dirty buffer to carry the block; the copy
+		 * goes to every disk, a rebuilding one included.
+		 */
+		hammer2_io_metadata_mirror_write(hmp,
+		    (mp->primary >= 0 && !hmp->raid_failed[mp->primary]) ?
+		    mp->primary : -1, mp->off, mp->data, mp->bytes);
+
+		hammer2_spin_ex(&hmp->mirror_spin);
+		hmp->mirror_inflight = NULL;
+		hammer2_spin_unex(&hmp->mirror_spin);
+		kfree(mp->data, M_HAMMER2);
+		kfree(mp, M_HAMMER2);
+	}
+	lockmgr(&hmp->mirror_flush_lk, LK_RELEASE);
+}
+
+/*
  * v3 RAIDZ2-native: read a metadata block from the first surviving
  * mirror copy.  Used when the primary disk for a metadata DIO is
  * failed.  Iterates disks in index order, skipping skip_disk_idx and
@@ -802,6 +940,23 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+
+	/* a copy queued for the next sync is newer than the disks' */
+	if (hmp->mirror_pend_count || hmp->mirror_inflight) {
+		struct hammer2_mirror_pend *mp;
+
+		hammer2_spin_ex(&hmp->mirror_spin);
+		mp = hammer2_mirror_find_locked(hmp, per_disk_off);
+		if (mp == NULL && hmp->mirror_inflight &&
+		    hmp->mirror_inflight->off == per_disk_off)
+			mp = hmp->mirror_inflight;
+		if (mp && (size_t)mp->bytes >= bytes) {
+			bcopy(mp->data, buf, bytes);
+			hammer2_spin_unex(&hmp->mirror_spin);
+			return 0;
+		}
+		hammer2_spin_unex(&hmp->mirror_spin);
+	}
 
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
 		if (i == skip_disk_idx)

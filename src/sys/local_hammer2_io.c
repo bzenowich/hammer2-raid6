@@ -931,19 +931,27 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			/*
 			 * v3 RAIDZ2-native metadata mirror (I5).  After the
 			 * primary bp has been disposed above (bdwrite /
-			 * cluster_write / bawrite to dio->devvp), replicate
-			 * the same payload synchronously to every surviving
-			 * sibling disk at the same per-disk byte offset.
-			 * skip_disk_idx avoids re-writing to the primary,
-			 * unless the primary was skipped above (failed, or
-			 * being rebuilt and so wanting the copy).
+			 * cluster_write / bawrite to dio->devvp), the same
+			 * payload goes to every surviving sibling disk at the
+			 * same per-disk byte offset.  The primary's bdwrite
+			 * coalesces repeated releases of a block; the copies
+			 * are queued the same way and written by the sync
+			 * (hammer2_io_metadata_mirror_flush) so that they do
+			 * too.
 			 */
 			if (rz_meta && md_mirror_data) {
 				hammer2_off_t per_disk_off = pbase - dio->dbase;
-				hammer2_io_metadata_mirror_write(hmp,
-				    dropped ? -1 : dio->disk_idx, per_disk_off,
+
+				/*
+				 * Written once per sync, not per release.
+				 * With the primary down the flush writes the
+				 * copy to every disk (the primary's own copy
+				 * is gone), so there is no immediate write
+				 * to race the flusher.
+				 */
+				hammer2_io_metadata_mirror_defer(hmp,
+				    dio->disk_idx, per_disk_off,
 				    md_mirror_data, psize);
-				kfree(md_mirror_data, M_HAMMER2);
 				md_mirror_data = NULL;
 			}
 		} else if (bp) {
