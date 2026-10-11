@@ -230,11 +230,11 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
 
 static int hammer2_vfs_init(struct vfsconf *conf);
 static int hammer2_vfs_uninit(struct vfsconf *vfsp);
+static void hammer2_persist_task_fn(void *arg, int pending);
+static struct task hammer2_persist_task;
 #ifdef DISK_GONE
 static void hammer2_disk_gone(void *arg, struct disk *dp);
 static void hammer2_disk_gone_task(void *arg, int pending);
-static void hammer2_persist_task_fn(void *arg, int pending);
-static struct task hammer2_persist_task;
 
 struct hammer2_gone {
 	TAILQ_ENTRY(hammer2_gone) entry;
