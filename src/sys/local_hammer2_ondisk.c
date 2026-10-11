@@ -691,97 +691,240 @@ hammer2_verify_volumes(const hammer2_volume_t *volumes,
 }
 
 /*
- * Returns zone# of returned volume header or < 0 on failure.
+ * Per-zone summary of one disk's volume headers, kept so the v3 quorum
+ * can count a disk for every TXG seq it holds, not just its newest.
+ */
+typedef struct hammer2_volzone {
+	int		valid;
+	int		volu_id;
+	uint64_t	seq;		/* rz_txg_seq */
+	uint64_t	mirror_tid;
+	hammer2_off_t	volu_size;
+	int		raid6;		/* v3 RAID6 header */
+	uuid_t		fsid;
+} hammer2_volzone_t;
+
+/*
+ * Read and verify volume header copy 'i' of a device into *voldata.
+ * Returns 0 if it is valid, else -1.
  */
 static int
-hammer2_read_volume_header(struct vnode *devvp, const char *path,
-			   hammer2_volume_data_t *voldata)
+hammer2_read_volume_zone(struct vnode *devvp, const char *path, int i,
+			 hammer2_volume_data_t *voldata)
 {
 	hammer2_volume_data_t *vd;
 	struct buf *bp = NULL;
 	hammer2_crc32_t crc0, crc1;
-	int zone = -1;
-	int i;
 
-	/*
-	 * There are up to 4 copies of the volume header (syncs iterate
-	 * between them so there is no single master).  We don't trust the
-	 * volu_size field so we don't know precisely how large the filesystem
-	 * is, so depend on the OS to return an error if we go beyond the
-	 * block device's EOF.
-	 */
-	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
-		if (bread(devvp, i * HAMMER2_ZONE_BYTES64, HAMMER2_VOLUME_BYTES,
-			  &bp)) {
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-
-		vd = (struct hammer2_volume_data *)bp->b_data;
-		/* verify volume header magic */
-		if ((vd->magic != HAMMER2_VOLUME_ID_HBO) &&
-		    (vd->magic != HAMMER2_VOLUME_ID_ABO)) {
-			hprintf("%s #%d: bad magic\n", path, i);
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-
-		if (vd->magic == HAMMER2_VOLUME_ID_ABO) {
-			/* XXX: Reversed-endianness filesystem */
-			hprintf("%s #%d: reverse-endian filesystem detected\n",
-				path, i);
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-
-		/* verify volume header CRC's */
-		crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0];
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC0_OFF,
-				      HAMMER2_VOLUME_ICRC0_SIZE);
-		if (crc0 != crc1) {
-			hprintf("%s #%d: volume header crc mismatch sect0 %08x/%08x\n",
-				path, i, crc0, crc1);
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-		crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT1];
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC1_OFF,
-				      HAMMER2_VOLUME_ICRC1_SIZE);
-		if (crc0 != crc1) {
-			hprintf("%s #%d: volume header crc mismatch sect1 %08x/%08x\n",
-				path, i, crc0, crc1);
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-		crc0 = vd->icrc_volheader;
-		crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRCVH_OFF,
-				      HAMMER2_VOLUME_ICRCVH_SIZE);
-		if (crc0 != crc1) {
-			hprintf("%s #%d: volume header crc mismatch vh %08x/%08x\n",
-				path, i, crc0, crc1);
-			brelse(bp);
-			bp = NULL;
-			continue;
-		}
-
-		if (zone == -1 || voldata->mirror_tid < vd->mirror_tid) {
-			*voldata = *vd;
-			zone = i;
-		}
+	if (bread(devvp, i * HAMMER2_ZONE_BYTES64, HAMMER2_VOLUME_BYTES,
+		  &bp)) {
 		brelse(bp);
-		bp = NULL;
+		return -1;
 	}
 
+	vd = (struct hammer2_volume_data *)bp->b_data;
+	/* verify volume header magic */
+	if ((vd->magic != HAMMER2_VOLUME_ID_HBO) &&
+	    (vd->magic != HAMMER2_VOLUME_ID_ABO)) {
+		hprintf("%s #%d: bad magic\n", path, i);
+		goto bad;
+	}
+
+	if (vd->magic == HAMMER2_VOLUME_ID_ABO) {
+		/* XXX: Reversed-endianness filesystem */
+		hprintf("%s #%d: reverse-endian filesystem detected\n",
+			path, i);
+		goto bad;
+	}
+
+	/* verify volume header CRC's */
+	crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT0];
+	crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC0_OFF,
+			      HAMMER2_VOLUME_ICRC0_SIZE);
+	if (crc0 != crc1) {
+		hprintf("%s #%d: volume header crc mismatch sect0 %08x/%08x\n",
+			path, i, crc0, crc1);
+		goto bad;
+	}
+	crc0 = vd->icrc_sects[HAMMER2_VOL_ICRC_SECT1];
+	crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRC1_OFF,
+			      HAMMER2_VOLUME_ICRC1_SIZE);
+	if (crc0 != crc1) {
+		hprintf("%s #%d: volume header crc mismatch sect1 %08x/%08x\n",
+			path, i, crc0, crc1);
+		goto bad;
+	}
+	crc0 = vd->icrc_volheader;
+	crc1 = hammer2_icrc32(bp->b_data + HAMMER2_VOLUME_ICRCVH_OFF,
+			      HAMMER2_VOLUME_ICRCVH_SIZE);
+	if (crc0 != crc1) {
+		hprintf("%s #%d: volume header crc mismatch vh %08x/%08x\n",
+			path, i, crc0, crc1);
+		goto bad;
+	}
+
+	*voldata = *vd;
+	brelse(bp);
+	return 0;
+bad:
+	brelse(bp);
+	return -1;
+}
+
+/*
+ * Returns zone# of returned volume header or < 0 on failure.
+ *
+ * There are up to 4 copies of the volume header (syncs iterate between
+ * them so there is no single master).  The newest valid copy is
+ * returned: by rz_txg_seq on a v3 RAID6 volume (mirror_tid also moves
+ * with writes that do not commit a header), else by mirror_tid.  If
+ * zones is not NULL it receives a summary of every copy.
+ */
+static int
+hammer2_read_volume_header(struct vnode *devvp, const char *path,
+			   hammer2_volume_data_t *voldata,
+			   hammer2_volzone_t *zones)
+{
+	hammer2_volume_data_t *vd;
+	hammer2_volzone_t zs[HAMMER2_NUM_VOLHDRS];
+	int zone = -1;
+	int ref = -1;
+	int better;
+	int i, j, n;
+
+	/*
+	 * Pass 1: read and summarize every copy.
+	 */
+	bzero(zs, sizeof(zs));
+	vd = kmalloc(sizeof(*vd), M_HAMMER2, M_WAITOK);
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (hammer2_read_volume_zone(devvp, path, i, vd) < 0)
+			continue;
+		zs[i].valid = 1;
+		zs[i].volu_id = vd->volu_id;
+		zs[i].volu_size = vd->volu_size;
+		zs[i].seq = vd->raid_config.rz_txg_seq;
+		zs[i].mirror_tid = vd->mirror_tid;
+		zs[i].fsid = vd->fsid;
+		zs[i].raid6 = (vd->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			       vd->raid_config.raid_type ==
+				HAMMER2_RAID_TYPE_RAID6);
+	}
+	kfree(vd, M_HAMMER2);
+
+	/*
+	 * All header copies of a device must belong to one filesystem.
+	 * A stale copy from an earlier filesystem on the same device (a
+	 * smaller newfs, or a disk reused from a larger one) carries a
+	 * different fsid and may even have a newer sequence.  newfs always
+	 * writes zone 0, so its fsid is the reference.  If zone 0 is not
+	 * valid, take the fsid most copies agree on, the one holding the
+	 * lowest zone on a tie.
+	 */
+	if (zs[0].valid) {
+		ref = 0;
+	} else {
+		int best = 0;
+
+		for (i = 1; i < HAMMER2_NUM_VOLHDRS; ++i) {
+			if (!zs[i].valid)
+				continue;
+			n = 0;
+			for (j = 1; j < HAMMER2_NUM_VOLHDRS; ++j) {
+				if (zs[j].valid &&
+				    bcmp(&zs[j].fsid, &zs[i].fsid,
+					 sizeof(zs[i].fsid)) == 0)
+					++n;
+			}
+			if (n > best) {
+				best = n;
+				ref = i;
+			}
+		}
+	}
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (!zs[i].valid || i == ref)
+			continue;
+		if (bcmp(&zs[i].fsid, &zs[ref].fsid, sizeof(zs[i].fsid)) ||
+		    zs[i].volu_id != zs[ref].volu_id) {
+			hprintf("%s #%d: header belongs to another "
+				"filesystem (fsid/volume id differs from "
+				"#%d); ignored\n", path, i, ref);
+			zs[i].valid = 0;
+		}
+	}
+
+	/*
+	 * Pass 2: pick the newest remaining copy.
+	 */
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (!zs[i].valid)
+			continue;
+		if (zone == -1) {
+			better = 1;
+		} else if (zs[zone].raid6 && zs[i].raid6) {
+			better = zs[zone].seq < zs[i].seq;
+		} else {
+			better = zs[zone].mirror_tid < zs[i].mirror_tid;
+		}
+		if (better)
+			zone = i;
+	}
+
+	/*
+	 * A copy beyond the end of the volume the newest header describes
+	 * cannot have been written by that filesystem.
+	 */
+	if (zone != -1) {
+		for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+			if (!zs[i].valid || i == zone)
+				continue;
+			if ((hammer2_off_t)i * HAMMER2_ZONE_BYTES64 >=
+			    zs[zone].volu_size) {
+				hprintf("%s #%d: header lies beyond volume "
+					"size 0x%jx; ignored\n", path, i,
+					(uintmax_t)zs[zone].volu_size);
+				zs[i].valid = 0;
+			}
+		}
+	}
+
+	if (zones)
+		bcopy(zs, zones, sizeof(zs));
 	if (zone == -1) {
 		hprintf("%s has no valid volume headers\n", path);
 		return -EINVAL;
 	}
+
+	vd = kmalloc(sizeof(*vd), M_HAMMER2, M_WAITOK);
+	if (hammer2_read_volume_zone(devvp, path, zone, vd) < 0) {
+		kfree(vd, M_HAMMER2);
+		hprintf("%s #%d: header unreadable on second read\n",
+			path, zone);
+		return -EINVAL;
+	}
+	*voldata = *vd;
+	kfree(vd, M_HAMMER2);
 	return zone;
+}
+
+/*
+ * Find a valid header zone of volume 'id' carrying v3 seq 'seq' and the
+ * array's fsid.  Returns the zone number or -1.
+ */
+static int
+hammer2_volzone_find(const hammer2_volzone_t *zones, int id,
+		     const uuid_t *fsid, uint64_t seq)
+{
+	int i;
+
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (zones[i].valid && zones[i].volu_id == id &&
+		    zones[i].seq == seq &&
+		    bcmp(&zones[i].fsid, fsid, sizeof(*fsid)) == 0)
+			return i;
+	}
+	return -1;
 }
 
 static void
@@ -816,6 +959,8 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 	 */
 	uint64_t disk_seqs[HAMMER2_MAX_VOLUMES];
 	int disk_seen[HAMMER2_MAX_VOLUMES];
+	hammer2_volzone_t zi[HAMMER2_NUM_VOLHDRS];
+	hammer2_volzone_t (*zones)[HAMMER2_NUM_VOLHDRS];
 
 	bzero(disk_seqs, sizeof(disk_seqs));
 	bzero(disk_seen, sizeof(disk_seen));
@@ -829,6 +974,8 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 	}
 
 	voldata = kmalloc(sizeof(*voldata), M_HAMMER2, M_WAITOK | M_ZERO);
+	zones = kmalloc(sizeof(*zones) * HAMMER2_MAX_VOLUMES, M_HAMMER2,
+			M_WAITOK | M_ZERO);
 	bzero(&fsid, sizeof(fsid));
 	bzero(&fstype, sizeof(fstype));
 	bzero(rootvoldata, sizeof(*rootvoldata));
@@ -857,7 +1004,8 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 		}
 
 		/* returns negative error or positive zone# */
-		error = hammer2_read_volume_header(devvp, path, voldata);
+		bzero(zi, sizeof(zi));
+		error = hammer2_read_volume_header(devvp, path, voldata, zi);
 		if (error < 0) {
 			/*
 			 * For multi-device RAID, tolerate volume header
@@ -978,6 +1126,7 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 			}
 			disk_seqs[voldata->volu_id] = vrc->rz_txg_seq;
 			disk_seen[voldata->volu_id] = 1;
+			bcopy(zi, zones[voldata->volu_id], sizeof(zi));
 			hprintf("%s: v3 RAID6 disk %u/%u txg_seq %ju\n",
 				path, vrc->rz_disk_id, vrc->rz_ndisks,
 				(uintmax_t)vrc->rz_txg_seq);
@@ -1039,31 +1188,36 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 	}
 
 	/*
-	 * J2-full: majority quorum on the v3 TXG seqno
-	 * (docs/volhdr_quorum.md §Mount-time discovery).
+	 * v3 RAID6 quorum on the TXG seq (docs/volhdr_quorum.md).
 	 *
-	 * We require ⌈N/2⌉+1 disks to report the same seqno as the disk
-	 * whose voldata we adopted as rootvoldata.  Disks below that
-	 * seqno are tagged for resilver (logged here; caller marks them
-	 * failed during the normal degraded-mount path).  Disks above
-	 * (none in practice — rootvoldata already tracks the max) would
-	 * indicate corruption.
+	 * The headers of a TXG are written one disk after another, so a
+	 * crash can leave the disks at T+1 and T.  A disk that reached T+1
+	 * still holds its T header in another zone, so a disk votes for
+	 * every seq that one of its valid zones carries.  The mount takes
+	 * the highest seq a majority supports.  Stepping back one TXG is
+	 * the normal outcome of such a crash and needs no authorization;
+	 * deeper rollbacks need vfs.hammer2.j2_allow_rollback.
 	 *
-	 * No-majority case rolls back to the highest seqno that does
-	 * have majority (down to a hard limit of HAMMER2_J2_ROLLBACK_MAX
-	 * TXGs); if even seqno 0 has no majority, ENXIO.
+	 * A disk without a zone at the chosen seq is behind: its columns
+	 * for that TXG may be missing.  It is marked FAILED in the header
+	 * we mount with (the next commit persists that) until it is
+	 * resilvered.  A disk with a newer zone (an orphan T+1 header after
+	 * a rollback) is fine: only the chosen zone is ever used, and the
+	 * next commit writes its volume header into the zone after the
+	 * chosen one on every online disk, which is where the orphan is.
 	 */
 	if (!error &&
 	    rootvoldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    rootvoldata->raid_config.raid_type ==
 	     HAMMER2_RAID_TYPE_RAID6) {
-		const hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
+		hammer2_raid_config_t *rrc = &rootvoldata->raid_config;
 		uint32_t ndisks = rrc->ndisks;
 		uint32_t electorate = 0;
 		uint32_t majority;
-		uint64_t target = rrc->rz_txg_seq;
-		uint64_t fallback = target;
-		uint32_t at_target;
+		uint32_t nsupport;
+		uint32_t nfailed;
+		uint64_t target = rrc->rz_txg_seq;	/* newest seen */
+		uint64_t chosen = target;
 		uint64_t lowest = (uint64_t)-1;
 		uint32_t seen_count = 0;
 		uint32_t rollback_max = (uint32_t)
@@ -1097,88 +1251,114 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 		}
 
 		for (;;) {
-			at_target = 0;
+			nsupport = 0;
 			for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
-				if (disk_seen[j] && disk_seqs[j] == fallback)
-					at_target++;
+				if (disk_seen[j] &&
+				    hammer2_volzone_find(zones[j], j, &fsid,
+							 chosen) >= 0)
+					nsupport++;
 			}
-			if (at_target >= majority)
+			if (nsupport >= majority)
 				break;
-			if (fallback == 0 ||
-			    target - fallback >= rollback_max) {
+			if (chosen == 0 || target - chosen >= rollback_max) {
 				hprintf("v3 quorum: no majority within "
 					"%u-TXG rollback limit "
-					"(target seq %ju, lowest %ju, "
-					"%u disks seen of %u)\n",
+					"(newest seq %ju, lowest %ju, "
+					"%u disks seen of %u, need %u)\n",
 					rollback_max,
 					(uintmax_t)target,
 					(uintmax_t)lowest,
-					seen_count, ndisks);
+					seen_count, ndisks, majority);
 				error = ENXIO;
 				goto done;
 			}
-			fallback--;
+			chosen--;
 		}
 
-		if (fallback != target) {
-			if (!hammer2_j2_allow_rollback) {
+		if (chosen != target) {
+			int zn = -1;
+
+			if (target - chosen > 1 && !hammer2_j2_allow_rollback) {
 				hprintf("v3 quorum: would roll back "
-					"%ju -> %ju (%u/%u disks at "
-					"fallback seq); refusing.  Set "
+					"%ju -> %ju (%u/%u disks support "
+					"it); refusing.  Set "
 					"vfs.hammer2.j2_allow_rollback=1 to "
 					"authorize and accept the loss of "
 					"writes between those TXGs.\n",
-					(uintmax_t)target,
-					(uintmax_t)fallback,
-					at_target, ndisks);
+					(uintmax_t)target, (uintmax_t)chosen,
+					nsupport, ndisks);
 				error = ENXIO;
 				goto done;
 			}
 			hprintf("v3 quorum: rolling back %ju -> %ju "
-				"(%u/%u disks at fallback seq) "
-				"per j2_allow_rollback=1\n",
-				(uintmax_t)target, (uintmax_t)fallback,
-				at_target, ndisks);
+				"(%u/%u disks support seq %ju)\n",
+				(uintmax_t)target, (uintmax_t)chosen,
+				nsupport, ndisks, (uintmax_t)chosen);
+
 			/*
-			 * Re-read voldata from a fallback-seqno disk so
-			 * rootvoldata reflects the seqno we'll actually
-			 * mount at.  The first matching disk wins; the
-			 * extent table / disk_state / etc. all come from
-			 * that disk's copy.
+			 * Mount with the header of the chosen seq, read
+			 * from the lowest supporting disk.  The extent
+			 * table, disk_state etc. all come from that copy.
 			 */
-			TAILQ_FOREACH(e, devvpl, entry) {
-				if (e->devvp == NULL || !e->open)
+			for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
+				if (!disk_seen[j])
 					continue;
-				if (hammer2_read_volume_header(e->devvp,
-				    e->path, voldata) < 0)
-					continue;
-				if (voldata->version <
-				    HAMMER2_VOL_VERSION_RAIDZ2)
-					continue;
-				if (voldata->volu_id < HAMMER2_MAX_VOLUMES &&
-				    !disk_seen[voldata->volu_id])
-					continue;
-				if (voldata->raid_config.rz_txg_seq ==
-				    fallback) {
-					bcopy(voldata, rootvoldata,
-					      sizeof(*rootvoldata));
-					*rootvoldevvp = e->devvp;
+				zn = hammer2_volzone_find(zones[j], j, &fsid,
+							  chosen);
+				if (zn >= 0)
 					break;
-				}
 			}
+			KKASSERT(j < HAMMER2_MAX_VOLUMES);
+			e = volumes[j].dev;
+			if (hammer2_read_volume_zone(e->devvp, e->path, zn,
+						     rootvoldata) < 0) {
+				hprintf("v3 quorum: cannot re-read header "
+					"%d of %s\n", zn, e->path);
+				error = ENXIO;
+				goto done;
+			}
+			*rootvolzone = zn;
+			*rootvoldevvp = e->devvp;
 		}
 
 		/*
-		 * Log any disks that fell behind so the operator (or a
-		 * future auto-resilver) can address them.
+		 * Disks that do not support the chosen seq are behind and
+		 * need a resilver.  Count them with the disks already
+		 * failed and the ones absent; more than two is more than
+		 * RAID6 can carry.
 		 */
-		for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
-			if (disk_seen[j] && disk_seqs[j] < target) {
-				hprintf("v3 quorum: disk %d at seq %ju "
-					"(target %ju) — needs resilver\n",
-					j, (uintmax_t)disk_seqs[j],
-					(uintmax_t)target);
+		nfailed = 0;
+		for (j = 0; j < (int)ndisks && j < HAMMER2_MAX_VOLUMES; j++) {
+			if (rrc->disk_state[j] == HAMMER2_RAID6_DISK_FAILED) {
+				nfailed++;
+				continue;
 			}
+			for (i = 0; i < HAMMER2_NUM_VOLHDRS; i++) {
+				if (zones[j][i].valid)
+					break;
+			}
+			if (i == HAMMER2_NUM_VOLHDRS) {	/* absent */
+				nfailed++;
+				continue;
+			}
+			if (hammer2_volzone_find(zones[j], j, &fsid,
+						 chosen) >= 0)
+				continue;
+			hprintf("v3 quorum: disk %d newest seq %ju is below "
+				"%ju; marking it failed (needs resilver)\n",
+				j, (uintmax_t)disk_seqs[j],
+				(uintmax_t)chosen);
+			rrc->disk_state[j] = HAMMER2_RAID6_DISK_FAILED;
+			rrc->flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+			nfailed++;
+		}
+		if (nfailed > 2) {
+			hprintf("v3 quorum: %u of %u disks failed, absent or "
+				"behind seq %ju; more than RAID6 can "
+				"recover\n", nfailed, ndisks,
+				(uintmax_t)chosen);
+			error = ENXIO;
+			goto done;
 		}
 	}
 
@@ -1237,6 +1417,7 @@ done:
 			error = hammer2_verify_volumes(volumes, rootvoldata);
 	}
 	kfree(voldata, M_HAMMER2);
+	kfree(zones, M_HAMMER2);
 
 	return error;
 }

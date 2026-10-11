@@ -7,9 +7,14 @@
 #
 # Waits for the lock (prints who holds it).  Always deploy and test inside
 # ONE locked command: another worktree may load its own hammer2.ko as soon
-# as you release it.  The lock lives in the main checkout's run/ dir.
-LOCK=/home/bz/code/flynas/hammer2-raid6/run/h2dev.lock
-mkdir -p "$(dirname "$LOCK")"
+# as you release it.  The lock lives in the main checkout (gitignored).
+LOCK=/home/bz/code/flynas/hammer2-raid6/.h2dev.lock
+# Before 2026-10-11 the lock lived in run/, which a merge once deleted
+# while agents held it.  Wait until nobody holds that old (deleted) file.
+while ls -l /proc/[0-9]*/fd/ 2>/dev/null | grep -q 'run/h2dev.lock (deleted)'; do
+    [ -n "$waited" ] || { echo "h2dev-lock: waiting for holders of the old lock to finish" >&2; waited=1; }
+    sleep 10
+done
 exec 9>>"$LOCK"
 if ! flock -n 9; then
     echo "h2dev-lock: waiting; held by: $(cat "$LOCK.owner" 2>/dev/null)" >&2

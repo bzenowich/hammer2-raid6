@@ -279,6 +279,17 @@ a sync rewrite of A, all within one sync interval.
 - Always `newmod = 1` on v3 DATA/DIRENT. That costs a slot until bulkfree, so rate-limit it.
 - Or keep the generation's sealed rows on a list until the flush, and recompute P/Q there (safe only after R4's per-generation rows).
 
+**Repro status (r5-repro, 2026-10-11): REPRODUCED, panic on h2dev.** `tests/v3/test_r_rewrite_seal.sh` (group R, opt-in: `sh run_all.sh R`, not in the default list).
+- **Recipe** (fresh 4-disk array, no `sync` in between): O_SYNC `pwrite` of 4 KB to file A; eight more 4 KB O_SYNC files so A's row fills and seals; O_SYNC `pwrite` of 4 KB to A again.
+- **Result:** `panic: hammer2: v3 putblk for a row not open: phys 000000000dc00000 disk 2`, stack `hammer2_raid6_open_row_add_data` <- `_hammer2_io_putblk+0x53d` <- `hammer2_xop_strategy_write+0xca8` <- `hammer2_primary_xops_thread`. Seen three times, identical.
+- **Why the path is open (confirmed from the code):**
+  - `add_data` runs at the last drop of a dirty DATA dio, i.e. at every strategy write (`hammer2_xop_strategy_write` -> `hammer2_write_file_core` -> `hammer2_io_bawrite/bwrite`), not at chain flush. The same chain's data can be written any number of times per TXG.
+  - A strategy write happens whenever the logical buffer is written out: O_SYNC `bwrite`, `fsync`, the syncer, write-behind.
+  - `hammer2_dedup_record()` returns early on v3, so `HAMMER2_CHAIN_DEDUPABLE` is never set, and the `DEDUPABLE -> newmod = 1` branch in `chain_modify` (which would otherwise save this case) is dead on v3.
+  - So a still-MODIFIED data chain keeps its slot (`newmod = 0`); a full row seals and leaves `open_rows` as soon as its last column arrives; the second putblk finds no row and panics. The stale comment above the "latest copy wins" code in `add_data` describes a case that only works while the row is still open.
+- **A plain `fsync` of A does NOT trigger it** (control R3 passes): `hammer2_vop_fsync` -> `hammer2_inode_chain_flush` flushes the file's data chains and clears MODIFIED, so the next modify takes the fresh-slot path (`newmod = 1`). The trigger needs a data rewrite with no flush of that chain in between (O_SYNC writes, or two bufcache flushes before the syncer runs).
+- Not tested (would need the panic fixed first): the data/parity corruption variant when the row is still open but already partially sealed (R4).
+
 ### R6. `raid replace` accepts any disk, including a healthy member [V]
 **Where:** `local_hammer2_ioctl.c:1583–1647`.
 
@@ -469,6 +480,75 @@ failed disks) with a per-disk cache key. Writes stay primary plus mirrors.
 - **The dio hash drops the disk bits** (`io.c:2830`), so all columns of a row share a bucket. Mix in `pbase >> 56`. [V2]
 - **Each data column costs a 64 KB `kmalloc` + `bcopy`** held until the seal (`io.c:779–784`). Large kmallocs cost TLB-shootdown IPIs on free. Use an objcache, or the fold-in accumulation in S3.
 
+### P10. Small-file write amplification: every dirty metadata release mirrors 3 x 64 KB synchronously [V-measured]
+**Where:** `_hammer2_io_putblk`, `local_hammer2_io.c:932–948` (the `rz_meta` branch) calling
+`hammer2_io_metadata_mirror_write` (`local_hammer2_raid6.c:705`). This is the cost P3 names
+("an inode buffer that is released several times in one TXG pays that every time"), now measured.
+
+**Symptom.** Group P2 (`cp -R` of 4000 x 4 KB files = 15.6 MB, then `sync; sync`) writes
+5.1 GB to the members, 326x the user bytes, identically on h2dev and the Pi. Disk 0 gets 142 MB,
+disks 1..3 get 1669 MB each.
+
+**Method.** Temporary counters in `putblk` (not committed): dirty metadata releases per btype,
+and distinct 64 KB offsets among them; devstat per member. Runs at 100, 500, 1000 and 4000 files
+on h2dev, fresh array each time.
+
+| files | written to members | per file | disk 0 | disks 1..3 each |
+|------:|-------------------:|---------:|-------:|----------------:|
+| 100   | 132 MB  | 1354 KB | 3.6 MB   | 42.9 MB |
+| 500   | 590 MB  | 1207 KB | 16.6 MB  | 191 MB  |
+| 1000  | 1273 MB | 1304 KB | 33.9 MB  | 413 MB  |
+| 4000  | 5148 MB | 1318 KB | 142 MB   | 1669 MB |
+
+Linear in the file count, so it is a per-file cost and not a flush-pass cost.
+
+**Byte accounting at 4000 files** (counters read after the sync):
+
+| source | dirty releases (64 KB mirrored 3x) | distinct 64 KB blocks | bytes to members |
+|---|---:|---:|---:|
+| INODE metadata blocks | 16080 (4.0 per file) | 63 | 3015 MB |
+| INDIRECT blocks (directory tree) | 4383 | 53 | 822 MB |
+| FREEMAP_LEAF | 4227 | 3 | 793 MB |
+| FREEMAP_NODE | 0 | 0 | 0 |
+| **metadata mirror total** | **24690** | **119** | **~4630 MB (counters), 4578 MB (devstat: disks 1..3 minus disk 0's share)** |
+| DATA rows: 4000 columns packed 2 per row, so 2000 rows of 2 data + P + Q | | | ~512 MB, 128 MB per disk |
+| primary metadata (`bdwrite`, on the dio's own disk 0) | | 119 | ~8 MB |
+| space map, volume headers, rest | | | ~50 MB |
+
+The same 119 metadata blocks (64 inode blocks hold the 4000 inodes, about 63 per block) are
+written 24690 times: **a factor of 200 redundancy** in the mirror writes. DATA/DIRENT and parity
+are fine (512 MB for 16 MB of user data is the known 64 KB-column cost, P5, 32x, and
+is balanced).
+
+**Why disk 0 is different.** The dio's own disk (always disk 0 for metadata, P4) gets the
+block through `bdwrite`, which the buffer cache coalesces: a block released 135 times is written
+to disk 0 about once. The N-1 mirror copies bypass the cache coalescing: `mirror_write` does a
+`getblk` + `bcopy` + `hammer2_bwrite_start`/`wait` on every release, and the buffer is written
+out for real each time, so disks 1..3 take 24690 x 64 KB each = 1.5 GB. That accounts for the
+whole skew: disk 0 = its share of data and parity (128 MB) + 8 MB of coalesced metadata.
+
+**Why a release is not once per TXG.** Chain locks are cycled constantly while files are created
+(inode, parent directory block, freemap leaf each get unlocked/released after every operation),
+and `putblk` runs for the 1->0 dio ref transition. Each dirty release is a complete 64 KB
+write times 3 mirrors, though the inode has only changed by a few hundred bytes.
+
+**Fix (no on-disk format change, row sealing untouched).** Defer the mirror copies to the flush:
+`putblk` queues the block's bytes (the buffer it already kmalloc'd) in a per-mount table keyed by
+the per-disk offset, replacing any earlier copy; `hammer2_vfs_sync` writes every pending mirror
+once, after the chain flush and before the `VOP_FSYNC` drain and the volume header, so a mirror
+is exactly as durable at the header commit as before (R1 ordering unchanged). The table is also
+searched by `metadata_mirror_read` so a failover read never sees a stale mirror, a bound on the
+pending count forces an early flush, and the degraded "primary dropped" release still mirrors
+immediately. Expected: 24690 mirror block-writes become 119 x 3 and total writes fall from
+5.1 GB to roughly 0.7 GB (about 45x user bytes, the rest being P5's whole-column cost).
+
+**Fixed (fix/p2-writeamp).** `putblk` queues the copy (`hammer2_io_metadata_mirror_defer`),
+`hammer2_vfs_sync` writes it once (`hammer2_io_metadata_mirror_flush`, before the VOP_FSYNC
+drain), unmount flushes the rest, and `metadata_mirror_read` serves queued copies. Group P2 on h2dev:
+5148 MB (326x) becomes 536-582 MB (34-37x), per-disk deviation 4%, array reads 128 KB. The
+remainder is the 512 MB of whole-column data and parity (P5). Group P asserts balance and
+a 40x limit for P2. An R1 pass count does not change this (a clean run with P1+R1+R2 still wrote 328x).
+
 ---
 
 ## 4. Simplifications
@@ -554,6 +634,7 @@ ioctl and printed by `hammer2 raid stats`:
    - fill to ENOSPC, then delete + bulkfree + write;
    - `NDISKS=6` in a periodic matrix;
    - `raid6_simd=0` vs `1` parity cross-check on arm64.
+6. **Seen once, not reproduced (2026-10-11):** page fault in `hammer2_characterize_failed_chain+0xd6` (deref of `chain->dio->bp`) from `hammer2_chain_testcheck`, during group B on h2dev, a degraded 3-disk mount with a concurrent read-path self-heal repair write. The function is marked "not really MPSAFE". vmcore.9 had no module symbols, so the line was not confirmed. Group B passed 13/13 in the two reruns. Suspect: the repair path releases or replaces `chain->dio` while the CHECK FAIL report reads it. Build the module with debug info for h2dev runs so the next dump is usable.
 
 ---
 

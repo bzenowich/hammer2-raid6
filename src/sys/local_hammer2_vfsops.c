@@ -912,6 +912,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 	if (chains_still_present) {
 		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
 	} else {
+		/* the xop threads are gone; their group array is not */
+		if (pmp->xop_groups) {
+			kfree(pmp->xop_groups, M_HAMMER2);
+			pmp->xop_groups = NULL;
+		}
 		kmalloc_destroy_obj(&pmp->minode);
 		kfree(pmp, M_HAMMER2);
 	}
@@ -1456,9 +1461,10 @@ next_hmp:
 		}
 		if (!hmp->devvp) {
 			kprintf("hammer2: failed to initialize root volume\n");
-			hammer2_unmount_helper(mp, NULL, hmp);
+			hammer2_close_devvp(&devvpl, ronly);
+			hammer2_cleanup_devvp(&devvpl);
 			lockmgr(&hammer2_mntlk, LK_RELEASE);
-			hammer2_vfs_unmount(mp, MNT_FORCE);
+			kfree(hmp, M_HAMMER2);
 			return EINVAL;
 		}
 
@@ -1474,6 +1480,19 @@ next_hmp:
 				   sizeof(struct hammer2_io));
 		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
 		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
+
+		/*
+		 * Move devvpl entries to hmp now, so that every error
+		 * exit below closes the devices through
+		 * hammer2_unmount_helper().
+		 */
+		TAILQ_INIT(&hmp->devvpl);
+		while ((e = TAILQ_FIRST(&devvpl)) != NULL) {
+			TAILQ_REMOVE(&devvpl, e, entry);
+			TAILQ_INSERT_TAIL(&hmp->devvpl, e, entry);
+		}
+		KKASSERT(TAILQ_EMPTY(&devvpl));
+		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
 		hammer2_io_hash_init(hmp);
 		hammer2_spin_init(&hmp->list_spin, "h2mount_list");
 
@@ -1481,6 +1500,10 @@ next_hmp:
 		lockinit(&hmp->bulklk, "h2bulk", 0, 0);
 		lockinit(&hmp->bflock, "h2bflk", 0, 0);
 		lockinit(&hmp->rebuild_lk, "h2rbld", 0, 0);
+		hammer2_spin_init(&hmp->mirror_spin, "h2mirror");
+		lockinit(&hmp->mirror_flush_lk, "h2mflk", 0, 0);
+		for (i = 0; i < HAMMER2_MIRROR_HASH; ++i)
+			TAILQ_INIT(&hmp->mirror_pend[i]);
 
 		/*
 		 * vchain setup. vchain.data is embedded.
@@ -1639,17 +1662,6 @@ next_hmp:
 			hmp->total_size = hmp->voldata.volu_size;
 		}
 		KKASSERT(hmp->nvolumes > 0);
-
-		/*
-		 * Move devvpl entries to hmp.
-		 */
-		TAILQ_INIT(&hmp->devvpl);
-		while ((e = TAILQ_FIRST(&devvpl)) != NULL) {
-			TAILQ_REMOVE(&devvpl, e, entry);
-			TAILQ_INSERT_TAIL(&hmp->devvpl, e, entry);
-		}
-		KKASSERT(TAILQ_EMPTY(&devvpl));
-		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
 
 		/*
 		 * Log RAID6 array status at mount time.  If any disks
@@ -2350,6 +2362,11 @@ again:
 
 	KKASSERT(hmp->spmp == NULL);
 
+	/* mirror copies queued by the final flushes, while the disks are open */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 && !hmp->ronly &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		hammer2_io_metadata_mirror_flush(hmp);
+
 	/*
 	 * Finish up with the device vnode
 	 */
@@ -2423,6 +2440,7 @@ again:
 		spin_uninit(&hmp->stripe_bitmap_spin);
 	hammer2_raid6_sm_destroy(hmp);
 	hammer2_raid6_open_rows_free(hmp);
+	spin_uninit(&hmp->mirror_spin);
 
 	kfree(hmp, M_HAMMER2);
 }

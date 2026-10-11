@@ -778,6 +778,32 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 			exit(1);
 		}
 	}
+
+	/*
+	 * Invalidate the header zones beyond the filesystem that still fit
+	 * on the device.  A disk reused from a larger array, or formatted
+	 * with a smaller -s, may hold an old header there that the mount
+	 * would otherwise find.
+	 */
+	{
+		hammer2_off_t devsize = check_volume(vol->fd);
+		char *zbuf = calloc(1, HAMMER2_PBUFSIZE);
+
+		if (zbuf == NULL)
+			err(1, "calloc");
+		for (; i < HAMMER2_NUM_VOLHDRS; ++i) {
+			if ((hammer2_off_t)i * HAMMER2_ZONE_BYTES64 +
+			    HAMMER2_PBUFSIZE > devsize)
+				break;
+			n = pwrite(vol->fd, zbuf, HAMMER2_PBUFSIZE,
+				   i * HAMMER2_ZONE_BYTES64);
+			if (n != HAMMER2_PBUFSIZE) {
+				perror("write");
+				exit(1);
+			}
+		}
+		free(zbuf);
+	}
 	fsync(vol->fd);
 
 	/*

@@ -193,13 +193,18 @@ guarded() {
     wait $pid
 }
 
+# Seconds since the previous result (or since the group started), shown
+# after each result so slow tests are visible in every run's log.
+_RESULT_T=$(date +%s)
 result() {
+    local now dt
+    now=$(date +%s); dt=$((now - _RESULT_T)); _RESULT_T=$now
     TOTAL=$((TOTAL + 1))
     if [ "$1" = "PASS" ]; then
-        echo "  PASS: $2"
+        echo "  PASS: $2 [+${dt}s]"
         PASS=$((PASS + 1))
     else
-        echo "  FAIL: $2"
+        echo "  FAIL: $2 [+${dt}s]"
         FAIL=$((FAIL + 1))
         ERRORS="${ERRORS}  FAIL: $2
 "
@@ -248,13 +253,49 @@ check_no_checkfail() {
     return 0
 }
 
+# setup_fresh [size]: new array.  With a size (2g, say) it is built from
+# that much of each disk (newfs_hammer2 -s, one size per disk) instead of
+# the whole device; "full" forces the whole device.  Without an argument
+# $FRESH_SIZE is used if set (a whole-run shortcut: FRESH_SIZE=2g sh
+# run_all.sh), else the whole device.  RAID6 rounds a disk down to a
+# multiple of the 2 GB zone, so 2g is the smallest array; it also has
+# only one volume-header zone (a full array has one per 2 GB, up to 4),
+# so tests of header rotation and crash recovery (S, I) must not use it.  A test that
+# needs the whole device (N1/N2 cross the old 2 GB-per-disk limit, P
+# writes 5 GB) passes "full".
+fresh_size_opt() {
+    local sz="${1:-$FRESH_SIZE}" s="" d
+    { [ -n "$sz" ] && [ "$sz" != full ]; } || return 0
+    for d in $DEVS; do s="${s:+$s:}$sz"; done
+    echo "-s $s"
+}
+
 setup_fresh() {
     umount $MNTPT 2>/dev/null || true
     local newfs_ok=0
     local attempt=0
+    local sizeopt d
+    sizeopt=$(fresh_size_opt "$1")
+    if [ -n "$sizeopt" ]; then
+        # newfs writes a volume header in each 2 GB zone that fits in the
+        # array and leaves the rest of the disk alone.  The headers of a
+        # bigger array that lived here before sit at 2, 4 and 6 GB with a
+        # higher txg_seq than the new one, and mount takes them instead
+        # (the old tree fails its checks and the mount is refused, and
+        # the refused mount leaves the disks open until a reboot).  Known
+        # newfs/mount bug, worked around here; A5 tests for it.  Zero all
+        # four zones.
+        # shellcheck disable=SC2086
+        for d in $DEVS; do
+            for k in 0 1 2 3; do
+                dd if=/dev/zero of=$d bs=65536 count=1 seek=$((k * 32768)) \
+                    2>/dev/null || true
+            done
+        done
+    fi
     while [ "$attempt" -lt 5 ]; do
         # shellcheck disable=SC2086
-        if newfs_hammer2 -R 6 -L V3TEST $DEVS > /var/tmp/v4_newfs.txt 2>&1
+        if newfs_hammer2 -R 6 -L V3TEST $sizeopt $DEVS > /var/tmp/v4_newfs.txt 2>&1
         then
             newfs_ok=1
             break
@@ -265,7 +306,7 @@ setup_fresh() {
     if [ "$newfs_ok" = "0" ]; then
         echo "  FATAL: newfs_hammer2 failed after 5 attempts in setup_fresh"
         # shellcheck disable=SC2086
-        newfs_hammer2 -R 6 -L V3TEST $DEVS 2>&1 | head -5
+        newfs_hammer2 -R 6 -L V3TEST $sizeopt $DEVS 2>&1 | head -5
         exit 1
     fi
     if ! layout_from_newfs /var/tmp/v4_newfs.txt; then
