@@ -698,6 +698,9 @@ typedef struct hammer2_volzone {
 	int		valid;
 	int		volu_id;
 	uint64_t	seq;		/* rz_txg_seq */
+	uint64_t	mirror_tid;
+	hammer2_off_t	volu_size;
+	int		raid6;		/* v3 RAID6 header */
 	uuid_t		fsid;
 } hammer2_volzone_t;
 
@@ -783,47 +786,125 @@ hammer2_read_volume_header(struct vnode *devvp, const char *path,
 			   hammer2_volzone_t *zones)
 {
 	hammer2_volume_data_t *vd;
+	hammer2_volzone_t zs[HAMMER2_NUM_VOLHDRS];
 	int zone = -1;
+	int ref = -1;
 	int better;
-	int i;
+	int i, j, n;
 
 	/*
-	 * We don't trust the volu_size field so we don't know precisely
-	 * how large the filesystem is, so depend on the OS to return an
-	 * error if we go beyond the block device's EOF.
+	 * Pass 1: read and summarize every copy.
 	 */
+	bzero(zs, sizeof(zs));
 	vd = kmalloc(sizeof(*vd), M_HAMMER2, M_WAITOK);
 	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
 		if (hammer2_read_volume_zone(devvp, path, i, vd) < 0)
 			continue;
-		if (zones) {
-			zones[i].valid = 1;
-			zones[i].volu_id = vd->volu_id;
-			zones[i].seq = vd->raid_config.rz_txg_seq;
-			zones[i].fsid = vd->fsid;
-		}
-		if (zone == -1) {
-			better = 1;
-		} else if (vd->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-			   voldata->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-			   vd->raid_config.raid_type ==
-			    HAMMER2_RAID_TYPE_RAID6) {
-			better = voldata->raid_config.rz_txg_seq <
-				 vd->raid_config.rz_txg_seq;
-		} else {
-			better = voldata->mirror_tid < vd->mirror_tid;
-		}
-		if (better) {
-			*voldata = *vd;
-			zone = i;
-		}
+		zs[i].valid = 1;
+		zs[i].volu_id = vd->volu_id;
+		zs[i].volu_size = vd->volu_size;
+		zs[i].seq = vd->raid_config.rz_txg_seq;
+		zs[i].mirror_tid = vd->mirror_tid;
+		zs[i].fsid = vd->fsid;
+		zs[i].raid6 = (vd->version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			       vd->raid_config.raid_type ==
+				HAMMER2_RAID_TYPE_RAID6);
 	}
 	kfree(vd, M_HAMMER2);
 
+	/*
+	 * All header copies of a device must belong to one filesystem.
+	 * A stale copy from an earlier filesystem on the same device (a
+	 * smaller newfs, or a disk reused from a larger one) carries a
+	 * different fsid and may even have a newer sequence.  newfs always
+	 * writes zone 0, so its fsid is the reference.  If zone 0 is not
+	 * valid, take the fsid most copies agree on, the one holding the
+	 * lowest zone on a tie.
+	 */
+	if (zs[0].valid) {
+		ref = 0;
+	} else {
+		int best = 0;
+
+		for (i = 1; i < HAMMER2_NUM_VOLHDRS; ++i) {
+			if (!zs[i].valid)
+				continue;
+			n = 0;
+			for (j = 1; j < HAMMER2_NUM_VOLHDRS; ++j) {
+				if (zs[j].valid &&
+				    bcmp(&zs[j].fsid, &zs[i].fsid,
+					 sizeof(zs[i].fsid)) == 0)
+					++n;
+			}
+			if (n > best) {
+				best = n;
+				ref = i;
+			}
+		}
+	}
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (!zs[i].valid || i == ref)
+			continue;
+		if (bcmp(&zs[i].fsid, &zs[ref].fsid, sizeof(zs[i].fsid)) ||
+		    zs[i].volu_id != zs[ref].volu_id) {
+			hprintf("%s #%d: header belongs to another "
+				"filesystem (fsid/volume id differs from "
+				"#%d); ignored\n", path, i, ref);
+			zs[i].valid = 0;
+		}
+	}
+
+	/*
+	 * Pass 2: pick the newest remaining copy.
+	 */
+	for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+		if (!zs[i].valid)
+			continue;
+		if (zone == -1) {
+			better = 1;
+		} else if (zs[zone].raid6 && zs[i].raid6) {
+			better = zs[zone].seq < zs[i].seq;
+		} else {
+			better = zs[zone].mirror_tid < zs[i].mirror_tid;
+		}
+		if (better)
+			zone = i;
+	}
+
+	/*
+	 * A copy beyond the end of the volume the newest header describes
+	 * cannot have been written by that filesystem.
+	 */
+	if (zone != -1) {
+		for (i = 0; i < HAMMER2_NUM_VOLHDRS; ++i) {
+			if (!zs[i].valid || i == zone)
+				continue;
+			if ((hammer2_off_t)i * HAMMER2_ZONE_BYTES64 >=
+			    zs[zone].volu_size) {
+				hprintf("%s #%d: header lies beyond volume "
+					"size 0x%jx; ignored\n", path, i,
+					(uintmax_t)zs[zone].volu_size);
+				zs[i].valid = 0;
+			}
+		}
+	}
+
+	if (zones)
+		bcopy(zs, zones, sizeof(zs));
 	if (zone == -1) {
 		hprintf("%s has no valid volume headers\n", path);
 		return -EINVAL;
 	}
+
+	vd = kmalloc(sizeof(*vd), M_HAMMER2, M_WAITOK);
+	if (hammer2_read_volume_zone(devvp, path, zone, vd) < 0) {
+		kfree(vd, M_HAMMER2);
+		hprintf("%s #%d: header unreadable on second read\n",
+			path, zone);
+		return -EINVAL;
+	}
+	*voldata = *vd;
+	kfree(vd, M_HAMMER2);
 	return zone;
 }
 

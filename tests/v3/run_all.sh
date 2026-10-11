@@ -4,7 +4,7 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs all groups A..N, P, S (M last: it can hang the guest).
+#   If no groups are specified, runs all groups A..N, P, S, T (M last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #   Opt-in groups, never in the default list: R (R5 repro; expected to
 #   panic an unfixed kernel).  Run with: sh run_all.sh R
@@ -57,7 +57,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L N P S M}"
+GROUPS="${*:-A B C D E F G H I J K L N P S T M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -78,7 +78,8 @@ for GROUP in $GROUPS; do
     P) run_group "Group P" "$SCRIPTDIR/test_p_perfshape.sh"    ;;
     R) run_group "Group R" "$SCRIPTDIR/test_r_rewrite_seal.sh" ;;
     S) run_group "Group S" "$SCRIPTDIR/test_s_split_header.sh" ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S)" ;;
+    T) run_group "Group T" "$SCRIPTDIR/test_t_reuse.sh"        ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S T)" ;;
     esac
 done
 

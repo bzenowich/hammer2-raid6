@@ -877,6 +877,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 	if (chains_still_present) {
 		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
 	} else {
+		/* the xop threads are gone; their group array is not */
+		if (pmp->xop_groups) {
+			kfree(pmp->xop_groups, M_HAMMER2);
+			pmp->xop_groups = NULL;
+		}
 		kmalloc_destroy_obj(&pmp->minode);
 		kfree(pmp, M_HAMMER2);
 	}
@@ -1421,9 +1426,10 @@ next_hmp:
 		}
 		if (!hmp->devvp) {
 			kprintf("hammer2: failed to initialize root volume\n");
-			hammer2_unmount_helper(mp, NULL, hmp);
+			hammer2_close_devvp(&devvpl, ronly);
+			hammer2_cleanup_devvp(&devvpl);
 			lockmgr(&hammer2_mntlk, LK_RELEASE);
-			hammer2_vfs_unmount(mp, MNT_FORCE);
+			kfree(hmp, M_HAMMER2);
 			return EINVAL;
 		}
 
@@ -1439,6 +1445,19 @@ next_hmp:
 				   sizeof(struct hammer2_io));
 		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
 		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
+
+		/*
+		 * Move devvpl entries to hmp now, so that every error
+		 * exit below closes the devices through
+		 * hammer2_unmount_helper().
+		 */
+		TAILQ_INIT(&hmp->devvpl);
+		while ((e = TAILQ_FIRST(&devvpl)) != NULL) {
+			TAILQ_REMOVE(&devvpl, e, entry);
+			TAILQ_INSERT_TAIL(&hmp->devvpl, e, entry);
+		}
+		KKASSERT(TAILQ_EMPTY(&devvpl));
+		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
 		hammer2_io_hash_init(hmp);
 		hammer2_spin_init(&hmp->list_spin, "h2mount_list");
 
@@ -1605,17 +1624,6 @@ next_hmp:
 			hmp->total_size = hmp->voldata.volu_size;
 		}
 		KKASSERT(hmp->nvolumes > 0);
-
-		/*
-		 * Move devvpl entries to hmp.
-		 */
-		TAILQ_INIT(&hmp->devvpl);
-		while ((e = TAILQ_FIRST(&devvpl)) != NULL) {
-			TAILQ_REMOVE(&devvpl, e, entry);
-			TAILQ_INSERT_TAIL(&hmp->devvpl, e, entry);
-		}
-		KKASSERT(TAILQ_EMPTY(&devvpl));
-		KKASSERT(!TAILQ_EMPTY(&hmp->devvpl));
 
 		/*
 		 * Log RAID6 array status at mount time.  If any disks

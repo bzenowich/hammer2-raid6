@@ -497,12 +497,32 @@ cmd_show(const char *devpath, const char *chspec, int which)
 	 */
 	volu_loff = 0;
 	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
+		uuid_t reffsid;
+		int haveref = 0;
+
+		best_mirror_tid = 0;
+
 		for (j = 0; j < HAMMER2_NUM_VOLHDRS; ++j) {
 			off = j * HAMMER2_ZONE_BYTES64;
 			fd = hammer2_get_volume_fd(volu_loff);
 			lseek(fd, off, SEEK_SET);
 			if (read(fd, &media, HAMMER2_PBUFSIZE) ==
 			    (ssize_t)HAMMER2_PBUFSIZE) {
+				/*
+				 * Skip blank copies and stale ones of an
+				 * earlier filesystem (another fsid than
+				 * the first valid copy), as the mount does.
+				 */
+				if (media.voldata.magic !=
+				    HAMMER2_VOLUME_ID_HBO)
+					continue;
+				if (!haveref) {
+					reffsid = media.voldata.fsid;
+					haveref = 1;
+				} else if (bcmp(&reffsid, &media.voldata.fsid,
+						sizeof(reffsid)) != 0) {
+					continue;
+				}
 				if (bests[i] < 0 || best_mirror_tid <
 				    media.voldata.mirror_tid) {
 					bests[i] = j;
