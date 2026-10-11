@@ -259,6 +259,8 @@ Then either:
 The cheapest stopgap is to zero-fill reserved-but-pending columns in `row_io` as well.
 That fixes (a) but not (b).
 
+**Design: §10** (checked against the code; one claim corrected, zero-fill is unsafe as written).
+
 ### R5. Rewriting a block in the same TXG after its row sealed panics [V logic, R trigger]
 **Where:**
 - `local_hammer2_chain.c:1567–1588`: an already-MODIFIED chain keeps its slot; the forced `newmod = 1` for v3 applies only to unmodified chains;
@@ -289,6 +291,8 @@ a sync rewrite of A, all within one sync interval.
   - So a still-MODIFIED data chain keeps its slot (`newmod = 0`); a full row seals and leaves `open_rows` as soon as its last column arrives; the second putblk finds no row and panics. The stale comment above the "latest copy wins" code in `add_data` describes a case that only works while the row is still open.
 - **A plain `fsync` of A does NOT trigger it** (control R3 passes): `hammer2_vop_fsync` -> `hammer2_inode_chain_flush` flushes the file's data chains and clears MODIFIED, so the next modify takes the fresh-slot path (`newmod = 1`). The trigger needs a data rewrite with no flush of that chain in between (O_SYNC writes, or two bufcache flushes before the syncer runs).
 - Not tested (would need the panic fixed first): the data/parity corruption variant when the row is still open but already partially sealed (R4).
+
+**Design: §10.2.**
 
 ### R6. `raid replace` accepts any disk, including a healthy member [V]
 **Where:** `local_hammer2_ioctl.c:1583–1647`.
@@ -684,3 +688,168 @@ ioctl and printed by `hammer2 raid stats`:
    - P8;
    - P5/S9 sub-column allocation last.
 7. **Cleanup:** S-a to S-g and §8, in any order.
+
+---
+
+## 10. R4/R5 design: generation-tagged rows
+
+Design only, written against `824811e` (R1 three-phase flush merged). Nothing here is
+implemented. It decides §9 step 4.
+
+### 10.1 What the code does today (checked)
+
+- **R4 confirmed.** `row_io` skips reserved columns (`alloc_mask` test), so a
+  partial seal leaves the slot's old bytes under P/Q computed as zero.
+  - (b) confirmed: a late column makes `add_data` seal the `partial` row again, so P/Q are rewritten in place over committed parity.
+  - (c) confirmed: `add_data` skips the seal while `sealing` is set, and `seal_all` never revisits a row in the same pass (`seal_gen`). The column and a header that commits it can land with the old P/Q.
+- **The review's premise for S2 is only half true.** Rows do not normally span TXGs:
+  `seal_all` seals every complete row and removes it, so after a flush `open_rows` holds
+  only `partial` rows, and those are already closed to packing. The real hazard is the
+  *flush window*: `seal_all` runs after the vchain flush, and a chain allocated in that
+  window packs into a row that is then partial-sealed. S2 therefore means "put a cut at
+  the right place and wait", not "stop packing across TXGs".
+- **The reservation window is short.** `stripe_alloc` runs in `assign_physical` (via
+  `chain_modify`/`chain_create`) and the put happens at the last drop of the dio in
+  `write_bp`, in one `hammer2_xop_strategy_write` call, with the chain locked. A column is
+  pending only for the length of that call, unless the reservation leaks (next point).
+- **Leaked reservations exist today** (this is R9's suspected source; confirmed by reading).
+  `hammer2_chain_resize` calls `chain_modify(.., flags 0)`, which allocates a slot for an
+  unmodified chain, and then calls `stripe_alloc` again. The first slot is never put. It is
+  hit whenever `assign_physical` sees `chain->bytes != pblksize`, i.e. a small file growing.
+  Such a row never completes and is partial-sealed at every flush ("still waiting" log). Any
+  design that *waits* for pending columns must fix this first.
+- **Zero-fill at partial seal is unsafe as written** (new finding). The zero write in `row_io`
+  is `getblk(devvp, phys_off)` + `bzero` + `bwrite`, the same buffer key as the column's
+  `bdwrite` in `putblk`. If the column arrives while the seal I/O runs unlocked, the zero
+  write destroys real data. It is only safe once the reservation is cancelled under the spin.
+- **`mirror_tid` is the wrong counter.** It is bumped inside `hammer2_flush` (flush_core,
+  vchain/fchain), before the point where `seal_all` runs.
+- **Flush is not a TXG cut.** `hammer2_flush` visits whatever is MODIFIED when it gets there,
+  and frontend writers are not blocked (normal transactions do not interlock with ISFLUSH).
+  So the header can commit a blockref whose chain was allocated a moment earlier. Every chain
+  the header commits was allocated before the vchain flush returned.
+- Only the syncer (`vfsops.c:3324`) passes `XOP_VOLHDR`; `fsync(2)` never commits a header or
+  runs `seal_all`. The new wait therefore costs fsync nothing.
+
+### 10.2 Design
+
+**Generation.** `hmp->rz_gen` (uint32, under `stripe_bitmap_spin`; reuse the field
+`open_rows_sealgen`, whose only use is the visit marker). Not `rz_sm_gen`/`stripe_generation`
+(space-map write counter) and not `mirror_tid`. A new `r->gen = hmp->rz_gen` is set in
+`open_row_register_locked`.
+
+**Where it advances.** At the top of the seal phase in `hammer2_xop_inode_flush`: after the
+vchain flush returns and all chain locks are dropped, before the mirror drain, the device
+fsync and R1 phase 1. That is the latest point where "everything the header can commit is in a
+row of gen <= G" still holds, and the earliest point that does not sweep later allocations
+into this flush. Advancing earlier (before `hammer2_flush`) would let a header commit a chain
+whose row is gen G+1 and unsealed, which is the R1 hole again.
+
+**Allocation.** `open_row_pack_locked` skips rows with `r->gen != hmp->rz_gen`. New rows get the
+current gen. Rows of gen <= G are closed to new reservations the moment the gen advances, so
+their set of pending columns can only shrink.
+
+**Flush.** `hammer2_raid6_seal_all_open_rows` is replaced by `seal_gen`:
+1. under the spin, `G = rz_gen++`;
+2. for every row with `gen <= G`: if `pending_mask == 0` (all reserved columns arrived), unlink and seal it as today (`seal_row_locked_to_unlocked`, full, once);
+3. otherwise `ssleep(&hmp->open_rows, &spin, 0, "h2rzgen", hz/10)` until the column arrives (`add_data` does `wakeup` when it completes a row of an old gen and a waiter is flagged);
+4. after `vfs.hammer2.raid6_gen_wait_ms` (default 5000) of no progress, **fail the flush**: set `fsync_error`, so the header is not written (the existing `fsync_error == 0` guard), log the row, leave it on the list. The next flush waits again (its gen is still old).
+
+Rows of gen G+1 are untouched by this flush, so no row is ever sealed with a pending column:
+`partial`, `sealing`, `dirty`, `idle` and `seal_partial_locked` are deleted. R4 (a), (b), (c) all
+disappear. `add_data` still seals a *full* row (`n_alloc >= ndata`) itself, as today.
+
+**Crash consistency (against R1).** The header for T is written only after: every gen <= G row
+has all its columns and its P/Q written (`row_io` waits on P/Q), the mirror drain, `VOP_FSYNC`
+and the phase-1 cache flush. A crash before the header leaves T-1 committed; the gen <= G slots
+are free in the committed space map (written after the seal, from the same flush) and are
+overwritten in full when reallocated. Gen G+1 rows are written concurrently but nothing
+committed references them. A crash after the header sees exact parity on every committed row.
+No committed row is ever re-sealed in a later TXG.
+
+**Failed flush on timeout** trades the old silent-bad-parity for a visible error, and keeps
+committed state valid. The zero-fill and S1 options (10.4) would let it commit instead.
+
+### 10.3 R5: same-TXG rewrite
+
+**Chosen: a rewrite after the column has reached its row takes a fresh slot (newmod=1).**
+Rule, in `chain_modify`'s "already MODIFIED" branch, for v3 DATA/DIRENT:
+`newmod = hammer2_raid6_col_arrived(hmp, bref)`, i.e. 1 unless the chain's column is still
+pending in an open row. The tracker answers under `stripe_bitmap_spin`: no open row for
+`phys_off` (S4 bit clear, 10.5) means sealed, so 1; a row with `col_data[d] != NULL` means
+arrived, so 1; `col_data[d] == NULL` means pending (a deferred first put), so 0 and the put
+coalesces into it. A pending column pins its row open, so the check cannot race a seal.
+`stripe_alloc` is the existing path and the new slot goes to the current-gen row.
+
+Why not the alternative (keep the gen's sealed rows until flush, recompute P/Q):
+- memory: it retains every column of a TXG (up to 30 s of writes, GBs on the Pi) unless it early-seals, and early seal reintroduces the rewrite-after-seal case it was meant to avoid;
+- it needs a "rewrite in flight" pin so the flush cannot seal under a rewrite, with a release on every error path between `chain_modify` and the put;
+- it blocks S3 (fold on arrival, drop the copy). The chosen rule guarantees an arrived column is never replaced, which is exactly S3's precondition.
+
+Cost: a rewrite burns one 64 KB column and its share of P/Q until two bulkfree passes. This is
+the same price `fsync` already pays today (a flushed chain clears MODIFIED, so the next write
+takes a fresh slot). Worst case is an O_SYNC loop on one block: 64 KB of slot per iteration.
+No rate limiter in the first cut; add `vfs.hammer2.raid6_rewrite_slots` (counter) and decide
+from numbers. `add_data`'s "latest copy wins" stays only for the pending case; a second put on
+an arrived column becomes a counted anomaly.
+
+### 10.4 R4: which option, and the others later
+
+| | flush waits (chosen) | zero-fill at partial seal | S1 column mask |
+|---|---|---|---|
+| partial seals | none | still happen | still happen, exact |
+| on-disk format | none | none | space map v1 -> v2 |
+| fixes (a) | yes | yes | yes |
+| fixes (b) | yes (no re-seal) | no, needs gen rows too | yes |
+| flush latency | + in-flight writers (ms) | none | none |
+| extra I/O | none | zero writes for pending cols | none |
+| risk | stuck reservation fails the flush | clobbers an arriving column (10.1) | mask must be ordered with P/Q (like `rz_sm_gen`) |
+
+- **Now: flush waits** (needs 10.2 and the resize leak fix). No format change, deletes more code than it adds.
+- **Later, zero-fill:** only as the timeout fallback, and only after the reservation is cancelled under the spin (`add_data` to a cancelled column must drop the data before the `bdwrite`, which means claiming the row before the buffer is disposed in `putblk`). Not worth it until a real stuck reservation shows up.
+- **Later, S1:** worth it with S9 (sub-column packing) and per-column free. The persisted map changes: today one byte per slot (a live-chain refcount, `HAMMER2_SM_PAGE_SLOTS == HAMMER2_PBUFSIZE`). A column mask needs up to 32 bits (`alloc_mask` is uint32, `HAMMER2_MAX_VOLUMES` is 64) plus a P/Q-valid bit, so either 4 bytes per slot or an 8-disk limit. Bump `HAMMER2_SM_VERSION` to 2; `sm_read` already treats a mismatching header as "map invalid" and rebuilds by a tree walk, so old arrays mount and convert.
+
+### 10.5 R9 and S4
+
+The per-slot open bit falls out and is cheap: `hmp->stripe_open` (one bit per slot, same size as
+`stripe_bitmap`), set in `open_row_register_locked`, cleared where a row is unlinked, both under
+the spin. Uses: (1) `bf_end` skips (and does not stage) a slot with the bit set, closing R9;
+(2) `col_arrived` and `add_data` answer "no row" in O(1). The resize fix is the other half:
+`hammer2_raid6_stripe_release(hmp, bref)` clears the reservation (alloc_mask bit, n_alloc,
+refcount; frees an empty row) when the column was never put.
+
+### 10.6 Concurrency
+
+- **Lock.** `stripe_bitmap_spin` only, as today. Never held across kmalloc/kfree/I/O (the existing seal already drops it around `row_io`). `ssleep` releases it.
+- **Callers.** XOP strategy threads (`stripe_alloc` via `chain_modify`/`chain_resize`/`chain_create`, `add_data` via `putblk`); the flusher, which is the XOP thread running `xop_inode_flush` (`seal_gen`); bulkfree (`bf_end`); the syncer thread only waits on the flush XOP.
+- **With chain locks.** `col_arrived` and `stripe_release` are called with the chain locked and take only the leaf spin, the same as `stripe_alloc` today. The flusher holds no chain lock, no dio ref and not `rebuild_lk` while it waits (all dropped before the seal phase; `rebuild_lk` is first taken in the header section). A writer whose put the flusher waits for needs only chain locks the flusher has released.
+- **To check in the implementation:** no xop group that runs `xop_inode_flush` is also the only runner of a queue holding a strategy write for a pending column (a pending column means that write is already executing, so it should not be); and `row_io`'s `rebuild_lk` shared lock is not held across the new wait.
+- The timeout turns any missed deadlock into a failed flush, not a hang.
+
+### 10.7 Tests
+
+- **Group R (R5) must pass**: the three-write recipe, then umount and `h2stripe_check` clean.
+- **New R4(a), deterministic.** Needs a test hook: `vfs.hammer2.raid6_put_stall_ms` (RW, 0 default), a sleep in `write_bp` between the alloc and the dio drop for one write.
+  1. fresh array, fill with random files, `rm`, `bulkfree` x2 (free slots now hold garbage);
+  2. stall 3000, start one 4 KB write in the background, `sync` in the foreground;
+  3. assert `sync` took at least ~3 s (it waited) and that the header was written;
+  4. host `system_reset` right after `sync` returns (as `crash_host.sh`), after the guest boots and before mounting, `h2stripe_check` on the raw disks (it needs the array unmounted): every committed row has exact parity.
+  - Before the fix the same run shows a parity error on the garbage column. Also a timeout variant: stall > `gen_wait_ms`, expect `sync` to report an error and the committed state to be T-1 (`h2stripe_check` clean).
+- **Leak test (J):** grow a small file 4 KB -> 8 KB -> 16 KB, `sync`, expect `open_rows_count == 0` (expose count/high as a sysctl).
+- **Regression groups:** F (COW invariant, parity), J (packed rows, bulkfree with survivors), D (resilver reads rows), K (scrub, writes during scrub), N (capacity, bulkfree, reuse), P (I/O shape), I and `crash_host.sh` once. T (reuse) and A as usual.
+- **Expected perf.** Group P amplification (45x limit) unchanged: normal writes still take the same path. Flush latency: + the time of in-flight strategy writes (ms; the XOP threads are idle at a tidy flush). One P/Q write per row instead of two for rows that were partial-sealed. O_SYNC rewrites cost one extra column each (10.3). P2 (small-file write) is untouched.
+
+### 10.8 Implementation plan (small commits)
+
+1. **R9 leak:** `stripe_release` on the resize path (and the `io_newnz` error path in `write_bp`); stats sysctls for open row count/high. Test: the J leak test.
+2. **S4 + R9 guard:** `stripe_open` bitmap, set/clear, `bf_end` skip. Test: N, J.
+3. **R5:** `col_arrived`, `chain_modify` rule, `add_data` anomaly counter. Test: group R now passes; F.
+4. **S2:** `rz_gen`, `r->gen`, pack filter, `seal_gen` with wait and failed flush, delete partial-seal state; `flush.c` handles the error. Test: J, F, D, K, I.
+5. **Test hooks and R4(a) test:** `raid6_put_stall_ms`, `raid6_gen_wait_ms`, the new tests and the `crash_host.sh` variant.
+6. **Later:** S3 fold-in (R5 is its precondition), P3 async sealing, then re-evaluate S1 with S9.
+
+### 10.9 Open questions
+
+- Timeout policy: fail the flush forever on a permanent stuck reservation (unmount then cannot commit), or after N failures cancel the reservation and zero-fill? The second needs the claim-before-bdwrite reorder in `putblk`.
+- `add_data` on a missing row is a `panic` today. Keep it through soak (it found R5), or log and drop?
+- Is 5 s the right default wait on the Pi with a USB disk stalled in the middle of a write?
