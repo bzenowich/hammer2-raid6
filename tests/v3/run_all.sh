@@ -30,9 +30,12 @@ run_group() {
     echo ""
     echo "########## $name ##########"
     # Run script once, capture output, then display and parse from the file.
+    local t0=$(date +%s)
     sh "$script" > "$tmpout" 2>&1
     RC=$?
     cat "$tmpout"
+    echo "=== $name time: $(( $(date +%s) - t0 ))s ==="
+    GROUP_TIMES="${GROUP_TIMES} ${name#Group }=$(( $(date +%s) - t0 ))s"
     # Parse PASS/FAIL counts from summary line (e.g. "=== 4/5 PASS, 1 FAIL ===")
     local pass fail
     pass=$(grep "^=== " "$tmpout" | grep -oE '[0-9]+/[0-9]+' | cut -d/ -f1)
@@ -84,6 +87,7 @@ echo "========================================="
 echo "  v3 RAIDZ2-native Integration Test Suite"
 echo "  NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
+echo "  Group times:$GROUP_TIMES"
 echo "========================================="
 if [ -n "$SUITE_ERRORS" ]; then
     printf "Groups with failures:\n%b" "$SUITE_ERRORS"

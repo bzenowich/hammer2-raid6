@@ -193,13 +193,18 @@ guarded() {
     wait $pid
 }
 
+# Seconds since the previous result (or since the group started), shown
+# after each result so slow tests are visible in every run's log.
+_RESULT_T=$(date +%s)
 result() {
+    local now dt
+    now=$(date +%s); dt=$((now - _RESULT_T)); _RESULT_T=$now
     TOTAL=$((TOTAL + 1))
     if [ "$1" = "PASS" ]; then
-        echo "  PASS: $2"
+        echo "  PASS: $2 [+${dt}s]"
         PASS=$((PASS + 1))
     else
-        echo "  FAIL: $2"
+        echo "  FAIL: $2 [+${dt}s]"
         FAIL=$((FAIL + 1))
         ERRORS="${ERRORS}  FAIL: $2
 "
