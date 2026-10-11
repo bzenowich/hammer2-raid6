@@ -14,7 +14,8 @@
 #   D1  basic resilver
 #   D2  two sequential resilvers with writes in between
 #   D3  writes concurrent with a resilver (overlap is asserted)
-#   D4  resilver_skip_unalloc=1 is correct and faster than =0
+#   D4  resilver_skip_unalloc=1 is correct and skips unallocated slots;
+#       =0 walks them (checked on the media, not by timing)
 #   D5  stale re-add: the failed disk comes back with its OLD contents
 #       (missed writes) instead of zeros; resilver must overwrite it
 #   D6  dual-degraded rebuild: two disks failed, resilver the first
@@ -101,9 +102,11 @@ teardown "D2"
 # D3: writes during resilver.  With resilver_skip_unalloc=0 the
 # resilver walks every slot of the disk, which takes long enough for
 # the concurrent write to land inside it; the overlap is checked rather
-# than assumed.
+# than assumed.  The smallest array (2 GB per disk) keeps that walk to
+# about a minute; it only has to outlast the one-second sleep and the
+# write.
 D3_DISK=0
-setup_fresh
+setup_fresh ${D3_SIZE:-2g}
 check_v3
 write_ref_data "pre"
 if fail_disk "$D3_DISK" "D3"; then
@@ -131,27 +134,64 @@ if fail_disk "$D3_DISK" "D3"; then
 fi
 teardown "D3"
 
-# D4: bitmap-skip resilver.  Sparse array (5 MB of data), resilver
-# with skip=0 (walks every slot) and skip=1 (allocated slots only).
-# Timed with time -p (10 ms resolution; date +%s made "0s <= 0s" pass).
+# D4: bitmap-skip resilver.  Sparse array (5 MB of data) on the smallest
+# array (2 GB per disk: the walk of every slot takes minutes per 16 GB
+# disk, and what is checked does not depend on the size).  skip=0 walks
+# every slot, skip=1 only the allocated ones.
+#
+# The proof is on the media, not the clock: after fresh_disk, a marker
+# of random data is written into the rebuilt disk's data zone far past
+# the allocated rows (a stripe slot nothing references).  A resilver that
+# visited that slot rewrites it with the reconstructed column, so the
+# marker is gone; one that skipped it leaves the marker.  skip=0 must
+# destroy the marker (the walk really covered the unallocated slots),
+# skip=1 must keep it (it really skipped them).  Wall time is printed
+# for information only: at this size it is too noisy to assert on.
+D4_MARK_BLK=$((DATA_BLK + 2000))
+D4_MARK_CNT=64
+d4_mark_sum() {
+    dd if=$(disk_dev $D4_DISK) bs=65536 skip=$D4_MARK_BLK count=$D4_MARK_CNT \
+        2>/dev/null | sha256 -q
+}
 d4_resilver() {
-    local skip="$1"
+    local skip="$1" before after
     sysctl -w vfs.hammer2.resilver_skip_unalloc=$skip > /dev/null
     fail_disk "$D4_DISK" "D4" || return 1
+    umount $MNTPT || return 1
     fresh_disk "$D4_DISK"
+    dd if=/dev/urandom of=$(disk_dev $D4_DISK) bs=65536 count=$D4_MARK_CNT \
+        seek=$D4_MARK_BLK conv=notrunc 2>/dev/null
+    before=$(d4_mark_sum)
+    mount -t hammer2 "$PFSPATH" $MNTPT || return 1
     /usr/bin/time -p hammer2 -s $MNTPT raid replace \
         "$(disk_dev $D4_DISK)" "$(disk_dev $D4_DISK)" \
         > /dev/null 2> /var/tmp/d4_time.txt
     local rc=$?
     D4_T=$(awk '$1 == "real" { printf "%d\n", $2 * 100 }' /var/tmp/d4_time.txt)
-    if [ "$rc" = "0" ]; then
-        check_rebuilt "$D4_DISK" "D4 skip=$skip (${D4_T}0ms)" "d4"
-    else
+    if [ "$rc" != "0" ]; then
         result FAIL "D4: skip=$skip resilver rc=$rc"
+        return 1
+    fi
+    check_rebuilt "$D4_DISK" "D4 skip=$skip (${D4_T}0ms)" "d4"
+    umount $MNTPT || return 1
+    after=$(d4_mark_sum)
+    mount -t hammer2 "$PFSPATH" $MNTPT || return 1
+    if [ "$skip" = "0" ]; then
+        if [ "$after" != "$before" ]; then
+            result PASS "D4: skip=0 rewrote an unallocated slot (full walk)"
+        else
+            result FAIL "D4: skip=0 left the unallocated-slot marker (no full walk)"
+        fi
+    else
+        if [ "$after" = "$before" ]; then
+            result PASS "D4: skip=1 left an unallocated slot alone"
+        else
+            result FAIL "D4: skip=1 rewrote an unallocated slot (no skip)"
+        fi
     fi
 }
 D4_DISK=2
-setup_fresh
+setup_fresh ${D4_SIZE:-2g}
 check_v3
 dd if=/dev/urandom of=$MNTPT/d4_a bs=65536 count=80 2>/dev/null
 cp $MNTPT/d4_a $MNTPT/d4_b
@@ -162,11 +202,7 @@ D4_T0=${D4_T:-0}
 d4_resilver 1
 D4_T1=${D4_T:-0}
 sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
-if [ "$D4_T0" -gt 0 ] && [ "$D4_T1" -lt "$D4_T0" ]; then
-    result PASS "D4: skip=1 faster than skip=0 (${D4_T1}0ms vs ${D4_T0}0ms)"
-else
-    result FAIL "D4: skip=1 not faster (${D4_T1}0ms vs ${D4_T0}0ms)"
-fi
+echo "  D4: resilver time skip=0 ${D4_T0}0ms, skip=1 ${D4_T1}0ms (informational)"
 teardown "D4"
 
 # D5: stale re-add.  Fail a disk, keep writing (it misses those
