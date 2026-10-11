@@ -56,7 +56,7 @@ ds_snap() {
 
 # ds_report <label> <user_bytes> <before> <after>: print and assert.
 ds_report() {
-    local label="$1" ubytes="$2" before="$3" after="$4" strict="${5:-1}"
+    local label="$1" ubytes="$2" before="$3" after="$4" strict="${5:-1}" maxamp="${6:-2.15}"
     local out=/var/tmp/p_ds.txt
     join "$before" "$after" | awk -v ub="$ubytes" '
         { rd = $7 - $3; wr = $9 - $5
@@ -86,12 +86,12 @@ ds_report() {
     else
         echo "  INFO: $label: per-disk writes unbalanced (max deviation $dev > 0.10) [known, not asserted]"
     fi
-    if awk -v r="$ratio" 'BEGIN { exit !(r <= 2.15) }'; then
-        result PASS "$label: write amplification $ratio (<= 2.15)"
+    if awk -v r="$ratio" -v m="$maxamp" 'BEGIN { exit !(r <= m) }'; then
+        result PASS "$label: write amplification $ratio (<= $maxamp)"
     elif [ "$strict" = 1 ]; then
-        result FAIL "$label: write amplification $ratio (> 2.15)"
+        result FAIL "$label: write amplification $ratio (> $maxamp)"
     else
-        echo "  INFO: $label: write amplification $ratio (> 2.15) [known, not asserted]"
+        echo "  INFO: $label: write amplification $ratio (> $maxamp) [known, not asserted]"
     fi
 }
 
@@ -145,10 +145,10 @@ ds_snap /var/tmp/p_b2
 cp -R $SMALLSRC $MNTPT/small
 sync; sync; sleep 2
 ds_snap /var/tmp/p_a2
-# Balance and write amplification are reported but not asserted here:
-# 4000 small files currently write ~300x the user bytes, almost all of it
-# on disks 1..3 (a separate bug from the pre-read, see the P2 report).
-ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 0
+# Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
+# P5), about 32x the user bytes, so the amplification limit here is 40x;
+# before P10 (metadata mirrors written on every dirty release) it was 326x.
+ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 40
 n=$(ls $MNTPT/small | wc -l | tr -d ' ')
 if [ "$n" = "$NFILES" ]; then
     result PASS "P2: $n files present"

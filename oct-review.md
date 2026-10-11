@@ -542,6 +542,13 @@ pending count forces an early flush, and the degraded "primary dropped" release 
 immediately. Expected: 24690 mirror block-writes become 119 x 3 and total writes fall from
 5.1 GB to roughly 0.7 GB (about 45x user bytes, the rest being P5's whole-column cost).
 
+**Fixed (fix/p2-writeamp).** `putblk` queues the copy (`hammer2_io_metadata_mirror_defer`),
+`hammer2_vfs_sync` writes it once (`hammer2_io_metadata_mirror_flush`, before the VOP_FSYNC
+drain), unmount flushes the rest, and `metadata_mirror_read` serves queued copies. Group P2 on h2dev:
+5148 MB (326x) becomes 536-582 MB (34-37x), per-disk deviation 4%, array reads 128 KB. The
+remainder is the 512 MB of whole-column data and parity (P5). Group P asserts balance and
+a 40x limit for P2. An R1 pass count does not change this (a clean run with P1+R1+R2 still wrote 328x).
+
 ---
 
 ## 4. Simplifications

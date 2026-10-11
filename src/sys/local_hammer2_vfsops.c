@@ -1446,6 +1446,10 @@ next_hmp:
 		lockinit(&hmp->bulklk, "h2bulk", 0, 0);
 		lockinit(&hmp->bflock, "h2bflk", 0, 0);
 		lockinit(&hmp->rebuild_lk, "h2rbld", 0, 0);
+		hammer2_spin_init(&hmp->mirror_spin, "h2mirror");
+		lockinit(&hmp->mirror_flush_lk, "h2mflk", 0, 0);
+		for (i = 0; i < HAMMER2_MIRROR_HASH; ++i)
+			TAILQ_INIT(&hmp->mirror_pend[i]);
 
 		/*
 		 * vchain setup. vchain.data is embedded.
@@ -2321,6 +2325,11 @@ again:
 
 	KKASSERT(hmp->spmp == NULL);
 
+	/* mirror copies queued by the final flushes, while the disks are open */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 && !hmp->ronly &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		hammer2_io_metadata_mirror_flush(hmp);
+
 	/*
 	 * Finish up with the device vnode
 	 */
@@ -2394,6 +2403,7 @@ again:
 		spin_uninit(&hmp->stripe_bitmap_spin);
 	hammer2_raid6_sm_destroy(hmp);
 	hammer2_raid6_open_rows_free(hmp);
+	spin_uninit(&hmp->mirror_spin);
 
 	kfree(hmp, M_HAMMER2);
 }
