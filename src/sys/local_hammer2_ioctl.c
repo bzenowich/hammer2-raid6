@@ -1535,6 +1535,88 @@ hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
 }
 
 /*
+ * Check a device offered to raid replace for failed slot `slot`.  The
+ * device is already open (ours); rebuild_lk is held exclusive, so the
+ * members cannot change.  Returns 0, or:
+ *
+ *	EBUSY	another member (same vnode, same disk or same path), or
+ *		mounted or open elsewhere: a resilver onto it would
+ *		overwrite a live column
+ *	ENOSPC	smaller than the member it replaces
+ *
+ * The device may be the failed slot's own (a replug: the disk was
+ * closed when it went away, or a failed disk is replaced onto itself).
+ */
+static int
+hammer2_raid6_replace_check(hammer2_dev_t *hmp, int slot,
+			    struct vnode *new_devvp, const char *new_path)
+{
+	hammer2_devvp_t *dev;
+	struct partinfo part;
+	struct vattr va;
+	hammer2_off_t need;
+	hammer2_off_t have;
+	int allowed;
+	int i;
+
+	allowed = 1;			/* our own open */
+	for (i = 0; i < hmp->nvolumes; i++) {
+		dev = hmp->volumes[i].dev;
+		if (dev == NULL)
+			continue;
+		if (i == slot) {
+			/* failed but not yet closed: its open is ours too */
+			if (dev->open && dev->devvp &&
+			    dev->devvp->v_rdev == new_devvp->v_rdev)
+				allowed++;
+			continue;
+		}
+		if ((dev->path && strcmp(dev->path, new_path) == 0) ||
+		    (dev->devvp && (dev->devvp == new_devvp ||
+		     (dev->devvp->v_rdev &&
+		      (dev->devvp->v_rdev == new_devvp->v_rdev ||
+		       (dev->devvp->v_rdev->si_disk &&
+			dev->devvp->v_rdev->si_disk ==
+			new_devvp->v_rdev->si_disk)))))) {
+			kprintf("hammer2: raid replace: %s is already "
+				"member %d of the array\n", new_path, i);
+			return EBUSY;
+		}
+	}
+	if (vfs_mountedon(new_devvp)) {
+		kprintf("hammer2: raid replace: %s is mounted\n", new_path);
+		return EBUSY;
+	}
+	if (vcount(new_devvp) > allowed) {
+		kprintf("hammer2: raid replace: %s is open elsewhere "
+			"(%d opens)\n", new_path, vcount(new_devvp));
+		return EBUSY;
+	}
+
+	/* the size every member has: its own, else any live member's */
+	need = hmp->volumes[slot].size;
+	for (i = 0; i < hmp->nvolumes && (need == 0 ||
+	    need == (hammer2_off_t)-1); i++) {
+		if (hmp->volumes[i].dev && hmp->volumes[i].dev->open)
+			need = hmp->volumes[i].size;
+	}
+	have = 0;
+	if (VOP_IOCTL(new_devvp, DIOCGPART, (void *)&part, 0,
+		      curthread->td_ucred, NULL) == 0) {
+		have = part.media_size;
+	} else if (VOP_GETATTR_LITE(new_devvp, &va) == 0) {
+		have = va.va_size;
+	}
+	if (need != 0 && need != (hammer2_off_t)-1 && have < need) {
+		kprintf("hammer2: raid replace: %s is %ju bytes, smaller "
+			"than the %ju the member needs\n", new_path,
+			(uintmax_t)have, (uintmax_t)need);
+		return ENOSPC;
+	}
+	return 0;
+}
+
+/*
  * RAID 6 disk replacement (online resilver).
  *
  * Identifies the failed disk by matching old_dev against volume paths,
@@ -1625,6 +1707,16 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		vn_unlock(new_devvp);
 		vrele(new_devvp);
 		return EBUSY;
+	}
+	error = hammer2_raid6_replace_check(hmp, failed_disk_idx, new_devvp,
+					    rr->new_dev);
+	if (error) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		vn_lock(new_devvp, LK_EXCLUSIVE | LK_RETRY);
+		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
+		vn_unlock(new_devvp);
+		vrele(new_devvp);
+		return error;
 	}
 	dev = hmp->volumes[failed_disk_idx].dev;
 	old_devvp = dev->devvp;

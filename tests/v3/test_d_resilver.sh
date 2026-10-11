@@ -20,6 +20,9 @@
 #   D6  dual-degraded rebuild: two disks failed, resilver the first
 #       from the two survivors (P+Q), then the second.  Disk 0 is kept
 #       out of the pair: an array with disk 0 failed does not remount.
+#   D7  replace onto a healthy member's device is refused and nothing
+#       is written; replace into its own failed slot still works
+#   D8  replace onto a device smaller than the member is refused
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
@@ -206,5 +209,66 @@ if fail_disk "$D6_A" "D6" && fail_disk "$D6_B" "D6"; then
     fi
 fi
 teardown "D6"
+
+# D7: raid replace must refuse the device of a healthy member (a typo
+# such as `replace da3 da1` would overwrite a live column), refuse a
+# member's device under another name's slot, and still accept the failed
+# slot's own device (the documented replug workflow).
+D7_FAILED=1
+D7_HEALTHY=2
+setup_fresh
+check_v3
+write_ref_data "d7"
+if fail_disk "$D7_FAILED" "D7"; then
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $D7_FAILED)" \
+            "$(disk_dev $D7_HEALTHY)" > /var/tmp/d7_replace.txt 2>&1; then
+        result FAIL "D7: replace onto healthy member disk${D7_HEALTHY} accepted"
+    else
+        result PASS "D7: replace onto healthy member disk${D7_HEALTHY} refused"
+        if grep -q "member of the array" /var/tmp/d7_replace.txt; then
+            result PASS "D7: refusal is explained"
+        else
+            result FAIL "D7: refusal not explained"
+            sed 's/^/      /' /var/tmp/d7_replace.txt
+        fi
+    fi
+    if disk_state_is "$D7_HEALTHY" ONLINE && disk_state_is "$D7_FAILED" FAILED; then
+        result PASS "D7: states unchanged after refused replace"
+    else
+        result FAIL "D7: states changed by refused replace"
+    fi
+    verify_ref "D7: data intact after refused replace" "d7"
+    fresh_disk "$D7_FAILED"
+    replace_disk "$D7_FAILED" "D7" && check_rebuilt "$D7_FAILED" "D7" "d7"
+fi
+teardown "D7"
+
+# D8: a replacement smaller than the member fails at once, not when the
+# resilver reaches its end.  Needs vnconfig for a small device.
+setup_fresh
+check_v3
+write_ref_data "d8"
+if fail_disk 1 "D8"; then
+    D8_FILE=/var/tmp/d8_small.img
+    dd if=/dev/zero of=$D8_FILE bs=1m count=64 2>/dev/null
+    D8_VN=$(vnconfig -c -S 64m vn7 $D8_FILE 2>/dev/null | head -1)
+    if [ -c /dev/vn7 ]; then
+        if hammer2 -s $MNTPT raid replace "$(disk_dev 1)" /dev/vn7 \
+                > /var/tmp/d8_replace.txt 2>&1; then
+            result FAIL "D8: replace onto a 64 MB device accepted"
+        else
+            result PASS "D8: replace onto a 64 MB device refused"
+        fi
+        disk_state_is 1 FAILED && result PASS "D8: slot still FAILED" ||
+            result FAIL "D8: slot state changed by refused replace"
+        vnconfig -u vn7 2>/dev/null
+    else
+        echo "  INFO: D8 skipped (no vnconfig device)"
+    fi
+    rm -f $D8_FILE
+    fresh_disk 1
+    replace_disk 1 "D8" && check_rebuilt 1 "D8" "d8"
+fi
+teardown "D8"
 
 summary
