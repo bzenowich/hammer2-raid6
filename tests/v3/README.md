@@ -3,7 +3,7 @@
 Run on the h2dev guest from `/root/hammer2-tests/v3` (`./deploy.sh tests`
 syncs them):
 
-    sh run_all.sh            # groups A..N (M last)
+    sh run_all.sh            # groups A..N, P (M last)
     sh run_all.sh B D        # selected groups
 
 `crash_host.sh` runs on the **host** (it resets the guest):
@@ -29,6 +29,7 @@ Test disks are `/dev/vbd1..vbd4`; `vbd0` is the system disk.
 | K | scrub: clean array is not modified, corruption detected and repaired, scrub under writes |
 | L | read-path self-heal, data and metadata |
 | N | capacity: fill past the old 2 GB-per-disk limit, two-pass bulkfree frees deleted space and it is reused, a snapshot survives the allocator wrapping the disk |
+| P | I/O shape (devstat at the members): 256 MB write and 4000 x 4 KB files read nothing from the array while writing; P1 balance and write amplification asserted; cold-read ratio printed |
 | M | silent corruption in two columns (runs last: it can hang the kernel) |
 | crash_host.sh | power loss under a write+sync loop: every synced file must survive, scrub clean |
 
