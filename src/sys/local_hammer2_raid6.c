@@ -793,6 +793,17 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
  * are on the disks (though not flushed from their caches) no later than
  * before.  hammer2_io_metadata_mirror_read() looks here first, so a
  * failover read never sees an older copy.
+ *
+ * Invariant: a block the flush has committed is not queued again until
+ * the next TXG.  The flush drains the queue after hammer2_flush() has
+ * released every dirty dio of the TXG (the sync runs it after the chain
+ * flush), and a chain whose flush cleared MODIFIED is copied on write by
+ * the next hammer2_chain_modify() (v3 always sets newmod).  That covers
+ * FREEMAP_LEAF/NODE too: hammer2_freemap_alloc() gives them a new offset
+ * from hammer2_freemap_reserve(), which rotates through the 8 reserved
+ * copies on every COW.  So a copy queued after the drain belongs to a
+ * block of the next TXG, and a copy replaced in the queue is a rewrite
+ * within one TXG.
  */
 static __inline int
 hammer2_mirror_hash(hammer2_off_t off)
@@ -858,31 +869,6 @@ hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 }
 
 /*
- * Forget a queued copy of a block (its release is about to write the
- * copies at once).
- */
-void
-hammer2_io_metadata_mirror_drop(hammer2_dev_t *hmp, hammer2_off_t per_disk_off)
-{
-	struct hammer2_mirror_pend *mp;
-
-	if (hmp->mirror_pend_count == 0)
-		return;
-	hammer2_spin_ex(&hmp->mirror_spin);
-	mp = hammer2_mirror_find_locked(hmp, per_disk_off);
-	if (mp) {
-		TAILQ_REMOVE(&hmp->mirror_pend[
-		    hammer2_mirror_hash(per_disk_off)], mp, entry);
-		--hmp->mirror_pend_count;
-	}
-	hammer2_spin_unex(&hmp->mirror_spin);
-	if (mp) {
-		kfree(mp->data, M_HAMMER2);
-		kfree(mp, M_HAMMER2);
-	}
-}
-
-/*
  * Write every queued mirror copy.  Entries stay visible to mirror reads
  * until written.  A block queued again while the flush runs is written
  * by the next one (it belongs to a later TXG).
@@ -916,9 +902,9 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 			break;
 
 		/*
-		 * A primary that failed since the release lost its dirty
-		 * buffer; the copy goes to every disk then, as for a release
-		 * made with the primary down.
+		 * A primary that is down (failed before the release, or
+		 * since) has no dirty buffer to carry the block; the copy
+		 * goes to every disk, a rebuilding one included.
 		 */
 		hammer2_io_metadata_mirror_write(hmp,
 		    (mp->primary >= 0 && !hmp->raid_failed[mp->primary]) ?

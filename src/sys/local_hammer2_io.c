@@ -937,27 +937,21 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * coalesces repeated releases of a block; the copies
 			 * are queued the same way and written by the sync
 			 * (hammer2_io_metadata_mirror_flush) so that they do
-			 * too.  If the primary was skipped above (failed, or
-			 * being rebuilt and so wanting the copy) write at
-			 * once.
+			 * too.
 			 */
 			if (rz_meta && md_mirror_data) {
 				hammer2_off_t per_disk_off = pbase - dio->dbase;
 
-				if (dropped) {
-					/* an older queued copy must not land later */
-					hammer2_io_metadata_mirror_drop(hmp,
-					    per_disk_off);
-					hammer2_io_metadata_mirror_write(hmp,
-					    -1, per_disk_off,
-					    md_mirror_data, psize);
-					kfree(md_mirror_data, M_HAMMER2);
-				} else {
-					/* written once per sync, not per release */
-					hammer2_io_metadata_mirror_defer(hmp,
-					    dio->disk_idx, per_disk_off,
-					    md_mirror_data, psize);
-				}
+				/*
+				 * Written once per sync, not per release.
+				 * With the primary down the flush writes the
+				 * copy to every disk (the primary's own copy
+				 * is gone), so there is no immediate write
+				 * to race the flusher.
+				 */
+				hammer2_io_metadata_mirror_defer(hmp,
+				    dio->disk_idx, per_disk_off,
+				    md_mirror_data, psize);
 				md_mirror_data = NULL;
 			}
 		} else if (bp) {

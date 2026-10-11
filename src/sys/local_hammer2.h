@@ -2194,8 +2194,6 @@ int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
 void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 		hammer2_off_t per_disk_off, char *data, int bytes);
-void hammer2_io_metadata_mirror_drop(hammer2_dev_t *hmp,
-		hammer2_off_t per_disk_off);
 void hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
