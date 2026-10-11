@@ -279,6 +279,17 @@ a sync rewrite of A, all within one sync interval.
 - Always `newmod = 1` on v3 DATA/DIRENT. That costs a slot until bulkfree, so rate-limit it.
 - Or keep the generation's sealed rows on a list until the flush, and recompute P/Q there (safe only after R4's per-generation rows).
 
+**Repro status (r5-repro, 2026-10-11): REPRODUCED, panic on h2dev.** `tests/v3/test_r_rewrite_seal.sh` (group R, opt-in: `sh run_all.sh R`, not in the default list).
+- **Recipe** (fresh 4-disk array, no `sync` in between): O_SYNC `pwrite` of 4 KB to file A; eight more 4 KB O_SYNC files so A's row fills and seals; O_SYNC `pwrite` of 4 KB to A again.
+- **Result:** `panic: hammer2: v3 putblk for a row not open: phys 000000000dc00000 disk 2`, stack `hammer2_raid6_open_row_add_data` <- `_hammer2_io_putblk+0x53d` <- `hammer2_xop_strategy_write+0xca8` <- `hammer2_primary_xops_thread`. Seen three times, identical.
+- **Why the path is open (confirmed from the code):**
+  - `add_data` runs at the last drop of a dirty DATA dio, i.e. at every strategy write (`hammer2_xop_strategy_write` -> `hammer2_write_file_core` -> `hammer2_io_bawrite/bwrite`), not at chain flush. The same chain's data can be written any number of times per TXG.
+  - A strategy write happens whenever the logical buffer is written out: O_SYNC `bwrite`, `fsync`, the syncer, write-behind.
+  - `hammer2_dedup_record()` returns early on v3, so `HAMMER2_CHAIN_DEDUPABLE` is never set, and the `DEDUPABLE -> newmod = 1` branch in `chain_modify` (which would otherwise save this case) is dead on v3.
+  - So a still-MODIFIED data chain keeps its slot (`newmod = 0`); a full row seals and leaves `open_rows` as soon as its last column arrives; the second putblk finds no row and panics. The stale comment above the "latest copy wins" code in `add_data` describes a case that only works while the row is still open.
+- **A plain `fsync` of A does NOT trigger it** (control R3 passes): `hammer2_vop_fsync` -> `hammer2_inode_chain_flush` flushes the file's data chains and clears MODIFIED, so the next modify takes the fresh-slot path (`newmod = 1`). The trigger needs a data rewrite with no flush of that chain in between (O_SYNC writes, or two bufcache flushes before the syncer runs).
+- Not tested (would need the panic fixed first): the data/parity corruption variant when the row is still open but already partially sealed (R4).
+
 ### R6. `raid replace` accepts any disk, including a healthy member [V]
 **Where:** `local_hammer2_ioctl.c:1583–1647`.
 
