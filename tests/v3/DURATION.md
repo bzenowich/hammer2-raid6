@@ -91,6 +91,36 @@ saved only ~15%); it is not used by default, and must not be used for S and
 I: a 2 GB array has one volume-header zone, so header rotation and crash
 recovery are not exercised.  N1/N2 and P pass `full` explicitly.
 
+## Measured on the Pi (4x 16 GB USB SSD slices)
+Kernel #18 ran the untrimmed suite, kernel #19 the trimmed one (both
+2026-10-11, same disks).  Seconds per group:
+
+| Group | untrimmed (#18) | trimmed (#19) |
+|-------|-----------------|---------------|
+| A     | 23   | 25 (A5 added) |
+| B     | 51   | 47   |
+| C     | 78   | 77   |
+| D     | 1519 | 320  |
+| E-L   | 194  | 192  |
+| N     | 5902 | 1456 |
+| P     | 149  | 127  |
+| S     | 21*  | 67   |
+| total | ~7940 (2 h 12 min) | 2331 (39 min) |
+
+\* S failed on a `sort -k` portability bug in #18's run (fixed in
+15951ea); its fixed rerun took 65 s.
+
+- N3: 5170 s for 187 x 512 MB on the full array; 731 s for 24 x 512 MB on
+  the 2 GB array, wrap asserted (12288 MB written > 3 x 3960 MB, 1190 MB
+  in use at the end).
+- D4: skip=0 walk 730 s on the full disk, 83 s at 2 GB; skip=1 21 s /
+  4.5 s.  Both media-marker assertions passed.
+- D3: the 2 GB walk took 76 s and the concurrent writes finished inside
+  it (7 s), so the overlap margin is wide.
+- What is left is N1+N2 (~12 min: 4.6 GB written and read back cold on
+  the full disks, which they need to cross 2 GB per disk) and D's other
+  resilvers (~4 min).  Neither has a cheap trim that keeps what it proves.
+
 ## Found while doing this (kernel / newfs, not fixed here)
 1. `newfs_hammer2 -s` onto a disk that held a bigger array leaves that
    array's volume headers at 2/4/6 GB.  Mount adopts the highest
