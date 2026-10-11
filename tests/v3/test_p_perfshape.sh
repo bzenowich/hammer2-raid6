@@ -113,7 +113,7 @@ awk -v n=$NFILES 'BEGIN {
 }'
 
 # P1: large incompressible write
-setup_fresh
+setup_fresh full
 check_v3
 sync; sleep 2
 ds_snap /var/tmp/p_b1
@@ -124,7 +124,7 @@ ds_report "P1" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
 teardown "P1"
 
 # P3 first needs P1's file, so run it before P2 re-creates the array.
-setup_fresh
+setup_fresh full
 dd if=$BIGSRC of=$MNTPT/big bs=1048576 2>/dev/null
 sync; sync
 remount
@@ -138,7 +138,7 @@ echo "  INFO: P3 cold read: $((rd / 1048576)) MB read from members for $BIG_MB M
 teardown "P3"
 
 # P2: many small files
-setup_fresh
+setup_fresh full
 check_v3
 sync; sleep 2
 ds_snap /var/tmp/p_b2

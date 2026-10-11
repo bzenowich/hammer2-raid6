@@ -55,7 +55,7 @@ CH=$(sha256 -q $CHUNK)
 # ----------------------------------------------------------------
 # N1: fill past the old limit
 # ----------------------------------------------------------------
-setup_fresh
+setup_fresh full
 check_v3
 
 i=0
@@ -151,7 +151,11 @@ teardown "N2"
 # ----------------------------------------------------------------
 # N3: snapshot survives allocator wrap with bulkfree running
 # ----------------------------------------------------------------
-setup_fresh
+# The wrap needs churn > capacity, whatever the capacity, so N3 builds the
+# smallest array (2 GB per disk, the RAID6 zone size) instead of the whole
+# disks: 3x capacity is then a few GB, not 100+ GB.  N1/N2 above keep the
+# full disks because they exist to cross 2 GB per disk.
+setup_fresh ${N3_SIZE:-2g}
 check_v3
 
 dd if=/dev/urandom of=$MNTPT/keep bs=1m count=128 2>/dev/null
@@ -185,6 +189,18 @@ if [ "$werr" = "0" ] && [ "$r" = "$rounds" ]; then
     result PASS "N3: churned $rounds x 512 MB through a ${cap} MB array"
 else
     result FAIL "N3: churn write failed in round $r of $rounds"
+fi
+# The test only means something if the allocator had to reuse space:
+# every byte written was new data, so writing more than the capacity
+# without ENOSPC, with the array not full at the end, can only happen
+# if freed rows were handed out again (the cursor wrapped).  The churn
+# must also have covered the snapshot's rows several times over.
+churned=$((r * 512))
+used=$(used_mb)
+if [ "$churned" -ge $((cap * 3)) ] && [ "$used" -lt "$cap" ]; then
+    result PASS "N3: wrapped (${churned} MB written > 3 x ${cap} MB, ${used} MB in use)"
+else
+    result FAIL "N3: no proven wrap (${churned} MB written, cap ${cap} MB, ${used} MB in use)"
 fi
 remount
 [ "$(sha256 -q $MNTPT/keep 2>/dev/null)" = "$LH" ] &&
