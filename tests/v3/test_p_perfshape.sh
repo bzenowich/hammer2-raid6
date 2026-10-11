@@ -146,11 +146,14 @@ cp -R $SMALLSRC $MNTPT/small
 sync; sync; sleep 2
 ds_snap /var/tmp/p_a2
 # Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
-# P5), about 32x the user bytes, so the amplification limit here is 40x;
-# before P10 (metadata mirrors written on every dirty release) it was 326x.
+# P5), about 32x the user bytes.  Measured 35.0-35.7x on h2dev and the Pi,
+# but once 41.3x on the Pi (kernel #20, full run: one extra syncer pass
+# during the copy rewrote metadata, +32 MB on each of disks 1-3), so the
+# limit is 45x.  Before P10 (metadata mirrors written on every dirty
+# release) it was 326x, which this still catches by a wide margin.
 # Metadata primaries all live on disk 0 (oct-review P4) and the syncer
 # rewrites them a varying number of times, so allow 25% imbalance.
-ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 40 0.25
+ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 45 0.25
 n=$(ls $MNTPT/small | wc -l | tr -d ' ')
 if [ "$n" = "$NFILES" ]; then
     result PASS "P2: $n files present"
