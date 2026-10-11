@@ -6,6 +6,8 @@
 # Usage: sh run_all.sh [group ...]
 #   If no groups are specified, runs all groups A..M (M last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
+#   Opt-in groups, never in the default list: R (R5 repro; expected to
+#   panic an unfixed kernel).  Run with: sh run_all.sh R
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
@@ -70,6 +72,7 @@ for GROUP in $GROUPS; do
     L) run_group "Group L" "$SCRIPTDIR/test_l_selfheal.sh"     ;;
     M) run_group "Group M" "$SCRIPTDIR/test_m_multi_corrupt.sh" ;;
     N) run_group "Group N" "$SCRIPTDIR/test_n_capacity.sh"     ;;
+    R) run_group "Group R" "$SCRIPTDIR/test_r_rewrite_seal.sh" ;;
     *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M)" ;;
     esac
 done
