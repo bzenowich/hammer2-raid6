@@ -56,7 +56,7 @@ ds_snap() {
 
 # ds_report <label> <user_bytes> <before> <after>: print and assert.
 ds_report() {
-    local label="$1" ubytes="$2" before="$3" after="$4" strict="${5:-1}"
+    local label="$1" ubytes="$2" before="$3" after="$4" strict="${5:-1}" maxamp="${6:-2.15}" maxdev="${7:-0.10}"
     local out=/var/tmp/p_ds.txt
     join "$before" "$after" | awk -v ub="$ubytes" '
         { rd = $7 - $3; wr = $9 - $5
@@ -79,19 +79,19 @@ ds_report() {
     else
         result FAIL "$label: array reads during write $rdt B (> 1 MB)"
     fi
-    if awk -v d="$dev" 'BEGIN { exit !(d <= 0.10) }'; then
+    if awk -v d="$dev" -v m="$maxdev" 'BEGIN { exit !(d <= m) }'; then
         result PASS "$label: per-disk writes balanced (max deviation $dev)"
     elif [ "$strict" = 1 ]; then
-        result FAIL "$label: per-disk writes unbalanced (max deviation $dev > 0.10)"
+        result FAIL "$label: per-disk writes unbalanced (max deviation $dev > $maxdev)"
     else
-        echo "  INFO: $label: per-disk writes unbalanced (max deviation $dev > 0.10) [known, not asserted]"
+        echo "  INFO: $label: per-disk writes unbalanced (max deviation $dev > $maxdev) [known, not asserted]"
     fi
-    if awk -v r="$ratio" 'BEGIN { exit !(r <= 2.15) }'; then
-        result PASS "$label: write amplification $ratio (<= 2.15)"
+    if awk -v r="$ratio" -v m="$maxamp" 'BEGIN { exit !(r <= m) }'; then
+        result PASS "$label: write amplification $ratio (<= $maxamp)"
     elif [ "$strict" = 1 ]; then
-        result FAIL "$label: write amplification $ratio (> 2.15)"
+        result FAIL "$label: write amplification $ratio (> $maxamp)"
     else
-        echo "  INFO: $label: write amplification $ratio (> 2.15) [known, not asserted]"
+        echo "  INFO: $label: write amplification $ratio (> $maxamp) [known, not asserted]"
     fi
 }
 
@@ -113,7 +113,7 @@ awk -v n=$NFILES 'BEGIN {
 }'
 
 # P1: large incompressible write
-setup_fresh
+setup_fresh full
 check_v3
 sync; sleep 2
 ds_snap /var/tmp/p_b1
@@ -124,7 +124,7 @@ ds_report "P1" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
 teardown "P1"
 
 # P3 first needs P1's file, so run it before P2 re-creates the array.
-setup_fresh
+setup_fresh full
 dd if=$BIGSRC of=$MNTPT/big bs=1048576 2>/dev/null
 sync; sync
 remount
@@ -138,17 +138,19 @@ echo "  INFO: P3 cold read: $((rd / 1048576)) MB read from members for $BIG_MB M
 teardown "P3"
 
 # P2: many small files
-setup_fresh
+setup_fresh full
 check_v3
 sync; sleep 2
 ds_snap /var/tmp/p_b2
 cp -R $SMALLSRC $MNTPT/small
 sync; sync; sleep 2
 ds_snap /var/tmp/p_a2
-# Balance and write amplification are reported but not asserted here:
-# 4000 small files currently write ~300x the user bytes, almost all of it
-# on disks 1..3 (a separate bug from the pre-read, see the P2 report).
-ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 0
+# Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
+# P5), about 32x the user bytes, so the amplification limit here is 40x;
+# before P10 (metadata mirrors written on every dirty release) it was 326x.
+# Metadata primaries all live on disk 0 (oct-review P4) and the syncer
+# rewrites them a varying number of times, so allow 25% imbalance.
+ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 40 0.25
 n=$(ls $MNTPT/small | wc -l | tr -d ' ')
 if [ "$n" = "$NFILES" ]; then
     result PASS "P2: $n files present"

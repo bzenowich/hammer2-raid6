@@ -1552,6 +1552,14 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		hammer2_raid6_seal_all_open_rows(hmp);
 
 	/*
+	 * Metadata mirror copies deferred by putblk: write each block once,
+	 * before the drain and the volume header below.
+	 */
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		hammer2_io_metadata_mirror_flush(hmp);
+
+	/*
 	 * We can't safely flush the volume header until we have
 	 * flushed any device buffers which have built up.
 	 *

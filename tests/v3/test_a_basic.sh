@@ -109,4 +109,32 @@ else
 fi
 teardown "A4"
 
+# A5: newfs onto a smaller size must not leave the old array's volume
+# headers in the zones beyond the new size.  Volume headers sit every 2 GB;
+# newfs -s 2g writes only zone 0, and a header left at 2 GB carries a
+# higher txg_seq than the new one, so mount adopts it (and then refuses
+# the mount; the refusal also leaves the disks open).  Known bug: this
+# FAILs until newfs clears them.  Checked on the media, nothing is mounted.
+setup_fresh full
+check_v3
+sync
+umount $MNTPT 2>/dev/null
+d0=$(disk_dev 0)
+zone1_before=$(dd if=$d0 bs=65536 skip=32768 count=1 2>/dev/null | sha256 -q)
+zero64=$(dd if=/dev/zero bs=65536 count=1 2>/dev/null | sha256 -q)
+if [ "$zone1_before" = "$zero64" ]; then
+    result PASS "A5: (no second header zone on this disk, nothing to check)"
+else
+    newfs_hammer2 -R 6 -L V3TEST $(fresh_size_opt 2g) $DEVS > /var/tmp/a5_newfs.txt 2>&1
+    zone1_after=$(dd if=$d0 bs=65536 skip=32768 count=1 2>/dev/null | sha256 -q)
+    if [ "$zone1_after" = "$zone1_before" ]; then
+        result FAIL "A5: newfs -s 2g left the old array's header at 2 GB (mount would adopt it)"
+    else
+        result PASS "A5: newfs -s 2g cleared the old header at 2 GB"
+    fi
+fi
+setup_fresh full
+check_v3
+teardown "A5"
+
 summary

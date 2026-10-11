@@ -62,7 +62,7 @@ zone_seqs() {
 
 # max_seq <idx>: the newest header seq on disk idx.
 max_seq() {
-    zone_seqs "$1" | sort -k2,2n | tail -1 | awk '{ print $2 }'
+    zone_seqs "$1" | awk '$2 + 0 >= m + 0 { m = $2 } END { if (m != "") print m }'
 }
 
 # overall_max: the newest seq on any disk.
@@ -79,7 +79,7 @@ overall_max() {
 # rewind_disk <idx>: zero the newest header zone of disk idx.
 rewind_disk() {
     local idx="$1" z
-    z=$(zone_seqs "$idx" | sort -k2,2n | tail -1 | awk '{ print $1 }')
+    z=$(zone_seqs "$idx" | awk 'NR == 1 || $2 + 0 > m + 0 { m = $2; z = $1 } END { print z }')
     [ -n "$z" ] || return 1
     dd if=/dev/zero of="$(disk_dev "$idx")" bs=65536 count=1 \
         seek=$((z * ZONE_BLKS)) conv=notrunc 2>/dev/null
