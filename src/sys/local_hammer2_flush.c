@@ -1314,6 +1314,54 @@ hammer2_devvp_write_errors(struct vnode *devvp)
 }
 
 /*
+ * Index of the RAID6 member backed by devvpl entry e, or -1.
+ */
+static int
+hammer2_flush_member_idx(hammer2_dev_t *hmp, hammer2_devvp_t *e)
+{
+	int di;
+
+	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return -1;
+	for (di = 0; di < hmp->nvolumes; di++) {
+		if (hmp->volumes[di].dev == e)
+			return di;
+	}
+	return -1;
+}
+
+/*
+ * Start a cache flush on a device vnode without waiting, so that the
+ * flushes of all members are in flight at once.  Complete it with
+ * hammer2_flush_cache_wait().
+ */
+static struct buf *
+hammer2_flush_cache_start(struct vnode *devvp)
+{
+	struct buf *bp;
+
+	bp = getpbuf(NULL);
+	bp->b_bio1.bio_offset = 0;
+	bp->b_bufsize = 0;
+	bp->b_bcount = 0;
+	bp->b_cmd = BUF_CMD_FLUSH;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vn_strategy(devvp, &bp->b_bio1);
+	return bp;
+}
+
+static int
+hammer2_flush_cache_wait(struct buf *bp)
+{
+	int error;
+
+	error = biowait(&bp->b_bio1, "h2volf");
+	relpbuf(bp, NULL);
+	return error;
+}
+
+/*
  * flush helper (backend threaded)
  *
  * Flushes chain topology for the specified inode.
@@ -1509,6 +1557,24 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	 *
 	 * XXX this isn't being incremental
 	 */
+	/*
+	 * Start the writeback on every member first (MNT_NOWAIT), so the
+	 * MNT_WAIT pass below finds the members draining in parallel
+	 * instead of waiting out each disk one after another.
+	 */
+	TAILQ_FOREACH(e, &hmp->devvpl, entry) {
+		devvp = e->devvp;
+		if (!e->open || devvp == NULL)
+			continue;
+		di = hammer2_flush_member_idx(hmp, e);
+		if (di >= 0 && (hmp->raid_failed[di] ||
+		    hammer2_devvp_write_errors(devvp)))
+			continue;
+		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+		VOP_FSYNC(devvp, MNT_NOWAIT, 0);
+		vn_unlock(devvp);
+	}
+
 	TAILQ_FOREACH(e, &hmp->devvpl, entry) {
 		devvp = e->devvp;
 		KKASSERT(devvp);
@@ -1587,11 +1653,13 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		struct buf *bp;
-		struct buf *fbp[HAMMER2_MAX_VOLUMES];
+		hammer2_devvp_t *me[HAMMER2_MAX_VOLUMES];
+		struct buf *mbp[HAMMER2_MAX_VOLUMES];
+		int mdi[HAMMER2_MAX_VOLUMES];
+		int nm;
 		uint64_t sm_gen = 0;
 		int vol_error = 0;
 		int have_open_dev = 0;
-		int nfbp = 0;
 		int k;
 
 		/*
@@ -1659,12 +1727,31 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * Shared rebuild_lk, as for any writer to a member: a disk
 		 * that goes away is failed and its buffers thrown out under
 		 * the exclusive lock (hammer2_disk_gone_hmp), and a buffer
-		 * getblk() makes here meanwhile panics vinvalbuf().
+		 * getblk() makes here meanwhile panics vinvalbuf().  Held
+		 * across all three phases below.
+		 *
+		 * The header must not reach any disk before every member
+		 * has flushed the data, parity, mirror and space map writes
+		 * it commits: VOP_FSYNC on a device vnode sends no cache
+		 * flush, so these flushes are the only ones.  Hence
+		 *
+		 *	1. FLUSH every member, in parallel, and wait;
+		 *	2. write every header, in parallel, and wait;
+		 *	3. FLUSH every member again, so that sync() does not
+		 *	   return with a header in a drive's write cache.
+		 *
+		 * A member that fails is auto-failed and left out of the
+		 * header writes; the array commits only while it keeps
+		 * its redundancy.
 		 */
 		lockmgr(&hmp->rebuild_lk, LK_SHARED);
+		nm = 0;
 		TAILQ_FOREACH(e, &hmp->devvpl, entry) {
 			if (!e->open || e->devvp == NULL)
 				continue;
+			if (nm >= HAMMER2_MAX_VOLUMES)
+				break;
+			di = hammer2_flush_member_idx(hmp, e);
 
 			/*
 			 * Not to a failed member that is not being rebuilt:
@@ -1673,39 +1760,82 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			 * that out.  Its header is stale anyway, and the
 			 * resilver writes it.
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
-				for (di = 0; di < hmp->nvolumes; di++) {
-					if (hmp->volumes[di].dev == e)
-						break;
-				}
-				if (di < hmp->nvolumes &&
-				    !hammer2_raid6_disk_writable(hmp, di))
-					continue;
-			}
-
-			/*
-			 * Synchronize the disk before flushing the
-			 * volume header.
-			 */
-			bp = getpbuf(NULL);
-			bp->b_bio1.bio_offset = 0;
-			bp->b_bufsize = 0;
-			bp->b_bcount = 0;
-			bp->b_cmd = BUF_CMD_FLUSH;
-			bp->b_bio1.bio_done = biodone_sync;
-			bp->b_bio1.bio_flags |= BIO_SYNC;
-			vn_strategy(e->devvp, &bp->b_bio1);
-			vol_error = biowait(&bp->b_bio1, "h2vol");
-			relpbuf(bp, NULL);
-
-			if (vol_error) {
-				fsync_error = vol_error;
+			if (di >= 0 && !hammer2_raid6_disk_writable(hmp, di))
 				continue;
-			}
+			me[nm] = e;
+			mdi[nm] = di;
+			nm++;
+		}
 
+		/*
+		 * Phase 1.
+		 */
+		for (k = 0; k < nm; k++) {
+			mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+		}
+		for (k = 0; k < nm; k++) {
+			vol_error = hammer2_flush_cache_wait(mbp[k]);
+			mbp[k] = NULL;
+			if (vol_error == 0)
+				continue;
+			kprintf("hammer2: cache flush error %d dev=%s\n",
+				vol_error, me[k]->path);
+			if (mdi[k] >= 0)
+				vol_error = hammer2_raid6_write_failed(hmp,
+							mdi[k], vol_error);
+			if (vol_error && fsync_error == 0)
+				fsync_error = vol_error;
+			me[k] = NULL;
+		}
+		if (fsync_error) {
 			/*
-			 * Write the volume header.
+			 * Beyond redundancy (or a plain member failed to
+			 * flush): write no header, and try the commit again
+			 * on the next sync.
 			 */
+			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			atomic_set_int(&hmp->vchain.flags,
+				       HAMMER2_CHAIN_VOLUMESYNC);
+			goto skip_volhdr;
+		}
+
+		/*
+		 * A member failed since volsync was snapshotted (the fsync
+		 * loop above, or phase 1) is still ONLINE in the copy.  The
+		 * header that commits this TXG must record the failure.
+		 */
+		if (hammer2_raid6_v3(hmp)) {
+			int dirty = 0;
+
+			hammer2_voldata_lock(hmp);
+			for (k = 0; k < hmp->nvolumes; k++) {
+				if (hmp->voldata.raid_config.disk_state[k] ==
+				    HAMMER2_RAID6_DISK_FAILED &&
+				    hmp->volsync.raid_config.disk_state[k] !=
+				    HAMMER2_RAID6_DISK_FAILED) {
+					hmp->volsync.raid_config.disk_state[k] =
+					    HAMMER2_RAID6_DISK_FAILED;
+					hmp->volsync.raid_config.flags |=
+					    HAMMER2_RAID6_FLAG_DEGRADED;
+					dirty = 1;
+				}
+			}
+			if (dirty) {
+				hmp->volsync.icrc_volheader =
+				    hammer2_icrc32((char *)&hmp->volsync +
+						   HAMMER2_VOLUME_ICRCVH_OFF,
+						   HAMMER2_VOLUME_ICRCVH_SIZE);
+			}
+			hammer2_voldata_unlock(hmp);
+		}
+
+		/*
+		 * Phase 2.
+		 */
+		for (k = 0; k < nm; k++) {
+			if (me[k] == NULL)
+				continue;
+			e = me[k];
 			bp = getblk(e->devvp,
 				    j * HAMMER2_ZONE_BYTES64,
 				    HAMMER2_VOLUME_BYTES,
@@ -1777,35 +1907,51 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 					break;
 				}
 			}
-			vol_error = bwrite(bp);
-			if (vol_error) {
-				fsync_error = vol_error;
-				continue;
-			}
-
-			/*
-			 * Flush the header itself, or sync() returns while
-			 * it sits in the drive's write cache and a power
-			 * loss brings back the previous header, losing what
-			 * this sync committed.  Waited for below, so the
-			 * flush overlaps the next member's header.
-			 */
-			if (nfbp < HAMMER2_MAX_VOLUMES) {
-				bp = getpbuf(NULL);
-				bp->b_bio1.bio_offset = 0;
-				bp->b_bufsize = 0;
-				bp->b_bcount = 0;
-				bp->b_cmd = BUF_CMD_FLUSH;
-				bp->b_bio1.bio_done = biodone_sync;
-				bp->b_bio1.bio_flags |= BIO_SYNC;
-				vn_strategy(e->devvp, &bp->b_bio1);
-				fbp[nfbp++] = bp;
-			}
+			if (hammer2_bwrite_start(bp))
+				mbp[k] = bp;
+			else
+				me[k] = NULL;
 		}
-		for (k = 0; k < nfbp; k++) {
-			vol_error = biowait(&fbp[k]->b_bio1, "h2volf");
-			relpbuf(fbp[k], NULL);
-			if (vol_error)
+		for (k = 0; k < nm; k++) {
+			if (mbp[k] == NULL)
+				continue;
+			vol_error = hammer2_bwrite_wait(mbp[k]);
+			mbp[k] = NULL;
+			if (vol_error == 0)
+				continue;
+			kprintf("hammer2: volume header write error %d "
+				"dev=%s\n", vol_error, me[k]->path);
+			if (mdi[k] >= 0)
+				vol_error = hammer2_raid6_write_failed(hmp,
+							mdi[k], vol_error);
+			if (vol_error && fsync_error == 0)
+				fsync_error = vol_error;
+			me[k] = NULL;
+		}
+
+		/*
+		 * Phase 3: flush the headers themselves, or sync() returns
+		 * while they sit in the drives' write cache and a power loss
+		 * brings back the previous header, losing what this sync
+		 * committed.
+		 */
+		for (k = 0; k < nm; k++) {
+			if (me[k] != NULL)
+				mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+		}
+		for (k = 0; k < nm; k++) {
+			if (mbp[k] == NULL)
+				continue;
+			vol_error = hammer2_flush_cache_wait(mbp[k]);
+			mbp[k] = NULL;
+			if (vol_error == 0)
+				continue;
+			kprintf("hammer2: cache flush error %d dev=%s\n",
+				vol_error, me[k]->path);
+			if (mdi[k] >= 0)
+				vol_error = hammer2_raid6_write_failed(hmp,
+							mdi[k], vol_error);
+			if (vol_error && fsync_error == 0)
 				fsync_error = vol_error;
 		}
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
