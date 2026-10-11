@@ -1,0 +1,22 @@
+#!/bin/sh
+# h2dev-lock — run a command while holding the h2dev VM lock, so parallel
+# worktrees never deploy or test on the shared guest at the same time.
+#
+#   bin/h2dev-lock ./deploy.sh fast
+#   bin/h2dev-lock sh -c './deploy.sh fast && ./ssh.sh --raw sh < mytest.sh'
+#
+# Waits for the lock (prints who holds it).  Always deploy and test inside
+# ONE locked command: another worktree may load its own hammer2.ko as soon
+# as you release it.  The lock lives in the main checkout's run/ dir.
+LOCK=/home/bz/code/flynas/hammer2-raid6/run/h2dev.lock
+mkdir -p "$(dirname "$LOCK")"
+exec 9>>"$LOCK"
+if ! flock -n 9; then
+    echo "h2dev-lock: waiting; held by: $(cat "$LOCK.owner" 2>/dev/null)" >&2
+    flock 9
+fi
+echo "$(pwd) pid $$ since $(date +%T): $*" > "$LOCK.owner"
+"$@"
+rc=$?
+: > "$LOCK.owner"
+exit $rc

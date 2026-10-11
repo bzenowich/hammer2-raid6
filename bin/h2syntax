@@ -1,0 +1,36 @@
+#!/bin/sh
+# h2syntax — compile-check this tree's hammer2 kernel sources (src/sys) on
+# the Linux host with the Pi kernel's exact flags (arm64 cross clang-18,
+# ARM64_RPI4_R6 objdir), without touching h2dev or the Pi.  Light: one
+# clang -fsyntax-only per file, run serially.
+#
+#   bin/h2syntax            check every local_*.c
+#   bin/h2syntax io flush   check local_hammer2_io.c and local_hammer2_flush.c
+#
+# Needs a prior Pi kernel build (dfly/tools/kobj/ARM64_RPI4_R6) for the
+# generated headers.  Exit status is non-zero on any error; warnings print.
+set -e
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DFLY=/home/bz/code/flynas/dfly
+KOBJ=$DFLY/tools/kobj/ARM64_RPI4_R6
+R6=$DFLY/tools/r6src/sys/vfs/hammer2
+CC=$DFLY/tools/host/xbin/cc
+[ -f "$KOBJ/opt_global.h" ] || { echo "no $KOBJ; build the Pi kernel once" >&2; exit 2; }
+T=$(mktemp -d "${TMPDIR:-/tmp}/h2syntax.XXXXXX")
+trap 'rm -rf "$T"' EXIT
+cp -R "$R6"/. "$T"/
+for f in "$DIR"/src/sys/local_*.[ch]; do
+    cp "$f" "$T/$(basename "$f" | sed 's/^local_//')"
+done
+if [ $# -eq 0 ]; then
+    set -- $(cd "$DIR/src/sys" && ls local_*.c | sed 's/^local_hammer2_\{0,1\}//; s/\.c$//')
+fi
+rc=0
+cd "$KOBJ"
+for n in "$@"; do
+    case $n in hammer2*) f=$n.c ;; *) f=hammer2_$n.c ;; esac
+    [ -f "$T/$f" ] || { echo "no $f" >&2; rc=1; continue; }
+    echo "== $f"
+    $CC -fsyntax-only -Wno-unused-command-line-argument -O2 -pipe   -Wall -Wredundant-decls -Wnested-externs -Wstrict-prototypes  -Wmissing-prototypes -Wpointer-arith -Wcast-qual  -Wold-style-definition -Wmissing-include-dirs -Winit-self  -Wundef -Wno-pointer-sign -std=gnu11 -g -nostdinc -I. -Iinclude -I/home/bz/code/flynas/dfly/tools/r6src/sys -I/home/bz/code/flynas/dfly/tools/kobj/ARM64_RPI4_R6 -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/acpica -I/home/bz/code/flynas/dfly/tools/r6src/sys/contrib/dev/acpica/source/include -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/netif/ath/ath_hal -I/home/bz/code/flynas/dfly/tools/r6src/sys/contrib/dev/ath/ath_hal -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/drm/include -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/drm/include/drm -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/drm/include/uapi -I/home/bz/code/flynas/dfly/tools/r6src/sys/dev/drm/amd/include -I/home/bz/code/flynas/dfly/tools/r6src/sys/libfdt  -D_KERNEL -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h  -fno-common -ffreestanding -fno-stack-protector -fno-strict-aliasing -fno-strict-overflow -fno-asynchronous-unwind-tables -fno-omit-frame-pointer -mgeneral-regs-only -ffixed-x18 -mno-outline-atomics "$T/$f" || rc=1
+done
+exit $rc
