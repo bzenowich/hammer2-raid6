@@ -3,7 +3,7 @@
 Run on the h2dev guest from `/root/hammer2-tests/v3` (`./deploy.sh tests`
 syncs them):
 
-    sh run_all.sh            # groups A..N, P (M last)
+    sh run_all.sh            # groups A..N, P, S (M last)
     sh run_all.sh B D        # selected groups
 
 `crash_host.sh` runs on the **host** (it resets the guest):
