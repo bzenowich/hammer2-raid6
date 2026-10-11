@@ -4,7 +4,7 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs all groups A..M (M last: it can hang the guest).
+#   If no groups are specified, runs all groups A..N, P (M last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #
 # Environment:
@@ -52,7 +52,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L N M}"
+GROUPS="${*:-A B C D E F G H I J K L N P M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -70,7 +70,8 @@ for GROUP in $GROUPS; do
     L) run_group "Group L" "$SCRIPTDIR/test_l_selfheal.sh"     ;;
     M) run_group "Group M" "$SCRIPTDIR/test_m_multi_corrupt.sh" ;;
     N) run_group "Group N" "$SCRIPTDIR/test_n_capacity.sh"     ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M)" ;;
+    P) run_group "Group P" "$SCRIPTDIR/test_p_perfshape.sh"    ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P)" ;;
     esac
 done
 
