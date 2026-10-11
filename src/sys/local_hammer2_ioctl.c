@@ -1628,13 +1628,8 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	}
 	dev = hmp->volumes[failed_disk_idx].dev;
 	old_devvp = dev->devvp;
-	if (dev->open) {
-		/* failed but never closed (auto-fail): release it now */
-		vn_lock(old_devvp, LK_EXCLUSIVE | LK_RETRY);
-		VOP_CLOSE(old_devvp, FREAD | FWRITE, NULL);
-		vn_unlock(old_devvp);
-		dev->open = 0;
-	}
+	/* failed but never closed (auto-fail): release it now */
+	hammer2_raid6_close_member_locked(hmp, failed_disk_idx, NULL);
 	if (hmp->stripe_bitmap_size)
 		hmp->rebuild_done = kmalloc(hmp->stripe_bitmap_size,
 					    M_HAMMER2, M_WAITOK | M_ZERO);
@@ -1749,6 +1744,7 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 {
 	hammer2_ioc_raid_fail_disk_t *rfd = data;
 	hammer2_dev_t *hmp;
+	int error;
 	int i;
 
 	hmp = ip->pmp->pfs_hmps[0];
@@ -1756,11 +1752,6 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 		return EINVAL;
 	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
 		return ENOTSUP;
-	if (hmp->raid_nfailed >= 2) {
-		kprintf("hammer2: raid fail-disk: already %d disk(s) failed, "
-			"cannot tolerate more\n", hmp->raid_nfailed);
-		return ENXIO;
-	}
 
 	rfd->dev[sizeof(rfd->dev) - 1] = 0;
 
@@ -1777,32 +1768,15 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 			 * marking the disk failed.
 			 */
 			hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
-			hmp->raid_failed[i] = 1;
-			atomic_add_int(&hmp->raid_nfailed, 1);
-			/* Update on-disk disk_state (both runtime and persisted) */
-			hammer2_voldata_lock(hmp);
-			hmp->raid_config.disk_state[i] =
-				HAMMER2_RAID6_DISK_FAILED;
-			hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-			hmp->voldata.raid_config.disk_state[i] =
-				HAMMER2_RAID6_DISK_FAILED;
-			hmp->voldata.raid_config.flags |=
-				HAMMER2_RAID6_FLAG_DEGRADED;
-			hammer2_voldata_modify(hmp);
-			hammer2_voldata_unlock(hmp);
-			/*
-			 * Release the open file reference on the failed disk.
-			 */
-			if (hmp->volumes[i].dev->open) {
-				vn_lock(hmp->volumes[i].dev->devvp,
-					LK_EXCLUSIVE | LK_RETRY);
-				vinvalbuf(hmp->volumes[i].dev->devvp,
-					  0, 0, 0);
-				VOP_CLOSE(hmp->volumes[i].dev->devvp,
-					  FREAD | FWRITE, NULL);
-				vn_unlock(hmp->volumes[i].dev->devvp);
-				hmp->volumes[i].dev->open = 0;
+			error = hammer2_raid6_mark_failed(hmp, i, 0);
+			if (error) {
+				kprintf("hammer2: raid fail-disk: already %d "
+					"disk(s) failed, cannot tolerate "
+					"more\n", hmp->raid_nfailed);
+				return error;
 			}
+			/* Release the open file reference on the failed disk */
+			hammer2_raid6_close_member(hmp, i, NULL);
 			kprintf("hammer2: RAID6 disk %d (%s) marked failed; "
 				"operating in degraded mode\n",
 				i, rfd->dev);

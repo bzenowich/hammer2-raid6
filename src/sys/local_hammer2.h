@@ -1199,6 +1199,7 @@ struct hammer2_dev {
 	int		raid_type;		/* 0=JBOD, 6=RAID6 */
 	int		raid_failed[HAMMER2_MAX_VOLUMES]; /* failed disk tracking */
 	int		raid_nfailed;		/* count of failed disks */
+	uint32_t	raid_persist_pending;	/* disks to record FAILED */
 
 	/*
 	 * RAIDZ2-native space map (v3, docs/capacity.md).  The row
@@ -2187,6 +2188,10 @@ hammer2_raid6_v3(hammer2_dev_t *hmp)
 		hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 }
 
+/* hammer2_raid6_mark_failed() flags */
+#define HAMMER2_FAIL_DEFER	0x0001	/* may not sleep: record via a task */
+#define HAMMER2_FAIL_FORCE	0x0002	/* mount: exceed the two-disk cap */
+
 static __inline int
 hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
 {
@@ -2241,6 +2246,13 @@ int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
+int hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags);
+int hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
+			struct vnode *expect_devvp);
+int hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
+			struct vnode *expect_devvp);
+void hammer2_raid6_persist_failed(hammer2_dev_t *hmp);
+void hammer2_raid6_persist_kick(void);
 int hammer2_raid6_write_failed(hammer2_dev_t *hmp, int disk_idx, int error);
 
 /*
@@ -2285,6 +2297,7 @@ int hammer2_bref_check_match(const hammer2_blockref_t *bref,
  * tests/v3/test_e_eio_inject.sh.
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
+extern int hammer2_inject_eio_autofail;
 extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
 
