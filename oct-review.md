@@ -15,11 +15,110 @@ Date: 2026-10-10. Tree: `035b1b7` plus the uncommitted whole-buffer fix in
 - Findings that two reviewers reported independently are merged.
 - Every finding carries one of these tags:
   - **[V]** I re-read the code myself and confirmed it.
+  - **[V-measured]** Confirmed by a measurement on the hardware.
   - **[V2]** Two reviewers reported it independently and the code quotes match, but I did not re-check it myself.
   - **[R]** A reviewer traced it, but nobody has reproduced it.
   - **[U]** Unverified trigger or reachability.
-- No finding except §1 has been reproduced on h2dev or the Pi yet. §9 lists the cheap repro tests to write first.
+- No finding except §1 and P9 (read amplification) has been reproduced on h2dev or the Pi yet. §7 lists the cheap repro tests to write first; §0 explains why the suite missed these bugs.
 - Line numbers are from `src/sys/` at the tree above.
+
+---
+
+## 0. Why the test suite missed these bugs
+
+`tests/v3` copies the *scenarios* of the mdadm test suite: fail a disk, two failed
+disks, replace and resilver, scrub, degraded mount, and unclean shutdown. It does not
+copy md's *checks* or its *kinds of failure*. Almost every test drives a feature and
+then asks one question: do the file contents read back? Most bugs in §2 cannot
+change that answer.
+
+### 0.1 The crash test cannot lose a write
+- `crash_host.sh` "cuts power" with QMP `system_reset`.
+- `qemu-machine.sh:75` attaches the RAID disks with `cache=writeback`.
+- So every write QEMU has acknowledged is still in the host page cache, and is still there after the reset.
+- The test simulates "stop sending I/O", not "lose the drive's volatile write cache".
+- All four disks also stop at the same instant.
+
+R1 (header written before the other disks flushed) and R2 (split headers) only show up
+when unflushed writes are lost, or when the disks are cut at different points.
+This test can produce neither.
+
+In the md world this testing is done by separate tools (`dm-log-writes`, `dm-flakey`,
+the xfstests generic/log-writes tests), not by the mdadm suite. Copying the mdadm
+suite brought in its blind spot.
+
+### 0.2 md's main correctness check was lost
+- After most operations, the md tests run a `check` pass and require `mismatch_cnt == 0`.
+- Our equivalent, `h2stripe_check`, runs once, in F2 (`test_f_cow_invariant.sh:54`).
+- Every other test checks only file contents.
+
+RAID6 is built to hide bad parity: block checksums plus self-heal return correct data
+whether or not parity is right. Bad parity only shows when a second disk fails. These
+bugs all leave reads correct and parity wrong until a second failure:
+- R4: partial-seal garbage column;
+- R2c: a lagging disk trusted;
+- R3: a disk failed in memory only;
+- R10c: a repair onto a reallocated slot.
+
+### 0.3 Failures only happen at tidy moments, and only on reads
+- Disks are failed in three ways:
+  - by ioctl (`fail-disk`);
+  - by being left out of the mount spec;
+  - with errors on reads.
+- `hammer2_inject_eio_disk_mask` covers only `bread`/`breadnx` (`local_hammer2.h:2281–2296`).
+- Nothing makes a write or a cache flush fail.
+- Nothing hangs a disk without failing it.
+- Nothing fails a disk partway through a write, a seal or the header loop.
+
+Those are exactly the weak paths in R3, R7 and R11. They were exercised only by the
+Pi's real USB dropouts. That is why the Pi found bugs that h2dev never did.
+
+### 0.4 Our design has failure modes md doesn't
+md rewrites stripes in place, under a stripe cache and a write-intent bitmap. v3 has
+different machinery:
+- copy-on-write;
+- rows that fill across transactions;
+- deferred seals, and partial seals at a flush;
+- a header quorum.
+
+Copying md's scenarios covered md's risks, not the ones this design adds. No test
+rewrites a block in the same TXG after its row sealed (R5), because md has no such state.
+
+### 0.5 Correct output is not correct behaviour
+- **Performance.** The §1 bug produced correct output, so no functional test could catch it. Only an I/O-count check could.
+- **Admin mistakes.** md is protected from the wrong-replace-disk mistake (R6) by the Linux kernel's exclusive open of member devices, so the mdadm suite never needed that test. On DragonFly we have to check it ourselves.
+
+### 0.6 The tests are sequential and small, and coverage is not measured
+- The tests are shell scripts that run one step after another on 4 GB virtual disks.
+- So they hit the narrow timing windows only by luck: the remaining vinvalbuf paths (R7), and a rewrite after a seal (R5).
+- Nothing records which kernel paths a test actually reached. The 2026-10-04 audit found that the old 65/0 pass was largely vacuous for this reason.
+
+Most findings in §2 are still [R] or [U], so some may turn out not to be real. Closing
+these gaps is how to find out.
+
+### 0.7 What would close the gaps, in order of value
+1. **Parity check after every group.** Run `h2stripe_check` on the unmounted array at
+   the end of each group. Add a check that every disk's newest header has the same
+   sequence and agrees with the others. This is cheap, and restores md's main check.
+2. **A crash test that can lose writes.**
+   - Use `cache=none` or `directsync`.
+   - Add a recording layer, as a host-side QEMU block filter or a guest shim under each member, that logs every write and flush per disk.
+   - Replay up to every flush point, including combinations where each disk is cut at a different point.
+   - After each replay: mount, run the quorum, then the parity check.
+
+   This is the `dm-log-writes` method, and it tests R1 and R2 directly.
+3. **Error and hang injection for writes and flushes.** Add `inject_wio_disk_mask`,
+   `inject_flush_err_disk_mask` and `inject_delay_ms_disk_mask`. Add a QMP `device_del`
+   of a member while it is being written, to exercise `disk_gone`.
+4. **I/O-count checks (group P, §7):** no reads during writes, even per-disk writes, and
+   total writes at most 2.1× the user data. A read-side check belongs here too: a cold
+   sequential read on the Pi currently moves about 2.2× the file data, because
+   read-ahead pulls in P/Q (P9).
+5. **A random concurrent stress run:** fsx or fsstress, with a `fail-disk`, `replace`
+   or `scrub` partway through, ending with the check in item 1.
+6. **Counters that prove each path ran** (§6). Every test asserts that the counters for
+   its target path went up: `seal_partial`, `degraded_read_2`, `selfheal_queued`,
+   `new_preread == 0`. A test then can't pass without exercising its code.
 
 ---
 
@@ -366,7 +465,7 @@ failed disks) with a per-disk cache key. Writes stay primary plus mirrors.
 - Treat a row as full once every *writable* data disk is allocated.
 
 ### P9. Smaller items
-- **Data read-ahead on v3** reads neighbouring slots on the same disk, and half of those are P/Q (`io.c:488–520`). Use `hce = 0` for Path A dios and rely on logical read-ahead. [R]
+- **Data read-ahead on v3** reads neighbouring slots on the same disk, and half of those are P/Q (`io.c:488–520`). Use `hce = 0` for Path A dios and rely on logical read-ahead. Measured on the Pi on 2026-10-10 (kernel #16): a cold sequential read of 1 GB read about 170 MB/s across the four disks to deliver 78 MB/s of file data, about 2.2× read amplification. Fixing this should roughly double sequential reads. [V-measured]
 - **The dio hash drops the disk bits** (`io.c:2830`), so all columns of a row share a bucket. Mix in `pbase >> 56`. [V2]
 - **Each data column costs a 64 KB `kmalloc` + `bcopy`** held until the seal (`io.c:779–784`). Large kmallocs cost TLB-shootdown IPIs on free. Use an objcache, or the fold-in accumulation in S3.
 
