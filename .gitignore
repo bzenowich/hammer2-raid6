@@ -21,3 +21,4 @@ run/
 
 # Byte-cache from importing bin/ scripts as modules (tests)
 __pycache__/
+/.h2dev.lock*
