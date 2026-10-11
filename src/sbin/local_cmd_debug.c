@@ -530,9 +530,15 @@ cmd_show(const char *devpath, const char *chspec, int which)
 			if (read(fd, &media, HAMMER2_PBUFSIZE) ==
 			    (ssize_t)HAMMER2_PBUFSIZE) {
 				broot.mirror_tid = media.voldata.mirror_tid;
-				printf("Volume %d header %d: mirror_tid=%016jx\n",
+				printf("Volume %d header %d: mirror_tid=%016jx",
 				       media.voldata.volu_id, j,
 				       (intmax_t)broot.mirror_tid);
+				if (media.voldata.version >=
+				    HAMMER2_VOL_VERSION_RAIDZ2)
+					printf(" txg_seq=%ju", (uintmax_t)
+					    media.voldata.raid_config.
+					    rz_txg_seq);
+				printf("\n");
 				if (all_volume_headers || bests[i] == j) {
 					switch(which) {
 					case 0:
