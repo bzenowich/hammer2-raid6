@@ -877,6 +877,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 	if (chains_still_present) {
 		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
 	} else {
+		/* the xop threads are gone; their group array is not */
+		if (pmp->xop_groups) {
+			kfree(pmp->xop_groups, M_HAMMER2);
+			pmp->xop_groups = NULL;
+		}
 		kmalloc_destroy_obj(&pmp->minode);
 		kfree(pmp, M_HAMMER2);
 	}

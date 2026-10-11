@@ -20,7 +20,7 @@
 #       mount is refused ("space map rebuild failed ... refusing RW
 #       mount").  newfs on the same devices must then work without a
 #       reboot (the devices were left open: "Device busy"), and
-#       kldunload must not report 'HAMMER2-mount' still allocated.
+#       the live HAMMER2-mount object count (vmstat -m) must not grow.
 #
 # Each of T1/T2 requires: the mount succeeds, the filesystem is the new
 # one (empty, new fsid) and a scrub is clean.
@@ -118,6 +118,13 @@ new_fs_checks() {
     return 0
 }
 
+# h2_mem_count: live kmalloc objects of the HAMMER2-mount type (vmstat -m
+# Count).  kldunload's malloc_uninit message also counts memory the module
+# keeps for its lifetime, so compare the live count before and after.
+h2_mem_count() {
+    vmstat -m | awk '$1 == "HAMMER2-mount" { print $2 }'
+}
+
 # --- T1: newfs with a smaller -s must clear the old zone 1 ---
 t1() {
     local label=T1 fsid
@@ -195,11 +202,12 @@ t2() {
 
 # --- T3: a refused RW mount releases the devices and memory ---
 t3() {
-    local label=T3 i attempt
+    local label=T3 i attempt c0 c1 c2
     setup_fresh
     check_v3
     write_ref_data "ref"
     umount $MNTPT || { result FAIL "$label: umount"; return; }
+    c0=$(h2_mem_count)
     # Space map and the start of the metadata (super-root) on every disk.
     i=0
     while [ "$i" -lt "$NDISKS" ]; do
@@ -217,6 +225,12 @@ t3() {
         result PASS "$label: RW mount refused"
     else
         result PASS "$label: mount failed (not by the space map refusal)"
+    fi
+    c1=$(h2_mem_count)
+    if [ "$c1" = "$c0" ]; then
+        result PASS "$label: the refused mount freed everything it allocated"
+    else
+        result FAIL "$label: HAMMER2-mount objects $c0 -> $c1 after the refused mount"
     fi
     # The devices must be closed again.
     attempt=0
@@ -238,16 +252,11 @@ t3() {
     else
         result FAIL "$label: new filesystem does not mount"
     fi
-    kmsg_clear
-    if kldunload hammer2 2>/dev/null; then
-        if kmsg | grep -q "malloc_uninit.*HAMMER2"; then
-            result FAIL "$label: kldunload: $(kmsg | grep 'malloc_uninit.*HAMMER2' | head -2 | tr '\n' ' ')"
-        else
-            result PASS "$label: kldunload leaves no HAMMER2 memory allocated"
-        fi
-        kldload hammer2
+    c2=$(h2_mem_count)
+    if [ "$c2" = "$c0" ]; then
+        result PASS "$label: no HAMMER2-mount objects left over ($c0 before, $c2 after)"
     else
-        result FAIL "$label: kldunload hammer2 failed"
+        result FAIL "$label: HAMMER2-mount objects $c0 -> $c2 (leak)"
     fi
 }
 
