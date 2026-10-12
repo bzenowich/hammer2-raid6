@@ -280,6 +280,7 @@ struct hammer2_io {
 	int		ticks;
 	int		error;
 	int		disk_idx;	/* RAID6: physical disk index (-1 if N/A) */
+	int		rdisk;		/* v3 metadata: mirror the last read came from (-1 = disk_idx) */
 	char		*absent_data;	/* RAID6 absent disk: kmalloc'd reconstruction buffer */
 #ifdef HAMMER2_IO_DEBUG
 	int		debug_index;
@@ -1620,6 +1621,7 @@ extern int hammer2_xop_xbase;
 extern int hammer2_xop_mod;
 extern long hammer2_debug_inode;
 extern int hammer2_cluster_meta_read;
+extern int hammer2_md_read_spread;
 extern int hammer2_cluster_data_read;
 extern int hammer2_cluster_write;
 extern int hammer2_dedup_enable;
@@ -2197,6 +2199,13 @@ void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 void hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
+int hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
+		void *dst, int bytes, int nocache);
+int hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
+		void *dst, int bytes, int nocache);
+int hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
+		hammer2_off_t per_disk_off, void *buf, size_t bytes, int block);
+int hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, hammer2_off_t per_disk_off);
 int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
 		const void *data, int bytes);
 void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
@@ -2325,6 +2334,7 @@ void hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 		uint64_t chk_hash);
 uint64_t hammer2_io_repair_hash(const void *data, size_t bytes);
 int hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
+		int alt_disk_idx,
 		hammer2_off_t dev_pbase, int psize, int off,
 		const hammer2_blockref_t *bref, void *bdata, size_t bytes);
 int hammer2_bref_check_match(const hammer2_blockref_t *bref,
