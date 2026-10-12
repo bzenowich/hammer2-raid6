@@ -1591,9 +1591,21 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 	} else {
 		/*
 		 * Already flagged modified, no new allocation is needed.
+		 *
+		 * v3 DATA/DIRENT: unless the column has already been
+		 * handed to its row.  Its row may be sealed or about to
+		 * be, with P/Q on disk that cover the old bytes, so the
+		 * rewrite takes a fresh slot.
 		 */
 		newmod = 0;
 		setmodified = 0;
+		if (hammer2_raid6_v3(hmp) && chain->bytes &&
+		    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+		     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT) &&
+		    hammer2_raid6_col_arrived(hmp, &chain->bref)) {
+			newmod = 1;
+			atomic_add_long(&hammer2_rz_rewrite_slots, 1);
+		}
 	}
 
 	/*

@@ -2311,6 +2311,38 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 }
 
 /*
+ * Return 1 if the column bref names cannot take another put in place:
+ * its row has sealed (no open row) or the column's data is already in
+ * the row.  Return 0 if it is still pending, i.e. a put is on its way
+ * and a new put coalesces into it.  A column in a sealed row sits under
+ * P/Q that are already on disk, and an arrived one may be sealed by
+ * another chain's put at any moment, so a chain that rewrites it in the
+ * same TXG must take a fresh slot (oct-review.md §10.3).  A pending
+ * column keeps its row open, so this cannot race a seal.
+ */
+int
+hammer2_raid6_col_arrived(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
+{
+	struct hammer2_open_row *r;
+	uint64_t slot;
+	int arrived = 1;
+
+	if (!hammer2_raid6_bref_slot(hmp, bref, &slot))
+		return 0;
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	if (isset(hmp->stripe_open, slot)) {
+		TAILQ_FOREACH(r, &hmp->open_rows, entry) {
+			if (r->row_id != slot)
+				continue;
+			arrived = (r->col_data[bref->copyid] != NULL);
+			break;
+		}
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	return arrived;
+}
+
+/*
  * Putblk → open_row sink.  Takes ownership of `data` (kfree'd when
  * row seals).  If every reserved col then has its data and the row is
  * full, or was partially sealed and so takes no more cols, seal it.
@@ -2347,14 +2379,16 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	KKASSERT(r->alloc_mask & (1U << disk_idx));
 
 	/*
-	 * A single chain's dio can putblk multiple times in one TXG
-	 * if it's re-dirtied after the first bawrite (in-TXG modify-
-	 * after-flush).  The latest copy wins — detach the prior
-	 * col_data here, kfree it AFTER releasing the spinlock (kfree
-	 * of a stripe_unit buffer can call vm_map_remove which sleeps
-	 * on the kernel map lock — not safe under a spinlock).
+	 * A column is put once.  chain_modify gives a chain whose column
+	 * has arrived a fresh slot (hammer2_raid6_col_arrived), so a second
+	 * put here means a dio dirtied again without a modify; the latest
+	 * copy wins, which is only right while the row stays open, and it
+	 * is counted (vfs.hammer2.rz_put_anomaly).  kfree the old copy
+	 * after the spinlock is released: it can sleep on the kernel map.
 	 */
 	to_free = r->col_data[disk_idx];
+	if (to_free)
+		hammer2_rz_put_anomaly++;
 	r->col_data[disk_idx] = data;
 	r->dirty = 1;
 	r->idle = 0;

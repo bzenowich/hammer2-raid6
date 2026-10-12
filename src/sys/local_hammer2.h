@@ -2259,6 +2259,8 @@ void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, int disk_idx,
 		void *data /* takes ownership */, size_t bytes, int dropped);
 void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
+int  hammer2_raid6_col_arrived(hammer2_dev_t *hmp,
+			       const hammer2_blockref_t *bref);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
 void hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 		hammer2_off_t *freep);
