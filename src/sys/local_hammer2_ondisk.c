@@ -1496,8 +1496,7 @@ hammer2_raid6_bref_slot(hammer2_dev_t *hmp, const hammer2_blockref_t *bref,
 	phys_off = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
 	if (phys_off < HAMMER2_ZONE_SEG64)
 		return 0;
-	slot = (phys_off - HAMMER2_ZONE_SEG64) /
-	    hmp->raid_config.stripe_unit;
+	slot = hammer2_raid6_slot(phys_off, hmp->raid_config.stripe_unit);
 	if (slot >= hmp->stripe_num_slots)
 		return 0;
 	*slotp = slot;
@@ -2266,14 +2265,18 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 				   hammer2_off_t *phys_off_out,
 				   int *disk_idx_out)
 {
-	hammer2_raid_config_t *rc = &hmp->raid_config;
-	int ndisks = rc->ndisks;
 	struct hammer2_open_row *r;
 	struct hammer2_open_row *nr;
-	int t, candidate;
+	uint32_t failed_mask = 0;
+	int d, candidate;
 
 	if (!hmp->open_rows_inited)
 		return 0;
+
+	for (d = 0; d < hmp->raid_config.ndisks; d++) {
+		if (hmp->raid_failed[d])
+			failed_mask |= 1U << d;
+	}
 
 	TAILQ_FOREACH_MUTABLE(r, &hmp->open_rows_pack, pentry, nr) {
 		if (!hammer2_raid6_row_can_take(hmp, r)) {
@@ -2281,15 +2284,9 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 			r->packable = 0;
 			continue;
 		}
-		for (t = 0; t < ndisks; t++) {
-			candidate = hmp->stripe_next_disk % ndisks;
-			hmp->stripe_next_disk++;
-			if (candidate == r->p_disk || candidate == r->q_disk)
-				continue;
-			if (hmp->raid_failed[candidate])
-				continue;
-			if (r->alloc_mask & (1U << candidate))
-				continue;
+		candidate = hammer2_raid6_pick_data_disk(hmp, r->p_disk,
+		    r->q_disk, failed_mask | r->alloc_mask);
+		if (candidate >= 0) {
 			r->alloc_mask |= (1U << candidate);
 			r->n_alloc++;
 			if (!hammer2_raid6_row_can_take(hmp, r)) {
@@ -2317,10 +2314,10 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 				       int disk_idx)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
-	int ndisks = rc->ndisks;
 	int ndata = rc->ndata;
-	int p_disk = (int)(row_id % ndisks);
-	int q_disk = (p_disk + 1) % ndisks;
+	int p_disk, q_disk;
+
+	hammer2_raid6_pq(row_id, rc->ndisks, &p_disk, &q_disk);
 
 	/*
 	 * TAILQ-backed tracker — never force-seal.  Each new row
@@ -2407,8 +2404,8 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	KKASSERT(hmp->open_rows_inited);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	r = hammer2_raid6_open_row_find(hmp, (phys_off - HAMMER2_ZONE_SEG64) /
-					     hmp->raid_config.stripe_unit);
+	r = hammer2_raid6_open_row_find(hmp, hammer2_raid6_slot(phys_off,
+					     hmp->raid_config.stripe_unit));
 	if (r == NULL) {
 		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 		panic("hammer2: v3 putblk for a row not open: phys %016jx "
@@ -2477,8 +2474,8 @@ hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	bytes = hmp->raid_config.stripe_unit;
 	zero = kmalloc(bytes, M_HAMMER2, M_WAITOK | M_ZERO);
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	r = hammer2_raid6_open_row_find(hmp, (phys_off - HAMMER2_ZONE_SEG64) /
-					     bytes);
+	r = hammer2_raid6_open_row_find(hmp, hammer2_raid6_slot(phys_off,
+					     bytes));
 	if (r)
 		need = ((r->alloc_mask & (1U << disk_idx)) &&
 			r->col_data[disk_idx] == NULL);
@@ -2779,7 +2776,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			 * One more live chain in the row: freeing any one
 			 * of them must not free the row.
 			 */
-			slot = (pack_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+			slot = hammer2_raid6_slot(pack_off, stripe_unit);
 			if (hmp->stripe_row_refcount[slot] < 0xff)
 				hmp->stripe_row_refcount[slot]++;
 			hammer2_raid6_sm_touch(hmp, slot);
@@ -2821,32 +2818,22 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 found:
 	/*
 	 * Choose data disk (round-robin, skipping the P and Q disks for
-	 * this stripe).  P = slot % ndisks, Q = (slot + 1) % ndisks.
+	 * this stripe).
 	 */
 	{
-		int ndisks = rc->ndisks;
-		int p_disk = (int)(slot % ndisks);
-		int q_disk = (p_disk + 1) % ndisks;
-		int candidate;
-		int tries;
+		int p_disk, q_disk;
 
-		/* Pick a data disk round-robin, skipping P and Q */
-		for (tries = 0; tries < ndisks; tries++) {
-			candidate = hmp->stripe_next_disk % ndisks;
-			hmp->stripe_next_disk++;
-			if (candidate != p_disk && candidate != q_disk) {
-				disk_idx = candidate;
-				goto have_disk;
-			}
+		hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
+		disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk, 0);
+		if (disk_idx < 0) {
+			/* All disks are P or Q: can't happen for ndisks >= 4 */
+			hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+			hmp->stripe_row_refcount[slot] = 0;
+			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			kfree(newrow, M_HAMMER2);
+			return ENOSPC;
 		}
-		/* All disks are P or Q — can't happen for ndisks >= 4 */
-		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
-		hmp->stripe_row_refcount[slot] = 0;
-		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-		kfree(newrow, M_HAMMER2);
-		return ENOSPC;
 	}
-have_disk:
 	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
 	/*
 	 * Register the newly-allocated row so subsequent stripe_alloc

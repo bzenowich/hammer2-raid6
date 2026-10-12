@@ -113,6 +113,69 @@ hammer2_gf_pow(uint8_t base, uint8_t exp)
 }
 
 /*
+ * v3 stripe-row layout.  A row is one stripe_unit-sized slot at the same
+ * per-disk physical offset on every disk.  P lives on disk slot % ndisks,
+ * Q on the next disk, and the remaining disks hold data columns in
+ * disk-index order.  Keep every use of this rotation behind these inlines.
+ */
+static __inline uint64_t
+hammer2_raid6_slot(hammer2_off_t phys_off, uint64_t stripe_unit)
+{
+	return (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+}
+
+static __inline void
+hammer2_raid6_pq(uint64_t slot, int ndisks, int *p_disk, int *q_disk)
+{
+	*p_disk = (int)(slot % ndisks);
+	*q_disk = (*p_disk + 1) % ndisks;
+}
+
+/*
+ * Logical column of physical disk d: data columns count the non-P/Q
+ * disks below d, P is column ndata and Q is column ndata + 1.
+ */
+static __inline int
+hammer2_raid6_lcol(int d, int p_disk, int q_disk, int ndata)
+{
+	int di, col = 0;
+
+	if (d == p_disk)
+		return ndata;
+	if (d == q_disk)
+		return ndata + 1;
+	for (di = 0; di < d; di++) {
+		if (di != p_disk && di != q_disk)
+			col++;
+	}
+	return col;
+}
+
+/*
+ * Round-robin data disk picker: advances hmp->stripe_next_disk and
+ * returns the first disk that is neither P, Q nor in skip_mask, or -1.
+ * Caller holds stripe_bitmap_spin.
+ */
+static __inline int
+hammer2_raid6_pick_data_disk(hammer2_dev_t *hmp, int p_disk, int q_disk,
+			     uint32_t skip_mask)
+{
+	int ndisks = hmp->raid_config.ndisks;
+	int candidate, tries;
+
+	for (tries = 0; tries < ndisks; tries++) {
+		candidate = hmp->stripe_next_disk % ndisks;
+		hmp->stripe_next_disk++;
+		if (candidate == p_disk || candidate == q_disk)
+			continue;
+		if (skip_mask & (1U << candidate))
+			continue;
+		return candidate;
+	}
+	return -1;
+}
+
+/*
  * Function prototypes are declared in hammer2.h (which all kernel
  * files include) to avoid redundant-declaration warnings.
  */

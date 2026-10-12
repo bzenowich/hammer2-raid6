@@ -2103,26 +2103,12 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 		 *   otherwise count data disks below data_disk_idx.
 		 */
 		uint64_t stripe_slot;
-		int d_col;
 
 		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK;
-		stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
-		p_disk      = (int)(stripe_slot % ndisks);
-		q_disk      = (p_disk + 1) % ndisks;
-
-		if (data_disk_idx == p_disk) {
-			target_col = ndata;
-		} else if (data_disk_idx == q_disk) {
-			target_col = ndata + 1;
-		} else {
-			/* Count data disks with index < data_disk_idx */
-			d_col = 0;
-			for (di = 0; di < data_disk_idx; di++) {
-				if (di != p_disk && di != q_disk)
-					d_col++;
-			}
-			target_col = d_col;
-		}
+		stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
+		hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
+		target_col = hammer2_raid6_lcol(data_disk_idx, p_disk, q_disk,
+						ndata);
 
 		di = 0;
 		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
@@ -2437,10 +2423,11 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 * Issue every read of the pass.
 	 */
 	for (s = 0; s < nslots; s++) {
-		int p_disk = (int)(slots[s] % ndisks);
-		int q_disk = (p_disk + 1) % ndisks;
+		int p_disk, q_disk;
 		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
 		int second = 0;
+
+		hammer2_raid6_pq(slots[s], ndisks, &p_disk, &q_disk);
 
 		for (d = 0; d < ndisks; d++) {
 			if (d != failed_disk_idx && hmp->raid_failed[d])
@@ -2478,25 +2465,19 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 * Rebuild each slot's column into outs[s].
 	 */
 	for (s = 0; s < nslots && error == 0; s++) {
-		int p_disk = (int)(slots[s] % ndisks);
-		int q_disk = (p_disk + 1) % ndisks;
+		int p_disk, q_disk;
 		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
 		int phys_to_lcol[HAMMER2_MAX_VOLUMES];
 		void *ptrs[HAMMER2_MAX_VOLUMES];
 		int have[HAMMER2_MAX_VOLUMES];	/* ptrs[col] is read */
 		int failed_col, other_col = -1;
 		void *out = outs[s];
-		int di = 0;
 
+		hammer2_raid6_pq(slots[s], ndisks, &p_disk, &q_disk);
 		bzero(phys_to_lcol, sizeof(phys_to_lcol));
-		for (d = 0; d < ndisks; d++) {
-			if (d == p_disk)
-				phys_to_lcol[d] = ndata;
-			else if (d == q_disk)
-				phys_to_lcol[d] = ndata + 1;
-			else
-				phys_to_lcol[d] = di++;
-		}
+		for (d = 0; d < ndisks; d++)
+			phys_to_lcol[d] = hammer2_raid6_lcol(d, p_disk, q_disk,
+							     ndata);
 		failed_col = phys_to_lcol[failed_disk_idx];
 		for (d = 0; d < ndisks; d++) {
 			if (d != failed_disk_idx && hmp->raid_failed[d])
