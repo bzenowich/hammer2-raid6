@@ -824,8 +824,10 @@ refcount; frees an empty row) when the column was never put.
 - **Lock.** `stripe_bitmap_spin` only, as today. Never held across kmalloc/kfree/I/O (the existing seal already drops it around `row_io`). `ssleep` releases it.
 - **Callers.** XOP strategy threads (`stripe_alloc` via `chain_modify`/`chain_resize`/`chain_create`, `add_data` via `putblk`); the flusher, which is the XOP thread running `xop_inode_flush` (`seal_gen`); bulkfree (`bf_end`); the syncer thread only waits on the flush XOP.
 - **With chain locks.** `col_arrived` and `stripe_release` are called with the chain locked and take only the leaf spin, the same as `stripe_alloc` today. The flusher holds no chain lock, no dio ref and not `rebuild_lk` while it waits (all dropped before the seal phase; `rebuild_lk` is first taken in the header section). A writer whose put the flusher waits for needs only chain locks the flusher has released.
-- **To check in the implementation:** no xop group that runs `xop_inode_flush` is also the only runner of a queue holding a strategy write for a pending column (a pending column means that write is already executing, so it should not be); and `row_io`'s `rebuild_lk` shared lock is not held across the new wait.
+- **Checked (phase 2).** Strategy writes run on XOP groups `0..sgroups*mod`; non-strategy XOPs, including `xop_inode_flush`, use `xbase` and above, so the two sets of threads are disjoint and a flush XOP never queues behind a pending-column write. `hammer2_trans_init(ISFLUSH)` interlocks only against other ISFLUSH transactions; strategy writes run in normal/BUFCACHE transactions and never block on the flush. The flusher holds no `rebuild_lk` across the wait. Only the syncer's VOLHDR flush runs `seal_all`; `fsync(2)` does not wait.
 - The timeout turns any missed deadlock into a failed flush, not a hang.
+
+- **Liveness (reviewed).** Every reservation reaches its put: stripe_alloc registers only on success; the strategy XOP runs alloc, newnz (sets DIRTY in every branch) and the drop in one pass; `hammer2_io_inval` is a NOP so a deleted chain's dio still writes at lastdrop; a logical buffer discarded by rm/truncate never reaches strategy, so it never reserves; v3 has dedup off. Gaps found and closed with `hammer2_raid6_col_release` (zero column, dropped, counter `rz_col_released`): a DIRTY DATA/DIRENT dio that lastdrops without GOOD (io error in getblk, failed degraded rebuild), and `chain_modify`'s bread error after the alloc. Untested by the suite (needs 3 failures or injection).
 
 ### 10.7 Tests
 
@@ -842,14 +844,20 @@ refcount; frees an empty row) when the column was never put.
 
 ### 10.8 Implementation plan (small commits)
 
-1. **R9 leak:** `stripe_release` on the resize path (and the `io_newnz` error path in `write_bp`); stats sysctls for open row count/high. Test: the J leak test.
+1. **Resize radix (was: R9 leak):** the resize leak claim in 10.1 was wrong (the old S_a copy is put; `open_left` is 0 on J and N). The real bug was `chain->bytes` still the old size when `stripe_alloc` ran, giving a radix/lsize mismatch panic in `_hammer2_io_getblk`. `stripe_release` was not needed. Stats sysctls for open row count/high. Test: J3.
 2. **S4 + R9 guard:** `stripe_open` bitmap, set/clear, `bf_end` skip. Test: N, J.
 3. **R5:** `col_arrived`, `chain_modify` rule, `add_data` anomaly counter. Test: group R now passes; F.
 4. **S2:** `rz_gen`, `r->gen`, pack filter, `seal_gen` with wait and failed flush, delete partial-seal state; `flush.c` handles the error. Test: J, F, D, K, I.
 5. **Test hooks and R4(a) test:** `raid6_put_stall_ms`, `raid6_gen_wait_ms`, the new tests and the `crash_host.sh` variant.
 6. **Later:** S3 fold-in (R5 is its precondition), P3 async sealing, then re-evaluate S1 with S9.
 
-### 10.9 Open questions
+### 10.9 Open questions (answered by the coordinator; implemented as noted)
+
+- Timeout: the flush fails (EAGAIN, `rz_gen_wait_fail`, one kprintf with the stuck row); unmount never waits and commits T-1 with a kprintf. Cancel + zero-fill only if the counter is ever nonzero in soak.
+- `add_data` keeps the panic for a missing row; `rz_put_anomaly` counts a second put.
+- `raid6_gen_wait_ms` is RW, default 5000.
+
+Original questions:
 
 - Timeout policy: fail the flush forever on a permanent stuck reservation (unmount then cannot commit), or after N failures cancel the reservation and zero-fill? The second needs the claim-before-bdwrite reorder in `putblk`.
 - `add_data` on a missing row is a `panic` today. Keep it through soak (it found R5), or log and drop?

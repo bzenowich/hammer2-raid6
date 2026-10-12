@@ -1422,7 +1422,14 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
 	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+		/*
+		 * stripe_alloc derives the radix in bref.data_off from
+		 * chain->bytes, so it must hold the new size by now.
+		 */
+		chain->bytes = nbytes;
 		error = hammer2_raid6_stripe_alloc(hmp, chain);
+		if (error)
+			chain->bytes = obytes;
 	} else {
 		error = hammer2_freemap_alloc(chain, nbytes);
 	}
@@ -1597,9 +1604,21 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 	} else {
 		/*
 		 * Already flagged modified, no new allocation is needed.
+		 *
+		 * v3 DATA/DIRENT: unless the column has already been
+		 * handed to its row.  Its row may be sealed or about to
+		 * be, with P/Q on disk that cover the old bytes, so the
+		 * rewrite takes a fresh slot.
 		 */
 		newmod = 0;
 		setmodified = 0;
+		if (hammer2_raid6_v3(hmp) && chain->bytes &&
+		    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+		     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT) &&
+		    hammer2_raid6_col_arrived(hmp, &chain->bref)) {
+			newmod = 1;
+			atomic_add_long(&hammer2_rz_rewrite_slots, 1);
+		}
 	}
 
 	/*
@@ -1891,6 +1910,20 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			hammer2_io_brelse(&dio);
 			hammer2_io_brelse(&chain->dio);
 			chain->data = NULL;
+			/*
+			 * v3: the slot allocated above will never be put
+			 * (a READ leaves the dio clean), so release it or
+			 * its row can never seal.
+			 */
+			if (hammer2_raid6_v3(hmp) &&
+			    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+			     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+				hammer2_raid6_col_release(hmp,
+				    chain->bref.data_off &
+				    HAMMER2_RAID6_PHYS_MASK &
+				    ~(hammer2_off_t)HAMMER2_OFF_MASK_RADIX,
+				    chain->bref.copyid);
+			}
 			break;
 		}
 		chain->error = 0;

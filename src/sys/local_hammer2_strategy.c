@@ -528,6 +528,7 @@ static void zero_write(char *data, hammer2_inode_t *ip,
 				hammer2_chain_t **parentp,
 				hammer2_key_t lbase,
 				hammer2_tid_t mtid, int *errorp);
+static void hammer2_put_stall(void);
 static void hammer2_write_bp(hammer2_chain_t *chain, char *data,
 				int ioflag, int pblksize,
 				hammer2_tid_t mtid, int *errorp,
@@ -1153,6 +1154,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			 */
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 			hammer2_dedup_record(chain, dio, bdata);
+			hammer2_put_stall();
 
 			/* Now write the related bdp. */
 			if (ioflag & IO_SYNC) {
@@ -1266,6 +1268,23 @@ test_block_zeros(const char *buf, size_t bytes)
  *
  * Function to "write" a block that contains only zeros.
  */
+/*
+ * Test hook (oct-review.md §10.7): hold one data write between its slot
+ * reservation and its put (the bdwrite), for vfs.hammer2.raid6_put_stall_ms.
+ */
+static void
+hammer2_put_stall(void)
+{
+	int ms;
+
+	if (hammer2_raid6_put_stall_ms == 0)
+		return;
+	ms = atomic_swap_int(&hammer2_raid6_put_stall_ms, 0);
+	if (ms > 0)
+		tsleep(&hammer2_raid6_put_stall_ms, 0, "h2pstl",
+		       (ms * hz + 999) / 1000);
+}
+
 static
 void
 zero_write(char *data, hammer2_inode_t *ip,
@@ -1370,6 +1389,8 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag,
 		 */
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 		hammer2_dedup_record(chain, dio, bdata);
+
+		hammer2_put_stall();
 
 		if (ioflag & IO_SYNC) {
 			/*

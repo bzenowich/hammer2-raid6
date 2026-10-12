@@ -41,6 +41,12 @@ else
 fi
 CRASH_ROUNDS="${CRASH_ROUNDS:-1}"
 CRASH_FAIL="${CRASH_FAIL:-}"
+# CRASH_STALL=1: each writer iteration arms vfs.hammer2.raid6_put_stall_ms
+# (oct-review.md §10.7), so a sync waits for a stalled column (R4) and the
+# reset lands while rows are in flight.
+CRASH_STALL="${CRASH_STALL:-}"
+STALL_CMD=""
+[ -n "$CRASH_STALL" ] && STALL_CMD="sysctl vfs.hammer2.raid6_put_stall_ms=300 > /dev/null;"
 FAILS=0
 # The module deploy.sh builds.  A reset guest boots without hammer2
 # loaded, and a bare `kldload hammer2` would take /boot/kernel's copy,
@@ -87,6 +93,7 @@ while [ "$round" -le "$CRASH_ROUNDS" ]; do
                 i=\$((i + 1)); done'
         else
             daemon -f sh -c 'i=0; while :; do
+                $STALL_CMD
                 dd if=/dev/urandom of=/mnt/v3test/c\$i bs=65536 count=\$((i % 32 + 1)) 2>/dev/null;
                 h=\$(sha256 -q /mnt/v3test/c\$i); sync;
                 echo \"c\$i \$h\" >> $LOG; fsync $LOG; i=\$((i + 1)); done'
