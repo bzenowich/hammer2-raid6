@@ -1,3 +1,10 @@
+> **HISTORICAL (2026-10).** This is the original design plan.  It is not
+> kept current: sections 5.4 and 5.6 (one slot per write, "no P/Q is ever
+> overwritten") were superseded by packed open rows and re-sealing, and the
+> status lines below are from May.  The current plan, findings and designs
+> are in `oct-review.md` (repository root); the open-item list is
+> `docs/outstanding.md`.
+
 # HAMMER2 RAID6 — New Development Plan (Revised)
 
 **Date**: 2026-05-21
