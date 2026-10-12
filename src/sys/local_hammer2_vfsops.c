@@ -96,6 +96,8 @@ int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;
 long hammer2_rz_open_high;
 long hammer2_rz_rewrite_slots;
+long hammer2_rz_resize_inplace;
+long hammer2_rz_cols_alloc;
 long hammer2_rz_put_anomaly;
 long hammer2_rz_col_released;
 long hammer2_rz_gen_wait_fail;
@@ -198,6 +200,12 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_open_high, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_rewrite_slots, CTLFLAG_RD,
 	   &hammer2_rz_rewrite_slots, 0,
 	   "v3 RAID6: same-TXG rewrites that took a fresh slot");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_resize_inplace, CTLFLAG_RD,
+	   &hammer2_rz_resize_inplace, 0,
+	   "v3 RAID6: resizes that only changed the radix of the column");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_cols_alloc, CTLFLAG_RD,
+	   &hammer2_rz_cols_alloc, 0,
+	   "v3 RAID6: columns reserved by stripe_alloc");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_put_anomaly, CTLFLAG_RD,
 	   &hammer2_rz_put_anomaly, 0,
 	   "v3 RAID6: second put on an arrived column");

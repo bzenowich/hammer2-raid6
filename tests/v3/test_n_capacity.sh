@@ -49,7 +49,9 @@ NDATA=$((NDISKS - 2))
 OLD_LIMIT_MB=$((2048 * NDATA))
 NFILL=$((OLD_LIMIT_MB / 64 + 8))
 
-dd if=/dev/urandom of=$CHUNK bs=1m count=64 2>/dev/null
+# dd on /dev/urandom returns short reads (6-15 MB seen), so N1 wrote far
+# less than it asserted; head -c loops until it has the whole 64 MB.
+head -c 67108864 /dev/urandom > $CHUNK
 CH=$(sha256 -q $CHUNK)
 
 # ----------------------------------------------------------------

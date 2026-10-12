@@ -862,3 +862,165 @@ Original questions:
 - Timeout policy: fail the flush forever on a permanent stuck reservation (unmount then cannot commit), or after N failures cancel the reservation and zero-fill? The second needs the claim-before-bdwrite reorder in `putblk`.
 - `add_data` on a missing row is a `panic` today. Keep it through soak (it found R5), or log and drop?
 - Is 5 s the right default wait on the Pi with a USB disk stalled in the middle of a write?
+
+## 11. P5/S9 design: sub-column allocation
+
+Design only, written against `e098809` plus the P5 resize fix (below). Nothing in 11.2 on is
+implemented. It builds on §10 (generation-tagged rows, R5 `col_arrived`) and decides the "last" item
+of §9. File:line references are to this tree.
+
+### 11.1 Goal and numbers
+
+- **P2 today:** 4000 x 4 KB files (16.4 MB) write 536-582 MB to the members, 34-37x. 512 MB of that
+  is data: every chain takes a whole 64 KB column, 2000 rows x (2 data + P + Q) x 64 KB. The rest is
+  metadata (P10). Space: each 4 KB file reserves 64 KB of data column, **16x** the user bytes, 24x
+  with parity.
+- **Compression saves nothing on v3.** A block LZ4-compressed to 4 KB still takes a column
+  (`stripe_alloc` at `ondisk.c:2738` takes a whole slot or column per chain).
+- **Targets (P2, 6-disk 4+2):** data and parity 16.4 MB x 1.5 = ~25 MB (16 chains per column, 64
+  per row), plus the ~25-70 MB metadata of P10 gives **60-95 MB, 4-6x; assert <= 8x** (was 45x).
+  Space: 4000 files reserve ~1.5-2x user bytes (was 24x). 4000 compressible 4 KB files (1 KB after
+  LZ4) must use <= 1/3 of the columns of the incompressible ones.
+- A big sequential write (P1, 64 KB blocks) must not change.
+
+### 11.2 Facts checked in the code
+
+- **Part A (merged first, same branch): resize.** The old `chain_resize` called `chain_modify`
+  with flags 0 (reads and copies the old block into slot #1, which is put and leaks) and then
+  `stripe_alloc` again (slot #2). J3 counted 200 columns for 120 chain writes. Now one
+  `chain_modify(OPTDATA)` after `chain->bytes` is set (`chain.c:1373` `hammer2_chain_resize`): a
+  pending column is kept and only the radix of `bref.data_off` changes (counter `rz_resize_inplace`);
+  an arrived one or an unmodified chain takes one fresh slot through the §10.3 rule. J3 now 120.
+  P2 never resizes, so it is unchanged. The review's "slot #1 leaks until bulkfree" is right, but
+  §10.1 was right that it is put, not a pending reservation.
+- **The dio is always 64 KB and the offset is free.** `psize = HAMMER2_PBUFSIZE`, the dio key is
+  `pbase`, and `lbase` need only fit inside one pbuf (`io.c:185-203`); `hammer2_io_data(dio, lbase)`
+  addresses inside it (`io.c:1127`). `data_off` = `lbase | radix`, radix in bits 0-5, so bits 6-15
+  can carry a 1 KB-unit offset (`HAMMER2_ALLOC_MIN` 1024, `disk.h:86`). **No blockref format change.**
+- **`bref_slot` already ignores the sub-offset** (`ondisk.c:1487`: `phys_off / stripe_unit`), so the
+  slot, bulkfree marking and the space map all stay per row.
+- **Check codes are per chain, over `[off, off+bytes)` of the column**:
+  `hammer2_bref_check_match(bref, copy + off, bytes)` in `metadata_mirror_heal` (`io.c:1967`);
+  `scrub_verify_bref` reads `lbase`/`lsize` (`io.c:3250-3273`); heal patches are `(off, bytes)`
+  ranges. The degraded read rebuilds the whole column (`io.c:2057`). So detection and repair need
+  nothing new for a shared column, and one reconstruct heals all its chains.
+- **A put hands over the whole 64 KB buffer image** (`io.c:895`: `kmalloc(psize)` + `bcopy`) at
+  the last drop of the dio. Two chains in one column would put twice (`rz_put_anomaly`, `ondisk.c:2412`)
+  and the first put already makes the column "arrived" (`col_arrived`, `ondisk.c:2367`, tests
+  `col_data[d] != NULL`). Sharing therefore needs a pin (11.4).
+- **Space map:** one byte per slot, refcount only ever set/incremented, tested `!= 0`
+  (`ondisk.c:1517, 2783, 2810, 2955`; S-d confirmed), `HAMMER2_SM_VERSION 1`,
+  `SM_PAGE_SLOTS == PBUFSIZE` (`disk.h:1209-1212`). `bf_end` frees a row only if no chain marked it
+  (`ondisk.c:2916-2990`).
+- **Metadata mirrors go to every member** (P10 table), not a fixed 3: an all-disk mirror costs N x.
+
+### 11.3 Options
+
+| | (a) pack in a column | (b1) mirrored small area | (b2) 4+2 row, small unit | (c) RAIDZ variable width |
+|---|---|---|---|---|
+| raw cost of a 4 KB file | 1.5x + share of a column | N x (6 disks: 6x; 3 copies: 3x) | 1.5x | 3x (1 sector + 2 parity) |
+| on-disk format | none for brefs; sm v2 optional | none (freemap exists) | second geometry and map | new address scheme, all of it |
+| gen rows / seal | one extra pin, see 11.4 | none (metadata path) | all of §10 again, per area | none: a block owns its row |
+| R5 | sub-block arrived = column put | metadata rule | as today | none (no shared parity) |
+| bulkfree | column mask, holes not reused | freemap, exact 1 KB | as today | freemap-like extents |
+| degraded / heal | unchanged (per chain check) | exists (`mirror_heal`) | needs dio psize != 64 KB | per block width |
+| resilver (P6) / scrub | unchanged, can skip dead columns | exists (md copy) | second loop | tree walk, not row walk |
+| code | moderate, all in alloc and putblk | small | large: `psize` is hard-coded 64 KB (`io.c:185, 285`) | rewrite |
+
+- **(a) Pack several chains into one column.** One column is filled by a bump allocator in 1 KB
+  units (a radix sub-allocator as in the freemap is overkill: nothing is freed in place, 11.5).
+  Detail in 11.4. It keeps every invariant of §10 and never uses more space than today.
+- **(b1) Mirrored small area** (freemap-allocated, 1 KB granularity, mirror like metadata). It reuses
+  the freemap, bulkfree, heal and resilver code, and has no R4/R5 or parity problem. Its price is the
+  copies: all members get every copy (6x on 6 disks) or the mirror must be capped at 3 (survives 2
+  failures, 3x), and it brings back the P10 mirror write cost for data. Worse than (a) on space
+  and bytes written, and more mirror traffic on the USB disks. Reasonable only as a fallback if (a)'s
+  pin proves hard.
+- **(b2) Separate 4+2 area with a 4 KB stripe unit.** 4 chains per 16 KB row, 1.5x. It needs a second
+  space map, open-row tree and gen logic, and a dio with `psize` 4 KB (`io.c:185, 285` assert
+  64 KB). It only helps blocks <= 4 KB; 8-60 KB (including most LZ4 results) still need a tier.
+  Rejected.
+- **(c) RAIDZ-style variable width.** Removes the write hole and the seal machinery for data, but a
+  4 KB block costs 3x (1 data + 2 parity), the address becomes array-wide (every bref, bulkfree,
+  scrub and resilver change; resilver must walk the tree instead of rows). A new format, not a
+  stage. Rejected for this plan.
+
+### 11.4 Recommendation: (a), with a pinned open column
+
+**Allocation.** `stripe_alloc` for a v3 DATA chain of `bytes <= vfs.hammer2.raid6_subcol_max`
+(default 16384; 0 = off, which is today's behaviour) takes the next 1 KB-aligned range of the
+*open sub-column*; if none fits it takes a new column (as now) and opens a sub-column in it.
+`data_off = phys_off + off | radix` (`bref_slot` unchanged). A sub-column is
+`{row, disk, gen, next_off, npending, dio}`; there is one per (current gen, data disk) at most
+and it lives on the open row (`struct hammer2_open_row`, `local_hammer2.h:1160`).
+
+**The pin.** The sub-column holds one dio reference (`io_getblk` of the whole pbase, NEW, so the
+buffer is zero-filled once). Chains in the column take their own refs and drop them as today, so the
+last drop (and the `putblk` -> `add_data` put) happens exactly once, when the sub-column
+**closes** and drops the pin. Close when it is full or the gen advances. `npending` counts
+reserved sub-blocks whose chain has not yet dropped its dio; close waits for 0.
+
+**"Arrived".** A column arrives when it is put, as today (`col_data[d] != NULL`): all chains
+in it arrive together. The R5 rule in `chain_modify` stays textually the same (`col_arrived`). For a
+chain whose column is still open the rewrite is in place when the new size fits the old range and
+a fresh sub-range otherwise (a bump, no new column); once closed it is the existing
+fresh-slot rule. A late chain can never join a closed column, so there is no RMW. The Part A
+radix-only resize is the special case of a chain too big for sub-columns.
+
+**Seal (§10.2).** `seal_gen` first closes every sub-column of gen <= G (wait for `npending`,
+bounded by `raid6_gen_wait_ms`; a timeout fails the flush as for rows), then waits for rows as now.
+A partly filled column is written at its full 64 KB, so an `fsync` of one 4 KB file costs what it
+costs today. Open columns are pinned memory: <= 64 KB x (data disks) x 1 per gen.
+
+**Rows.** A row still holds up to `ndata` columns, now of up to 16 chains each; `row_complete`,
+P/Q, `dropped_mask` and `col_released` count columns and are untouched. `col_release`
+(`ondisk.c`, §10.6) on a failed put zeroes the column: it must also drop every sub-block, so the
+release is per column and the chains see EIO on read (same as a lost column today).
+
+**Space map and bulkfree.** `bf_mark` marks (slot, column) instead of slot; `bf_end` frees a column
+when no chain referenced it in two consecutive passes, and the row when no column is live. A
+column with one live 4 KB file still pins 64 KB (status quo, never worse). Holes in a column are not
+reused (that would be RMW of P/Q). Persisting the mask is S1: `HAMMER2_SM_VERSION` 2 with a `uint32`
+mask per slot replacing the refcount byte (S-d), 4x the map (4 GB disk: 64K slots, 256 KB); `sm_read`
+already rebuilds an invalid map by a tree walk, so v1 arrays mount and convert. It is **not
+needed for correctness** (the mask is rebuildable) but lets resilver and scrub skip dead columns
+(P6) and removes the refcount byte; so it is a later, separate commit.
+
+**Degraded, self-heal, scrub, resilver.** Per 11.2: unchanged. Resilver and scrub work per row and
+column. A bad sub-block is repaired by range patch; the column reconstruct fixes its neighbours too.
+
+**Risks.** (1) The pin holds a dirty buffer across chain lock cycles; the vnode buffer
+discard path (`rm`) must not invalidate it (`hammer2_io_inval` is a NOP on v3, §10.6). (2) Chains in
+a column complete in any order and a flush can start while some are being written: covered by
+`npending`. (3) Fragmentation after heavy deletes (bounded by status quo). (4) Both getblk NEW
+zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_getblk` (`io.c:332-640`).
+
+### 11.5 Commit plan and tests
+
+1. **P2 numbers and counters** (done in Part A: `rz_cols_alloc`, `rz_resize_inplace`; P2 prints
+   columns reserved). Add a P2 `df` space measure and a compressible variant (P2c). Record today's
+   34-37x as the failing baseline of the new asserts, set the limit to 8x/2x only in step 4.
+2. **Sub-offset plumbing, off by default:** `raid6_subcol_max=0`. A test hook places a chain at an
+   offset (`vfs.hammer2.raid6_subcol_test`) to exercise `data_off` with offset on read, scrub,
+   degraded read, self-heal patch and resilver. Tests: L, K, D, B, C with the hook.
+3. **Open sub-column + pin + close in `seal_gen`**, with `npending` and the timeout. Default still 0.
+   Tests: J, R (rewrites across sub-columns), F, I and `crash_host.sh` (kill with an open column).
+4. **Turn on at 16 KB.** P2 asserts: write amp <= 8x, balance as now, space <= 2x user, P2c
+   columns <= 1/3. New group Q: 4000 files, remove half, bulkfree x2, remount, every file verified;
+   two-disk failure with reads; corrupt one sub-block, scrub finds and repairs exactly it; overwrite
+   in the same TXG (pending and closed). N and T (reuse) for capacity.
+5. **Bulkfree per column** (`bf_mark`/`bf_end`), still with the v1 map (refcount byte becomes a
+   bitmask of 8 data disks, or an in-memory-only mask). Test: Q after rm leaves ~50% of columns freed.
+6. **Later: sm v2 / S1 mask** and resilver/scrub skip of dead columns (P6); S3 fold-in.
+
+### 11.6 Open questions
+
+- Threshold: 16 KB, or 32 KB (4 chains per column)? Larger blocks waste less per column but more
+  blocks go through the pin.
+- Is an `fsync` of a tiny file allowed to cost a full column plus P/Q (as today), or must a sync write
+  only the touched 4 KB (that needs RMW parity and returns the write hole)?
+- Is the all-disk metadata mirror intended for data in (b1), or is 3 copies acceptable? (Only matters if
+  (a) is rejected.)
+- Do v1 space maps have to stay mountable by an older kernel (affects when step 6 may land)?
+- Hole reuse inside a live column (a repack at bulkfree) is left out: does a workload with churn on
+  small files matter enough to design it?
