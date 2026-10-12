@@ -307,7 +307,7 @@ hammer2_io_meta_spread_read(hammer2_io_t *dio, hammer2_off_t dev_pbase)
 	}
 	bkvasync(bp);
 	error = hammer2_io_metadata_read_one(hmp, m, dev_pbase, bp->b_data,
-					     dio->psize);
+					     dio->psize, 0);
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 	if (error) {
 		/* nothing valid in it: let the primary read start over */
@@ -1827,7 +1827,7 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
  * its pages freed rather than left on the inactive queue.  A block
  * that was cached stays cached.
  */
-static int
+int
 hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
 			       void *dst, int bytes, int nocache)
 {

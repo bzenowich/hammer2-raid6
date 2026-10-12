@@ -2199,10 +2199,12 @@ void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 void hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
+int hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
+		void *dst, int bytes, int nocache);
 int hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
 		void *dst, int bytes, int nocache);
 int hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
-		hammer2_off_t per_disk_off, void *buf, size_t bytes);
+		hammer2_off_t per_disk_off, void *buf, size_t bytes, int block);
 int hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, hammer2_off_t per_disk_off);
 int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
 		const void *data, int bytes);

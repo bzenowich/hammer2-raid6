@@ -910,8 +910,9 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 /*
  * v3 RAIDZ2-native metadata read from one member.  Returns 0 with the
  * copy in buf, ENXIO if the member cannot be read (failed, absent or
- * closed; a member being rebuilt counts as failed until it is done), or
- * the read error.  A copy queued for the next sync is newer than the
+ * closed; a member being rebuilt counts as failed until it is done),
+ * EWOULDBLOCK if its buffer is busy and block is 0 (a copy is being
+ * written), or the read error.  A copy queued for the next sync is newer than the
  * disks' and is returned instead.  The copy is not kept in the member's
  * buffer cache unless it was there already: the dio that asks keeps the
  * block, and a second copy in the cache is a waste of RAM.
@@ -919,7 +920,7 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 int
 hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 			     hammer2_off_t per_disk_off,
-			     void *buf, size_t bytes)
+			     void *buf, size_t bytes, int block)
 {
 	hammer2_volume_t *vol;
 	int error;
@@ -949,9 +950,29 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 	if (vol->dev == NULL || vol->dev->devvp == NULL || !vol->dev->open)
 		return ENXIO;
 	error = hammer2_inject_eio(disk_idx);
-	if (error == 0)
-		error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
+	if (error)
+		return error;
+	/*
+	 * Never the raw media read that hammer2_io_raid6_read_sibling()
+	 * falls back to when the buffer is busy: the sync writes the
+	 * copies with bawrite(), and until it completes the media holds
+	 * the old one while the queue no longer has the new.  A busy
+	 * buffer is EWOULDBLOCK; the caller chooses another copy or waits.
+	 */
+	if (!block)
+		return hammer2_io_raid6_read_bufcache(vol->dev->devvp,
 		    per_disk_off, buf, (int)bytes, 1);
+	{
+		struct buf *bp = NULL;
+
+		error = bread(vol->dev->devvp, per_disk_off, (int)bytes, &bp);
+		if (error == 0) {
+			bkvasync(bp);
+			bcopy(bp->b_data, buf, bytes);
+		}
+		if (bp)
+			brelse(bp);
+	}
 	return error;
 }
 
@@ -987,20 +1008,24 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 	int start;
 	int i;
 	int k;
+	int pass;
 	int error;
 	int last_err = 0;
 
 	start = hammer2_io_metadata_read_disk(hmp, per_disk_off);
-	for (k = 0; k < ndisks; k++) {
-		i = (start + k) % ndisks;
-		if (i == skip_disk_idx)
-			continue;
-		error = hammer2_io_metadata_read_one(hmp, i, per_disk_off,
-						     buf, bytes);
-		if (error == 0)
-			return 0;
-		if (error != ENXIO)
-			last_err = error;
+	for (pass = 0; pass < 2; pass++) {
+		for (k = 0; k < ndisks; k++) {
+			i = (start + k) % ndisks;
+			if (i == skip_disk_idx)
+				continue;
+			error = hammer2_io_metadata_read_one(hmp, i,
+			    per_disk_off, buf, bytes, pass);
+			if (error == 0)
+				return 0;
+			if (error != ENXIO && error != EWOULDBLOCK)
+				last_err = error;
+		}
+		/* second pass: wait for copies still being written */
 	}
 
 	return last_err ? last_err : EIO;
