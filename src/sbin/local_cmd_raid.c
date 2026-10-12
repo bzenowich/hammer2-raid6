@@ -120,6 +120,28 @@ raid_replace(const char *sel_path, const char *old_dev, const char *new_dev)
 	if (rc < 0) {
 		fprintf(stderr, "raid replace %s -> %s: %s\n",
 			old_dev, new_dev, strerror(errno));
+		switch (errno) {
+		case EBUSY:
+			fprintf(stderr, "  %s is a member of the array, is "
+				"mounted or open elsewhere; or the disk to "
+				"replace is not failed, or a resilver is "
+				"running.  Nothing was written (details in "
+				"the kernel log).\n", new_dev);
+			break;
+		case ENOSPC:
+			fprintf(stderr, "  %s is smaller than the disk it "
+				"would replace.\n", new_dev);
+			break;
+		case ENOENT:
+			fprintf(stderr, "  %s is not a member of the array "
+				"(or %s does not exist).\n", old_dev, new_dev);
+			break;
+		case EINVAL:
+			fprintf(stderr, "  %s is not a disk.\n", new_dev);
+			break;
+		default:
+			break;
+		}
 		return 1;
 	}
 	if (rr.error) {

@@ -82,4 +82,58 @@ if fail_disk "$G3_DISK" "G3"; then
 fi
 teardown "G3"
 
+# G4: a disk failed by a read error (here injected, with autofail on)
+# is recorded as FAILED in the volume header, so it is not trusted
+# again, stale, after a remount.
+G4_DISK=$((NDISKS - 2))
+setup_fresh
+check_v3
+write_ref_data "g4"
+remount
+sysctl -w vfs.hammer2.inject_eio_autofail=1 > /dev/null 2>&1
+sysctl -w vfs.hammer2.inject_eio_disk_mask=$((1 << G4_DISK)) > /dev/null 2>&1
+verify_ref "G4: data correct while disk${G4_DISK} returns EIO" "g4"
+sysctl -w vfs.hammer2.inject_eio_disk_mask=0 > /dev/null 2>&1
+sysctl -w vfs.hammer2.inject_eio_autofail=0 > /dev/null 2>&1
+if disk_state_is "$G4_DISK" FAILED; then
+    result PASS "G4: read EIO failed disk${G4_DISK}"
+else
+    result FAIL "G4: read EIO did not fail disk${G4_DISK}"
+fi
+sleep 2		# the deferred record is written by a task
+sync; sync
+umount $MNTPT
+mount -t hammer2 $PFSPATH $MNTPT
+if disk_state_is "$G4_DISK" FAILED; then
+    result PASS "G4: read-EIO failure persisted across remount"
+else
+    result FAIL "G4: disk${G4_DISK} ONLINE after remount (failure not persisted)"
+fi
+teardown "G4"
+
+# G5: a disk absent at mount is recorded as FAILED, so a later mount
+# with all disks does not trust its stale columns.
+G5_DISK=$((NDISKS - 1))
+setup_fresh
+check_v3
+write_ref_data "g5"
+sync; sync
+umount $MNTPT
+if mount -t hammer2 "$(degraded_spec $G5_DISK)@V3TEST" $MNTPT 2>/dev/null; then
+    write_ref_data "g5b"
+    sleep 2
+    sync; sync
+    umount $MNTPT
+    mount -t hammer2 $PFSPATH $MNTPT
+    if disk_state_is "$G5_DISK" FAILED; then
+        result PASS "G5: absent disk${G5_DISK} persisted as FAILED"
+    else
+        result FAIL "G5: absent disk${G5_DISK} ONLINE after full remount"
+    fi
+    verify_ref "G5: data written while degraded is intact" "g5b"
+else
+    result FAIL "G5: degraded mount failed"
+fi
+teardown "G5"
+
 summary

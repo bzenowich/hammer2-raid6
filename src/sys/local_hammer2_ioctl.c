@@ -1535,6 +1535,96 @@ hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
 }
 
 /*
+ * Check a device offered to raid replace for failed slot `slot`.  The
+ * device is already open (ours); rebuild_lk is held exclusive, so the
+ * members cannot change.  Returns 0, or:
+ *
+ *	EBUSY	another member (same vnode, same disk or same path), or
+ *		mounted or open elsewhere: a resilver onto it would
+ *		overwrite a live column
+ *	ENOSPC	smaller than the member it replaces
+ *
+ * The device may be the failed slot's own (a replug: the disk was
+ * closed when it went away, or a failed disk is replaced onto itself).
+ */
+static int
+hammer2_raid6_replace_check(hammer2_dev_t *hmp, int slot,
+			    struct vnode *new_devvp, const char *new_path)
+{
+	hammer2_devvp_t *dev;
+	struct partinfo part;
+	struct vattr_lite va;
+	hammer2_off_t need;
+	hammer2_off_t have;
+	int allowed;
+	int i;
+
+	allowed = 1;			/* our own open */
+	for (i = 0; i < hmp->nvolumes; i++) {
+		dev = hmp->volumes[i].dev;
+		if (dev == NULL)
+			continue;
+		if (i == slot) {
+			/* failed but not yet closed: its open is ours too */
+			if (dev->open && dev->devvp &&
+			    dev->devvp->v_rdev == new_devvp->v_rdev)
+				allowed++;
+			continue;
+		}
+		if ((dev->path && strcmp(dev->path, new_path) == 0) ||
+		    (dev->devvp && (dev->devvp == new_devvp ||
+		     (dev->devvp->v_rdev &&
+		      (dev->devvp->v_rdev == new_devvp->v_rdev ||
+		       (dev->devvp->v_rdev->si_disk &&
+			dev->devvp->v_rdev->si_disk ==
+			new_devvp->v_rdev->si_disk)))))) {
+			kprintf("hammer2: raid replace: %s is already "
+				"member %d of the array\n", new_path, i);
+			return EBUSY;
+		}
+	}
+	/*
+	 * Our own mount marks every member's device mounted, so the
+	 * failed slot's own device (a replug, or a failed disk replaced
+	 * onto itself) is mounted by us and fine.
+	 */
+	dev = hmp->volumes[slot].dev;
+	if (vfs_mountedon(new_devvp) &&
+	    !(dev && dev->devvp && dev->devvp->v_rdev &&
+	      dev->devvp->v_rdev == new_devvp->v_rdev)) {
+		kprintf("hammer2: raid replace: %s is mounted\n", new_path);
+		return EBUSY;
+	}
+	if (vcount(new_devvp) > allowed) {
+		kprintf("hammer2: raid replace: %s is open elsewhere "
+			"(%d opens)\n", new_path, vcount(new_devvp));
+		return EBUSY;
+	}
+
+	/* the size every member has: its own, else any live member's */
+	need = hmp->volumes[slot].size;
+	for (i = 0; i < hmp->nvolumes && (need == 0 ||
+	    need == (hammer2_off_t)-1); i++) {
+		if (hmp->volumes[i].dev && hmp->volumes[i].dev->open)
+			need = hmp->volumes[i].size;
+	}
+	have = 0;
+	if (VOP_IOCTL(new_devvp, DIOCGPART, (void *)&part, 0,
+		      curthread->td_ucred, NULL) == 0) {
+		have = part.media_size;
+	} else if (VOP_GETATTR_LITE(new_devvp, &va) == 0) {
+		have = va.va_size;
+	}
+	if (need != 0 && need != (hammer2_off_t)-1 && have < need) {
+		kprintf("hammer2: raid replace: %s is %ju bytes, smaller "
+			"than the %ju the member needs\n", new_path,
+			(uintmax_t)have, (uintmax_t)need);
+		return ENOSPC;
+	}
+	return 0;
+}
+
+/*
  * RAID 6 disk replacement (online resilver).
  *
  * Identifies the failed disk by matching old_dev against volume paths,
@@ -1626,15 +1716,20 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 		vrele(new_devvp);
 		return EBUSY;
 	}
+	error = hammer2_raid6_replace_check(hmp, failed_disk_idx, new_devvp,
+					    rr->new_dev);
+	if (error) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		vn_lock(new_devvp, LK_EXCLUSIVE | LK_RETRY);
+		VOP_CLOSE(new_devvp, FREAD | FWRITE, NULL);
+		vn_unlock(new_devvp);
+		vrele(new_devvp);
+		return error;
+	}
 	dev = hmp->volumes[failed_disk_idx].dev;
 	old_devvp = dev->devvp;
-	if (dev->open) {
-		/* failed but never closed (auto-fail): release it now */
-		vn_lock(old_devvp, LK_EXCLUSIVE | LK_RETRY);
-		VOP_CLOSE(old_devvp, FREAD | FWRITE, NULL);
-		vn_unlock(old_devvp);
-		dev->open = 0;
-	}
+	/* failed but never closed (auto-fail): release it now */
+	hammer2_raid6_close_member_locked(hmp, failed_disk_idx, NULL);
 	if (hmp->stripe_bitmap_size)
 		hmp->rebuild_done = kmalloc(hmp->stripe_bitmap_size,
 					    M_HAMMER2, M_WAITOK | M_ZERO);
@@ -1749,6 +1844,7 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 {
 	hammer2_ioc_raid_fail_disk_t *rfd = data;
 	hammer2_dev_t *hmp;
+	int error;
 	int i;
 
 	hmp = ip->pmp->pfs_hmps[0];
@@ -1756,11 +1852,6 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 		return EINVAL;
 	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
 		return ENOTSUP;
-	if (hmp->raid_nfailed >= 2) {
-		kprintf("hammer2: raid fail-disk: already %d disk(s) failed, "
-			"cannot tolerate more\n", hmp->raid_nfailed);
-		return ENXIO;
-	}
 
 	rfd->dev[sizeof(rfd->dev) - 1] = 0;
 
@@ -1777,32 +1868,15 @@ hammer2_ioctl_raid_fail_disk(hammer2_inode_t *ip, void *data)
 			 * marking the disk failed.
 			 */
 			hammer2_vfs_sync_pmp(ip->pmp, MNT_WAIT);
-			hmp->raid_failed[i] = 1;
-			atomic_add_int(&hmp->raid_nfailed, 1);
-			/* Update on-disk disk_state (both runtime and persisted) */
-			hammer2_voldata_lock(hmp);
-			hmp->raid_config.disk_state[i] =
-				HAMMER2_RAID6_DISK_FAILED;
-			hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-			hmp->voldata.raid_config.disk_state[i] =
-				HAMMER2_RAID6_DISK_FAILED;
-			hmp->voldata.raid_config.flags |=
-				HAMMER2_RAID6_FLAG_DEGRADED;
-			hammer2_voldata_modify(hmp);
-			hammer2_voldata_unlock(hmp);
-			/*
-			 * Release the open file reference on the failed disk.
-			 */
-			if (hmp->volumes[i].dev->open) {
-				vn_lock(hmp->volumes[i].dev->devvp,
-					LK_EXCLUSIVE | LK_RETRY);
-				vinvalbuf(hmp->volumes[i].dev->devvp,
-					  0, 0, 0);
-				VOP_CLOSE(hmp->volumes[i].dev->devvp,
-					  FREAD | FWRITE, NULL);
-				vn_unlock(hmp->volumes[i].dev->devvp);
-				hmp->volumes[i].dev->open = 0;
+			error = hammer2_raid6_mark_failed(hmp, i, 0);
+			if (error) {
+				kprintf("hammer2: raid fail-disk: already %d "
+					"disk(s) failed, cannot tolerate "
+					"more\n", hmp->raid_nfailed);
+				return error;
 			}
+			/* Release the open file reference on the failed disk */
+			hammer2_raid6_close_member(hmp, i, NULL);
 			kprintf("hammer2: RAID6 disk %d (%s) marked failed; "
 				"operating in degraded mode\n",
 				i, rfd->dev);

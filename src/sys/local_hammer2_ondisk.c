@@ -1847,6 +1847,14 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 	bzero(derr, sizeof(derr));
 	pbuf = kmalloc(HAMMER2_SM_PAGE, M_HAMMER2, M_WAITOK);
 
+	/*
+	 * Shared rebuild_lk, as for any writer to a member: a disk that
+	 * goes away is failed and its buffers thrown out under the
+	 * exclusive lock, and a buffer getblk() makes here meanwhile
+	 * panics vinvalbuf().
+	 */
+	lockmgr(&hmp->rebuild_lk, LK_SHARED);
+
 	for (p = 0; p < npages; p++) {
 		if ((hmp->sm_dirty[p] & bit) == 0)
 			continue;
@@ -1905,6 +1913,7 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 		if (bwrite(bp) == 0)
 			perr = 0;
 	}
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 	kfree(pbuf, M_HAMMER2);
 
 	if (perr)

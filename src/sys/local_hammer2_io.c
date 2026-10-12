@@ -447,38 +447,14 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			 * write path.  Just getblk() and zero the buffer
 			 * for DOP_NEW.
 			 *
-			 * Failed disk on RAID6: reconstruct from parity
-			 * so the dirty buffer reflects the live content
-			 * before the caller overwrites it.
+			 * A failed disk never gets here: the degraded
+			 * pre-emption above has taken every op on it.
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->raid_nfailed > 0 &&
-			    dio->disk_idx >= 0 &&
-			    hmp->raid_failed[dio->disk_idx]) {
-				dio->bp = getblk(dio->devvp, dev_pbase,
-				    dio->psize, GETBLK_KVABIO, 0);
-				if (dio->bp) {
-					bkvasync(dio->bp);
-					error = hammer2_io_raid6_read_degraded(
-					    hmp, dio->pbase, dio->disk_idx,
-					    dio->bp->b_data, dio->psize,
-					    (dio->btype ==
-						HAMMER2_BREF_TYPE_DATA ||
-					     dio->btype ==
-						HAMMER2_BREF_TYPE_DIRENT)
-					    ? 1 : 0);
-					if (op == HAMMER2_DOP_NEW)
-						bzero(dio->bp->b_data,
-						    dio->psize);
-				}
-			} else {
-				dio->bp = getblk(dio->devvp,
-						 dev_pbase, dio->psize,
-						 GETBLK_KVABIO, 0);
-				if (op == HAMMER2_DOP_NEW) {
-					bkvasync(dio->bp);
-					bzero(dio->bp->b_data, dio->psize);
-				}
+			dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+					 GETBLK_KVABIO, 0);
+			if (op == HAMMER2_DOP_NEW) {
+				bkvasync(dio->bp);
+				bzero(dio->bp->b_data, dio->psize);
 			}
 			atomic_set_long(&dio->refs, HAMMER2_DIO_DIRTY);
 			break;
@@ -617,19 +593,20 @@ io_done:
 	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
 		int injected = (dio->disk_idx >= 0 &&
 				hammer2_inject_eio(dio->disk_idx) != 0);
+		int merr = 0;
 		/*
 		 * Mark this disk as failed (auto-detect from I/O error).
 		 * Skip the auto-fail when the EIO came from the test
 		 * injection sysctl so the test stays repeatable.
 		 */
-		if (!injected && dio->disk_idx >= 0 &&
-		    !hmp->raid_failed[dio->disk_idx]) {
-			hmp->raid_failed[dio->disk_idx] = 1;
-			atomic_add_int(&hmp->raid_nfailed, 1);
-			kprintf("hammer2: RAID6 disk %d failed (I/O error)\n",
-				dio->disk_idx);
+		if ((!injected || hammer2_inject_eio_autofail) &&
+		    dio->disk_idx >= 0 &&
+		    hammer2_raid6_mark_failed(hmp, dio->disk_idx,
+					      HAMMER2_FAIL_DEFER) != 0) {
+			/* third failure: nothing to reconstruct from */
+			merr = ENXIO;
 		}
-		if (hmp->raid_nfailed <= 2) {
+		if (merr == 0 && hmp->raid_nfailed <= 2) {
 			int is_meta = (dio->btype ==
 				    HAMMER2_BREF_TYPE_INODE ||
 				   dio->btype ==
@@ -1272,45 +1249,165 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 }
 
 /*
- * Auto-fail a disk that returned EIO during a RAID6 I/O operation.
+ * Record disk_idx as FAILED in the volume header config, so the failure
+ * survives unmount and a stale disk is not trusted at the next mount.
+ * The next header commit writes it.  Caller holds the voldata lock.
+ */
+static void
+hammer2_raid6_persist_one(hammer2_dev_t *hmp, int disk_idx)
+{
+	if (hmp->voldata.raid_config.disk_state[disk_idx] ==
+	    HAMMER2_RAID6_DISK_FAILED &&
+	    hmp->raid_config.disk_state[disk_idx] ==
+	    HAMMER2_RAID6_DISK_FAILED)
+		return;
+	hmp->raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
+	hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	hmp->voldata.raid_config.disk_state[disk_idx] =
+	    HAMMER2_RAID6_DISK_FAILED;
+	hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	if (hmp->ronly == 0)
+		hammer2_voldata_modify(hmp);
+}
+
+/*
+ * Persist the failures queued by HAMMER2_FAIL_DEFER.  Called by the task
+ * (and by unmount, before the final sync, so a failure does not get lost).
+ */
+void
+hammer2_raid6_persist_failed(hammer2_dev_t *hmp)
+{
+	uint32_t mask;
+	int i;
+
+	if (hmp->raid_persist_pending == 0)
+		return;
+	mask = atomic_swap_int(&hmp->raid_persist_pending, 0);
+	hammer2_voldata_lock(hmp);
+	for (i = 0; i < hmp->nvolumes; i++) {
+		if ((mask & (1U << i)) && hmp->raid_failed[i])
+			hammer2_raid6_persist_one(hmp, i);
+	}
+	hammer2_voldata_unlock(hmp);
+}
+
+/*
+ * The one place a RAID6 member is declared failed: read and write
+ * errors, a gone disk, the fail-disk ioctl and absent disks at mount.
  *
- * Updates both the runtime hmp->raid_failed[] state and the on-disk
- * voldata.raid_config, so the failed state survives unmount/remount.
+ * Counts the disk once even when two threads race, refuses a third
+ * failure (ENXIO, nothing changed; HAMMER2_FAIL_FORCE, used at mount
+ * for disks that are not there, overrides), and records DISK_FAILED in
+ * the volume header config.  A disk already failed in memory only (an
+ * absent disk at mount) is recorded too.
  *
- * If raid_nfailed would reach 3 (triple failure), returns ENXIO to
- * signal unrecoverable array state; otherwise marks the disk failed
- * and returns 0.
+ * Without HAMMER2_FAIL_DEFER the caller may sleep: the voldata lock is
+ * taken here.  A read completion cannot take it (it may hold chains
+ * the flush wants while holding the voldata lock), so it passes
+ * HAMMER2_FAIL_DEFER and a task records the failure shortly after; the
+ * in-memory state changes at once.
  *
- * Called from I/O context — does NOT close the vnode.  The disk is
- * excluded from future I/Os via raid_failed[]; the vnode is released
- * at unmount.
+ * The vnode is not closed; see hammer2_raid6_close_member().
+ */
+int
+hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags)
+{
+	int n;
+
+	if (disk_idx < 0 || disk_idx >= hmp->nvolumes)
+		return EINVAL;
+	while (hmp->raid_failed[disk_idx] == 0) {
+		n = hmp->raid_nfailed;
+		if (n >= 2 && (flags & HAMMER2_FAIL_FORCE) == 0) {
+			kprintf("hammer2: RAID6 unrecoverable: I/O error on "
+				"disk %d but already %d disk(s) failed\n",
+				disk_idx, n);
+			return ENXIO;
+		}
+		if (!atomic_cmpset_int(&hmp->raid_nfailed, n, n + 1))
+			continue;
+		if (atomic_cmpset_int(&hmp->raid_failed[disk_idx], 0, 1)) {
+			kprintf("hammer2: RAID6 disk %d failed\n", disk_idx);
+			break;
+		}
+		atomic_add_int(&hmp->raid_nfailed, -1);
+	}
+
+	if (hmp->voldata.raid_config.disk_state[disk_idx] !=
+	    HAMMER2_RAID6_DISK_FAILED) {
+		if (flags & HAMMER2_FAIL_DEFER) {
+			atomic_set_int(&hmp->raid_persist_pending,
+				       1U << disk_idx);
+			hammer2_raid6_persist_kick();
+		} else {
+			hammer2_voldata_lock(hmp);
+			hammer2_raid6_persist_one(hmp, disk_idx);
+			hammer2_voldata_unlock(hmp);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Auto-fail a disk that returned an I/O error.  Returns ENXIO past two
+ * failed disks, else 0.  May sleep.
  */
 int
 hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 {
-	hammer2_voldata_lock(hmp);
-	if (hmp->raid_failed[disk_idx]) {
-		hammer2_voldata_unlock(hmp);
+	return hammer2_raid6_mark_failed(hmp, disk_idx, 0);
+}
+
+/*
+ * Close a failed member's device so that the driver can free it (a
+ * replugged disk then comes back under its old name).  Caller holds
+ * rebuild_lk exclusive: writers to the member hold it shared, and a
+ * buffer getblk()ed meanwhile would make vinvalbuf() panic.
+ *
+ * Returns 0 when the member was closed or already is, EBUSY when it is
+ * the resilver target, ESTALE when it is not the failed member the
+ * caller meant (expect_devvp, if given, is no longer its device: a
+ * replace finished while the caller waited for the lock), and EINVAL
+ * if it is not failed.
+ */
+int
+hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
+				  struct vnode *expect_devvp)
+{
+	hammer2_devvp_t *dev;
+	struct vnode *devvp;
+
+	dev = hmp->volumes[disk_idx].dev;
+	if (dev == NULL || dev->devvp == NULL)
 		return 0;
-	}
-	if (hmp->raid_nfailed >= 2) {
-		hammer2_voldata_unlock(hmp);
-		kprintf("hammer2: RAID6 unrecoverable: I/O error on disk %d "
-			"but already %d disk(s) failed\n",
-			disk_idx, hmp->raid_nfailed);
-		return ENXIO;
-	}
-	kprintf("hammer2: RAID6 disk %d auto-failed due to I/O error\n",
-		disk_idx);
-	hmp->raid_failed[disk_idx] = 1;
-	atomic_add_int(&hmp->raid_nfailed, 1);
-	hmp->raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
-	hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-	hmp->voldata.raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
-	hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-	hammer2_voldata_modify(hmp);
-	hammer2_voldata_unlock(hmp);
+	if (expect_devvp && dev->devvp != expect_devvp)
+		return ESTALE;
+	if (!hmp->raid_failed[disk_idx])
+		return EINVAL;
+	if (hmp->rebuild_active && hmp->rebuild_disk == disk_idx)
+		return EBUSY;
+	if (!dev->open)
+		return 0;
+	devvp = dev->devvp;
+	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+	vinvalbuf(devvp, 0, 0, 0);
+	VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
+	vn_unlock(devvp);
+	dev->open = 0;
 	return 0;
+}
+
+int
+hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
+			   struct vnode *expect_devvp)
+{
+	int error;
+
+	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	error = hammer2_raid6_close_member_locked(hmp, disk_idx,
+						  expect_devvp);
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	return error;
 }
 
 /*
