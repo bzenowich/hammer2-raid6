@@ -1586,6 +1586,7 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	uint64_t nslots = rc->rz_num_slots;
 	uint64_t npages;
+	uint64_t slot;
 
 	if (rc->rz_layout != HAMMER2_RZ_LAYOUT) {
 		kprintf("hammer2: RAID6 v3 volume has stripe layout %u, "
@@ -1608,8 +1609,21 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 	hmp->stripe_num_slots = nslots;
 	hmp->sm_npages = (uint32_t)npages;
 	hmp->stripe_bitmap_size = (size_t)((nslots + 7) / 8);
-	hmp->stripe_bitmap = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
-				     M_WAITOK | M_ZERO);
+	/*
+	 * The allocator scans the bitmap and the data mask 64 bits at a
+	 * time: round the allocation up so the last word is readable.
+	 */
+	hmp->stripe_bitmap = kmalloc(roundup2(hmp->stripe_bitmap_size, 8),
+				     M_HAMMER2, M_WAITOK | M_ZERO);
+	hmp->stripe_data_mask = kmalloc(roundup2(hmp->stripe_bitmap_size, 8),
+					M_HAMMER2, M_WAITOK | M_ZERO);
+	hmp->stripe_data_slots = 0;
+	for (slot = 0; slot < nslots; slot++) {
+		if (hammer2_raid6_slot_is_data(hmp, slot)) {
+			setbit(hmp->stripe_data_mask, slot);
+			++hmp->stripe_data_slots;
+		}
+	}
 	hmp->stripe_row_refcount = kmalloc((size_t)npages * HAMMER2_SM_PAGE,
 					   M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->sm_dirty = kmalloc((size_t)npages, M_HAMMER2, M_WAITOK | M_ZERO);
@@ -1651,6 +1665,10 @@ hammer2_raid6_sm_destroy(hammer2_dev_t *hmp)
 	if (hmp->stripe_bitmap) {
 		kfree(hmp->stripe_bitmap, M_HAMMER2);
 		hmp->stripe_bitmap = NULL;
+	}
+	if (hmp->stripe_data_mask) {
+		kfree(hmp->stripe_data_mask, M_HAMMER2);
+		hmp->stripe_data_mask = NULL;
 	}
 	if (hmp->stripe_row_refcount) {
 		kfree(hmp->stripe_row_refcount, M_HAMMER2);
@@ -2588,6 +2606,38 @@ hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 }
 
 /*
+ * Find the first free data slot in [from, to): a clear bit in
+ * stripe_bitmap that is set in stripe_data_mask (slots outside the
+ * metadata extents, see hammer2_raid6_slot_is_data).  Scans 64 slots
+ * at a time; bit n of byte j is slot 8j+n, which on a little-endian
+ * machine is bit (slot % 64) of word slot / 64.  Caller holds
+ * stripe_bitmap_spin.
+ */
+static int
+hammer2_raid6_find_free_slot(hammer2_dev_t *hmp, uint64_t from, uint64_t to,
+			     uint64_t *slotp)
+{
+	const uint64_t *bm = (const uint64_t *)hmp->stripe_bitmap;
+	const uint64_t *dm = (const uint64_t *)hmp->stripe_data_mask;
+	uint64_t avail;
+	uint64_t wi;
+
+	while (from < to) {
+		wi = from / 64;
+		avail = dm[wi] & ~bm[wi];
+		avail &= ~(uint64_t)0 << (from % 64);
+		if ((to - 1) / 64 == wi && (to % 64) != 0)
+			avail &= ((uint64_t)1 << (to % 64)) - 1;
+		if (avail) {
+			*slotp = wi * 64 + (uint64_t)(ffsl((long)avail) - 1);
+			return 1;
+		}
+		from = (wi + 1) * 64;
+	}
+	return 0;
+}
+
+/*
  * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
  * Sets chain->bref.data_off to the physical column offset on the chosen disk
  * and chain->bref.copyid to the disk index (0..ndisks-1).
@@ -2605,7 +2655,6 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	uint64_t max_stripes = hmp->stripe_num_slots;
 	uint64_t slot;
 	uint64_t start;
-	int wrapped = 0;
 	uint64_t byte_idx;
 	int bit_idx;
 	int disk_idx;
@@ -2660,41 +2709,23 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		}
 	}
 
+	/*
+	 * Next free data slot from the cursor, wrapping once.
+	 */
 	start = hmp->stripe_cursor;
 	if (start >= max_stripes)
 		start = 0;
-	slot = start;
-
-	for (;;) {
-		if (slot >= max_stripes) {
-			if (wrapped)
-				break;
-			wrapped = 1;
-			slot = 0;
-			if (slot >= start)
-				break;
-			continue;
-		}
-		if (wrapped && slot >= start)
-			break;
-
-		if (!hammer2_raid6_slot_is_data(hmp, slot)) {
-			slot++;
-			continue;
-		}
-
+	if (hammer2_raid6_find_free_slot(hmp, start, max_stripes, &slot) ||
+	    hammer2_raid6_find_free_slot(hmp, 0, start, &slot)) {
 		byte_idx = slot / 8;
 		bit_idx  = (int)(slot % 8);
-		if ((hmp->stripe_bitmap[byte_idx] & (1 << bit_idx)) == 0) {
-			hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
-			hmp->stripe_row_refcount[slot] = 1;
-			hammer2_raid6_sm_touch(hmp, slot);
-			if (hmp->stripe_bf_active)
-				setbit(hmp->stripe_bf_new, slot);
-			hmp->stripe_cursor = slot + 1;
-			goto found;
-		}
-		slot++;
+		hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+		hmp->stripe_row_refcount[slot] = 1;
+		hammer2_raid6_sm_touch(hmp, slot);
+		if (hmp->stripe_bf_active)
+			setbit(hmp->stripe_bf_new, slot);
+		hmp->stripe_cursor = slot + 1;
+		goto found;
 	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	kfree(newrow, M_HAMMER2);

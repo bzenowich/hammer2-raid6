@@ -1231,6 +1231,7 @@ struct hammer2_dev {
 	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
 	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
 	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
+	uint8_t		*stripe_data_mask;	/* bit per slot: may hold a row (not metadata) */
 	uint8_t		*stripe_row_refcount;	/* sm_npages * HAMMER2_SM_PAGE bytes */
 	uint32_t	sm_npages;		/* refcount pages per copy */
 	uint8_t		*sm_dirty;		/* per page: bit c = copy c stale */
