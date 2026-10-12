@@ -1847,18 +1847,6 @@ hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
 }
 
 /*
- * write_nowait for the resilver, which writes each block of the new
- * disk once: the written block is not kept cached unless it already
- * was.  See read_sibling.
- */
-static int
-hammer2_io_raid6_write_stream(struct vnode *devvp, off_t off,
-			      const void *data, int bytes)
-{
-	return hammer2_io_raid6_write_flags(devvp, off, data, bytes, 1);
-}
-
-/*
  * Point the cached DIOs of one disk at a new device vnode (disk
  * replacement).  A DIO keeps the devvp it was created with.
  */
@@ -2216,6 +2204,9 @@ read_degraded_done:
 #define RESILVER_BATCH		16
 #define RESILVER_MAXPBUFS	64
 
+/* Phase A: metadata chunks (64 KB) copied per window */
+#define MD_WINDOW		16
+
 /*
  * Start a read of one column straight from the media, without waiting.
  * The data is in bp->b_data once hammer2_resilver_read_wait() returns;
@@ -2538,6 +2529,52 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 }
 
 /*
+ * Read one chunk of the metadata mirror from any survivor, trying each
+ * in turn; the serial path of the resilver's metadata copy.  Mirror
+ * copies are written synchronously, so read those first (pass 0): the
+ * primary's newest copy may still be a delayed write held by a DIO, and
+ * read_sibling then reads the media.  Caller holds rebuild_lk exclusive.
+ */
+static int
+hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx, int surv,
+			 off_t off, void *buf, int bytes)
+{
+	hammer2_volume_t *vol;
+	int ndisks = hmp->raid_config.ndisks;
+	int prim = -1;		/* as hammer2_get_volume() */
+	int lerror = EIO;
+	int pass, i;
+
+	for (i = 0; i < hmp->nvolumes; i++) {
+		vol = &hmp->volumes[i];
+		if (off >= (off_t)vol->offset &&
+		    off < (off_t)(vol->offset + vol->size)) {
+			prim = i;
+			break;
+		}
+	}
+	for (pass = 0; pass < 2 && lerror; pass++) {
+		for (i = surv; i < ndisks; i++) {
+			if (i == failed_disk_idx || hmp->raid_failed[i] ||
+			    hmp->volumes[i].dev == NULL ||
+			    hmp->volumes[i].dev->devvp == NULL ||
+			    !hmp->volumes[i].dev->open)
+				continue;
+			if ((pass == 0) == (i == prim))
+				continue;
+			vol = &hmp->volumes[i];
+			lerror = hammer2_inject_eio(i);
+			if (lerror == 0)
+				lerror = hammer2_io_raid6_read_sibling(
+				    vol->dev->devvp, off, buf, bytes, 1);
+			if (lerror == 0)
+				break;
+		}
+	}
+	return lerror;
+}
+
+/*
  * RAID 6 online resilver.
  *
  * Reconstruct all data for the disk at failed_disk_idx onto new_devvp.
@@ -2683,12 +2720,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		 * within buffer-cache limits.
 		 */
 		const size_t MD_CHUNK = HAMMER2_PBUFSIZE;
-		void *md_buf = kmalloc(MD_CHUNK, M_HAMMER2, M_WAITOK);
+		char *md_buf = kmalloc(MD_WINDOW * MD_CHUNK, M_HAMMER2,
+				       M_WAITOK);
 		hammer2_off_t md_end;
 		uint32_t nzones;
 		uint32_t ex;
 		int surv = -1;
-		int pass;
 		int prim;
 
 		for (i = 0; i < ndisks; i++) {
@@ -2737,10 +2774,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				ms = HAMMER2_ZONE_SEG64 - HAMMER2_VOLUME_BYTES;
 			}
 
-			for (off = 0; off < ms; off += MD_CHUNK) {
-				size_t this_chunk =
-				    (size_t)((ms - off > MD_CHUNK) ?
-					     MD_CHUNK : (ms - off));
+			for (off = 0; off < ms; off += MD_WINDOW * MD_CHUNK) {
+				struct buf *rbp[MD_WINDOW];
+				struct buf *wbp[MD_WINDOW];
+				int wpb[MD_WINDOW];
+				size_t clen[MD_WINDOW];
+				int nch, c;
 
 				/* forced unmount (hammer2_vfs_unmount) */
 				if (hmp->raid_abort) {
@@ -2748,84 +2787,152 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					hmp->resilver_running = 0;
 					return EINTR;
 				}
-				/*
-				 * dscheck rejects non-sector-aligned bcount.
-				 * The trailing partial chunk of a non-aligned
-				 * extent must round up; the few extra bytes
-				 * land in the kmalloc()'d md_buf safely.
-				 */
-				this_chunk = (this_chunk + DEV_BSIZE - 1) &
-				    ~((size_t)DEV_BSIZE - 1);
-				if (this_chunk > MD_CHUNK)
-					this_chunk = MD_CHUNK;
+				for (nch = 0; nch < MD_WINDOW; nch++) {
+					hammer2_off_t coff =
+					    off + (hammer2_off_t)nch * MD_CHUNK;
+					size_t this_chunk;
+
+					if (coff >= ms)
+						break;
+					this_chunk = (size_t)((ms - coff >
+					    MD_CHUNK) ? MD_CHUNK : (ms - coff));
+					/*
+					 * dscheck rejects non-sector-aligned
+					 * bcount.  The trailing partial chunk
+					 * of a non-aligned extent must round
+					 * up; the few extra bytes land in the
+					 * buffer safely.
+					 */
+					this_chunk = (this_chunk + DEV_BSIZE -
+					    1) & ~((size_t)DEV_BSIZE - 1);
+					if (this_chunk > MD_CHUNK)
+						this_chunk = MD_CHUNK;
+					clen[nch] = this_chunk;
+				}
 
 				/*
-				 * Every survivor holds a mirror copy; on a
-				 * read error try the next one.  Mirror copies
-				 * are written synchronously, so read those
-				 * first (pass 0): the primary's newest copy
-				 * may still be a delayed write held by a DIO,
-				 * and read_sibling then reads the media.
+				 * Every survivor holds a mirror copy.  Mirror
+				 * copies are written synchronously, so the
+				 * media of any survivor but the primary (the
+				 * disk that holds the offset, as
+				 * hammer2_get_volume() finds it) is current:
+				 * the primary's newest copy may still be a
+				 * delayed write held by a DIO.  Start those
+				 * reads of the window together; a chunk
+				 * that has no such survivor, whose block is
+				 * in the buffer cache there, or whose read
+				 * fails, takes the serial path below, which
+				 * tries every survivor and reads through
+				 * the buffer cache.
 				 *
-				 * Exclusive rebuild_lk keeps a concurrent
-				 * mirror write from landing between our read
-				 * and our write to the new disk.
+				 * Exclusive rebuild_lk across the window
+				 * keeps a concurrent mirror write from
+				 * landing between our reads and our writes
+				 * to the new disk.
 				 */
-				prim = -1;	/* as hammer2_get_volume() */
-				for (i = 0; i < hmp->nvolumes; i++) {
-					vol = &hmp->volumes[i];
-					if (mo + off >= vol->offset &&
-					    mo + off < vol->offset + vol->size) {
-						prim = i;
+				lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+				for (c = 0; c < nch; c++) {
+					hammer2_off_t coff = mo + off +
+					    (hammer2_off_t)c * MD_CHUNK;
+					int src = -1;
+
+					rbp[c] = NULL;
+					wbp[c] = NULL;
+					wpb[c] = 0;
+					prim = -1;
+					for (i = 0; i < hmp->nvolumes; i++) {
+						vol = &hmp->volumes[i];
+						if (coff >= vol->offset &&
+						    coff < vol->offset +
+							   vol->size) {
+							prim = i;
+							break;
+						}
+					}
+					for (i = surv; i < ndisks; i++) {
+						if (i == failed_disk_idx ||
+						    i == prim ||
+						    hmp->raid_failed[i] ||
+						    hmp->volumes[i].dev == NULL ||
+						    hmp->volumes[i].dev->devvp == NULL ||
+						    !hmp->volumes[i].dev->open)
+							continue;
+						if (hammer2_inject_eio(i))
+							continue;
+						src = i;
 						break;
 					}
+					/* a cached buffer may be newer */
+					if (src >= 0 && findblk(
+					    hmp->volumes[src].dev->devvp,
+					    (off_t)coff, FINDBLK_TEST))
+						src = -1;
+					if (src >= 0)
+						rbp[c] = hammer2_resilver_read_start(
+						    hmp->volumes[src].dev->devvp,
+						    (off_t)coff, (int)clen[c]);
 				}
-				lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
-				lerror = EIO;
-				for (pass = 0; pass < 2 && lerror; pass++) {
-				    for (i = surv; i < ndisks; i++) {
-					if (i == failed_disk_idx ||
-					    hmp->raid_failed[i] ||
-					    hmp->volumes[i].dev == NULL ||
-					    hmp->volumes[i].dev->devvp == NULL ||
-					    !hmp->volumes[i].dev->open)
-						continue;
-					if ((pass == 0) == (i == prim))
-						continue;
-					vol = &hmp->volumes[i];
-					lerror = hammer2_inject_eio(i);
-					if (lerror == 0)
-						lerror =
-						 hammer2_io_raid6_read_sibling(
-						    vol->dev->devvp,
-						    (off_t)(mo + off), md_buf,
-						    (int)this_chunk, 1);
-					if (lerror == 0)
-						break;
-				    }
-				}
-				if (lerror) {
-					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-					kprintf("hammer2: resilver Phase A: "
-						"read err %d at off %jx "
-						"on every survivor\n",
-						lerror, (intmax_t)(mo + off));
-					kfree(md_buf, M_HAMMER2);
-					hmp->resilver_running = 0;
-					return EIO;
-				}
+				for (c = 0; c < nch; c++) {
+					hammer2_off_t coff = mo + off +
+					    (hammer2_off_t)c * MD_CHUNK;
 
-				lerror = hammer2_io_raid6_write_stream(
-				    new_devvp, (off_t)(mo + off), md_buf,
-				    (int)this_chunk);
+					lerror = EIO;
+					if (rbp[c]) {
+						lerror = hammer2_resilver_read_wait(
+						    rbp[c]);
+						if (lerror == 0)
+							bcopy(rbp[c]->b_data,
+							    md_buf + (size_t)c * MD_CHUNK,
+							    clen[c]);
+						relpbuf(rbp[c], NULL);
+						rbp[c] = NULL;
+					}
+					if (lerror)
+						lerror = hammer2_resilver_md_read(
+						    hmp, failed_disk_idx, surv,
+						    (off_t)coff,
+						    md_buf + (size_t)c * MD_CHUNK,
+						    (int)clen[c]);
+					if (lerror) {
+						kprintf("hammer2: resilver Phase "
+							"A: read err %d at off "
+							"%jx on every survivor\n",
+							lerror, (intmax_t)coff);
+						for (i = c + 1; i < nch; i++) {
+							if (rbp[i] == NULL)
+								continue;
+							hammer2_resilver_read_wait(
+							    rbp[i]);
+							relpbuf(rbp[i], NULL);
+						}
+						for (i = 0; i < c; i++)
+							hammer2_resilver_write_wait(
+							    wbp[i], wpb[i]);
+						lockmgr(&hmp->rebuild_lk,
+							LK_RELEASE);
+						kfree(md_buf, M_HAMMER2);
+						hmp->resilver_running = 0;
+						return EIO;
+					}
+					wbp[c] = hammer2_resilver_write_start(
+					    new_devvp, (off_t)coff,
+					    md_buf + (size_t)c * MD_CHUNK,
+					    (int)clen[c], &wpb[c]);
+				}
+				lerror = 0;
+				for (c = 0; c < nch; c++) {
+					i = hammer2_resilver_write_wait(wbp[c],
+					    wpb[c]);
+					if (i && !lerror)
+						lerror = i;
+				}
 				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 				if (lerror) {
 					kfree(md_buf, M_HAMMER2);
 					hmp->resilver_running = 0;
 					return lerror;
 				}
-				if ((off >> 22) % 16 == 0)
-					lwkt_yield();
+				lwkt_yield();
 			}
 		}
 		kfree(md_buf, M_HAMMER2);
