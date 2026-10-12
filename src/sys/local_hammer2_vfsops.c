@@ -88,6 +88,7 @@ int hammer2_limit_saved_depth;
 int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
+int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 int hammer2_raid6_pack_open_rows = 1;	/* v3: enable 6C packing */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
@@ -166,6 +167,10 @@ SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_eio_disk_mask, CTLFLAG_RW,
 	   &hammer2_inject_eio_disk_mask, 0,
 	   "v3 RAID6 fault injection: bitmask of disk indices to force "
 	   "EIO on (no auto-fail).  Default 0 (disabled).");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_eio_autofail, CTLFLAG_RW,
+	   &hammer2_inject_eio_autofail, 0,
+	   "v3 RAID6 fault injection: 1 = an injected read EIO fails the "
+	   "disk like a real one (persisted).  Default 0.");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_pack_open_rows, CTLFLAG_RW,
 	   &hammer2_raid6_pack_open_rows, 0,
 	   "v3 RAID6: enable 6C open-row packing (default 1).  Set 0 to "
@@ -249,6 +254,8 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
 
 static int hammer2_vfs_init(struct vfsconf *conf);
 static int hammer2_vfs_uninit(struct vfsconf *vfsp);
+static void hammer2_persist_task_fn(void *arg, int pending);
+static struct task hammer2_persist_task;
 #ifdef DISK_GONE
 static void hammer2_disk_gone(void *arg, struct disk *dp);
 static void hammer2_disk_gone_task(void *arg, int pending);
@@ -426,6 +433,7 @@ hammer2_vfs_init(struct vfsconf *conf)
 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
 
 	hammer2_raid6_init();
+	TASK_INIT(&hammer2_persist_task, 0, hammer2_persist_task_fn, NULL);
 
 #ifdef DISK_GONE
 	spin_init(&hammer2_gone_spin, "h2gone");
@@ -445,10 +453,32 @@ hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
 	EVENTHANDLER_DEREGISTER(disk_gone, hammer2_gone_tag);
 	taskqueue_drain(taskqueue_thread[0], &hammer2_gone_task);
 #endif
+	taskqueue_drain(taskqueue_thread[0], &hammer2_persist_task);
 	objcache_destroy(cache_buffer_read);
 	objcache_destroy(cache_buffer_write);
 	objcache_destroy(cache_xops);
 	return 0;
+}
+
+/*
+ * Failures marked from a context that cannot take the voldata lock
+ * (hammer2_raid6_mark_failed with HAMMER2_FAIL_DEFER) are recorded here.
+ */
+static void
+hammer2_persist_task_fn(void *arg __unused, int pending __unused)
+{
+	hammer2_dev_t *hmp;
+
+	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
+	TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry)
+		hammer2_raid6_persist_failed(hmp);
+	lockmgr(&hammer2_mntlk, LK_RELEASE);
+}
+
+void
+hammer2_raid6_persist_kick(void)
+{
+	taskqueue_enqueue(taskqueue_thread[0], &hammer2_persist_task);
 }
 
 #ifdef DISK_GONE
@@ -484,6 +514,7 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 {
 	hammer2_devvp_t *dev;
 	struct vnode *devvp;
+	int error;
 	int i;
 
 	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
@@ -497,28 +528,32 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 		    devvp->v_rdev->si_disk != dp)
 			continue;
 
-		/* A third failure is left alone: the array is lost anyway */
-		if (hammer2_raid6_auto_fail_disk(hmp, i) != 0 ||
-		    hmp->raid_failed[i] == 0)
-			continue;
-
-		/* As in raid replace: wait out writers to the disk */
+		/*
+		 * As in raid replace: wait out writers to the disk.  A
+		 * replace may have finished while we waited, so check
+		 * again that the member is still the disk that went away
+		 * before failing it, or the new disk would be failed.
+		 */
 		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
-		if (hmp->rebuild_active && hmp->rebuild_disk == i) {
-			/* its writes fail, and with them the resilver */
+		if (dev->devvp != devvp || !dev->open) {
 			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-			kprintf("hammer2: RAID6 disk %d (%s) is gone while "
-				"resilvering\n", i, dev->path);
 			continue;
 		}
-		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-		vinvalbuf(devvp, 0, 0, 0);
-		VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
-		vn_unlock(devvp);
-		dev->open = 0;
+		/* A third failure is left alone: the array is lost anyway */
+		if (hammer2_raid6_mark_failed(hmp, i, 0) != 0) {
+			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			continue;
+		}
+		error = hammer2_raid6_close_member_locked(hmp, i, devvp);
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-		kprintf("hammer2: RAID6 disk %d (%s) is gone; failed and "
-			"closed\n", i, dev->path);
+		if (error == EBUSY) {
+			/* its writes fail, and with them the resilver */
+			kprintf("hammer2: RAID6 disk %d (%s) is gone while "
+				"resilvering\n", i, dev->path);
+		} else if (error == 0) {
+			kprintf("hammer2: RAID6 disk %d (%s) is gone; failed "
+				"and closed\n", i, dev->path);
+		}
 	}
 }
 
@@ -1561,18 +1596,21 @@ next_hmp:
 
 			/*
 			 * Mark any absent disks (device unavailable at
-			 * mount time) as failed.  This handles degraded
-			 * mounts where a disk has been physically removed
-			 * or detached.
+			 * mount time) as failed, and record it: an absent
+			 * disk that stayed ONLINE in the header would be
+			 * trusted, stale, at the next mount.  This handles
+			 * degraded mounts where a disk has been physically
+			 * removed or detached.  The mount is never refused
+			 * for it, so the two-disk cap does not apply.  The
+			 * voldata cannot be modified yet; a task records it.
 			 */
 			for (i = 0; i < hmp->nvolumes; i++) {
 				if (hmp->volumes[i].dev == NULL ||
 				    hmp->volumes[i].dev->devvp == NULL ||
 				    !hmp->volumes[i].dev->open) {
-					if (!hmp->raid_failed[i]) {
-						hmp->raid_failed[i] = 1;
-						hmp->raid_nfailed++;
-					}
+					hammer2_raid6_mark_failed(hmp, i,
+					    HAMMER2_FAIL_DEFER |
+					    HAMMER2_FAIL_FORCE);
 				}
 			}
 
@@ -1672,19 +1710,7 @@ next_hmp:
 						hmp->volumes[i].dev ?
 						    hmp->volumes[i].dev->path :
 						    "(absent)");
-					if (hmp->volumes[i].dev &&
-					    hmp->volumes[i].dev->devvp &&
-					    hmp->volumes[i].dev->open) {
-						vn_lock(hmp->volumes[i].dev->devvp,
-							LK_EXCLUSIVE |
-							LK_RETRY);
-						VOP_CLOSE(
-						    hmp->volumes[i].dev->devvp,
-						    FREAD | FWRITE, NULL);
-						vn_unlock(
-						    hmp->volumes[i].dev->devvp);
-						hmp->volumes[i].dev->open = 0;
-					}
+					hammer2_raid6_close_member(hmp, i, NULL);
 				}
 			}
 		}
@@ -2305,6 +2331,9 @@ again:
 	 * final flush below).
 	 */
 	hammer2_io_repair_stop(hmp);
+
+	/* a failure queued by a read completion must reach the final flush */
+	hammer2_raid6_persist_failed(hmp);
 
 	hammer2_pfsfree_scan(hmp, 0);
 

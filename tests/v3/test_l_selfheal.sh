@@ -9,6 +9,9 @@
 # L2 — after the deferred repair writes land, a scrub must be clean
 #      (proves the read path repaired the media, not just the buffer
 #      cache).
+# L4 — R8: disk 0 (the metadata primary) failed AND disk 1's metadata
+#      copies corrupt.  The degraded read takes the first surviving
+#      copy, which is bad; the tree must still read from disks 2/3.
 # L3 — metadata self-heal: corrupt a slice of the metadata zone on one
 #      disk, remount, walk the tree (find + stat).  All files must be
 #      reachable (mirror-copy failover) and no CHECK errors may leak to
@@ -169,5 +172,48 @@ else
 fi
 kmsg_clear
 teardown "L3"
+
+# L4: R8.  With disk 0 failed, a metadata read falls back to the
+# mirror copies in disk order.  Disk 1's copy is bitrotted, so the
+# first copy taken fails its CHECK and the read has to go on to the
+# copies on disks 2 and 3.
+setup_fresh
+check_v3
+mkdir -p $MNTPT/l4
+i=0
+while [ $i -lt 200 ]; do
+    mkdir -p $MNTPT/l4/dir$i
+    echo "content-$i" > $MNTPT/l4/dir$i/file
+    i=$((i + 1))
+done
+sync; sync
+FCOUNT_REF=$(find $MNTPT/l4 | wc -l | tr -d ' ')
+if fail_disk 0 "L4"; then
+    sync
+    umount $MNTPT
+    corrupt_disk 1 $((MD_BLK + 16)) $((DATA_BLK - MD_BLK - 16))
+    if mount -t hammer2 $PFSPATH $MNTPT; then
+        kmsg_clear
+        FCOUNT=$(find $MNTPT/l4 2>/var/tmp/l4_find_err.txt | wc -l | tr -d ' ')
+        CATFAIL=0
+        i=0
+        while [ $i -lt 200 ]; do
+            C=$(cat $MNTPT/l4/dir$i/file 2>/dev/null)
+            [ "$C" = "content-$i" ] || CATFAIL=$((CATFAIL + 1))
+            i=$((i + 10))
+        done
+        if [ "$FCOUNT" = "$FCOUNT_REF" ] && [ "$CATFAIL" = "0" ] && \
+           [ ! -s /var/tmp/l4_find_err.txt ]; then
+            result PASS "L4: tree reachable, disk 0 failed + disk 1 metadata corrupt ($FCOUNT nodes)"
+        else
+            result FAIL "L4: tree walk degraded (count=$FCOUNT/$FCOUNT_REF catfail=$CATFAIL)"
+            cat /var/tmp/l4_find_err.txt
+        fi
+    else
+        result FAIL "L4: remount refused"
+    fi
+fi
+kmsg_clear
+teardown "L4"
 
 summary

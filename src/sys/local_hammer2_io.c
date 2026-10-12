@@ -336,6 +336,19 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	 * We break to here if GOOD is not set and we acquired INPROG for
 	 * the I/O.
 	 */
+	/*
+	 * A failed I/O leaves its buffer (or absent_data) on the dio with
+	 * GOOD clear, and a ref holder that waited on INPROG ends up
+	 * here.  Nothing in it is valid; discard it.
+	 */
+	if (dio->bp) {
+		brelse(dio->bp);
+		dio->bp = NULL;
+	}
+	if (dio->absent_data) {
+		kfree(dio->absent_data, M_HAMMER2);
+		dio->absent_data = NULL;
+	}
 	KKASSERT(dio->bp == NULL);
 	if (btype == HAMMER2_BREF_TYPE_DATA)
 		hce = hammer2_cluster_data_read;
@@ -447,38 +460,14 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			 * write path.  Just getblk() and zero the buffer
 			 * for DOP_NEW.
 			 *
-			 * Failed disk on RAID6: reconstruct from parity
-			 * so the dirty buffer reflects the live content
-			 * before the caller overwrites it.
+			 * A failed disk never gets here: the degraded
+			 * pre-emption above has taken every op on it.
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->raid_nfailed > 0 &&
-			    dio->disk_idx >= 0 &&
-			    hmp->raid_failed[dio->disk_idx]) {
-				dio->bp = getblk(dio->devvp, dev_pbase,
-				    dio->psize, GETBLK_KVABIO, 0);
-				if (dio->bp) {
-					bkvasync(dio->bp);
-					error = hammer2_io_raid6_read_degraded(
-					    hmp, dio->pbase, dio->disk_idx,
-					    dio->bp->b_data, dio->psize,
-					    (dio->btype ==
-						HAMMER2_BREF_TYPE_DATA ||
-					     dio->btype ==
-						HAMMER2_BREF_TYPE_DIRENT)
-					    ? 1 : 0);
-					if (op == HAMMER2_DOP_NEW)
-						bzero(dio->bp->b_data,
-						    dio->psize);
-				}
-			} else {
-				dio->bp = getblk(dio->devvp,
-						 dev_pbase, dio->psize,
-						 GETBLK_KVABIO, 0);
-				if (op == HAMMER2_DOP_NEW) {
-					bkvasync(dio->bp);
-					bzero(dio->bp->b_data, dio->psize);
-				}
+			dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+					 GETBLK_KVABIO, 0);
+			if (op == HAMMER2_DOP_NEW) {
+				bkvasync(dio->bp);
+				bzero(dio->bp->b_data, dio->psize);
 			}
 			atomic_set_long(&dio->refs, HAMMER2_DIO_DIRTY);
 			break;
@@ -617,19 +606,20 @@ io_done:
 	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
 		int injected = (dio->disk_idx >= 0 &&
 				hammer2_inject_eio(dio->disk_idx) != 0);
+		int merr = 0;
 		/*
 		 * Mark this disk as failed (auto-detect from I/O error).
 		 * Skip the auto-fail when the EIO came from the test
 		 * injection sysctl so the test stays repeatable.
 		 */
-		if (!injected && dio->disk_idx >= 0 &&
-		    !hmp->raid_failed[dio->disk_idx]) {
-			hmp->raid_failed[dio->disk_idx] = 1;
-			atomic_add_int(&hmp->raid_nfailed, 1);
-			kprintf("hammer2: RAID6 disk %d failed (I/O error)\n",
-				dio->disk_idx);
+		if ((!injected || hammer2_inject_eio_autofail) &&
+		    dio->disk_idx >= 0 &&
+		    hammer2_raid6_mark_failed(hmp, dio->disk_idx,
+					      HAMMER2_FAIL_DEFER) != 0) {
+			/* third failure: nothing to reconstruct from */
+			merr = ENXIO;
 		}
-		if (hmp->raid_nfailed <= 2) {
+		if (merr == 0 && hmp->raid_nfailed <= 2) {
 			int is_meta = (dio->btype ==
 				    HAMMER2_BREF_TYPE_INODE ||
 				   dio->btype ==
@@ -663,6 +653,20 @@ io_done:
 					     dio->btype ==
 						HAMMER2_BREF_TYPE_DIRENT)
 					    ? 1 : 0);
+				}
+				/*
+				 * A NEW range was zeroed in the buffer just
+				 * discarded; the rebuilt one holds the old
+				 * block's contents, which a new INDIRECT
+				 * would carry as live blockrefs.
+				 */
+				if (error == 0 && (op == HAMMER2_DOP_NEW ||
+						   op == HAMMER2_DOP_NEWNZ)) {
+					if (op == HAMMER2_DOP_NEW)
+						bzero(hammer2_io_data(dio,
+						    lbase), lsize);
+					atomic_set_long(&dio->refs,
+							HAMMER2_DIO_DIRTY);
 				}
 				dio->error = error;
 				/*
@@ -1272,45 +1276,165 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
 }
 
 /*
- * Auto-fail a disk that returned EIO during a RAID6 I/O operation.
+ * Record disk_idx as FAILED in the volume header config, so the failure
+ * survives unmount and a stale disk is not trusted at the next mount.
+ * The next header commit writes it.  Caller holds the voldata lock.
+ */
+static void
+hammer2_raid6_persist_one(hammer2_dev_t *hmp, int disk_idx)
+{
+	if (hmp->voldata.raid_config.disk_state[disk_idx] ==
+	    HAMMER2_RAID6_DISK_FAILED &&
+	    hmp->raid_config.disk_state[disk_idx] ==
+	    HAMMER2_RAID6_DISK_FAILED)
+		return;
+	hmp->raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
+	hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	hmp->voldata.raid_config.disk_state[disk_idx] =
+	    HAMMER2_RAID6_DISK_FAILED;
+	hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
+	if (hmp->ronly == 0)
+		hammer2_voldata_modify(hmp);
+}
+
+/*
+ * Persist the failures queued by HAMMER2_FAIL_DEFER.  Called by the task
+ * (and by unmount, before the final sync, so a failure does not get lost).
+ */
+void
+hammer2_raid6_persist_failed(hammer2_dev_t *hmp)
+{
+	uint32_t mask;
+	int i;
+
+	if (hmp->raid_persist_pending == 0)
+		return;
+	mask = atomic_swap_int(&hmp->raid_persist_pending, 0);
+	hammer2_voldata_lock(hmp);
+	for (i = 0; i < hmp->nvolumes; i++) {
+		if ((mask & (1U << i)) && hmp->raid_failed[i])
+			hammer2_raid6_persist_one(hmp, i);
+	}
+	hammer2_voldata_unlock(hmp);
+}
+
+/*
+ * The one place a RAID6 member is declared failed: read and write
+ * errors, a gone disk, the fail-disk ioctl and absent disks at mount.
  *
- * Updates both the runtime hmp->raid_failed[] state and the on-disk
- * voldata.raid_config, so the failed state survives unmount/remount.
+ * Counts the disk once even when two threads race, refuses a third
+ * failure (ENXIO, nothing changed; HAMMER2_FAIL_FORCE, used at mount
+ * for disks that are not there, overrides), and records DISK_FAILED in
+ * the volume header config.  A disk already failed in memory only (an
+ * absent disk at mount) is recorded too.
  *
- * If raid_nfailed would reach 3 (triple failure), returns ENXIO to
- * signal unrecoverable array state; otherwise marks the disk failed
- * and returns 0.
+ * Without HAMMER2_FAIL_DEFER the caller may sleep: the voldata lock is
+ * taken here.  A read completion cannot take it (it may hold chains
+ * the flush wants while holding the voldata lock), so it passes
+ * HAMMER2_FAIL_DEFER and a task records the failure shortly after; the
+ * in-memory state changes at once.
  *
- * Called from I/O context — does NOT close the vnode.  The disk is
- * excluded from future I/Os via raid_failed[]; the vnode is released
- * at unmount.
+ * The vnode is not closed; see hammer2_raid6_close_member().
+ */
+int
+hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags)
+{
+	int n;
+
+	if (disk_idx < 0 || disk_idx >= hmp->nvolumes)
+		return EINVAL;
+	while (hmp->raid_failed[disk_idx] == 0) {
+		n = hmp->raid_nfailed;
+		if (n >= 2 && (flags & HAMMER2_FAIL_FORCE) == 0) {
+			kprintf("hammer2: RAID6 unrecoverable: I/O error on "
+				"disk %d but already %d disk(s) failed\n",
+				disk_idx, n);
+			return ENXIO;
+		}
+		if (!atomic_cmpset_int(&hmp->raid_nfailed, n, n + 1))
+			continue;
+		if (atomic_cmpset_int(&hmp->raid_failed[disk_idx], 0, 1)) {
+			kprintf("hammer2: RAID6 disk %d failed\n", disk_idx);
+			break;
+		}
+		atomic_add_int(&hmp->raid_nfailed, -1);
+	}
+
+	if (hmp->voldata.raid_config.disk_state[disk_idx] !=
+	    HAMMER2_RAID6_DISK_FAILED) {
+		if (flags & HAMMER2_FAIL_DEFER) {
+			atomic_set_int(&hmp->raid_persist_pending,
+				       1U << disk_idx);
+			hammer2_raid6_persist_kick();
+		} else {
+			hammer2_voldata_lock(hmp);
+			hammer2_raid6_persist_one(hmp, disk_idx);
+			hammer2_voldata_unlock(hmp);
+		}
+	}
+	return 0;
+}
+
+/*
+ * Auto-fail a disk that returned an I/O error.  Returns ENXIO past two
+ * failed disks, else 0.  May sleep.
  */
 int
 hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 {
-	hammer2_voldata_lock(hmp);
-	if (hmp->raid_failed[disk_idx]) {
-		hammer2_voldata_unlock(hmp);
+	return hammer2_raid6_mark_failed(hmp, disk_idx, 0);
+}
+
+/*
+ * Close a failed member's device so that the driver can free it (a
+ * replugged disk then comes back under its old name).  Caller holds
+ * rebuild_lk exclusive: writers to the member hold it shared, and a
+ * buffer getblk()ed meanwhile would make vinvalbuf() panic.
+ *
+ * Returns 0 when the member was closed or already is, EBUSY when it is
+ * the resilver target, ESTALE when it is not the failed member the
+ * caller meant (expect_devvp, if given, is no longer its device: a
+ * replace finished while the caller waited for the lock), and EINVAL
+ * if it is not failed.
+ */
+int
+hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
+				  struct vnode *expect_devvp)
+{
+	hammer2_devvp_t *dev;
+	struct vnode *devvp;
+
+	dev = hmp->volumes[disk_idx].dev;
+	if (dev == NULL || dev->devvp == NULL)
 		return 0;
-	}
-	if (hmp->raid_nfailed >= 2) {
-		hammer2_voldata_unlock(hmp);
-		kprintf("hammer2: RAID6 unrecoverable: I/O error on disk %d "
-			"but already %d disk(s) failed\n",
-			disk_idx, hmp->raid_nfailed);
-		return ENXIO;
-	}
-	kprintf("hammer2: RAID6 disk %d auto-failed due to I/O error\n",
-		disk_idx);
-	hmp->raid_failed[disk_idx] = 1;
-	atomic_add_int(&hmp->raid_nfailed, 1);
-	hmp->raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
-	hmp->raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-	hmp->voldata.raid_config.disk_state[disk_idx] = HAMMER2_RAID6_DISK_FAILED;
-	hmp->voldata.raid_config.flags |= HAMMER2_RAID6_FLAG_DEGRADED;
-	hammer2_voldata_modify(hmp);
-	hammer2_voldata_unlock(hmp);
+	if (expect_devvp && dev->devvp != expect_devvp)
+		return ESTALE;
+	if (!hmp->raid_failed[disk_idx])
+		return EINVAL;
+	if (hmp->rebuild_active && hmp->rebuild_disk == disk_idx)
+		return EBUSY;
+	if (!dev->open)
+		return 0;
+	devvp = dev->devvp;
+	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+	vinvalbuf(devvp, 0, 0, 0);
+	VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
+	vn_unlock(devvp);
+	dev->open = 0;
 	return 0;
+}
+
+int
+hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
+			   struct vnode *expect_devvp)
+{
+	int error;
+
+	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	error = hammer2_raid6_close_member_locked(hmp, disk_idx,
+						  expect_devvp);
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	return error;
 }
 
 /*
@@ -1375,9 +1499,12 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 		return;
 	devvp = vol->dev->devvp;
 
-	if (req->patch_off == 0 && req->patch_len == req->bufsize) {
+	bp = NULL;
+	if (req->patch_off == 0 && req->patch_len == req->bufsize &&
+	    req->chk_len == 0) {
 		/*
-		 * Full-buffer overwrite (DATA/DIRENT stripe column).
+		 * Full-buffer overwrite (DATA/DIRENT stripe column) with
+		 * nothing to verify: no need to read the old contents.
 		 */
 		bp = getblk(devvp, req->base, req->bufsize, GETBLK_KVABIO, 0);
 		if (bp == NULL)
@@ -1388,9 +1515,9 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 		/*
 		 * Sub-buffer patch (metadata block inside a shared device
 		 * buffer): read-modify-write so sibling blocks in the same
-		 * buffer are preserved.
+		 * buffer are preserved.  A full column with a recorded hash
+		 * is read as well.
 		 */
-		bp = NULL;
 		error = bread(devvp, req->base, req->bufsize, &bp);
 		if (error || bp == NULL) {
 			if (bp)
@@ -1398,6 +1525,29 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 			return;
 		}
 		bkvasync(bp);
+		if (req->chk_len) {
+			/*
+			 * COW can free this slot and allocate it again while
+			 * the repair waits in the queue.  Write only if it
+			 * still holds the bytes found bad, or the healed
+			 * bytes the reader put in the cache; anything else
+			 * is newer data (or another block) to leave alone.
+			 */
+			char *cur = (char *)bp->b_data + req->chk_off;
+
+			if (hammer2_io_repair_hash(cur, req->chk_len) !=
+			    req->chk_hash &&
+			    bcmp(cur, req->data + (req->chk_off -
+				 req->patch_off), req->chk_len) != 0) {
+				brelse(bp);
+				atomic_add_64(&hmp->repair_writes_dropped, 1);
+				kprintf("hammer2: selfheal: repair skipped, "
+				    "disk %d base %016jx off %d changed\n",
+				    req->disk_idx, (uintmax_t)req->base,
+				    req->chk_off);
+				return;
+			}
+		}
 		bcopy(req->data, (char *)bp->b_data + req->patch_off,
 		      req->patch_len);
 	}
@@ -1501,6 +1651,28 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 			  hammer2_off_t base, int bufsize, int patch_off,
 			  int patch_len, char *data)
 {
+	hammer2_io_repair_enqueue_chk(hmp, disk_idx, base, bufsize,
+				      patch_off, patch_len, data, 0, 0, 0);
+}
+
+uint64_t
+hammer2_io_repair_hash(const void *data, size_t bytes)
+{
+	return XXH64(data, bytes, XXH_HAMMER2_SEED);
+}
+
+/*
+ * As hammer2_io_repair_enqueue, also recording the hash of the bad
+ * bytes found in [chk_off, chk_off + chk_len) of the buffer.  The
+ * repair kthread writes only if the slot still holds them (or the
+ * healed bytes); see hammer2_io_repair_execute.
+ */
+void
+hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
+			      hammer2_off_t base, int bufsize, int patch_off,
+			      int patch_len, char *data, int chk_off,
+			      int chk_len, uint64_t chk_hash)
+{
 	hammer2_repair_req_t *req;
 	hammer2_repair_req_t *scan;
 
@@ -1515,6 +1687,9 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 	req->patch_off = patch_off;
 	req->patch_len = patch_len;
 	req->data = data;
+	req->chk_off = chk_off;
+	req->chk_len = chk_len;
+	req->chk_hash = chk_hash;
 
 	hammer2_spin_ex(&hmp->repair_spin);
 	if (hmp->repair_queue_count >= HAMMER2_REPAIR_QUEUE_MAX) {
@@ -1710,6 +1885,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	hammer2_volume_t *vol;
 	char *copy;
 	char *patch;
+	uint64_t badhash;
 	int i;
 	int error;
 
@@ -1734,12 +1910,16 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		if (error)
 			continue;
 		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
+			badhash = hammer2_io_repair_hash(bdata, bytes);
 			bcopy(copy + off, bdata, bytes);
 			kfree(copy, M_HAMMER2);
+			if (hmp->raid_failed[bad_disk_idx])
+				return 0;
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 			bcopy(bdata, patch, bytes);
-			hammer2_io_repair_enqueue(hmp, bad_disk_idx,
-			    dev_pbase, psize, off, (int)bytes, patch);
+			hammer2_io_repair_enqueue_chk(hmp, bad_disk_idx,
+			    dev_pbase, psize, off, (int)bytes, patch,
+			    off, (int)bytes, badhash);
 			return 0;
 		}
 	}
