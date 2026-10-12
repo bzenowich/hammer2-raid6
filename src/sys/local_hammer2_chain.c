@@ -1409,7 +1409,14 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
 	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
 	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+		/*
+		 * stripe_alloc derives the radix in bref.data_off from
+		 * chain->bytes, so it must hold the new size by now.
+		 */
+		chain->bytes = nbytes;
 		error = hammer2_raid6_stripe_alloc(hmp, chain);
+		if (error)
+			chain->bytes = obytes;
 	} else {
 		error = hammer2_freemap_alloc(chain, nbytes);
 	}

@@ -201,4 +201,40 @@ else
     teardown "J2"
 fi
 
+# J3: growing small files must not leave open rows behind.  A file that
+# grows 4 KB -> 8 KB -> 16 KB resizes its data chain; the slot the resize
+# abandons must not stay reserved in an open row (oct-review.md §10.1).
+# After a sync, vfs.hammer2.rz_open_left (rows still open) must be 0.
+echo "--- J3: resize leaves no open row ---"
+setup_fresh
+check_v3
+k=0
+while [ "$k" -lt 40 ]; do
+    dd if=/dev/urandom of=$MNTPT/g_$k bs=4096 count=1 2>/dev/null
+    k=$((k + 1))
+done
+sync
+k=0
+while [ "$k" -lt 40 ]; do
+    dd if=/dev/urandom of=$MNTPT/g_$k bs=4096 count=1 seek=1 conv=notrunc 2>/dev/null
+    k=$((k + 1))
+done
+sync
+k=0
+while [ "$k" -lt 40 ]; do
+    dd if=/dev/urandom of=$MNTPT/g_$k bs=8192 count=1 seek=1 conv=notrunc 2>/dev/null
+    k=$((k + 1))
+done
+sync
+sync
+left=$(sysctl -n vfs.hammer2.rz_open_left 2>/dev/null)
+echo "    rz_open_left=$left rz_open_high=$(sysctl -n vfs.hammer2.rz_open_high)"
+if [ "$left" = "0" ]; then
+    result PASS "J3: no open rows after resizes"
+else
+    result FAIL "J3: $left rows still open after sync (leaked reservations)"
+fi
+scrub_clean "J3"
+teardown "J3"
+
 summary

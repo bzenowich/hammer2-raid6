@@ -2300,6 +2300,8 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	hmp->open_rows_count++;
 	if (hmp->open_rows_count > hmp->open_rows_high)
 		hmp->open_rows_high = hmp->open_rows_count;
+	if (hmp->open_rows_count > hammer2_rz_open_high)
+		hammer2_rz_open_high = hmp->open_rows_count;
 }
 
 /*
@@ -2404,6 +2406,7 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 				(uintmax_t)r->row_id, r->idle, r->alloc_mask);
 		}
 	}
+	hammer2_rz_open_left = hmp->open_rows_count;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 }
 

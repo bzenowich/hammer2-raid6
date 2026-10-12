@@ -364,7 +364,13 @@ verify_ref() {
     fi
 }
 
+# rz_stats: the v3 open-row counters (vfs.hammer2.rz_*), for the logs.
+rz_stats() {
+    echo "rz stats: $(sysctl vfs.hammer2 2>/dev/null | grep '\.rz_' | tr '\n' ' ')"
+}
+
 summary() {
+    rz_stats
     echo "========================================="
     echo "=== $PASS/$TOTAL PASS, $FAIL FAIL ==="
     echo "========================================="

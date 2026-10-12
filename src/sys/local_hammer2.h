@@ -2319,6 +2319,13 @@ extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
 
+/* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
+extern long hammer2_rz_open_left;	/* rows still open after the last flush */
+extern long hammer2_rz_open_high;	/* peak open rows */
+extern long hammer2_rz_rewrite_slots;	/* rewrites that took a fresh slot */
+extern long hammer2_rz_put_anomaly;	/* second put on an arrived column */
+extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
+
 static __inline int
 hammer2_inject_eio(int disk_idx)
 {
