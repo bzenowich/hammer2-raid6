@@ -1134,10 +1134,11 @@ typedef struct hammer2_volume hammer2_volume_t;
  * putblk's; alloc_mask bit set means the slot is reserved but
  * col_data may still be NULL until the chain flushes.
  *
- * A row whose chains have not all putblk'd at a TXG flush is sealed
- * partially: P/Q over the columns present, the pending ones counted
- * as zero.  It stays on the list (closed to packing, its column data
- * kept) and is sealed again, fully, when the last column arrives.
+ * gen is hmp->rz_gen when the row was registered.  The flush advances
+ * rz_gen, which closes every older row to new reservations, then waits
+ * for the columns still pending in them and seals each row once, in
+ * full (oct-review.md §10).  A row is never sealed with a column
+ * pending and never sealed twice.
  */
 /*
  * A metadata mirror copy waiting for the next sync (see
@@ -1165,11 +1166,7 @@ struct hammer2_open_row {
 	int		ndata;		/* cached rc->ndata */
 	size_t		bytes;		/* cached stripe_unit */
 	uint32_t	dropped_mask;	/* cols putblk did not write (disk failed) */
-	int		sealing;	/* partial seal I/O in progress */
-	int		partial;	/* P/Q written with cols still pending */
-	int		dirty;		/* col data arrived since the last seal */
-	int		idle;		/* flushes since the last data arrived */
-	uint32_t	seal_gen;	/* last seal_all pass that visited it */
+	uint32_t	gen;		/* hmp->rz_gen at registration */
 	void		*col_data[HAMMER2_MAX_VOLUMES];
 };
 
@@ -1276,7 +1273,8 @@ struct hammer2_dev {
 	int		open_rows_inited;	/* TAILQ_INIT done */
 	long		open_rows_count;	/* current entry count (diag) */
 	long		open_rows_high;		/* peak entry count (diag) */
-	uint32_t	open_rows_sealgen;	/* seal_all pass counter */
+	uint32_t	rz_gen;			/* current row generation */
+	int		rz_gen_waiting;		/* flusher sleeping on open_rows */
 
 	/*
 	 * Deferred metadata mirror copies (v3), one entry per block.
@@ -2258,7 +2256,7 @@ int  hammer2_raid6_open_row_pick(hammer2_dev_t *hmp,
 void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, int disk_idx,
 		void *data /* takes ownership */, size_t bytes, int dropped);
-void hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
+int  hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int  hammer2_raid6_col_arrived(hammer2_dev_t *hmp,
 			       const hammer2_blockref_t *bref);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
@@ -2321,6 +2319,7 @@ int hammer2_bref_check_match(const hammer2_blockref_t *bref,
 extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
+extern int hammer2_raid6_gen_wait_ms;
 
 /* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */

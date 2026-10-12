@@ -1949,6 +1949,9 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 
 	if (!hmp->open_rows_inited)
 		return;
+	if (hmp->open_rows_count)
+		kprintf("hammer2: v3 unmount drops %ld open rows "
+			"(columns not committed)\n", hmp->open_rows_count);
 	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL) {
 		TAILQ_REMOVE(&hmp->open_rows, r, entry);
 		if (hmp->stripe_open)
@@ -2111,7 +2114,6 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	int ncols = 0;
 	int d, i;
 
-	KKASSERT(r->sealing == 0);
 	for (d = 0; d < hmp->raid_config.ndisks; d++) {
 		if ((r->alloc_mask & (1U << d)) == 0)
 			continue;
@@ -2137,72 +2139,6 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	kfree(r, M_HAMMER2);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-}
-
-/*
- * Partially seal a row at a TXG flush: some reserved column has not
- * putblk'd yet (its chain was allocated after this flush started, or
- * its dio still has another ref).  Write P/Q over the columns present,
- * the pending ones counted as zero, so the flushed columns are
- * protected, but keep the row and its column data: closed to packing,
- * it is sealed in full when the last column arrives (add_data).
- *
- * Sealing it in full and dropping it here, as before, lost the late
- * column: its putblk found no row, and the P/Q on disk did not cover
- * it.
- *
- * r->sealing keeps add_data from sealing the row while the I/O runs
- * unlocked; data arriving meanwhile goes into col_data as usual, and
- * a column replaced meanwhile drops our older copy.  Caller holds
- * stripe_bitmap_spin; it is released around the I/O.
- */
-static void
-hammer2_raid6_seal_partial_locked(hammer2_dev_t *hmp,
-				  struct hammer2_open_row *r)
-{
-	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
-	void *to_free[HAMMER2_MAX_VOLUMES];
-	int nfree = 0;
-	int ncols = 0;
-	int d, i;
-
-	r->sealing = 1;
-	r->partial = 1;
-	r->dirty = 0;
-	for (d = 0; d < hmp->raid_config.ndisks; d++) {
-		if ((r->alloc_mask & (1U << d)) == 0)
-			continue;
-		if (r->col_data[d] == NULL)
-			continue;
-		cols[ncols].disk_idx = d;
-		cols[ncols].data = r->col_data[d];
-		cols[ncols].bytes = r->bytes;
-		r->col_data[d] = NULL;
-		ncols++;
-	}
-	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-
-	if (ncols > 0)
-		hammer2_raid6_row_io(hmp, r->phys_off, r->row_id,
-				     r->alloc_mask, r->dropped_mask,
-				     r->p_disk, r->q_disk, cols, ncols,
-				     r->bytes);
-
-	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	for (i = 0; i < ncols; i++) {
-		d = cols[i].disk_idx;
-		if (r->col_data[d] == NULL)
-			r->col_data[d] = cols[i].data;
-		else
-			to_free[nfree++] = cols[i].data;
-	}
-	r->sealing = 0;
-	if (nfree) {
-		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-		for (i = 0; i < nfree; i++)
-			kfree(to_free[i], M_HAMMER2);
-		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	}
 }
 
 /*
@@ -2246,7 +2182,7 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 		return 0;
 
 	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		if (r->n_alloc >= ndata || r->partial)
+		if (r->n_alloc >= ndata || r->gen != hmp->rz_gen)
 			continue;
 		for (t = 0; t < ndisks; t++) {
 			candidate = hmp->stripe_next_disk % ndisks;
@@ -2293,6 +2229,7 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	 * via hammer2_raid6_seal_all_open_rows.
 	 */
 	r->phys_off   = phys_off;
+	r->gen        = hmp->rz_gen;
 	r->row_id     = row_id;
 	r->p_disk     = p_disk;
 	r->q_disk     = q_disk;
@@ -2345,7 +2282,7 @@ hammer2_raid6_col_arrived(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 /*
  * Putblk → open_row sink.  Takes ownership of `data` (kfree'd when
  * row seals).  If every reserved col then has its data and the row is
- * full, or was partially sealed and so takes no more cols, seal it.
+ * full, seal it; a complete row of an older generation wakes the flush.
  */
 void
 hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
@@ -2354,6 +2291,7 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 {
 	struct hammer2_open_row *r;
 	void *to_free = NULL;
+	int wake = 0;
 
 	/*
 	 * Every chain that makes it through stripe_alloc has a row
@@ -2390,64 +2328,111 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	if (to_free)
 		hammer2_rz_put_anomaly++;
 	r->col_data[disk_idx] = data;
-	r->dirty = 1;
-	r->idle = 0;
 	if (dropped)
 		r->dropped_mask |= 1U << disk_idx;
 	else
 		r->dropped_mask &= ~(1U << disk_idx);
 
-	if (r->sealing == 0 && hammer2_raid6_row_complete(hmp, r) &&
-	    (r->n_alloc >= r->ndata || r->partial))
-		hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+	/*
+	 * A full row seals here.  A row of an older generation is sealed
+	 * by the flush, which is told when its last column has arrived.
+	 */
+	if (hammer2_raid6_row_complete(hmp, r)) {
+		if (r->gen != hmp->rz_gen && hmp->rz_gen_waiting)
+			wake = 1;
+		if (r->n_alloc >= r->ndata)
+			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
+	if (wake)
+		wakeup(&hmp->open_rows);
 	if (to_free)
 		kfree(to_free, M_HAMMER2);
 }
 
 /*
- * Seal the open rows at a TXG flush boundary, before VOP_FSYNC.
- * A row with every reserved col present seals and leaves the list;
- * unfilled cols are zero on disk, so P/Q is correct for what was
- * written.  A row still waiting for a col is sealed partially (see
- * hammer2_raid6_seal_partial_locked) and stays; one already partially
- * sealed with no new data since is left alone.
+ * Seal the open rows at a TXG flush, before VOP_FSYNC and the volume
+ * header (oct-review.md §10.2).  Called after the last chain flush has
+ * returned: every chain the header can commit was allocated before this
+ * point, so its row is of the current generation or an older one.
+ *
+ * Advance rz_gen, which closes every existing row to new reservations
+ * (packing takes only rows of the current generation), then seal each
+ * older row once its reserved columns have all arrived.  A column is
+ * pending only between the allocation and the put of one strategy
+ * write, so the wait is short; the row is sealed in full, never with a
+ * column missing.
+ *
+ * If no column arrives for vfs.hammer2.raid6_gen_wait_ms the flush
+ * fails with EAGAIN: the caller must not write the volume header.  The
+ * rows stay on the list and the next flush waits for them again.
  *
  * Each seal drops the spinlock, so the list is rescanned from the head
- * after every seal; seal_gen marks the rows this pass has handled.
+ * after every seal.
  */
-void
+int
 hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 {
 	struct hammer2_open_row *r;
-	uint32_t gen;
+	struct hammer2_open_row *stuck;
+	int deadline;
+	int d;
 
 	if (!hmp->open_rows_inited)
-		return;
+		return 0;
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	gen = ++hmp->open_rows_sealgen;
+	hmp->rz_gen++;
+	deadline = ticks + (int)((long)hz * hammer2_raid6_gen_wait_ms / 1000);
 	for (;;) {
+		stuck = NULL;
 		TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-			if (r->seal_gen != gen && r->sealing == 0)
+			if (r->gen == hmp->rz_gen)
+				continue;
+			if (hammer2_raid6_row_complete(hmp, r))
 				break;
+			if (stuck == NULL)
+				stuck = r;
 		}
-		if (r == NULL)
-			break;
-		r->seal_gen = gen;
-		if (hammer2_raid6_row_complete(hmp, r)) {
+		if (r != NULL) {
 			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
-		} else if (r->partial == 0 || r->dirty) {
-			hammer2_raid6_seal_partial_locked(hmp, r);
-		} else if (++r->idle == 16) {
-			kprintf("hammer2: v3 row %ju still waiting for a "
-				"column after %d flushes (mask %08x)\n",
-				(uintmax_t)r->row_id, r->idle, r->alloc_mask);
+			/* progress: the wait starts over */
+			deadline = ticks +
+			    (int)((long)hz * hammer2_raid6_gen_wait_ms / 1000);
+			continue;
 		}
+		if (stuck == NULL)
+			break;
+		if ((int)(ticks - deadline) >= 0) {
+			uint32_t pend = 0;
+			uint64_t row_id = stuck->row_id;
+			hammer2_off_t phys_off = stuck->phys_off;
+			uint32_t gen = stuck->gen;
+			uint32_t now = hmp->rz_gen;
+
+			for (d = 0; d < hmp->raid_config.ndisks; d++) {
+				if ((stuck->alloc_mask & (1U << d)) &&
+				    stuck->col_data[d] == NULL)
+					pend |= 1U << d;
+			}
+			hammer2_rz_gen_wait_fail++;
+			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			kprintf("hammer2: v3 flush failed: row %ju phys %016jx "
+				"gen %u (now %u) still waits for columns "
+				"%08x after %d ms\n",
+				(uintmax_t)row_id, (uintmax_t)phys_off, gen,
+				now, pend, hammer2_raid6_gen_wait_ms);
+			return EAGAIN;
+		}
+		hmp->rz_gen_waiting++;
+		ssleep(&hmp->open_rows, &hmp->stripe_bitmap_spin, 0,
+		       "h2rzgen", hz / 10 ? hz / 10 : 1);
+		hmp->rz_gen_waiting--;
 	}
 	hammer2_rz_open_left = hmp->open_rows_count;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	return 0;
 }
 
 /*

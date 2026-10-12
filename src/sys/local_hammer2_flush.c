@@ -1542,14 +1542,28 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	hammer2_chain_drop(&hmp->vchain);
 
 	/*
-	 * 6C: seal any open rows so their P/Q bwrites land before the
-	 * VOP_FSYNC drain below sweeps them to disk.  Rows that didn't
-	 * fill to ndata seal with implicit-zero columns, which is the
-	 * COW invariant.
+	 * 6C: seal the open rows of the closing generation so their P/Q
+	 * bwrites land before the VOP_FSYNC drain below sweeps them to
+	 * disk.  Rows that didn't fill to ndata seal with implicit-zero
+	 * columns, which is the COW invariant.  Waits for columns still
+	 * in flight (oct-review.md §10).
 	 */
 	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
-		hammer2_raid6_seal_all_open_rows(hmp);
+	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+		error = hammer2_raid6_seal_all_open_rows(hmp);
+		if (error) {
+			/*
+			 * A row still waits for a column: no volume header
+			 * for this flush (fsync_error blocks it), the
+			 * previous TXG stays committed, the next sync
+			 * retries.
+			 */
+			kprintf("hammer2: sync failed, TXG not committed: "
+				"row columns missing (error %d)\n", error);
+			if (fsync_error == 0)
+				fsync_error = error;
+		}
+	}
 
 	/*
 	 * Metadata mirror copies deferred by putblk: write each block once,

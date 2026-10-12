@@ -90,6 +90,7 @@ int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_raid6_pack_open_rows = 1;	/* v3: enable 6C packing */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
+int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;
 long hammer2_rz_open_high;
 long hammer2_rz_rewrite_slots;
@@ -174,6 +175,10 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 	   "v3 RAID6: skip unallocated stripe slots during resilver "
 	   "(default 1).  Set 0 to force full-iteration baseline for "
 	   "regression timing.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_gen_wait_ms, CTLFLAG_RW,
+	   &hammer2_raid6_gen_wait_ms, 0,
+	   "v3 RAID6: how long (ms, without progress) a flush waits for the "
+	   "pending columns of its rows before it fails");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_open_left, CTLFLAG_RD,
 	   &hammer2_rz_open_left, 0,
 	   "v3 RAID6: rows still open after the last flush");
