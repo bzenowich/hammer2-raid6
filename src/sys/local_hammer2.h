@@ -2292,6 +2292,9 @@ struct hammer2_repair_req {
 	int		patch_off;	/* offset of patch within buffer */
 	int		patch_len;	/* length of patch */
 	char		*data;		/* patch payload (owned) */
+	int		chk_off;	/* verified range within buffer */
+	int		chk_len;	/* 0 = no stale-slot check */
+	uint64_t	chk_hash;	/* XXH64 of that range, as found bad */
 };
 
 typedef struct hammer2_repair_req hammer2_repair_req_t;
@@ -2301,6 +2304,11 @@ void hammer2_io_repair_stop(hammer2_dev_t *hmp);
 void hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t base, int bufsize, int patch_off,
 		int patch_len, char *data);
+void hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
+		hammer2_off_t base, int bufsize, int patch_off,
+		int patch_len, char *data, int chk_off, int chk_len,
+		uint64_t chk_hash);
+uint64_t hammer2_io_repair_hash(const void *data, size_t bytes);
 int hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		hammer2_off_t dev_pbase, int psize, int off,
 		const hammer2_blockref_t *bref, void *bdata, size_t bytes);

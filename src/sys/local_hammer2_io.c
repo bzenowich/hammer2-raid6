@@ -336,6 +336,19 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	 * We break to here if GOOD is not set and we acquired INPROG for
 	 * the I/O.
 	 */
+	/*
+	 * A failed I/O leaves its buffer (or absent_data) on the dio with
+	 * GOOD clear, and a ref holder that waited on INPROG ends up
+	 * here.  Nothing in it is valid; discard it.
+	 */
+	if (dio->bp) {
+		brelse(dio->bp);
+		dio->bp = NULL;
+	}
+	if (dio->absent_data) {
+		kfree(dio->absent_data, M_HAMMER2);
+		dio->absent_data = NULL;
+	}
 	KKASSERT(dio->bp == NULL);
 	if (btype == HAMMER2_BREF_TYPE_DATA)
 		hce = hammer2_cluster_data_read;
@@ -663,6 +676,20 @@ io_done:
 					     dio->btype ==
 						HAMMER2_BREF_TYPE_DIRENT)
 					    ? 1 : 0);
+				}
+				/*
+				 * A NEW range was zeroed in the buffer just
+				 * discarded; the rebuilt one holds the old
+				 * block's contents, which a new INDIRECT
+				 * would carry as live blockrefs.
+				 */
+				if (error == 0 && (op == HAMMER2_DOP_NEW ||
+						   op == HAMMER2_DOP_NEWNZ)) {
+					if (op == HAMMER2_DOP_NEW)
+						bzero(hammer2_io_data(dio,
+						    lbase), lsize);
+					atomic_set_long(&dio->refs,
+							HAMMER2_DIO_DIRTY);
 				}
 				dio->error = error;
 				/*
@@ -1375,9 +1402,12 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 		return;
 	devvp = vol->dev->devvp;
 
-	if (req->patch_off == 0 && req->patch_len == req->bufsize) {
+	bp = NULL;
+	if (req->patch_off == 0 && req->patch_len == req->bufsize &&
+	    req->chk_len == 0) {
 		/*
-		 * Full-buffer overwrite (DATA/DIRENT stripe column).
+		 * Full-buffer overwrite (DATA/DIRENT stripe column) with
+		 * nothing to verify: no need to read the old contents.
 		 */
 		bp = getblk(devvp, req->base, req->bufsize, GETBLK_KVABIO, 0);
 		if (bp == NULL)
@@ -1388,9 +1418,9 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 		/*
 		 * Sub-buffer patch (metadata block inside a shared device
 		 * buffer): read-modify-write so sibling blocks in the same
-		 * buffer are preserved.
+		 * buffer are preserved.  A full column with a recorded hash
+		 * is read as well.
 		 */
-		bp = NULL;
 		error = bread(devvp, req->base, req->bufsize, &bp);
 		if (error || bp == NULL) {
 			if (bp)
@@ -1398,6 +1428,29 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 			return;
 		}
 		bkvasync(bp);
+		if (req->chk_len) {
+			/*
+			 * COW can free this slot and allocate it again while
+			 * the repair waits in the queue.  Write only if it
+			 * still holds the bytes found bad, or the healed
+			 * bytes the reader put in the cache; anything else
+			 * is newer data (or another block) to leave alone.
+			 */
+			char *cur = (char *)bp->b_data + req->chk_off;
+
+			if (hammer2_io_repair_hash(cur, req->chk_len) !=
+			    req->chk_hash &&
+			    bcmp(cur, req->data + (req->chk_off -
+				 req->patch_off), req->chk_len) != 0) {
+				brelse(bp);
+				atomic_add_64(&hmp->repair_writes_dropped, 1);
+				kprintf("hammer2: selfheal: repair skipped, "
+				    "disk %d base %016jx off %d changed\n",
+				    req->disk_idx, (uintmax_t)req->base,
+				    req->chk_off);
+				return;
+			}
+		}
 		bcopy(req->data, (char *)bp->b_data + req->patch_off,
 		      req->patch_len);
 	}
@@ -1501,6 +1554,28 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 			  hammer2_off_t base, int bufsize, int patch_off,
 			  int patch_len, char *data)
 {
+	hammer2_io_repair_enqueue_chk(hmp, disk_idx, base, bufsize,
+				      patch_off, patch_len, data, 0, 0, 0);
+}
+
+uint64_t
+hammer2_io_repair_hash(const void *data, size_t bytes)
+{
+	return XXH64(data, bytes, XXH_HAMMER2_SEED);
+}
+
+/*
+ * As hammer2_io_repair_enqueue, also recording the hash of the bad
+ * bytes found in [chk_off, chk_off + chk_len) of the buffer.  The
+ * repair kthread writes only if the slot still holds them (or the
+ * healed bytes); see hammer2_io_repair_execute.
+ */
+void
+hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
+			      hammer2_off_t base, int bufsize, int patch_off,
+			      int patch_len, char *data, int chk_off,
+			      int chk_len, uint64_t chk_hash)
+{
 	hammer2_repair_req_t *req;
 	hammer2_repair_req_t *scan;
 
@@ -1515,6 +1590,9 @@ hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 	req->patch_off = patch_off;
 	req->patch_len = patch_len;
 	req->data = data;
+	req->chk_off = chk_off;
+	req->chk_len = chk_len;
+	req->chk_hash = chk_hash;
 
 	hammer2_spin_ex(&hmp->repair_spin);
 	if (hmp->repair_queue_count >= HAMMER2_REPAIR_QUEUE_MAX) {
@@ -1710,6 +1788,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	hammer2_volume_t *vol;
 	char *copy;
 	char *patch;
+	uint64_t badhash;
 	int i;
 	int error;
 
@@ -1734,12 +1813,16 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		if (error)
 			continue;
 		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
+			badhash = hammer2_io_repair_hash(bdata, bytes);
 			bcopy(copy + off, bdata, bytes);
 			kfree(copy, M_HAMMER2);
+			if (hmp->raid_failed[bad_disk_idx])
+				return 0;
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 			bcopy(bdata, patch, bytes);
-			hammer2_io_repair_enqueue(hmp, bad_disk_idx,
-			    dev_pbase, psize, off, (int)bytes, patch);
+			hammer2_io_repair_enqueue_chk(hmp, bad_disk_idx,
+			    dev_pbase, psize, off, (int)bytes, patch,
+			    off, (int)bytes, badhash);
 			return 0;
 		}
 	}

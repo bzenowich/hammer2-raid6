@@ -1046,6 +1046,19 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 	}
 
 	/*
+	 * A degraded read of a failed disk's block is rebuilt on every
+	 * fetch (the first surviving mirror copy for metadata, parity for
+	 * data), and a heal of it only fixes that fetch's buffer: the
+	 * repair write has no disk to go to.  Test the check code on each
+	 * fetch rather than trusting TESTEDGOOD from an earlier one.
+	 */
+	if ((dio = chain->dio) != NULL && dio->disk_idx >= 0 &&
+	    hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hmp->raid_failed[dio->disk_idx]) {
+		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_TESTEDGOOD);
+	}
+
+	/*
 	 * NOTE: A locked chain's data cannot be modified without first
 	 *	 calling hammer2_chain_modify().
 	 */
@@ -5678,9 +5691,12 @@ hammer2_chain_selfheal_parity(hammer2_chain_t *chain, void *bdata,
 	int target_failed = hmp->raid_failed[disk_idx];
 	char *recon;
 	char *extra;
+	uint64_t badhash;
 	int error;
 	int e;
 
+	/* the repair kthread writes only while the slot still holds this */
+	badhash = hammer2_io_repair_hash(bdata, chain->bytes);
 	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
 	if (!target_failed) {
 		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
@@ -5696,8 +5712,9 @@ hammer2_chain_selfheal_parity(hammer2_chain_t *chain, void *bdata,
 			    "%016jx disk %d (parity reconstruction)\n",
 			    (uintmax_t)bref->data_off, disk_idx);
 			/* ownership of recon passes to the repair queue */
-			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
-			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+			hammer2_io_repair_enqueue_chk(hmp, disk_idx, col_base,
+			    (int)stripe_unit, 0, (int)stripe_unit, recon,
+			    (int)off, (int)chain->bytes, badhash);
 			return 0;
 		}
 	}
@@ -5727,8 +5744,9 @@ hammer2_chain_selfheal_parity(hammer2_chain_t *chain, void *bdata,
 		if (target_failed) {
 			kfree(recon, M_HAMMER2);
 		} else {
-			hammer2_io_repair_enqueue(hmp, disk_idx, col_base,
-			    (int)stripe_unit, 0, (int)stripe_unit, recon);
+			hammer2_io_repair_enqueue_chk(hmp, disk_idx, col_base,
+			    (int)stripe_unit, 0, (int)stripe_unit, recon,
+			    (int)off, (int)chain->bytes, badhash);
 		}
 		return 0;
 	}
@@ -5783,14 +5801,38 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 		 * The read was already served by degraded reconstruction,
 		 * so another column of the row is bad as well.  For data,
 		 * find it with a second erasure (the counters go to that
-		 * disk).  Metadata on a failed disk came from a mirror
-		 * copy that was already checked; nothing more to try.
+		 * disk).  Metadata on a failed disk came from the first
+		 * surviving mirror copy, taken without a check: try every
+		 * copy until one verifies.
 		 */
 		if ((bref->type == HAMMER2_BREF_TYPE_DATA ||
 		     bref->type == HAMMER2_BREF_TYPE_DIRENT) &&
 		    hammer2_chain_selfheal_parity(chain, bdata,
 						  disk_idx) == 0) {
 			return 0;
+		}
+		if (bref->type == HAMMER2_BREF_TYPE_INODE ||
+		    bref->type == HAMMER2_BREF_TYPE_INDIRECT ||
+		    bref->type == HAMMER2_BREF_TYPE_FREEMAP_NODE ||
+		    bref->type == HAMMER2_BREF_TYPE_FREEMAP_LEAF) {
+			hammer2_off_t dev_pbase = dio->pbase - dio->dbase;
+			hammer2_off_t mbase = bref->data_off &
+					      ~HAMMER2_OFF_MASK_RADIX;
+			int moff = (int)((mbase & HAMMER2_RAID6_PHYS_MASK) -
+					 dev_pbase);
+
+			if (moff >= 0 &&
+			    moff + (int)chain->bytes <= dio->psize &&
+			    hammer2_io_metadata_mirror_heal(hmp, disk_idx,
+				dev_pbase, dio->psize, moff, bref, bdata,
+				chain->bytes) == 0) {
+				krateprintf(&krate_h2heal,
+				    "hammer2: selfheal: read-path repair "
+				    "data_off %016jx disk %d failed "
+				    "(metadata mirror copy)\n",
+				    (uintmax_t)bref->data_off, disk_idx);
+				return 0;
+			}
 		}
 		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
 		atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx], 1);
