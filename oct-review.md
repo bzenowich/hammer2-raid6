@@ -827,6 +827,8 @@ refcount; frees an empty row) when the column was never put.
 - **Checked (phase 2).** Strategy writes run on XOP groups `0..sgroups*mod`; non-strategy XOPs, including `xop_inode_flush`, use `xbase` and above, so the two sets of threads are disjoint and a flush XOP never queues behind a pending-column write. `hammer2_trans_init(ISFLUSH)` interlocks only against other ISFLUSH transactions; strategy writes run in normal/BUFCACHE transactions and never block on the flush. The flusher holds no `rebuild_lk` across the wait. Only the syncer's VOLHDR flush runs `seal_all`; `fsync(2)` does not wait.
 - The timeout turns any missed deadlock into a failed flush, not a hang.
 
+- **Liveness (reviewed).** Every reservation reaches its put: stripe_alloc registers only on success; the strategy XOP runs alloc, newnz (sets DIRTY in every branch) and the drop in one pass; `hammer2_io_inval` is a NOP so a deleted chain's dio still writes at lastdrop; a logical buffer discarded by rm/truncate never reaches strategy, so it never reserves; v3 has dedup off. Gaps found and closed with `hammer2_raid6_col_release` (zero column, dropped, counter `rz_col_released`): a DIRTY DATA/DIRENT dio that lastdrops without GOOD (io error in getblk, failed degraded rebuild), and `chain_modify`'s bread error after the alloc. Untested by the suite (needs 3 failures or injection).
+
 ### 10.7 Tests
 
 - **Group R (R5) must pass**: the three-write recipe, then umount and `h2stripe_check` clean.

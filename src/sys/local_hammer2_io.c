@@ -965,11 +965,28 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			else
 				bqrelse(bp);
 		}
-	} else if (bp) {
+	} else {
 		/*
 		 * Errored disposal of bp
 		 */
-		brelse(bp);
+		if (bp)
+			brelse(bp);
+
+		/*
+		 * v3: a dirtied DATA/DIRENT dio whose I/O errored (GOOD
+		 * clear) never reaches the open_row_add_data above.  Its
+		 * column is still reserved, and a row of an older
+		 * generation seals only once every reserved column has
+		 * arrived, so release it as a zero column.
+		 */
+		if ((orefs & HAMMER2_DIO_DIRTY) &&
+		    hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+		     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
+			hammer2_raid6_col_release(hmp,
+			    pbase & HAMMER2_RAID6_PHYS_MASK, dio->disk_idx);
+		}
 	}
 
 	if (dio->absent_data) {

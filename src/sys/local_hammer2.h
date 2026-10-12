@@ -2264,6 +2264,8 @@ void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 int  hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int  hammer2_raid6_col_arrived(hammer2_dev_t *hmp,
 			       const hammer2_blockref_t *bref);
+void hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
+			       int disk_idx);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
 void hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 		hammer2_off_t *freep);
@@ -2347,6 +2349,7 @@ extern int hammer2_raid6_put_stall_ms;
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */
 extern long hammer2_rz_open_high;	/* peak open rows */
 extern long hammer2_rz_rewrite_slots;	/* rewrites that took a fresh slot */
+extern long hammer2_rz_col_released;
 extern long hammer2_rz_put_anomaly;	/* second put on an arrived column */
 extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
 

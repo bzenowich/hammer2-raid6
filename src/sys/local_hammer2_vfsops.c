@@ -97,6 +97,7 @@ long hammer2_rz_open_left;
 long hammer2_rz_open_high;
 long hammer2_rz_rewrite_slots;
 long hammer2_rz_put_anomaly;
+long hammer2_rz_col_released;
 long hammer2_rz_gen_wait_fail;
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
@@ -199,6 +200,9 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_rewrite_slots, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_put_anomaly, CTLFLAG_RD,
 	   &hammer2_rz_put_anomaly, 0,
 	   "v3 RAID6: second put on an arrived column");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_col_released, CTLFLAG_RD,
+	   &hammer2_rz_col_released, 0,
+	   "v3 RAID6: reservations released as zero columns after a failed write");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_gen_wait_fail, CTLFLAG_RD,
 	   &hammer2_rz_gen_wait_fail, 0,
 	   "v3 RAID6: flushes failed by a row-generation wait");

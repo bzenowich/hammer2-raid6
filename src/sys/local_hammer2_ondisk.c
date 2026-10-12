@@ -2361,6 +2361,46 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
+ * Release a reservation whose column will never be put: the write
+ * failed between stripe_alloc and putblk (the dio was errored, so
+ * putblk had no data to hand over).  The column is put as a zero
+ * buffer flagged dropped, so the row seals with zero in that column
+ * (on disk and in P/Q) instead of making every later flush wait for it.
+ * Nothing happens if the row is gone or the column already arrived.
+ * Counted in vfs.hammer2.rz_col_released.
+ */
+void
+hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
+			  int disk_idx)
+{
+	struct hammer2_open_row *r;
+	void *zero;
+	size_t bytes;
+	int need = 0;
+
+	if (!hmp->open_rows_inited || disk_idx < 0)
+		return;
+	bytes = hmp->raid_config.stripe_unit;
+	zero = kmalloc(bytes, M_HAMMER2, M_WAITOK | M_ZERO);
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
+		if (r->phys_off != phys_off)
+			continue;
+		need = ((r->alloc_mask & (1U << disk_idx)) &&
+			r->col_data[disk_idx] == NULL);
+		break;
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	if (need) {
+		hammer2_rz_col_released++;
+		hammer2_raid6_open_row_add_data(hmp, phys_off, disk_idx,
+						zero, bytes, 1);
+	} else {
+		kfree(zero, M_HAMMER2);
+	}
+}
+
+/*
  * Seal the open rows at a TXG flush, before VOP_FSYNC and the volume
  * header (oct-review.md §10.2).  Called after the last chain flush has
  * returned: every chain the header can commit was allocated before this

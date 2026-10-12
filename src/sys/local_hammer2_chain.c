@@ -1910,6 +1910,20 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			hammer2_io_brelse(&dio);
 			hammer2_io_brelse(&chain->dio);
 			chain->data = NULL;
+			/*
+			 * v3: the slot allocated above will never be put
+			 * (a READ leaves the dio clean), so release it or
+			 * its row can never seal.
+			 */
+			if (hammer2_raid6_v3(hmp) &&
+			    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+			     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+				hammer2_raid6_col_release(hmp,
+				    chain->bref.data_off &
+				    HAMMER2_RAID6_PHYS_MASK &
+				    ~(hammer2_off_t)HAMMER2_OFF_MASK_RADIX,
+				    chain->bref.copyid);
+			}
 			break;
 		}
 		chain->error = 0;

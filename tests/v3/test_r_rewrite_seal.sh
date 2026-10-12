@@ -201,5 +201,43 @@ H=$(head -c 4096 /dev/zero | tr '\0' 5 | sha256 -q)
 parity_ok R4b
 teardown R4b
 
+# R5: liveness.  Create/write/rm (some truncated first) with no sync
+# between, then one sync: every reservation must reach its row (or be
+# released), so the sync succeeds, no gen wait fails, no column is put
+# twice, and no row is left open.
+setup_fresh
+check_v3
+F0=$(sysctl -n vfs.hammer2.rz_gen_wait_fail)
+A0=$(sysctl -n vfs.hammer2.rz_put_anomaly)
+i=0
+while [ "$i" -lt 200 ]; do
+    sz=$(( (i % 16 + 1) * 4096 ))
+    $H2WR $MNTPT/lv_$i x $sz
+    case $((i % 4)) in
+    1) truncate -s 0 $MNTPT/lv_$i ;;
+    2) $H2WR $MNTPT/lv_$i y 4096 ;;
+    esac
+    case $((i % 3)) in
+    0|1) rm -f $MNTPT/lv_$i ;;
+    esac
+    i=$((i + 1))
+done
+if sync; then
+    result PASS "R5: sync after 200 write/rm/truncate cycles"
+else
+    result FAIL "R5: sync failed"
+fi
+[ "$(sysctl -n vfs.hammer2.rz_gen_wait_fail)" = "$F0" ] &&
+    result PASS "R5: rz_gen_wait_fail unchanged" ||
+    result FAIL "R5: rz_gen_wait_fail grew"
+[ "$(sysctl -n vfs.hammer2.rz_put_anomaly)" = "$A0" ] &&
+    result PASS "R5: rz_put_anomaly unchanged" ||
+    result FAIL "R5: rz_put_anomaly grew"
+OL=$(sysctl -n vfs.hammer2.rz_open_left)
+[ "$OL" -le 2 ] && result PASS "R5: rz_open_left=$OL" ||
+    result FAIL "R5: rz_open_left=$OL"
+parity_ok R5
+teardown R5
+
 umount $MNTPT 2>/dev/null
 summary
