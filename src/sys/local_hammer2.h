@@ -2352,6 +2352,9 @@ extern long hammer2_rz_rewrite_slots;	/* rewrites that took a fresh slot */
 extern long hammer2_rz_col_released;
 extern long hammer2_rz_put_anomaly;	/* second put on an arrived column */
 extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
+extern long hammer2_rz_seal_full;	/* rows sealed when filled */
+extern long hammer2_rz_seal_flush;	/* rows sealed by a flush */
+extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
 
 static __inline int
 hammer2_inject_eio(int disk_idx)

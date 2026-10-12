@@ -2350,8 +2350,10 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	if (hammer2_raid6_row_complete(hmp, r)) {
 		if (r->gen != hmp->rz_gen && hmp->rz_gen_waiting)
 			wake = 1;
-		if (r->n_alloc >= r->ndata)
+		if (r->n_alloc >= r->ndata) {
+			hammer2_rz_seal_full++;
 			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+		}
 	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
@@ -2446,6 +2448,9 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 				stuck = r;
 		}
 		if (r != NULL) {
+			hammer2_rz_seal_flush++;
+			if (r->n_alloc < r->ndata)
+				hammer2_rz_seal_flush_short++;
 			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 			/* progress: the wait starts over */
 			deadline = ticks +
