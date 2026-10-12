@@ -463,6 +463,9 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	hammer2_chain_t *parent;
 	hammer2_chain_t *rdrop;
 
+	/* a ticket in a shared column must not outlive the chain */
+	hammer2_raid6_subcol_net(chain);
+
 	/*
 	 * We need chain's spinlock to interlock the sub-tree test.
 	 * We already have chain's mutex, protecting chain->parent.
@@ -1945,10 +1948,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			if (hammer2_raid6_v3(hmp) &&
 			    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
 			     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
-				hammer2_raid6_col_release(hmp,
-				    chain->bref.data_off &
-				    HAMMER2_RAID6_COLUMN_MASK,
-				    chain->bref.copyid);
+				hammer2_raid6_chain_release(hmp, chain);
 			}
 			break;
 		}

@@ -92,6 +92,7 @@ uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
+int hammer2_raid6_subcol_max;	/* v3: chains up to this size share a column (0 = off) */
 int hammer2_raid6_subcol_test;	/* test hook: place chains inside their column */
 int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;
@@ -105,6 +106,12 @@ long hammer2_rz_gen_wait_fail;
 long hammer2_rz_seal_full;
 long hammer2_rz_seal_flush;
 long hammer2_rz_seal_flush_short;
+long hammer2_rz_subcol_open;
+long hammer2_rz_subcol_close;
+long hammer2_rz_subcol_chains;
+long hammer2_rz_subcol_nofit;
+long hammer2_rz_subcol_inplace;
+long hammer2_rz_subcol_stale;
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -189,6 +196,10 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_put_stall_ms, CTLFLAG_RW,
 	   &hammer2_raid6_put_stall_ms, 0,
 	   "test hook: stall the next v3 data write (ms) between reserve and put");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_subcol_max, CTLFLAG_RW,
+	   &hammer2_raid6_subcol_max, 0,
+	   "v3 RAID6: data chains up to this many bytes (a power of two, "
+	   "1024-32768) share a column; 0 = every chain takes its own column");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_subcol_test, CTLFLAG_RW,
 	   &hammer2_raid6_subcol_test, 0,
 	   "test hook: place new v3 data chains smaller than 64 KB at a "
@@ -226,6 +237,23 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_full, CTLFLAG_RD,
 	   "v3 RAID6: rows sealed by the put that filled them");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush, 0, "v3 RAID6: rows sealed by a flush");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_open, CTLFLAG_RD,
+	   &hammer2_rz_subcol_open, 0, "v3 RAID6: sub-columns opened");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_close, CTLFLAG_RD,
+	   &hammer2_rz_subcol_close, 0,
+	   "v3 RAID6: sub-columns closed (pin dropped, column put)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_chains, CTLFLAG_RD,
+	   &hammer2_rz_subcol_chains, 0,
+	   "v3 RAID6: chains placed in a sub-column");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_nofit, CTLFLAG_RD,
+	   &hammer2_rz_subcol_nofit, 0,
+	   "v3 RAID6: sub-columns closed because a chain found no aligned range");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_inplace, CTLFLAG_RD,
+	   &hammer2_rz_subcol_inplace, 0,
+	   "v3 RAID6: rewrites that kept their range in an open sub-column");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_stale, CTLFLAG_RD,
+	   &hammer2_rz_subcol_stale, 0,
+	   "v3 RAID6: sub-column tickets released by a safety net (a leak)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush_short, 0,
 	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");

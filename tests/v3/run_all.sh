@@ -4,7 +4,7 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs A B C D E F G H I J K L N P S T U,
+#   If no groups are specified, runs A B C D E F G H I J K L N P S T U V,
 #   then M (last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #   Groups: A basic, B single failure, C dual failure, D resilver,
@@ -12,7 +12,7 @@
 #   I unclean unmount, J packed rows, K scrub, L self-heal,
 #   M multi-corrupt, N capacity, P performance shape (devstat),
 #   R rewrite/seal (opt-in, not in the default list), S split header,
-#   T slot reuse, U sub-column offsets (test hook raid6_subcol_test).  Run R with: sh run_all.sh R
+#   T slot reuse, U sub-column offsets (test hook raid6_subcol_test), V sub-column allocation (raid6_subcol_max).  Run R with: sh run_all.sh R
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
@@ -62,7 +62,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L N P S T U M}"
+GROUPS="${*:-A B C D E F G H I J K L N P S T U V M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -85,7 +85,8 @@ for GROUP in $GROUPS; do
     S) run_group "Group S" "$SCRIPTDIR/test_s_split_header.sh" ;;
     T) run_group "Group T" "$SCRIPTDIR/test_t_reuse.sh"        ;;
     U) run_group "Group U" "$SCRIPTDIR/test_u_subcol_offset.sh" ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S T U)" ;;
+    V) run_group "Group V" "$SCRIPTDIR/test_v_subcol_alloc.sh" ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S T U V)" ;;
     esac
 done
 
