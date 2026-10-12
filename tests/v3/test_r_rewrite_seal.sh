@@ -25,30 +25,15 @@ echo "=== Group R: rewrite after row seal (R5, NDISKS=$NDISKS) ==="
 
 # h2wr <file> <byte> <nbytes> [fsync]: overwrite from offset 0 with
 # <nbytes> of <byte>, through an O_SYNC descriptor.
-H2WR=/var/tmp/h2wr
-cat > /var/tmp/h2wr.c <<'CEOF'
-#include <fcntl.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-int
-main(int argc, char **argv)
-{
-	size_t n = (size_t)atol(argv[3]);
-	char *buf = malloc(n);
-	int fd = open(argv[1], O_WRONLY | O_CREAT | O_SYNC, 0644);
-
-	if (fd < 0 || buf == NULL)
-		return 1;
-	memset(buf, argv[2][0], n);
-	if (pwrite(fd, buf, n, 0) != (ssize_t)n)
-		return 1;
-	if (argc > 4 && fsync(fd) != 0)
-		return 1;
-	return close(fd) != 0;
-}
-CEOF
-cc -O -o $H2WR /var/tmp/h2wr.c || { echo "  FATAL: cc failed"; exit 1; }
+# Prebuilt (the Pi has no compiler; tools/pi-h2deploy.sh cross-builds it),
+# else built from src/diag/h2wr.c.
+H2WR=$(command -v h2wr 2>/dev/null)
+[ -n "$H2WR" ] || H2WR=$(find /usr/local/bin /root /var/tmp -name h2wr -type f 2>/dev/null | head -1)
+if [ -z "$H2WR" ]; then
+    H2WR=/var/tmp/h2wr
+    SRC=$(find "$SCRIPTDIR/../../src/diag" /root/h2diag -name h2wr.c 2>/dev/null | head -1)
+    [ -n "$SRC" ] && cc -O -o $H2WR "$SRC" || { echo "  FATAL: h2wr not available (build src/diag/h2wr.c)"; exit 1; }
+fi
 
 if ! command -v h2stripe_check > /dev/null 2>&1; then
     H2CHECK=$(find /usr/local/bin /usr/bin /root /var/tmp -name h2stripe_check 2>/dev/null | head -1)
