@@ -198,7 +198,7 @@ setup_fresh ${D4_SIZE:-2g}
 check_v3
 dd if=/dev/urandom of=$MNTPT/d4_a bs=65536 count=80 2>/dev/null
 cp $MNTPT/d4_a $MNTPT/d4_b
-sha256 $MNTPT/d4_a $MNTPT/d4_b > /var/tmp/v4_d4.txt
+sha256 $MNTPT/d4_a $MNTPT/d4_b > /var/tmp/v3_d4.txt
 sync
 d4_resilver 0
 D4_T0=${D4_T:-0}
@@ -220,7 +220,7 @@ if fail_disk "$D5_DISK" "D5"; then
     write_ref_data "new"
     rm $MNTPT/old_b
     dd if=/dev/urandom of=$MNTPT/old_b bs=65536 count=64 2>/dev/null
-    sha256 $MNTPT/old_a $MNTPT/old_b > /var/tmp/v4_old.txt
+    sha256 $MNTPT/old_a $MNTPT/old_b > /var/tmp/v3_old.txt
     sync
     replace_disk "$D5_DISK" "D5" && check_rebuilt "$D5_DISK" "D5" "old" "new"
 fi

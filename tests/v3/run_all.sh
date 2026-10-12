@@ -4,10 +4,15 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs all groups A..N, P, S, T (M last: it can hang the guest).
+#   If no groups are specified, runs A B C D E F G H I J K L N P S T,
+#   then M (last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
-#   Opt-in groups, never in the default list: R (R5 repro; expected to
-#   panic an unfixed kernel).  Run with: sh run_all.sh R
+#   Groups: A basic, B single failure, C dual failure, D resilver,
+#   E EIO injection, F COW invariant, G auto-fail, H snapshots degraded,
+#   I unclean unmount, J packed rows, K scrub, L self-heal,
+#   M multi-corrupt, N capacity, P performance shape (devstat),
+#   R rewrite/seal (opt-in, not in the default list), S split header,
+#   T slot reuse.  Run R with: sh run_all.sh R
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
@@ -26,7 +31,7 @@ SUITE_ERRORS=""
 run_group() {
     local name="$1"
     local script="$2"
-    local tmpout="/var/tmp/v4_group_out.txt"
+    local tmpout="/var/tmp/v3_group_out.txt"
     echo ""
     echo "########## $name ##########"
     # Run script once, capture output, then display and parse from the file.

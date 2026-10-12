@@ -70,10 +70,10 @@ teardown "K1"
 # early allocations of our reference file.
 setup_fresh
 check_v3
-# 32 MB file = 256 rows; with NDISKS=4 / open_rows cap = 16, many
-# rows get TXG-force-sealed partial (ncols=1).  write_row zeros the
-# unwritten data cols on disk (see local_hammer2_raid6.c), so parity
-# reconstruction on those rows works correctly under scrub repair.
+# 32 MB file = 512 64 KB chains, packed up to ndata per row.  A row
+# still open at the flush is sealed partial (ncols < ndata).  write_row
+# zeros the unwritten data cols on disk (see local_hammer2_raid6.c), so
+# parity reconstruction on those rows works correctly under scrub repair.
 dd if=/dev/urandom of=$MNTPT/k2 bs=65536 count=512 2>/dev/null
 sha256 $MNTPT/k2 > /var/tmp/k2_ref.txt
 sync; sync

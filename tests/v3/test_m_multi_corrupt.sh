@@ -31,7 +31,7 @@ m_verify() {
     guarded 120 sh -c "sha256 $MNTPT/$1_a $MNTPT/$1_b > /var/tmp/m_check.txt 2>&1"
     local rc=$?
     [ "$rc" = 124 ] && return 124
-    if diff -q /var/tmp/v4_$1.txt /var/tmp/m_check.txt > /dev/null 2>&1; then
+    if diff -q /var/tmp/v3_$1.txt /var/tmp/m_check.txt > /dev/null 2>&1; then
         result PASS "$2"
     else
         result FAIL "$2"

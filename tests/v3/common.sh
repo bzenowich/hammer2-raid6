@@ -157,7 +157,7 @@ remount() {
 # unrepairable brefs (the mdadm "check, mismatch_cnt == 0" analogue).
 scrub_clean() {
     local label="$1"
-    local out=/var/tmp/v4_scrub.txt
+    local out=/var/tmp/v3_scrub.txt
     hammer2 -s $MNTPT raid scrub > $out 2>&1
     local rc=$?
     local bad unrep done_
@@ -295,7 +295,7 @@ setup_fresh() {
     fi
     while [ "$attempt" -lt 5 ]; do
         # shellcheck disable=SC2086
-        if newfs_hammer2 -R 6 -L V3TEST $sizeopt $DEVS > /var/tmp/v4_newfs.txt 2>&1
+        if newfs_hammer2 -R 6 -L V3TEST $sizeopt $DEVS > /var/tmp/v3_newfs.txt 2>&1
         then
             newfs_ok=1
             break
@@ -309,7 +309,7 @@ setup_fresh() {
         newfs_hammer2 -R 6 -L V3TEST $sizeopt $DEVS 2>&1 | head -5
         exit 1
     fi
-    if ! layout_from_newfs /var/tmp/v4_newfs.txt; then
+    if ! layout_from_newfs /var/tmp/v3_newfs.txt; then
         echo "  FATAL: no md-extent0 line in newfs_hammer2 output"
         exit 1
     fi
@@ -344,19 +344,19 @@ write_ref_data() {
     local prefix="${1:-ref}"
     dd if=/dev/urandom of=$MNTPT/${prefix}_a bs=65536 count=128 2>/dev/null
     dd if=/dev/urandom of=$MNTPT/${prefix}_b bs=65536 count=64 2>/dev/null
-    sha256 $MNTPT/${prefix}_a > /var/tmp/v4_${prefix}.txt
-    sha256 $MNTPT/${prefix}_b >> /var/tmp/v4_${prefix}.txt
+    sha256 $MNTPT/${prefix}_a > /var/tmp/v3_${prefix}.txt
+    sha256 $MNTPT/${prefix}_b >> /var/tmp/v3_${prefix}.txt
     sync; sync
 }
 
 verify_ref() {
     local label="$1"
     local prefix="${2:-ref}"
-    sha256 $MNTPT/${prefix}_a > /var/tmp/v4_check.txt 2>&1
-    sha256 $MNTPT/${prefix}_b >> /var/tmp/v4_check.txt 2>&1
-    if [ -s /var/tmp/v4_${prefix}.txt ] && \
-       ! grep -q "No such\|rror" /var/tmp/v4_check.txt && \
-       diff -q /var/tmp/v4_${prefix}.txt /var/tmp/v4_check.txt \
+    sha256 $MNTPT/${prefix}_a > /var/tmp/v3_check.txt 2>&1
+    sha256 $MNTPT/${prefix}_b >> /var/tmp/v3_check.txt 2>&1
+    if [ -s /var/tmp/v3_${prefix}.txt ] && \
+       ! grep -q "No such\|rror" /var/tmp/v3_check.txt && \
+       diff -q /var/tmp/v3_${prefix}.txt /var/tmp/v3_check.txt \
             > /dev/null 2>&1; then
         result PASS "$label"
     else
