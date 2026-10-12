@@ -1083,9 +1083,7 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
 	struct buf *bp;
 	int off;
 
-	lbase -= dio->dbase;
-	off = (int)((lbase & ~HAMMER2_OFF_MASK_RADIX) -
-		    (off_t)(dio->pbase - dio->dbase));
+	off = hammer2_io_boff(dio, lbase);
 
 	bp = dio->bp;
 	KKASSERT(bp != NULL);
@@ -1224,6 +1222,8 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
 	int lsize;
 	int isgood;
 
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, bref->data_off, bref->type, 1, &isgood, NULL);
 	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
 		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
@@ -1259,6 +1259,8 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 		return;
 	if (btype != HAMMER2_BREF_TYPE_DATA)
 		return;
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, data_off, btype, 0, &isgood, NULL);
 	if (dio) {
 		if (data_off < dio->pbase ||
@@ -1285,6 +1287,8 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
 	hammer2_io_t *dio;
 	int isgood;
 
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, data_off, HAMMER2_BREF_TYPE_DATA,
 			       0, &isgood, NULL);
 	if (dio) {

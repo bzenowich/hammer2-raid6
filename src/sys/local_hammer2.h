@@ -1503,6 +1503,20 @@ MPTOPMP(struct mount *mp)
 #define HAMMER2_DEDUP_FRAG      (HAMMER2_PBUFSIZE / 64)
 #define HAMMER2_DEDUP_FRAGRADIX (HAMMER2_PBUFRADIX - 6)
 
+/*
+ * Byte offset of data_off within the dio's buffer.  A v3 DATA/DIRENT dio
+ * carries its disk index in the top bits of pbase (hammer2_dio_key), which
+ * data_off does not, so compare the two without those bits.
+ */
+static __inline
+int
+hammer2_io_boff(const hammer2_io_t *dio, hammer2_off_t data_off)
+{
+	return (int)((data_off & ~HAMMER2_OFF_MASK_RADIX &
+		      ~HAMMER2_RAID6_DISK_MASK) -
+		     (dio->pbase & ~HAMMER2_RAID6_DISK_MASK));
+}
+
 static __inline
 uint64_t
 hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
@@ -1511,8 +1525,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
 	int bits;
 	uint64_t mask;
 
-	bbeg = (int)((data_off & ~HAMMER2_OFF_MASK_RADIX) - dio->pbase) >>
-	       HAMMER2_DEDUP_FRAGRADIX;
+	bbeg = hammer2_io_boff(dio, data_off) >> HAMMER2_DEDUP_FRAGRADIX;
 	bits = (int)((bytes + (HAMMER2_DEDUP_FRAG - 1)) >>
 	       HAMMER2_DEDUP_FRAGRADIX);
 	if (bbeg + bits == 64)
