@@ -47,6 +47,18 @@ CRASH_FAIL="${CRASH_FAIL:-}"
 CRASH_STALL="${CRASH_STALL:-}"
 STALL_CMD=""
 [ -n "$CRASH_STALL" ] && STALL_CMD="sysctl vfs.hammer2.raid6_put_stall_ms=300 > /dev/null;"
+# CRASH_SUBCOL=<bytes>: set vfs.hammer2.raid6_subcol_max in the guest, write
+# 1-32 KB files, and run a second writer that never syncs, so the reset
+# lands with an open sub-column (oct-review.md section 11.4).
+CRASH_SUBCOL="${CRASH_SUBCOL:-}"
+SUB_CMD=""
+WBS=65536
+SUB_DAEMON=""
+if [ -n "$CRASH_SUBCOL" ]; then
+    SUB_CMD="sysctl vfs.hammer2.raid6_subcol_max=$CRASH_SUBCOL > /dev/null;"
+    WBS=1024
+    SUB_DAEMON="daemon -f sh -c 'j=0; while :; do dd if=/dev/urandom of=/mnt/v3test/u\$j bs=1k count=\$((j % 7 + 1)) 2>/dev/null; j=\$((j + 1)); done';"
+fi
 FAILS=0
 # The module deploy.sh builds.  A reset guest boots without hammer2
 # loaded, and a bare `kldload hammer2` would take /boot/kernel's copy,
@@ -92,9 +104,10 @@ while [ "$round" -le "$CRASH_ROUNDS" ]; do
                 [ \$((i % 4)) = 3 ] && hammer2 bulkfree /mnt/v3test > /dev/null 2>&1;
                 i=\$((i + 1)); done'
         else
+            $SUB_CMD $SUB_DAEMON
             daemon -f sh -c 'i=0; while :; do
                 $STALL_CMD
-                dd if=/dev/urandom of=/mnt/v3test/c\$i bs=65536 count=\$((i % 32 + 1)) 2>/dev/null;
+                dd if=/dev/urandom of=/mnt/v3test/c\$i bs=$WBS count=\$((i % 32 + 1)) 2>/dev/null;
                 h=\$(sha256 -q /mnt/v3test/c\$i); sync;
                 echo \"c\$i \$h\" >> $LOG; fsync $LOG; i=\$((i + 1)); done'
         fi" ||
@@ -116,6 +129,9 @@ while [ "$round" -le "$CRASH_ROUNDS" ]; do
         continue
     fi
     echo "  ${B2} files logged; resetting guest"
+    if [ -n "$CRASH_SUBCOL" ]; then
+        "$GSH" "sysctl vfs.hammer2.raid6_subcol_max vfs.hammer2.rz_subcol_open vfs.hammer2.rz_subcol_close vfs.hammer2.rz_subcol_chains" 2>/dev/null | sed 's/^/    pre-reset: /'
+    fi
     "$QMP" system_reset > /dev/null
     sleep 30
     wait_guest

@@ -871,6 +871,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 					 mtid, errorp, ip->meta.check_algo);
 		}
 		if (chain) {
+			hammer2_raid6_subcol_done(chain);
 			hammer2_chain_unlock(chain);
 			hammer2_chain_drop(chain);
 		}
@@ -1182,6 +1183,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	}
 done:
 	if (chain) {
+		hammer2_raid6_subcol_done(chain);
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
 	}
@@ -1238,6 +1240,7 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 		}
 		if (chain) {
+			hammer2_raid6_subcol_done(chain);
 			hammer2_chain_unlock(chain);
 			hammer2_chain_drop(chain);
 		}

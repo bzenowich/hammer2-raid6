@@ -382,7 +382,7 @@ RB_PROTOTYPE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
 #define HAMMER2_CHAIN_NOTTESTED		0x00000080	/* crc not generated */
 #define HAMMER2_CHAIN_TESTEDGOOD	0x00000100	/* crc tested good */
 #define HAMMER2_CHAIN_ONFLUSH		0x00000200	/* on a flush list */
-#define HAMMER2_CHAIN_UNUSED0400	0x00000400
+#define HAMMER2_CHAIN_SUBHELD		0x00000400	/* holds a sub-column ticket */
 #define HAMMER2_CHAIN_VOLUMESYNC	0x00000800	/* needs volume sync */
 #define HAMMER2_CHAIN_UNUSED1000	0x00001000
 #define HAMMER2_CHAIN_COUNTEDBREFS	0x00002000	/* block table stats */
@@ -1156,6 +1156,27 @@ struct hammer2_mirror_pend {
 #define HAMMER2_MIRROR_HASH	64
 #define HAMMER2_MIRROR_MAXPEND	256	/* 16 MB of 64 KB blocks */
 
+/*
+ * An open sub-column (oct-review.md section 11.4): one column of an open
+ * row that several small data chains share.  used_mask has one bit per
+ * 1 KB; a chain of size S (a power of two, 1-32 KB) takes the first free
+ * S-aligned range.  The sub-column holds one ref on the column's dio (the
+ * pin), so the column is put exactly once, when the pin is dropped at
+ * close.  npending counts chains that have reserved a range and not yet
+ * finished their write (HAMMER2_CHAIN_SUBHELD); the pin is dropped when
+ * the sub-column is closing and npending is 0.  All fields under
+ * hmp->stripe_bitmap_spin.
+ */
+struct hammer2_subcol {
+	struct hammer2_open_row *row;
+	hammer2_io_t	*dio;		/* the pin; NULL until pinned */
+	uint64_t	used_mask;	/* 1 KB units taken */
+	int		disk;		/* data disk of the column */
+	int		npending;	/* tickets outstanding */
+	int		pinning;	/* creator is still getting the dio */
+	int		closing;	/* takes no new chains */
+};
+
 struct hammer2_open_row {
 	TAILQ_ENTRY(hammer2_open_row) entry;	/* all open rows, by registration */
 	TAILQ_ENTRY(hammer2_open_row) pentry;	/* packable rows */
@@ -1170,7 +1191,9 @@ struct hammer2_open_row {
 	size_t		bytes;		/* cached stripe_unit */
 	uint32_t	dropped_mask;	/* cols putblk did not write (disk failed) */
 	uint32_t	gen;		/* hmp->rz_gen at registration */
+	uint32_t	sub_mask;	/* columns managed as sub-columns */
 	void		*col_data[HAMMER2_MAX_VOLUMES];
+	struct hammer2_subcol *sub[HAMMER2_MAX_VOLUMES]; /* open ones */
 };
 
 RB_HEAD(hammer2_orow_tree, hammer2_open_row);
@@ -1284,6 +1307,7 @@ struct hammer2_dev {
 	long		open_rows_high;		/* peak entry count (diag) */
 	uint32_t	rz_gen;			/* current row generation */
 	int		rz_gen_waiting;		/* flusher sleeping on open_rows */
+	struct hammer2_subcol *sc_open;		/* the open sub-column, if any */
 
 	/*
 	 * Deferred metadata mirror copies (v3), one entry per block.
@@ -2288,6 +2312,10 @@ void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 int  hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int  hammer2_raid6_col_arrived(hammer2_dev_t *hmp,
 			       const hammer2_blockref_t *bref);
+int  hammer2_raid6_col_rewrite(hammer2_dev_t *hmp, hammer2_chain_t *chain);
+void hammer2_raid6_subcol_done(hammer2_chain_t *chain);
+void hammer2_raid6_subcol_net(hammer2_chain_t *chain);
+void hammer2_raid6_chain_release(hammer2_dev_t *hmp, hammer2_chain_t *chain);
 void hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			       int disk_idx);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
@@ -2368,6 +2396,8 @@ extern int hammer2_inject_eio_autofail;
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;
+extern int hammer2_raid6_subcol_test;
+extern int hammer2_raid6_subcol_max;
 
 /* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */
@@ -2381,6 +2411,12 @@ extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
 extern long hammer2_rz_seal_full;	/* rows sealed when filled */
 extern long hammer2_rz_seal_flush;	/* rows sealed by a flush */
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
+extern long hammer2_rz_subcol_open;	/* sub-columns opened */
+extern long hammer2_rz_subcol_close;	/* sub-columns closed (pin dropped) */
+extern long hammer2_rz_subcol_chains;	/* chains placed in a sub-column */
+extern long hammer2_rz_subcol_nofit;	/* sub-columns closed: no aligned range */
+extern long hammer2_rz_subcol_inplace;	/* rewrites that kept their range */
+extern long hammer2_rz_subcol_stale;	/* tickets released by a safety net */
 
 static __inline int
 hammer2_inject_eio(int disk_idx)

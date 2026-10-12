@@ -1998,14 +1998,37 @@ hammer2_raid6_open_rows_init(hammer2_dev_t *hmp)
 	hmp->open_rows_high = 0;
 }
 
+static hammer2_io_t *hammer2_raid6_subcol_close_locked(hammer2_dev_t *hmp,
+				struct hammer2_subcol *sc);
+static void hammer2_raid6_subcol_drop(struct hammer2_subcol *sc,
+				hammer2_io_t *dio);
+
 void
 hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 {
 	struct hammer2_open_row *r;
+	struct hammer2_subcol *sc;
+	hammer2_io_t *dio;
 	int d;
 
 	if (!hmp->open_rows_inited)
 		return;
+	/*
+	 * A sub-column still open holds a pin on its dio.  The unmount
+	 * flush has closed it; this is for a mount that never flushed.
+	 */
+	for (;;) {
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		sc = hmp->sc_open;
+		dio = NULL;
+		if (sc)
+			dio = hammer2_raid6_subcol_close_locked(hmp, sc);
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		if (dio)
+			hammer2_raid6_subcol_drop(sc, dio);
+		if (sc == NULL || dio == NULL)
+			break;
+	}
 	if (hmp->open_rows_count)
 		kprintf("hammer2: v3 unmount drops %ld open rows "
 			"(columns not committed)\n", hmp->open_rows_count);
@@ -2019,10 +2042,16 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 				kfree(r->col_data[d], M_HAMMER2);
 				r->col_data[d] = NULL;
 			}
+			if (r->sub[d]) {
+				/* tickets outstanding: a leak, drop the pin */
+				kfree(r->sub[d], M_HAMMER2);
+				r->sub[d] = NULL;
+			}
 		}
 		kfree(r, M_HAMMER2);
 	}
 	TAILQ_INIT(&hmp->open_rows_pack);
+	hmp->sc_open = NULL;
 	hmp->open_rows_count = 0;
 	hmp->open_rows_inited = 0;
 }
@@ -2263,7 +2292,8 @@ hammer2_raid6_row_can_take(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 static int
 hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 				   hammer2_off_t *phys_off_out,
-				   int *disk_idx_out)
+				   int *disk_idx_out,
+				   struct hammer2_open_row **row_out)
 {
 	struct hammer2_open_row *r;
 	struct hammer2_open_row *nr;
@@ -2295,6 +2325,7 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 			}
 			*phys_off_out = r->phys_off;
 			*disk_idx_out = candidate;
+			*row_out = r;
 			return 1;
 		}
 	}
@@ -2518,6 +2549,8 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 	struct hammer2_open_row *r;
 	struct hammer2_open_row *nr;
 	struct hammer2_open_row *stuck;
+	struct hammer2_subcol *sc;
+	hammer2_io_t *dio;
 	int deadline;
 	int d;
 
@@ -2529,6 +2562,20 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 	while ((r = TAILQ_FIRST(&hmp->open_rows_pack)) != NULL) {
 		TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
 		r->packable = 0;
+	}
+	/*
+	 * Close the open sub-column (always of the generation that just
+	 * ended) and drop its pin if no chain is mid-write; the last
+	 * chain's subcol_done drops it otherwise.  The column then arrives
+	 * and the row wait below covers it, with the same timeout.
+	 */
+	if ((sc = hmp->sc_open) != NULL) {
+		dio = hammer2_raid6_subcol_close_locked(hmp, sc);
+		if (dio) {
+			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			hammer2_raid6_subcol_drop(sc, dio);
+			hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		}
 	}
 	deadline = ticks + (int)((long)hz * hammer2_raid6_gen_wait_ms / 1000);
 	for (;;) {
@@ -2722,17 +2769,219 @@ hammer2_raid6_find_free_slot(hammer2_dev_t *hmp, uint64_t from, uint64_t to,
 }
 
 /*
- * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
- * Sets chain->bref.data_off to the physical column offset on the chosen disk
- * and chain->bref.copyid to the disk index (0..ndisks-1).
- *
- * Returns 0 on success, ENOSPC if no free stripe slot is available.
- *
- * The caller holds the chain in the appropriate state for modification.
- * The stripe bitmap spinlock protects concurrent alloc/free.
+ * Sub-offset of a chain of `bytes` inside its column, for the test hook
+ * vfs.hammer2.raid6_subcol_test (oct-review.md section 11.5 step 2).  The
+ * column stays private to the chain; only data_off gains an offset, so
+ * the read, scrub, degraded read, self-heal and resilver paths see what
+ * a shared column will give them.  A power-of-two size is placed at a
+ * multiple of itself, as the packing allocator will place it.  64 KB
+ * chains, and everything when the hook is off, stay at 0.
  */
-int
-hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+static uint32_t
+hammer2_raid6_test_off(uint64_t slot, size_t bytes)
+{
+	uint32_t n;
+
+	if (hammer2_raid6_subcol_test == 0 || bytes >= HAMMER2_PBUFSIZE ||
+	    bytes < HAMMER2_ALLOC_MIN)
+		return 0;
+	n = (uint32_t)(HAMMER2_PBUFSIZE / bytes);
+	if (hammer2_raid6_subcol_test == 1)
+		return (uint32_t)(HAMMER2_PBUFSIZE - bytes);
+	return (uint32_t)(bytes * (1 + (slot * 2654435761U + bytes) % (n - 1)));
+}
+
+/*
+ * The chain's column is still pending and private (nothing else lives in
+ * it), so a resize may move the chain inside it.  Keep the offset if the
+ * new size is aligned to it and fits, else pick a new one.  Only the
+ * offset bits of data_off change; the caller sets the radix.
+ */
+static void
+hammer2_raid6_replace_private(hammer2_chain_t *chain)
+{
+	hammer2_blockref_t *bref = &chain->bref;
+	hammer2_off_t cur;
+	hammer2_off_t base;
+	uint64_t slot;
+	size_t nbytes = chain->bytes;
+
+	if (!hammer2_raid6_bref_slot(chain->hmp, bref, &slot))
+		return;
+	base = bref->data_off & ~(hammer2_off_t)(HAMMER2_PBUFSIZE - 1);
+	cur = bref->data_off & (HAMMER2_PBUFSIZE - 1) &
+	      ~(hammer2_off_t)HAMMER2_OFF_MASK_RADIX;
+	if (nbytes == 0 || nbytes > HAMMER2_PBUFSIZE ||
+	    ((cur % nbytes) == 0 && cur + nbytes <= HAMMER2_PBUFSIZE))
+		return;
+	cur = hammer2_raid6_test_off(slot, nbytes);
+	bref->data_off = base | cur | (bref->data_off & HAMMER2_OFF_MASK_RADIX);
+}
+
+/*
+ * Sub-columns (oct-review.md section 11.4).  A sub-column is a column of
+ * an open row that several small data chains share.  Its used_mask has
+ * one bit per 1 KB; a chain of power-of-two size S takes the first free
+ * S-aligned range.  The sub-column holds one ref on the column's dio (the
+ * pin), so the column is put exactly once, when the sub-column closes
+ * and the last ref goes.  Each chain that has a range and has not yet
+ * finished its write holds a ticket (HAMMER2_CHAIN_SUBHELD, counted in
+ * npending); the pin is not dropped while any is out.  There is at most
+ * one open sub-column (hmp->sc_open), always of the current generation.
+ */
+
+/*
+ * Mark a sub-column closed to new chains.  Caller holds
+ * stripe_bitmap_spin.  If no ticket is out, returns the pin for the
+ * caller to drop (hammer2_raid6_subcol_drop(), spin released), else NULL
+ * and the last subcol_done drops it.
+ */
+static hammer2_io_t *
+hammer2_raid6_subcol_close_locked(hammer2_dev_t *hmp, struct hammer2_subcol *sc)
+{
+	hammer2_io_t *dio = NULL;
+
+	sc->closing = 1;
+	if (hmp->sc_open == sc)
+		hmp->sc_open = NULL;
+	if (sc->npending == 0 && sc->pinning == 0 && sc->dio != NULL) {
+		dio = sc->dio;
+		sc->dio = NULL;
+		sc->row->sub[sc->disk] = NULL;
+	}
+	return dio;
+}
+
+/*
+ * Drop the pin of a closed sub-column and free it.  The put of the
+ * column happens here unless another ref on the dio is still out, in
+ * which case it happens at that ref's drop.
+ */
+static void
+hammer2_raid6_subcol_drop(struct hammer2_subcol *sc, hammer2_io_t *dio)
+{
+	atomic_add_long(&hammer2_rz_subcol_close, 1);
+	hammer2_io_putblk(&dio);
+	kfree(sc, M_HAMMER2);
+}
+
+/*
+ * First free range of `units` 1 KB units aligned to `units` (a power of
+ * two, 1-32).  Returns 1 and the unit offset, or 0.
+ */
+static int
+hammer2_raid6_subcol_find(uint64_t used, int units, int *offp)
+{
+	uint64_t want = ((uint64_t)1 << units) - 1;
+	int i;
+
+	for (i = 0; i + units <= 64; i += units) {
+		if ((used & (want << i)) == 0) {
+			*offp = i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * The chain finished (or abandoned) its write: give back its ticket.
+ * Idempotent.  The last ticket of a closed sub-column drops the pin.
+ * Called with the chain locked, after its own dio ref is dropped, so
+ * that the put of the column (the pin drop) includes its bytes.
+ */
+void
+hammer2_raid6_subcol_done(hammer2_chain_t *chain)
+{
+	hammer2_dev_t *hmp;
+	struct hammer2_open_row *r;
+	struct hammer2_subcol *sc = NULL;
+	hammer2_io_t *dio = NULL;
+	uint64_t slot;
+
+	if ((chain->flags & HAMMER2_CHAIN_SUBHELD) == 0)
+		return;
+	hmp = chain->hmp;
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	if (chain->flags & HAMMER2_CHAIN_SUBHELD) {
+		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
+		if (hammer2_raid6_bref_slot(hmp, &chain->bref, &slot) &&
+		    (r = hammer2_raid6_open_row_find(hmp, slot)) != NULL &&
+		    (sc = r->sub[chain->bref.copyid]) != NULL &&
+		    sc->npending > 0) {
+			sc->npending--;
+			if (sc->closing && sc->npending == 0)
+				dio = hammer2_raid6_subcol_close_locked(hmp,
+									sc);
+		} else {
+			sc = NULL;
+			kprintf("hammer2: v3 sub-column ticket without a "
+				"sub-column: data_off %016jx copyid %d\n",
+				(uintmax_t)chain->bref.data_off,
+				chain->bref.copyid);
+		}
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	if (dio)
+		hammer2_raid6_subcol_drop(sc, dio);
+}
+
+/*
+ * Safety net for chains that leave the write paths holding a ticket
+ * (chain freed, or cleaned by the flush).  Counted: it should stay 0.
+ */
+void
+hammer2_raid6_subcol_net(hammer2_chain_t *chain)
+{
+	if (chain->flags & HAMMER2_CHAIN_SUBHELD) {
+		atomic_add_long(&hammer2_rz_subcol_stale, 1);
+		hammer2_raid6_subcol_done(chain);
+	}
+}
+
+/*
+ * chain_modify could not use the slot it was given (the dio read
+ * failed): give it back.  A sub-column chain just returns its ticket,
+ * the column is put by the pin as usual and the chain's bytes in it are
+ * zero.  A private column that will never be put is released.
+ */
+void
+hammer2_raid6_chain_release(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	struct hammer2_open_row *r;
+	uint64_t slot;
+	int sub = 0;
+
+	if (chain->flags & HAMMER2_CHAIN_SUBHELD) {
+		hammer2_raid6_subcol_done(chain);
+		return;
+	}
+	if (hammer2_raid6_bref_slot(hmp, &chain->bref, &slot)) {
+		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+		r = hammer2_raid6_open_row_find(hmp, slot);
+		if (r && (r->sub_mask & (1U << chain->bref.copyid)))
+			sub = 1;
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	}
+	if (sub == 0) {
+		hammer2_raid6_col_release(hmp, chain->bref.data_off &
+		    HAMMER2_RAID6_COLUMN_MASK, chain->bref.copyid);
+	}
+}
+
+/*
+ * Reserve a column for a new chain or sub-column: a column of an open
+ * row of the current generation if one has room, else a free slot,
+ * registered as a new row.  Caller holds stripe_bitmap_spin and passes
+ * a zeroed *newrowp, set to NULL if used (the caller frees it
+ * otherwise, after releasing the spin).  Returns the column's per-disk
+ * phys_off, its disk and its row.  ENOSPC if there is no free slot.
+ */
+static int
+hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
+				 struct hammer2_open_row **newrowp,
+				 hammer2_off_t *phys_offp, int *diskp,
+				 struct hammer2_open_row **rowp)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	uint64_t stripe_unit = rc->stripe_unit;
@@ -2742,33 +2991,19 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	uint64_t byte_idx;
 	int bit_idx;
 	int disk_idx;
+	int p_disk, q_disk;
 	hammer2_off_t phys_off;
-	struct hammer2_open_row *newrow;
-	int radix;
-	int n;
-
-	/*
-	 * The open_rows entry for a new row, allocated here because
-	 * kmalloc(M_WAITOK) may sleep and the scan holds a spinlock.
-	 */
-	newrow = kmalloc(sizeof(*newrow), M_HAMMER2, M_WAITOK | M_ZERO);
+	hammer2_off_t pack_off;
+	int pack_disk_idx;
 
 	/*
 	 * 6C packing: try to land in an existing open row first so a row
 	 * can be filled with up to ndata chains before P/Q is computed.
 	 */
-	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-
-	hammer2_off_t pack_off;
-	int pack_disk_idx;
-
 	if (hammer2_raid6_open_row_pack_locked(hmp, &pack_off,
-	    &pack_disk_idx)) {
-		int prc_radix;
-		int prc_n = chain->bytes;
-
+	    &pack_disk_idx, rowp)) {
 		/*
-		 * One more live chain in the row: freeing any one
+		 * One more live column in the row: freeing any one
 		 * of them must not free the row.
 		 */
 		slot = hammer2_raid6_slot(pack_off, stripe_unit);
@@ -2777,14 +3012,8 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		hammer2_raid6_sm_touch(hmp, slot);
 		if (hmp->stripe_bf_active)
 			setbit(hmp->stripe_bf_new, slot);
-		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-		kfree(newrow, M_HAMMER2);
-		prc_radix = 0;
-		while (prc_n > 1) { prc_n >>= 1; prc_radix++; }
-		chain->bref.data_off =
-		    pack_off | (hammer2_off_t)prc_radix;
-		chain->bref.copyid   = (uint8_t)pack_disk_idx;
-		atomic_add_long(&hammer2_rz_cols_alloc, 1);
+		*phys_offp = pack_off;
+		*diskp = pack_disk_idx;
 		return 0;
 	}
 
@@ -2794,50 +3023,326 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	start = hmp->stripe_cursor;
 	if (start >= max_stripes)
 		start = 0;
-	if (hammer2_raid6_find_free_slot(hmp, start, max_stripes, &slot) ||
-	    hammer2_raid6_find_free_slot(hmp, 0, start, &slot)) {
-		byte_idx = slot / 8;
-		bit_idx  = (int)(slot % 8);
-		hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
-		hmp->stripe_row_refcount[slot] = 1;
-		hammer2_raid6_sm_touch(hmp, slot);
-		if (hmp->stripe_bf_active)
-			setbit(hmp->stripe_bf_new, slot);
-		hmp->stripe_cursor = slot + 1;
-		goto found;
-	}
-	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-	kfree(newrow, M_HAMMER2);
-	return ENOSPC;
+	if (!hammer2_raid6_find_free_slot(hmp, start, max_stripes, &slot) &&
+	    !hammer2_raid6_find_free_slot(hmp, 0, start, &slot))
+		return ENOSPC;
+	byte_idx = slot / 8;
+	bit_idx  = (int)(slot % 8);
+	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
+	hmp->stripe_row_refcount[slot] = 1;
+	hammer2_raid6_sm_touch(hmp, slot);
+	if (hmp->stripe_bf_active)
+		setbit(hmp->stripe_bf_new, slot);
+	hmp->stripe_cursor = slot + 1;
 
-found:
 	/*
 	 * Choose data disk (round-robin, skipping the P and Q disks for
 	 * this stripe).
 	 */
-	{
-		int p_disk, q_disk;
-
-		hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
-		disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk, 0);
-		if (disk_idx < 0) {
-			/* All disks are P or Q: can't happen for ndisks >= 4 */
-			hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
-			hmp->stripe_row_refcount[slot] = 0;
-			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-			kfree(newrow, M_HAMMER2);
-			return ENOSPC;
-		}
+	hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
+	disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk, 0);
+	if (disk_idx < 0) {
+		/* All disks are P or Q: can't happen for ndisks >= 4 */
+		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
+		hmp->stripe_row_refcount[slot] = 0;
+		return ENOSPC;
 	}
 	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
 	/*
-	 * Register the newly-allocated row so subsequent stripe_alloc
-	 * calls within the same TXG can pack into it.  Done while still
-	 * holding stripe_bitmap_spin.
+	 * Register the newly-allocated row so subsequent allocations
+	 * within the same TXG can pack into it.
 	 */
-	hammer2_raid6_open_row_register_locked(hmp, newrow, slot, phys_off,
+	hammer2_raid6_open_row_register_locked(hmp, *newrowp, slot, phys_off,
 					       disk_idx);
+	*rowp = *newrowp;
+	*newrowp = NULL;
+	*phys_offp = phys_off;
+	*diskp = disk_idx;
+	return 0;
+}
+
+/*
+ * Place a chain in the open sub-column, opening one in a new column if
+ * there is none or the chain finds no aligned range.  Returns 0 with
+ * data_off, copyid and a ticket set, ENOSPC, or 1 if the chain could not
+ * be placed (the pin failed) and takes a private column instead.
+ */
+static int
+hammer2_raid6_subcol_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	struct hammer2_open_row *newrow;
+	struct hammer2_open_row *row;
+	struct hammer2_subcol *newsc;
+	struct hammer2_subcol *sc;
+	struct hammer2_subcol *oldsc = NULL;
+	hammer2_io_t *olddio = NULL;
+	hammer2_io_t *dio = NULL;
+	hammer2_blockref_t bref;
+	hammer2_off_t phys_off;
+	int units = (int)(chain->bytes >> 10);
+	int radix = 0;
+	int disk;
+	int off;
+	int error;
+	int n;
+
+	for (n = (int)chain->bytes; n > 1; n >>= 1)
+		radix++;
+	newrow = kmalloc(sizeof(*newrow), M_HAMMER2, M_WAITOK | M_ZERO);
+	newsc = kmalloc(sizeof(*newsc), M_HAMMER2, M_WAITOK | M_ZERO);
+
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+again:
+	sc = hmp->sc_open;
+	if (sc != NULL) {
+		if (sc->pinning) {
+			/* its creator is still getting the dio */
+			ssleep(&hmp->sc_open, &hmp->stripe_bitmap_spin, 0,
+			       "h2rzsc", hz);
+			goto again;
+		}
+		if (sc->row->gen == hmp->rz_gen &&
+		    hammer2_raid6_subcol_find(sc->used_mask, units, &off)) {
+			sc->used_mask |= (((uint64_t)1 << units) - 1) << off;
+			sc->npending++;
+			atomic_set_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
+			phys_off = sc->row->phys_off;
+			disk = sc->disk;
+			if (sc->used_mask == ~(uint64_t)0)
+				(void)hammer2_raid6_subcol_close_locked(hmp,
+									sc);
+			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			kfree(newrow, M_HAMMER2);
+			kfree(newsc, M_HAMMER2);
+			chain->bref.data_off = phys_off |
+			    ((hammer2_off_t)off << 10) | (hammer2_off_t)radix;
+			chain->bref.copyid = (uint8_t)disk;
+			atomic_add_long(&hammer2_rz_subcol_chains, 1);
+			return 0;
+		}
+		/* full, or no aligned range: close it and open the next */
+		atomic_add_long(&hammer2_rz_subcol_nofit, 1);
+		olddio = hammer2_raid6_subcol_close_locked(hmp, sc);
+		oldsc = sc;
+	}
+
+	error = hammer2_raid6_col_reserve_locked(hmp, &newrow, &phys_off,
+						 &disk, &row);
+	if (error) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		if (olddio)
+			hammer2_raid6_subcol_drop(oldsc, olddio);
+		if (newrow)
+			kfree(newrow, M_HAMMER2);
+		kfree(newsc, M_HAMMER2);
+		return error;
+	}
+	sc = newsc;
+	newsc = NULL;
+	sc->row = row;
+	sc->disk = disk;
+	sc->pinning = 1;
+	sc->npending = 1;
+	sc->used_mask = (((uint64_t)1 << units) - 1);	/* at offset 0 */
+	row->sub_mask |= 1U << disk;
+	row->sub[disk] = sc;
+	hmp->sc_open = sc;
+	atomic_set_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	if (newrow)
+		kfree(newrow, M_HAMMER2);
+	if (olddio)
+		hammer2_raid6_subcol_drop(oldsc, olddio);
+	atomic_add_long(&hammer2_rz_cols_alloc, 1);
+	atomic_add_long(&hammer2_rz_subcol_open, 1);
+
+	/*
+	 * The pin: the whole column, NEW, so the buffer is zero-filled once
+	 * and every chain that follows finds the dio good and takes its own
+	 * ref.  Other allocators wait for pinning to clear.
+	 */
+	bzero(&bref, sizeof(bref));
+	bref.type = HAMMER2_BREF_TYPE_DATA;
+	bref.copyid = (uint8_t)disk;
+	error = hammer2_io_new(hmp, HAMMER2_BREF_TYPE_DATA,
+			       phys_off | HAMMER2_PBUFRADIX,
+			       HAMMER2_PBUFSIZE, &dio, &bref);
+
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	sc->pinning = 0;
+	if (error == 0) {
+		sc->dio = dio;
+	} else {
+		/* give the reservation up; the chain takes a private column */
+		sc->closing = 1;
+		sc->npending--;
+		if (hmp->sc_open == sc)
+			hmp->sc_open = NULL;
+		row->sub[disk] = NULL;
+		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
+	}
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	wakeup(&hmp->sc_open);
+	if (error) {
+		hammer2_io_putblk(&dio);
+		hammer2_raid6_col_release(hmp, phys_off, disk);
+		kfree(sc, M_HAMMER2);
+		return 1;
+	}
+	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
+	chain->bref.copyid = (uint8_t)disk;
+	atomic_add_long(&hammer2_rz_subcol_chains, 1);
+	return 0;
+}
+
+/*
+ * A chain modified again while MODIFIED: should it take a fresh slot
+ * (return 1) or reuse its column (0)?  The column of a chain that has
+ * arrived, or whose row has sealed, is not ours any more.  A pending
+ * private one is, and the chain may have a new size
+ * (hammer2_chain_resize sets chain->bytes first), so it is re-placed
+ * inside the column.
+ *
+ * A pending sub-column column is shared.  While the sub-column is open
+ * (nothing of it has been put) the chain keeps its range if the new
+ * size fits it and otherwise takes a free aligned range of the same
+ * column; if there is none, or the sub-column is closed, it takes a
+ * fresh slot and the old range stays a hole (oct-review.md section 11.4,
+ * "Arrived").
+ */
+int
+hammer2_raid6_col_rewrite(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	struct hammer2_open_row *r;
+	struct hammer2_subcol *sc;
+	hammer2_io_t *dio = NULL;
+	hammer2_off_t doff;
+	uint64_t slot;
+	int d = chain->bref.copyid;
+	int units, ounits, off;
+
+	if (!hammer2_raid6_bref_slot(hmp, &chain->bref, &slot))
+		return 0;
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	r = isset(hmp->stripe_open, slot) ?
+	    hammer2_raid6_open_row_find(hmp, slot) : NULL;
+	if (r == NULL || r->col_data[d] != NULL) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		return 1;
+	}
+	if ((r->sub_mask & (1U << d)) == 0) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		hammer2_raid6_replace_private(chain);
+		return 0;
+	}
+	sc = r->sub[d];
+	if (sc == NULL || sc->closing || sc->pinning) {
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		return 1;
+	}
+	units = (int)(chain->bytes >> 10);
+	ounits = (chain->bref.data_off & HAMMER2_OFF_MASK_RADIX) ?
+	    (int)((1U << (int)(chain->bref.data_off &
+	    HAMMER2_OFF_MASK_RADIX)) >> 10) : 0;
+	if (units > 32 || units == 0) {
+		/* not a sub-column size any more: a private column */
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		return 1;
+	}
+	if (units <= ounits) {
+		/* the range it has is big enough; the radix shrinks */
+		if ((chain->flags & HAMMER2_CHAIN_SUBHELD) == 0) {
+			sc->npending++;
+			atomic_set_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
+		}
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		atomic_add_long(&hammer2_rz_subcol_inplace, 1);
+		return 0;
+	}
+	if (hammer2_raid6_subcol_find(sc->used_mask, units, &off)) {
+		sc->used_mask |= (((uint64_t)1 << units) - 1) << off;
+		if ((chain->flags & HAMMER2_CHAIN_SUBHELD) == 0) {
+			sc->npending++;
+			atomic_set_int(&chain->flags, HAMMER2_CHAIN_SUBHELD);
+		}
+		doff = chain->bref.data_off;
+		doff &= ~(hammer2_off_t)((HAMMER2_PBUFSIZE - 1) &
+					 ~HAMMER2_OFF_MASK_RADIX);
+		chain->bref.data_off = doff | ((hammer2_off_t)off << 10);
+		if (sc->used_mask == ~(uint64_t)0)
+			dio = hammer2_raid6_subcol_close_locked(hmp, sc);
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		if (dio)
+			hammer2_raid6_subcol_drop(sc, dio);
+		atomic_add_long(&hammer2_rz_subcol_chains, 1);
+		return 0;
+	}
+	/* no room to grow: close it, the chain takes a fresh slot */
+	atomic_add_long(&hammer2_rz_subcol_nofit, 1);
+	dio = hammer2_raid6_subcol_close_locked(hmp, sc);
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	if (dio)
+		hammer2_raid6_subcol_drop(sc, dio);
+	return 1;
+}
+
+/*
+ * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
+ * Sets chain->bref.data_off to the physical column offset on the chosen disk
+ * and chain->bref.copyid to the disk index (0..ndisks-1).
+ *
+ * Returns 0 on success, ENOSPC if no free stripe slot is available.
+ *
+ * The caller holds the chain in the appropriate state for modification.
+ * The stripe bitmap spinlock protects concurrent alloc/free.
+ *
+ * With vfs.hammer2.raid6_subcol_max set, a DATA chain of that size or
+ * less shares a column (hammer2_raid6_subcol_alloc); otherwise, and for
+ * everything else, every chain takes a column of its own.
+ */
+int
+hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	struct hammer2_open_row *newrow;
+	struct hammer2_open_row *row;
+	hammer2_off_t phys_off;
+	int disk_idx;
+	int radix;
+	int error;
+	int n;
+
+	/*
+	 * The chain is moving to a new range: it gives back a ticket it
+	 * still holds in the column it is leaving.
+	 */
+	if (chain->flags & HAMMER2_CHAIN_SUBHELD)
+		hammer2_raid6_subcol_done(chain);
+
+	if (hammer2_raid6_subcol_max >= HAMMER2_ALLOC_MIN &&
+	    chain->bref.type == HAMMER2_BREF_TYPE_DATA &&
+	    chain->bytes >= HAMMER2_ALLOC_MIN &&
+	    chain->bytes <= 32768 &&
+	    chain->bytes <= (size_t)hammer2_raid6_subcol_max &&
+	    (chain->bytes & (chain->bytes - 1)) == 0) {
+		error = hammer2_raid6_subcol_alloc(hmp, chain);
+		if (error <= 0)
+			return error;
+	}
+
+	/*
+	 * The open_rows entry for a new row, allocated here because
+	 * kmalloc(M_WAITOK) may sleep and the scan holds a spinlock.
+	 */
+	newrow = kmalloc(sizeof(*newrow), M_HAMMER2, M_WAITOK | M_ZERO);
+	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
+	error = hammer2_raid6_col_reserve_locked(hmp, &newrow, &phys_off,
+						 &disk_idx, &row);
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	if (newrow)
+		kfree(newrow, M_HAMMER2);
+	if (error)
+		return error;
 
 	/* Compute radix (log2 of chain->bytes) */
 	radix = 0;
@@ -2850,7 +3355,9 @@ found:
 	 * synthesizes a (disk_idx<<56)|phys_off key at lookup time to keep
 	 * per-disk entries distinct.
 	 */
-	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
+	chain->bref.data_off = phys_off |
+	    hammer2_raid6_test_off(hammer2_raid6_slot(phys_off,
+	    rc->stripe_unit), chain->bytes) | (hammer2_off_t)radix;
 	chain->bref.copyid   = (uint8_t)disk_idx;
 	atomic_add_long(&hammer2_rz_cols_alloc, 1);
 

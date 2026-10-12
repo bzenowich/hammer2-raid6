@@ -709,6 +709,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			 chain->parent == NULL);
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
 		atomic_add_long(&hammer2_count_modified_chains, -1);
+		hammer2_raid6_subcol_net(chain);
 
 		/*
 		 * Manage threads waiting for excessive dirty memory to
