@@ -1035,10 +1035,11 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
    two-disk failure with reads; corrupt one sub-block, scrub finds and repairs exactly it; overwrite
    in the same TXG (pending and closed). N and T (reuse) for capacity.
 5. **Bulkfree per column** (`bf_mark`/`bf_end`), still with the v1 map (refcount byte becomes a
-   bitmask of 8 data disks, or an in-memory-only mask). Test: Q after rm leaves ~50% of columns freed.
+   bitmask of 8 data disks, or an in-memory-only mask). Test: Q after rm leaves ~50% of columns freed;
+   Q churn variant (create, delete half, repeat) reports dead columns (11.6 Q5).
 6. **Later: sm v2 / S1 mask** and resilver/scrub skip of dead columns (P6); S3 fold-in.
 
-### 11.6 Open questions
+### 11.6 Open questions (all decided 2026-10-12)
 
 - ~~Threshold: 16 KB or 32 KB?~~ **Decided 2026-10-12: 32 KB** (all sub-64 KB chains; 11.1 shows
   the two are the same, since no chain lies between 32 and 64 KB). At 16 KB a 64 KB block that LZ4
@@ -1046,10 +1047,19 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
   takes a whole column, so compression would keep saving nothing. Pinned memory is the same for
   both. The cost is that compressible streams go through the pin (P1c) and 32 KB chains need the
   size-aligned placement of 11.4.
-- Is an `fsync` of a tiny file allowed to cost a full column plus P/Q (as today), or must a sync write
-  only the touched 4 KB (that needs RMW parity and returns the write hole)?
-- Is the all-disk metadata mirror intended for data in (b1), or is 3 copies acceptable? (Only matters if
-  (a) is rejected.)
-- Do v1 space maps have to stay mountable by an older kernel (affects when step 6 may land)?
-- Hole reuse inside a live column (a repack at bulkfree) is left out: does a workload with churn on
-  small files matter enough to design it?
+- ~~fsync cost?~~ **Decided 2026-10-12: as today for P5.** An `fsync` of a tiny file may cost a
+  full column plus P/Q (>= 192 KB on 4+2). Writing only the touched 4 KB is ruled out for good: it
+  needs RMW parity and returns the write hole. If fsync-heavy workloads matter later, the tool is an
+  intent log (a mirrored small log, like the ZFS ZIL), as a separate project.
+- ~~Option and mirror width for (b1)?~~ **Decided 2026-10-12: option (a)**, packing chains into a
+  shared column, so the (b1) mirror width does not arise. If (a)'s pin proves unworkable, (b1) with
+  3 copies (survives 2 failures, as RAID6) is the fallback, not the all-disk mirror.
+- ~~Must v1 maps stay mountable by an older kernel?~~ **Answered from the code:** `sm_read` accepts a
+  header only if `version == HAMMER2_SM_VERSION` (`ondisk.c:1767`); anything else takes the "no
+  valid space map header" path and is rebuilt by tree walk. An older kernel therefore mounts a v2
+  array (slower mount), writes v1, and the newer kernel converts back. No upgrade gate is needed.
+  Condition for step 6: the reserved space map area must fit the 4x larger v2 map.
+- ~~Hole reuse / repack?~~ **Decided 2026-10-12: left out.** Holes in a closed column are never
+  reused and there is no repack pass; the worst case is a column pinned by one live chain (status
+  quo). Group Q gets a churn variant (create, delete half, repeat) to measure dead columns; a repack
+  design is revisited only if they pile up.
