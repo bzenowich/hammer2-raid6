@@ -2924,6 +2924,29 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				 * to the new disk.
 				 */
 				lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+				/*
+				 * The sync's mirror copies are bawrite()s,
+				 * started under rebuild_lk shared and not
+				 * waited for, so one may still be in flight
+				 * (its buffer busy, the media old) although
+				 * no new one can start while we hold the
+				 * lock.  Wait for the survivors' writes
+				 * first: then the media of every mirror is
+				 * current, and the copy that the same flush
+				 * wrote to the new disk (synchronously, under
+				 * the shared lock) is never overwritten by an
+				 * older one.
+				 */
+				for (i = 0; i < ndisks; i++) {
+					if (i == failed_disk_idx ||
+					    hmp->raid_failed[i] ||
+					    hmp->volumes[i].dev == NULL ||
+					    hmp->volumes[i].dev->devvp == NULL ||
+					    !hmp->volumes[i].dev->open)
+						continue;
+					bio_track_wait(&hmp->volumes[i].dev->
+					    devvp->v_track_write, 0, 0);
+				}
 				for (c = 0; c < nch; c++) {
 					hammer2_off_t coff = mo + off +
 					    (hammer2_off_t)c * MD_CHUNK;
