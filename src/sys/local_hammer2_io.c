@@ -2207,6 +2207,337 @@ read_degraded_done:
 }
 
 /*
+ * Resilver data phase: slots rebuilt per pass.  All the survivors'
+ * reads of a pass are in flight together, then all the writes to the
+ * new disk.  Each read holds a pbuf (64 KB of kernel memory); the pool
+ * is shared with the rest of the system, so a pass is cut to keep the
+ * reads under RESILVER_MAXPBUFS.
+ */
+#define RESILVER_BATCH		16
+#define RESILVER_MAXPBUFS	64
+
+/*
+ * Start a read of one column straight from the media, without waiting.
+ * The data is in bp->b_data once hammer2_resilver_read_wait() returns;
+ * the caller relpbuf()s it.  The resilver only reads columns that are
+ * on the media (hammer2_vfs_sync_pmp ran first, and slots sealed since
+ * are rebuild_done), so the buffer cache is not consulted.
+ */
+static struct buf *
+hammer2_resilver_read_start(struct vnode *devvp, off_t off, int bytes)
+{
+	struct buf *bp;
+
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bp->b_cmd = BUF_CMD_READ;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vn_strategy(devvp, &bp->b_bio1);
+	return bp;
+}
+
+static int
+hammer2_resilver_read_wait(struct buf *bp)
+{
+	return biowait(&bp->b_bio1, "h2rsvr");
+}
+
+/*
+ * Start a write of a rebuilt column to the new disk, without waiting.
+ * As hammer2_io_raid6_write_flags(): never wait for a buffer (the
+ * caller holds rebuild_lk exclusive), use the cached one if it is free
+ * and drop it after the write if it was not cached already, else write
+ * the media through a pbuf.  *pbufp says which kind comes back, for
+ * hammer2_resilver_write_wait().  NULL: nothing to wait for.
+ */
+static struct buf *
+hammer2_resilver_write_start(struct vnode *devvp, off_t off,
+			     const void *data, int bytes, int *pbufp)
+{
+	struct buf *bp;
+
+	*pbufp = 0;
+	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
+	if (bp) {
+		if ((bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
+			bp->b_flags |= B_RELBUF | B_DIRECT;
+		bkvasync(bp);
+		bcopy(data, bp->b_data, bytes);
+		if (hammer2_bwrite_start(bp) == 0)
+			return NULL;
+		return bp;
+	}
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bcopy(data, bp->b_data, bytes);
+	bp->b_cmd = BUF_CMD_WRITE;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	bp->b_bio1.bio_done = biodone_sync;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	vn_strategy(devvp, &bp->b_bio1);
+	*pbufp = 1;
+	return bp;
+}
+
+static int
+hammer2_resilver_write_wait(struct buf *bp, int ispbuf)
+{
+	int error;
+
+	if (bp == NULL)
+		return 0;
+	if (!ispbuf)
+		return hammer2_bwrite_wait(bp);
+	error = biowait(&bp->b_bio1, "h2rsvw");
+	relpbuf(bp, NULL);
+	return error;
+}
+
+/*
+ * Rebuild the failed disk's column of nslots stripe slots.  Called with
+ * rebuild_lk exclusive, held across the whole pass: this is the rebuild
+ * window.  A seal, the only writer of a slot's parity and of a
+ * rebuilding disk's column, takes rebuild_lk shared, so it cannot touch
+ * any slot of the pass between our reads and our writes; a seal that
+ * follows writes the new disk's column itself and marks the slot
+ * rebuild_done, which the caller has filtered out beforehand.  The lock
+ * is held for one pass (RESILVER_BATCH columns of I/O per survivor),
+ * not per slot, which is what lets the I/O queue up.
+ *
+ * What is read depends on what is missing.  With the failed disk the
+ * only erasure of a row, XOR of the data and P (or a Q syndrome over
+ * the data) is enough and the other parity column is not read.  With a
+ * second erasure, known up front or from a read error, P and Q are both
+ * needed (dual_recov).
+ *
+ * xbufs: four stripe_unit-sized scratch buffers; outs: one
+ * stripe_unit-sized output buffer per slot.  Returns an errno for a
+ * stripe that cannot be rebuilt, else the first write error (the other
+ * slots of the pass are still written).
+ */
+static int
+hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
+		      struct vnode *new_devvp, const uint64_t *slots,
+		      int nslots, void **outs, void **xbufs)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	int ndisks = rc->ndisks;
+	int ndata = rc->ndata;
+	size_t su = rc->stripe_unit;
+	struct buf **rb;	/* [slot * HAMMER2_MAX_VOLUMES + disk] */
+	int *rerr;
+	uint8_t *rinj;		/* the error was injected, not real */
+	struct buf *wbp[RESILVER_BATCH];
+	int wpb[RESILVER_BATCH];
+	int s, d, col;
+	int error = 0;
+	int lerror;
+
+	KKASSERT(nslots <= RESILVER_BATCH);
+	rb = kmalloc(sizeof(*rb) * nslots * HAMMER2_MAX_VOLUMES, M_HAMMER2,
+		     M_WAITOK | M_ZERO);
+	rerr = kmalloc(sizeof(*rerr) * nslots * HAMMER2_MAX_VOLUMES,
+		       M_HAMMER2, M_WAITOK | M_ZERO);
+	rinj = kmalloc(nslots * HAMMER2_MAX_VOLUMES, M_HAMMER2,
+		       M_WAITOK | M_ZERO);
+	bzero(wbp, sizeof(wbp));
+	bzero(wpb, sizeof(wpb));
+
+	/*
+	 * Issue every read of the pass.
+	 */
+	for (s = 0; s < nslots; s++) {
+		int p_disk = (int)(slots[s] % ndisks);
+		int q_disk = (p_disk + 1) % ndisks;
+		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
+		int second = 0;
+
+		for (d = 0; d < ndisks; d++) {
+			if (d != failed_disk_idx && hmp->raid_failed[d])
+				second = 1;
+		}
+		for (d = 0; d < ndisks; d++) {
+			int i = s * HAMMER2_MAX_VOLUMES + d;
+
+			if (d == failed_disk_idx || hmp->raid_failed[d])
+				continue;
+			/* one erasure: no Q, and P only for a data column */
+			if (!second && (d == q_disk ||
+			    (d == p_disk && failed_disk_idx == q_disk)))
+				continue;
+			lerror = hammer2_inject_eio(d);
+			if (lerror) {
+				rerr[i] = lerror;
+				rinj[i] = 1;
+				continue;
+			}
+			rb[i] = hammer2_resilver_read_start(
+			    hmp->volumes[d].dev->devvp, phys_off, (int)su);
+		}
+	}
+	for (s = 0; s < nslots; s++) {
+		for (d = 0; d < ndisks; d++) {
+			int i = s * HAMMER2_MAX_VOLUMES + d;
+
+			if (rb[i])
+				rerr[i] = hammer2_resilver_read_wait(rb[i]);
+		}
+	}
+
+	/*
+	 * Rebuild each slot's column into outs[s].
+	 */
+	for (s = 0; s < nslots && error == 0; s++) {
+		int p_disk = (int)(slots[s] % ndisks);
+		int q_disk = (p_disk + 1) % ndisks;
+		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
+		int phys_to_lcol[HAMMER2_MAX_VOLUMES];
+		void *ptrs[HAMMER2_MAX_VOLUMES];
+		int have[HAMMER2_MAX_VOLUMES];	/* ptrs[col] is read */
+		int failed_col, other_col = -1;
+		void *out = outs[s];
+		int di = 0;
+
+		bzero(phys_to_lcol, sizeof(phys_to_lcol));
+		for (d = 0; d < ndisks; d++) {
+			if (d == p_disk)
+				phys_to_lcol[d] = ndata;
+			else if (d == q_disk)
+				phys_to_lcol[d] = ndata + 1;
+			else
+				phys_to_lcol[d] = di++;
+		}
+		failed_col = phys_to_lcol[failed_disk_idx];
+		for (d = 0; d < ndisks; d++) {
+			if (d != failed_disk_idx && hmp->raid_failed[d])
+				other_col = phys_to_lcol[d];
+		}
+		for (col = 0; col < ndisks; col++) {
+			ptrs[col] = NULL;
+			have[col] = 0;
+		}
+
+		for (d = 0; d < ndisks && error == 0; d++) {
+			int i = s * HAMMER2_MAX_VOLUMES + d;
+
+			col = phys_to_lcol[d];
+			if (rerr[i] == 0) {
+				if (rb[i]) {
+					ptrs[col] = rb[i]->b_data;
+					have[col] = 1;
+				}
+				continue;
+			}
+			/*
+			 * The unreadable column is a second erasure for
+			 * this stripe, which P+Q still recover.  A third
+			 * is fatal.  Injected EIO does not auto-fail the
+			 * disk so the test stays repeatable.
+			 */
+			if (other_col >= 0 ||
+			    (!rinj[i] && hammer2_raid6_auto_fail_disk(hmp, d))) {
+				kprintf("hammer2: resilver stripe %llu: "
+					"unrecoverable I/O error on disk %d\n",
+					(unsigned long long)slots[s], d);
+				error = EIO;
+				break;
+			}
+			other_col = col;
+		}
+		if (error)
+			break;
+
+		if (other_col < 0) {
+			/* the failed disk is the only erasure */
+			if (failed_col < ndata) {
+				/* data = P ^ the other data columns */
+				bcopy(ptrs[ndata], out, su);
+				for (col = 0; col < ndata; col++) {
+					if (col != failed_col)
+						hammer2_raid6_xor(out,
+						    ptrs[col], su);
+				}
+			} else if (failed_col == ndata) {
+				/* P = XOR of the data */
+				bcopy(ptrs[0], out, su);
+				for (col = 1; col < ndata; col++)
+					hammer2_raid6_xor(out, ptrs[col], su);
+			} else {
+				/* Q = the syndrome (P to scratch) */
+				ptrs[ndata] = xbufs[0];
+				ptrs[ndata + 1] = out;
+				hammer2_raid6_gen_syndrome(ndisks, su, ptrs);
+			}
+			continue;
+		}
+
+		/*
+		 * Two erasures: P and Q are both needed.  Read the one not
+		 * read yet (a read error made the second erasure after the
+		 * reads were issued) synchronously: this is the rare path.
+		 */
+		for (d = 0; d < ndisks && error == 0; d++) {
+			col = phys_to_lcol[d];
+			if (col < ndata || have[col] || col == other_col ||
+			    col == failed_col)
+				continue;
+			lerror = hammer2_inject_eio(d);
+			if (lerror == 0)
+				lerror = hammer2_io_raid6_read_sibling(
+				    hmp->volumes[d].dev->devvp, phys_off,
+				    xbufs[1 + col - ndata], (int)su, 1);
+			if (lerror) {
+				kprintf("hammer2: resilver stripe %llu: "
+					"unrecoverable I/O error on disk %d\n",
+					(unsigned long long)slots[s], d);
+				error = EIO;
+				break;
+			}
+			ptrs[col] = xbufs[1 + col - ndata];
+			have[col] = 1;
+		}
+		if (error)
+			break;
+		ptrs[failed_col] = out;
+		ptrs[other_col] = xbufs[3];
+		hammer2_raid6_dual_recov(ndisks, su, failed_col, other_col,
+					 ptrs);
+	}
+
+	/*
+	 * Write the rebuilt columns to the new disk, then wait for them.
+	 */
+	if (error == 0) {
+		for (s = 0; s < nslots; s++)
+			wbp[s] = hammer2_resilver_write_start(new_devvp,
+			    (off_t)(HAMMER2_ZONE_SEG64 + slots[s] * su),
+			    outs[s], (int)su, &wpb[s]);
+		for (s = 0; s < nslots; s++) {
+			lerror = hammer2_resilver_write_wait(wbp[s], wpb[s]);
+			if (lerror && !error)
+				error = lerror;
+		}
+	}
+
+	for (s = 0; s < nslots; s++) {
+		for (d = 0; d < ndisks; d++) {
+			if (rb[s * HAMMER2_MAX_VOLUMES + d])
+				relpbuf(rb[s * HAMMER2_MAX_VOLUMES + d], NULL);
+		}
+	}
+	kfree(rb, M_HAMMER2);
+	kfree(rerr, M_HAMMER2);
+	kfree(rinj, M_HAMMER2);
+	return error;
+}
+
+/*
  * RAID 6 online resilver.
  *
  * Reconstruct all data for the disk at failed_disk_idx onto new_devvp.
@@ -2228,13 +2559,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	uint64_t stripe_unit = rc->stripe_unit;
 	uint64_t num_stripes;
 	uint64_t stripe_num;
-	int p_disk, q_disk;
-	int phys_disk, di, col;
-	int failed_col, other_failed_col;
-	int phys_to_lcol[HAMMER2_MAX_VOLUMES];
-	hammer2_off_t phys_off;
-	void *ptrs[HAMMER2_MAX_VOLUMES];
-	void *col_bufs[HAMMER2_MAX_VOLUMES];
+	struct timespec ts0, ts1, ts2;
+	uint64_t nrebuilt = 0;
+	void *outs[RESILVER_BATCH];
+	void *xbufs[4];
+	uint64_t slots[RESILVER_BATCH];
+	int batch;
 	hammer2_volume_t *vol;
 	struct buf *bp, *wbp;
 	int error = 0;
@@ -2261,6 +2591,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	hmp->resilver_stripes_total = num_stripes;
 	hmp->resilver_stripes_done = 0;
 	hmp->resilver_running = 1;
+	nanouptime(&ts0);
 
 	/*
 	 * Phase 1: Copy the volume header from a surviving disk to new_devvp.
@@ -2500,14 +2831,24 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		kfree(md_buf, M_HAMMER2);
 	}
 
-	/*
-	 * Phase 2: Allocate per-column buffers.
-	 */
-	for (i = 0; i < ndisks; i++)
-		col_bufs[i] = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	nanouptime(&ts1);
 
 	/*
-	 * Phase 3: Rebuild each stripe.
+	 * Phase 2: Allocate the pass buffers.
+	 */
+	batch = RESILVER_MAXPBUFS / (ndisks - 1);
+	if (batch > RESILVER_BATCH)
+		batch = RESILVER_BATCH;
+	if (batch < 1)
+		batch = 1;
+	for (i = 0; i < batch; i++)
+		outs[i] = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK);
+	for (i = 0; i < 4; i++)
+		xbufs[i] = kmalloc(stripe_unit, M_HAMMER2, M_WAITOK);
+
+	/*
+	 * Phase 3: Rebuild the stripes, a pass of up to `batch` slots at
+	 * a time.
 	 *
 	 * Flush all pending writes first so that the rows sealed before
 	 * the rebuild started are on media before we read them.  Rows
@@ -2517,7 +2858,10 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	 */
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
-	for (stripe_num = 0; stripe_num < num_stripes; stripe_num++) {
+	stripe_num = 0;
+	while (stripe_num < num_stripes) {
+		int n = 0;
+
 		/* forced unmount (hammer2_vfs_unmount) */
 		if (hmp->raid_abort) {
 			error = EINTR;
@@ -2525,152 +2869,101 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		}
 
 		/*
-		 * v3 (RAIDZ2-native): skip unallocated stripe slots.
-		 * Bitmap lives in hmp->stripe_bitmap.  Gated by sysctl
-		 * vfs.hammer2.resilver_skip_unalloc (default 1) — set 0 for
-		 * full-iteration regression baseline.
+		 * Pick the next slots to rebuild.
 		 */
-		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-		    hammer2_raid6_resilver_skip_unalloc &&
-		    hmp->stripe_bitmap != NULL) {
-			int byte_idx = (int)(stripe_num / 8);
-			int bit_idx  = (int)(stripe_num % 8);
-			if (byte_idx >= (int)hmp->stripe_bitmap_size ||
-			    (hmp->stripe_bitmap[byte_idx] &
-			     (1 << bit_idx)) == 0)
+		for (; stripe_num < num_stripes && n < batch; stripe_num++) {
+			/*
+			 * v3 (RAIDZ2-native): skip unallocated stripe
+			 * slots.  Bitmap lives in hmp->stripe_bitmap.
+			 * Gated by sysctl vfs.hammer2.resilver_skip_unalloc
+			 * (default 1) — set 0 for full-iteration regression
+			 * baseline.
+			 */
+			if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			    hammer2_raid6_resilver_skip_unalloc &&
+			    hmp->stripe_bitmap != NULL) {
+				int byte_idx = (int)(stripe_num / 8);
+				int bit_idx  = (int)(stripe_num % 8);
+				if (byte_idx >= (int)hmp->stripe_bitmap_size) {
+					stripe_num = num_stripes - 1;
+					continue;
+				}
+				if ((hmp->stripe_bitmap[byte_idx] &
+				     (1 << bit_idx)) == 0) {
+					/* skip the rest of an empty byte */
+					if (bit_idx == 0 &&
+					    hmp->stripe_bitmap[byte_idx] == 0)
+						stripe_num += 7;
+					continue;
+				}
+			}
+
+			/*
+			 * Slots that never hold a row (metadata zone, zone
+			 * reserved segments, space map) were copied by
+			 * Phase A or are rewritten at sync; a parity
+			 * "rebuild" there would overwrite them with garbage.
+			 */
+			if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+			    !hammer2_raid6_slot_is_data(hmp, stripe_num))
 				continue;
+			slots[n++] = stripe_num;
 		}
+		if (n == 0)
+			break;
 
 		/*
-		 * Slots that never hold a row (metadata zone, zone reserved
-		 * segments, space map) were copied by Phase A or are
-		 * rewritten at sync; a parity
-		 * "rebuild" there would overwrite them with garbage.
-		 */
-		if (hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-		    !hammer2_raid6_slot_is_data(hmp, stripe_num))
-			continue;
-
-		phys_off = HAMMER2_ZONE_SEG64 + stripe_num * stripe_unit;
-
-		/*
-		 * Exclusive rebuild_lk holds off seals, the only writers
-		 * of a sealed slot's parity, until our copy is on the new
-		 * disk; a seal that follows rewrites the new disk's column
-		 * itself.  A slot already sealed during the rebuild is
-		 * done: copying it from media could read a data column
-		 * that is still a delayed write.
+		 * Exclusive rebuild_lk, for the whole pass, holds off seals,
+		 * the only writers of a sealed slot's parity, until our
+		 * columns are on the new disk; a seal that follows rewrites
+		 * the new disk's column itself.  A slot already sealed
+		 * during the rebuild is done: copying it from media could
+		 * read a data column that is still a delayed write.
 		 */
 		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
-		if (hmp->rebuild_done != NULL &&
-		    stripe_num / 8 < hmp->stripe_bitmap_size &&
-		    (hmp->rebuild_done[stripe_num / 8] &
-		     (1 << (stripe_num % 8)))) {
-			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-			continue;
-		}
+		if (hmp->rebuild_done != NULL) {
+			int m = 0;
 
-		/* Left-symmetric P and Q disk positions */
-		p_disk = (int)(stripe_num % ndisks);
-		q_disk = (p_disk + 1) % ndisks;
-
-		/* Build physical disk -> logical column mapping for this stripe */
-		di = 0;
-		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-			if (phys_disk == p_disk)
-				phys_to_lcol[phys_disk] = ndata;
-			else if (phys_disk == q_disk)
-				phys_to_lcol[phys_disk] = ndata + 1;
-			else
-				phys_to_lcol[phys_disk] = di++;
-		}
-
-		failed_col = phys_to_lcol[failed_disk_idx];
-
-		/* Check for a second failed disk (dual failure) */
-		other_failed_col = -1;
-		for (i = 0; i < ndisks; i++) {
-			if (i != failed_disk_idx && hmp->raid_failed[i]) {
-				other_failed_col = phys_to_lcol[i];
-				break;
+			for (i = 0; i < n; i++) {
+				if (slots[i] / 8 < hmp->stripe_bitmap_size &&
+				    (hmp->rebuild_done[slots[i] / 8] &
+				     (1 << (slots[i] % 8))))
+					continue;
+				slots[m++] = slots[i];
 			}
+			n = m;
 		}
-
-		/* Read all surviving columns, zero the failed one */
-		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-			col = phys_to_lcol[phys_disk];
-			bzero(col_bufs[col], stripe_unit);
-			ptrs[col] = col_bufs[col];
-
-			if (phys_disk == failed_disk_idx)
-				continue; /* will reconstruct */
-			if (hmp->raid_failed[phys_disk])
-				continue; /* second failed disk, treat as 0 */
-
-			vol = &hmp->volumes[phys_disk];
-			lerror = hammer2_inject_eio(phys_disk);
-			if (lerror == 0)
-				lerror = hammer2_io_raid6_read_sibling(
-				    vol->dev->devvp, phys_off,
-				    col_bufs[col], (int)stripe_unit, 1);
-			if (lerror) {
-				int injected = hammer2_inject_eio(phys_disk);
-				/*
-				 * The unreadable column is a second
-				 * erasure for this stripe, which P+Q
-				 * still recover.  A third is fatal.
-				 * Injected EIO does not auto-fail the
-				 * disk so the test stays repeatable.
-				 */
-				if (other_failed_col >= 0 ||
-				    (!injected &&
-				     hammer2_raid6_auto_fail_disk(hmp,
-							phys_disk))) {
-					lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-					error = EIO;
-					kprintf("hammer2: resilver stripe"
-						" %llu: unrecoverable"
-						" I/O error on disk %d\n",
-						(unsigned long long)
-						stripe_num, phys_disk);
-					goto resilver_done;
-				}
-				bzero(col_bufs[col], stripe_unit);
-				other_failed_col = col;
-			}
-		}
-
-		/* Reconstruct the failed column */
-		if (other_failed_col >= 0) {
-			/* Dual failure: use P+Q reconstruction */
-			hammer2_raid6_dual_recov(ndisks, stripe_unit,
-						 failed_col, other_failed_col,
-						 ptrs);
-		} else {
-			/* Single failure: pass failb = Q (last) column */
-			hammer2_raid6_dual_recov(ndisks, stripe_unit,
-						 failed_col, ndisks - 1,
-						 ptrs);
-		}
-
-		/* Write reconstructed column to the new device */
-		lerror = hammer2_io_raid6_write_stream(new_devvp, phys_off,
-		    ptrs[failed_col], (int)stripe_unit);
+		if (n > 0)
+			lerror = hammer2_resilver_pass(hmp, failed_disk_idx,
+			    new_devvp, slots, n, outs, xbufs);
+		else
+			lerror = 0;
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-		if (lerror && !error)
+		if (lerror) {
 			error = lerror;
-
-		/* Update progress and yield every 256 stripes */
-		if ((stripe_num & 255) == 255) {
-			hmp->resilver_stripes_done = stripe_num + 1;
-			lwkt_yield();
+			break;
 		}
+
+		/* Update progress and yield */
+		nrebuilt += n;
+		hmp->resilver_stripes_done = stripe_num;
+		lwkt_yield();
 	}
 
-resilver_done:
-	/* Free column buffers */
-	for (i = 0; i < ndisks; i++)
-		kfree(col_bufs[i], M_HAMMER2);
+	nanouptime(&ts2);
+	kprintf("hammer2: resilver disk %d: metadata %ld ms, "
+		"%ju slots in %ld ms\n", failed_disk_idx,
+		(long)((ts1.tv_sec - ts0.tv_sec) * 1000 +
+		       (ts1.tv_nsec - ts0.tv_nsec) / 1000000),
+		(uintmax_t)nrebuilt,
+		(long)((ts2.tv_sec - ts1.tv_sec) * 1000 +
+		       (ts2.tv_nsec - ts1.tv_nsec) / 1000000));
+
+	/* Free the pass buffers */
+	for (i = 0; i < batch; i++)
+		kfree(outs[i], M_HAMMER2);
+	for (i = 0; i < 4; i++)
+		kfree(xbufs[i], M_HAMMER2);
 
 	/* Mark resilver complete */
 	hmp->resilver_stripes_done = num_stripes;
