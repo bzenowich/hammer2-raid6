@@ -209,8 +209,7 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	 * INODE/INDIRECT/FREEMAP_* still flow through the freemap radix
 	 * (restricted to the metadata zone per metadata_zone.md).
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	if (hammer2_raid6_v3(hmp) &&
 	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
 	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
 		return hammer2_raid6_stripe_alloc(hmp, chain);
@@ -266,8 +265,7 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	 * This prevents metadata from leaking into the stripe data range,
 	 * which would break the mirror-write invariant in I5.
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	if (hammer2_raid6_v3(hmp) &&
 	    hmp->md_nextents > 0 &&
 	    bref->type != HAMMER2_BREF_TYPE_DATA &&
 	    bref->type != HAMMER2_BREF_TYPE_DIRENT) {

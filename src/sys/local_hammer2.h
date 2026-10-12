@@ -2220,10 +2220,6 @@ void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
 		struct vnode *devvp);
 
 /*
- * A disk takes writes if it is not failed, or if it is the disk an
- * online rebuild is filling.
- */
-/*
  * v3 RAIDZ2-native array.  Live dedup is off here: a dedup'd bref would
  * reference a stripe column without a row refcount, and the dedup heap
  * keys on data_off alone, which does not name the disk (bref.copyid).
@@ -2239,6 +2235,10 @@ hammer2_raid6_v3(hammer2_dev_t *hmp)
 #define HAMMER2_FAIL_DEFER	0x0001	/* may not sleep: record via a task */
 #define HAMMER2_FAIL_FORCE	0x0002	/* mount: exceed the two-disk cap */
 
+/*
+ * A disk takes writes if it is not failed, or if it is the disk an
+ * online rebuild is filling.
+ */
 static __inline int
 hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
 {

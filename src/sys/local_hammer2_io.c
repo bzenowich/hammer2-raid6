@@ -126,8 +126,7 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 	hammer2_volume_t *vol;
 	int disk_idx = -1;
 
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	if (hammer2_raid6_v3(hmp) &&
 	    bref != NULL &&
 	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
 	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
@@ -149,8 +148,7 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 		 * putblk can mirror the write to surviving siblings, and
 		 * getblk can read from a sibling if this disk is failed.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		if (hammer2_raid6_v3(hmp))
 			disk_idx = vol->id;
 	}
 
@@ -280,8 +278,7 @@ hammer2_io_meta_spread_read(hammer2_io_t *dio, hammer2_off_t dev_pbase)
 	int error;
 
 	if (hammer2_md_read_spread == 0 ||
-	    hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
-	    hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2 ||
+	    !hammer2_raid6_v3(hmp) ||
 	    dio->disk_idx < 0 || dio->psize != HAMMER2_PBUFSIZE ||
 	    (dio->btype != HAMMER2_BREF_TYPE_INODE &&
 	     dio->btype != HAMMER2_BREF_TYPE_INDIRECT &&
@@ -569,8 +566,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			break;
 		}
 	} else if ((op == HAMMER2_DOP_NEW || op == HAMMER2_DOP_NEWNZ) &&
-		   hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		   hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		   hammer2_raid6_v3(hmp) &&
 		   (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 		    dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
 		/*
@@ -886,8 +882,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * we capture for the N-way mirror write to sibling
 			 * disks (I5).
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+			if (hammer2_raid6_v3(hmp)) {
 				if (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 				    dio->btype == HAMMER2_BREF_TYPE_DIRENT) {
 					if (bp) {
@@ -1056,8 +1051,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		 * arrived, so release it as a zero column.
 		 */
 		if ((orefs & HAMMER2_DIO_DIRTY) &&
-		    hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    hammer2_raid6_v3(hmp) &&
 		    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 		     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
 			hammer2_raid6_col_release(hmp,
@@ -1977,8 +1971,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	int i;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	copy = kmalloc(psize, M_HAMMER2, M_WAITOK);
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
@@ -2081,8 +2074,7 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 	bzero(col_bufs, sizeof(col_bufs));
 
 	KKASSERT(bytes == stripe_unit);
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 	if (is_physical) {
 		/*
 		 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
@@ -3510,8 +3502,7 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	hammer2_chain_t *vsnap;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	/* Serialize concurrent scrub invocations */
 	if (atomic_cmpset_int((volatile u_int *)&hmp->scrub_running, 0, 1) == 0)

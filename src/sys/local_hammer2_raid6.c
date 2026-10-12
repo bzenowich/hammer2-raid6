@@ -721,8 +721,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 	int last_err = 0;
 	int wrote_any = 0;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	/* the copies are asynchronous: keep a big queue from piling up */
 	waitrunningbufspace();
@@ -922,8 +921,7 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 	hammer2_volume_t *vol;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	if (hmp->mirror_pend_count || hmp->mirror_inflight) {
 		struct hammer2_mirror_pend *mp;

@@ -2409,8 +2409,7 @@ again:
 	KKASSERT(hmp->spmp == NULL);
 
 	/* mirror copies queued by the final flushes, while the disks are open */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 && !hmp->ronly &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+	if (hammer2_raid6_v3(hmp) && !hmp->ronly)
 		hammer2_io_metadata_mirror_flush(hmp);
 
 	/*
