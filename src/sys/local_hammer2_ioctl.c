@@ -1553,7 +1553,7 @@ hammer2_raid6_replace_check(hammer2_dev_t *hmp, int slot,
 {
 	hammer2_devvp_t *dev;
 	struct partinfo part;
-	struct vattr va;
+	struct vattr_lite va;
 	hammer2_off_t need;
 	hammer2_off_t have;
 	int allowed;
