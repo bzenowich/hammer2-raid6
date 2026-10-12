@@ -405,17 +405,13 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	 * the I/O.
 	 */
 	/*
-	 * A failed I/O leaves its buffer (or absent_data) on the dio with
+	 * A failed I/O leaves its buffer on the dio with
 	 * GOOD clear, and a ref holder that waited on INPROG ends up
 	 * here.  Nothing in it is valid; discard it.
 	 */
 	if (dio->bp) {
 		brelse(dio->bp);
 		dio->bp = NULL;
-	}
-	if (dio->absent_data) {
-		kfree(dio->absent_data, M_HAMMER2);
-		dio->absent_data = NULL;
 	}
 	KKASSERT(dio->bp == NULL);
 	dio->rdisk = -1;
@@ -442,21 +438,14 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	    hmp->raid_failed[dio->disk_idx]) {
 		char *preempt_data;
 
-		if (dio->devvp) {
-			dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
-					 GETBLK_KVABIO, 0);
-			preempt_data = dio->bp ? dio->bp->b_data : NULL;
-		} else {
-			/*
-			 * Absent disk (no devvp): cannot call getblk()
-			 * without a valid vnode.  Allocate a kmalloc buffer
-			 * for the reconstruction data; callers access it
-			 * via hammer2_io_data() which checks absent_data.
-			 */
-			dio->absent_data = kmalloc(dio->psize, M_HAMMER2,
-						   M_INTWAIT | M_ZERO);
-			preempt_data = dio->absent_data;
-		}
+		/*
+		 * An absent disk has a dummy vnode (see
+		 * hammer2_add_absent_devvp()), so devvp is never NULL.
+		 */
+		KKASSERT(dio->devvp != NULL);
+		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+				 GETBLK_KVABIO, 0);
+		preempt_data = dio->bp ? dio->bp->b_data : NULL;
 		if (preempt_data) {
 			int is_meta = (dio->btype ==
 				    HAMMER2_BREF_TYPE_INODE ||
@@ -859,7 +848,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	bp = dio->bp;
 	dio->bp = NULL;
 
-	if ((orefs & HAMMER2_DIO_GOOD) && (bp || dio->absent_data)) {
+	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
 		/*
 		 * Non-errored disposal of bp
 		 */
@@ -885,16 +874,10 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			if (hammer2_raid6_v3(hmp)) {
 				if (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 				    dio->btype == HAMMER2_BREF_TYPE_DIRENT) {
-					if (bp) {
-						bkvasync(bp);
-						raid6_data = kmalloc(psize,
-						    M_HAMMER2, M_WAITOK);
-						bcopy(bp->b_data, raid6_data,
-						    psize);
-					} else if (dio->absent_data) {
-						raid6_data = dio->absent_data;
-						dio->absent_data = NULL;
-					}
+					bkvasync(bp);
+					raid6_data = kmalloc(psize,
+					    M_HAMMER2, M_WAITOK);
+					bcopy(bp->b_data, raid6_data, psize);
 				} else if (dio->btype ==
 					    HAMMER2_BREF_TYPE_INODE ||
 					   dio->btype ==
@@ -904,17 +887,11 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					   dio->btype ==
 					    HAMMER2_BREF_TYPE_FREEMAP_LEAF) {
 					rz_meta = 1;
-					if (bp) {
-						bkvasync(bp);
-						md_mirror_data = kmalloc(psize,
-						    M_HAMMER2, M_WAITOK);
-						bcopy(bp->b_data,
-						    md_mirror_data, psize);
-					} else if (dio->absent_data) {
-						md_mirror_data =
-						    dio->absent_data;
-						dio->absent_data = NULL;
-					}
+					bkvasync(bp);
+					md_mirror_data = kmalloc(psize,
+					    M_HAMMER2, M_WAITOK);
+					bcopy(bp->b_data, md_mirror_data,
+					    psize);
 				}
 			}
 
@@ -1059,10 +1036,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		}
 	}
 
-	if (dio->absent_data) {
-		kfree(dio->absent_data, M_HAMMER2);
-		dio->absent_data = NULL;
-	}
 
 	/*
 	 * Update iofree_count before disposing of the dio
@@ -1113,14 +1086,6 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
 	lbase -= dio->dbase;
 	off = (int)((lbase & ~HAMMER2_OFF_MASK_RADIX) -
 		    (off_t)(dio->pbase - dio->dbase));
-
-	/*
-	 * Absent disk (no devvp): data is in a kmalloc buffer.
-	 */
-	if (dio->absent_data) {
-		KKASSERT(off >= 0 && off < dio->psize);
-		return (dio->absent_data + off);
-	}
 
 	bp = dio->bp;
 	KKASSERT(bp != NULL);
@@ -1346,8 +1311,6 @@ dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
 void
 hammer2_io_bkvasync(hammer2_io_t *dio)
 {
-	if (dio->absent_data)
-		return;	/* kmalloc buffer is always CPU-accessible, no KVABIO needed */
 	KKASSERT(dio->bp != NULL);
 	bkvasync(dio->bp);
 }

@@ -2756,41 +2756,35 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 	/*
 	 * 6C packing: try to land in an existing open row first so a row
 	 * can be filled with up to ndata chains before P/Q is computed.
-	 * Bisect knob: hammer2_raid6_pack_open_rows=0 disables packing
-	 * (single-chain-per-row preserved), leaving only the deferred-P/Q
-	 * seal hook from 6C-2 — useful for diagnosing whether a failure
-	 * comes from packing or from the timing change.
 	 */
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 
-	if (hammer2_raid6_pack_open_rows) {
-		hammer2_off_t pack_off;
-		int pack_disk_idx;
+	hammer2_off_t pack_off;
+	int pack_disk_idx;
 
-		if (hammer2_raid6_open_row_pack_locked(hmp, &pack_off,
-		    &pack_disk_idx)) {
-			int prc_radix;
-			int prc_n = chain->bytes;
+	if (hammer2_raid6_open_row_pack_locked(hmp, &pack_off,
+	    &pack_disk_idx)) {
+		int prc_radix;
+		int prc_n = chain->bytes;
 
-			/*
-			 * One more live chain in the row: freeing any one
-			 * of them must not free the row.
-			 */
-			slot = hammer2_raid6_slot(pack_off, stripe_unit);
-			if (hmp->stripe_row_refcount[slot] < 0xff)
-				hmp->stripe_row_refcount[slot]++;
-			hammer2_raid6_sm_touch(hmp, slot);
-			if (hmp->stripe_bf_active)
-				setbit(hmp->stripe_bf_new, slot);
-			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-			kfree(newrow, M_HAMMER2);
-			prc_radix = 0;
-			while (prc_n > 1) { prc_n >>= 1; prc_radix++; }
-			chain->bref.data_off =
-			    pack_off | (hammer2_off_t)prc_radix;
-			chain->bref.copyid   = (uint8_t)pack_disk_idx;
-			return 0;
-		}
+		/*
+		 * One more live chain in the row: freeing any one
+		 * of them must not free the row.
+		 */
+		slot = hammer2_raid6_slot(pack_off, stripe_unit);
+		if (hmp->stripe_row_refcount[slot] < 0xff)
+			hmp->stripe_row_refcount[slot]++;
+		hammer2_raid6_sm_touch(hmp, slot);
+		if (hmp->stripe_bf_active)
+			setbit(hmp->stripe_bf_new, slot);
+		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+		kfree(newrow, M_HAMMER2);
+		prc_radix = 0;
+		while (prc_n > 1) { prc_n >>= 1; prc_radix++; }
+		chain->bref.data_off =
+		    pack_off | (hammer2_off_t)prc_radix;
+		chain->bref.copyid   = (uint8_t)pack_disk_idx;
+		return 0;
 	}
 
 	/*

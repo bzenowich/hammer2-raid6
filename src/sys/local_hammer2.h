@@ -281,7 +281,6 @@ struct hammer2_io {
 	int		error;
 	int		disk_idx;	/* RAID6: physical disk index (-1 if N/A) */
 	int		rdisk;		/* v3 metadata: mirror the last read came from (-1 = disk_idx) */
-	char		*absent_data;	/* RAID6 absent disk: kmalloc'd reconstruction buffer */
 #ifdef HAMMER2_IO_DEBUG
 	int		debug_index;
 #endif
@@ -2259,9 +2258,6 @@ typedef struct hammer2_row_col {
 int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, const hammer2_row_col_t *cols,
 		int ncols, size_t bytes);
-int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
-		hammer2_off_t pbase, int data_disk_idx,
-		void *data, size_t bytes);
 
 /*
  * Open-row packing (6C).  See struct hammer2_open_row in
@@ -2273,8 +2269,6 @@ int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 struct hammer2_open_row;
 void hammer2_raid6_open_rows_init(hammer2_dev_t *hmp);
 void hammer2_raid6_open_rows_free(hammer2_dev_t *hmp);
-int  hammer2_raid6_open_row_pick(hammer2_dev_t *hmp,
-		hammer2_off_t *phys_off_out, int *disk_idx_out);
 void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, int disk_idx,
 		void *data /* takes ownership */, size_t bytes, int dropped);
@@ -2358,7 +2352,6 @@ int hammer2_bref_check_match(const hammer2_blockref_t *bref,
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_inject_eio_autofail;
-extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;

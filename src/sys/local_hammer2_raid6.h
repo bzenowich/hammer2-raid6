@@ -46,18 +46,8 @@
 #define HAMMER2_RAID6_MIN_DISKS	4	/* minimum: 2 data + 2 parity */
 
 /*
- * RAID 6 disk states
+ * Disk states and array flags are persisted: see hammer2_disk.h.
  */
-#define HAMMER2_RAID6_DISK_ONLINE	0
-#define HAMMER2_RAID6_DISK_FAILED	1
-#define HAMMER2_RAID6_DISK_REBUILDING	2
-#define HAMMER2_RAID6_DISK_SPARE	3
-
-/*
- * RAID 6 array flags
- */
-#define HAMMER2_RAID6_FLAG_DEGRADED	0x0001
-#define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
 
 /*
  * GF(2^8) lookup tables.

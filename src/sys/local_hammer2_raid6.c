@@ -670,25 +670,6 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
- * Single-column convenience wrapper preserved for the current
- * one-chain-per-row putblk path.  6C-2 packing will convert call sites
- * to hammer2_io_raid6_write_row() directly.
- */
-int
-hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
-			       int data_disk_idx, void *data, size_t bytes)
-{
-	hammer2_row_col_t col = {
-		.disk_idx = data_disk_idx,
-		.data = data,
-		.bytes = bytes,
-	};
-	hammer2_off_t phys_off = pbase & HAMMER2_RAID6_PHYS_MASK;
-
-	return hammer2_io_raid6_write_row(hmp, phys_off, &col, 1, bytes);
-}
-
-/*
  * v3 RAIDZ2-native: mirror a metadata block to every
  * surviving disk at the same per-disk byte offset.  No parity — the
  * N-way mirror is its own redundancy.
