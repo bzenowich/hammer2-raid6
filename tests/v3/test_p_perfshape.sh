@@ -9,7 +9,28 @@
 #       first), per-disk bytes written within 10% of the mean, total
 #       written <= 2.15x user bytes (4+2 parity overhead is 1.5x for
 #       the data columns, the rest is metadata).
+#   P1c 256 MB of text-like data LZ4 halves (about 2x), then sync
+#   P2c 4000 files of 4 KB that LZ4 shrinks to about 1 KB, then sync
 #   P3  cold sequential read of the P1 file; informational only.
+#
+# P1/P1c/P2/P2c also print the columns reserved (vfs.hammer2.rz_cols_alloc),
+# the df space used and, for the big writes, the throughput, next to the
+# targets of oct-review.md 11.1 / 11.5 (sub-column allocation).  Those
+# targets fail today and are only printed; P5_ASSERT=1 turns them into
+# assertions (11.5 step 4):
+#   P2  write amp <= 8x, df space <= 2x user bytes
+#   P2c columns reserved <= 1/3 of P2
+#   P1c columns reserved <= 0.6x P1, throughput >= 90% of P1
+#
+# Baseline before sub-column allocation (h2dev, 4 disks = 2+2, 2026-10-12;
+# the PFS shows comp lz4:default, setcomp lz4 is applied anyway):
+#          written  amp     columns  df used   throughput
+#   P1     518 MB   2.03x   4096     256 MB    36.3 MB/s
+#   P1c    518 MB   2.03x   4096     256 MB    29.2 MB/s  (LZ4 saves nothing)
+#   P2     551 MB   35.3x   4000     256 MB (16.4x user bytes)
+#   P2c    534 MB   34.2x   4000     256 MB (same as P2)
+# Targets (not asserted): P2 amp <= 8x and df <= 2x; P2c columns <= 1333;
+# P1c columns <= 2457 and >= 90% of P1 throughput.
 # Source data is prepared outside the measured window.
 
 SCRIPTDIR=$(dirname "$0")
@@ -19,9 +40,12 @@ kldstat -q -m hammer2 || kldload hammer2
 
 BIGSRC=/var/tmp/p_rand256
 SMALLSRC=/var/tmp/p_small
+CMPSRC=/var/tmp/p_cmp256
+SMALLCSRC=/var/tmp/p_smallc
 BIG_MB=256
+P5_ASSERT=${P5_ASSERT:-0}
 NFILES=4000
-trap 'rm -rf $SMALLSRC' EXIT INT TERM
+trap 'rm -rf $SMALLSRC $SMALLCSRC $CMPSRC' EXIT INT TERM
 
 echo "=== Group P: I/O shape (NDISKS=$NDISKS) ==="
 
@@ -72,6 +96,8 @@ ds_report() {
         }' > $out
     set -- $(cat $out)
     local rdt="$1" wrt="$2" dev="$3" ratio="$4"
+    LAST_WRT=$wrt
+    LAST_RATIO=$ratio
     echo "  $label: user=$((ubytes / 1048576)) MB array-reads=$rdt B written=$((wrt / 1048576)) MB" \
          "max-disk-deviation=$dev write-amp=$ratio"
     if [ "$rdt" -le 1048576 ]; then
@@ -95,15 +121,103 @@ ds_report() {
     fi
 }
 
+
+# p5_target <label> <ok:0|1> <text>: a 11.1 target.  Printed always;
+# asserted only with P5_ASSERT=1 (they fail until step 4 of 11.5).
+p5_target() {
+    local label="$1" ok="$2" text="$3"
+    if [ "$P5_ASSERT" = 1 ]; then
+        if [ "$ok" = 1 ]; then result PASS "$label: $text"
+        else result FAIL "$label: $text"; fi
+    else
+        result PASS "$label: $text [target not asserted, P5_ASSERT=1]"
+    fi
+}
+
+# used_kb: df "Used" of the test mount, after a sync.
+used_kb() {
+    sync; sync; sleep 1
+    df -k $MNTPT | awk 'NR == 2 { print $3 }'
+}
+
+# Set LZ4 explicitly on the PFS root (new files inherit it) and show it.
+set_lz4() {
+    hammer2 setcomp lz4 $MNTPT > /var/tmp/p_comp.txt 2>&1 ||
+        echo "  INFO: setcomp lz4 failed: $(cat /var/tmp/p_comp.txt)"
+    echo "  comp: $(hammer2 stat $MNTPT 2>&1 | sed -n 2p)"
+}
+
+# big_write <label> <src>: P1-style write of a 256 MB file into a fresh
+# array; sets BW_COLS BW_SECS BW_MBS BW_USED_KB BW_WRT.
+big_write() {
+    local label="$1" src="$2" c0 u0 u1
+    setup_fresh full
+    check_v3
+    set_lz4
+    sync; sleep 2
+    u0=$(used_kb)
+    ds_snap /var/tmp/p_b1
+    c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
+    # /usr/bin/time -p gives the elapsed time to 10 ms (date has no %N).
+    /usr/bin/time -p sh -c "dd if=$src of=$MNTPT/big bs=1048576 2>/dev/null; sync; sync" \
+        2> /var/tmp/p_time.txt
+    sleep 2
+    ds_snap /var/tmp/p_a1
+    BW_COLS=$(( $(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null) - c0 ))
+    u1=$(used_kb)
+    BW_USED_KB=$((u1 - u0))
+    BW_SECS=$(awk '$1 == "real" { print $2 }' /var/tmp/p_time.txt)
+    BW_MBS=$(awk -v s="$BW_SECS" -v m=$BIG_MB 'BEGIN { printf "%.1f", (s > 0) ? m / s : 0 }')
+    ds_report "$label" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
+    BW_WRT=$LAST_WRT
+    echo "    $label: columns reserved +$BW_COLS, df used +$((BW_USED_KB / 1024)) MB," \
+         "$BW_SECS s (write+sync) = $BW_MBS MB/s"
+    teardown "$label"
+}
+
+# small_write <label> <srcdir>: P2-style copy of 4000 files into a fresh
+# array; sets SW_COLS SW_USED_KB SW_RATIO SW_WRT.  Leaves the array mounted
+# (P4/P5 use the tree) and does not tear down.
+small_write() {
+    local label="$1" src="$2" c0 r0 u0 u1
+    setup_fresh full
+    check_v3
+    set_lz4
+    sync; sleep 2
+    u0=$(used_kb)
+    ds_snap /var/tmp/p_b2
+    c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
+    r0=$(sysctl -n vfs.hammer2.rz_rewrite_slots 2>/dev/null)
+    cp -R $src $MNTPT/small
+    sync; sync; sleep 2
+    ds_snap /var/tmp/p_a2
+    SW_COLS=$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - c0 ))
+    echo "    $label: columns reserved +$SW_COLS, rewrite slots +$(( $(sysctl -n vfs.hammer2.rz_rewrite_slots) - r0 ))"
+    u1=$(used_kb)
+    SW_USED_KB=$((u1 - u0))
+}
+
 # Source data, outside the measured windows.
 if [ ! -s $BIGSRC ] || [ "$(stat -f %z $BIGSRC)" != "$((BIG_MB * 1048576))" ]; then
     dd if=/dev/urandom of=$BIGSRC bs=1048576 count=$BIG_MB 2>/dev/null
 fi
-rm -rf $SMALLSRC
-mkdir -p $SMALLSRC
-awk -v n=$NFILES 'BEGIN {
+rm -rf $SMALLSRC $SMALLCSRC
+mkdir -p $SMALLSRC $SMALLCSRC
+# P2: incompressible files (random hex, LZ4 cannot halve it); P2c: the
+# same count of text-like files that LZ4 shrinks to about 1 KB.  Both
+# deterministic (fixed srand seed).
+awk -v n=$NFILES -v d=$SMALLSRC 'BEGIN {
+    srand(2)
     for (i = 0; i < n; i++) {
-        f = sprintf("%s/f%d", "'$SMALLSRC'", i)
+        f = sprintf("%s/f%d", d, i)
+        for (j = 0; j < 512; j++)
+            printf "%08x", int(rand() * 4294967296) > f
+        close(f)
+    }
+}'
+awk -v n=$NFILES -v d=$SMALLCSRC 'BEGIN {
+    for (i = 0; i < n; i++) {
+        f = sprintf("%s/f%d", d, i)
         s = ""
         while (length(s) < 4096)
             s = s sprintf("file %d line %d lorem ipsum dolor sit amet\n", i, length(s))
@@ -111,17 +225,44 @@ awk -v n=$NFILES 'BEGIN {
         close(f)
     }
 }'
+# P1c source: 1 MB of pseudo-random words (a 256-word vocabulary of
+# 4-7 letter words, one random pick per word), repeated BIG_MB times.
+# Each 64 KB block compresses on its own, so the repeat does not help LZ4.
+# Tuned to about 2x.  Never zero blocks (those take the zero detection).
+if [ ! -s $CMPSRC ] || [ "$(stat -f %z $CMPSRC)" != "$((BIG_MB * 1048576))" ]; then
+    awk 'BEGIN {
+        srand(1)
+        for (w = 0; w < 256; w++) {
+            len = 4 + int(rand() * 4); v = ""
+            for (k = 0; k < len; k++) v = v sprintf("%c", 97 + int(rand() * 26))
+            voc[w] = v
+        }
+        n = 0
+        while (n < 1048576) {
+            l = ""
+            for (k = 0; k < 12; k++) l = l (k ? " " : "") voc[int(rand() * 256)]
+            l = l "\n"
+            if (n + length(l) > 1048576) l = substr(l, 1, 1048576 - n)
+            printf "%s", l; n += length(l)
+        }
+    }' > /var/tmp/p_cmp1m
+    : > $CMPSRC
+    i=0
+    while [ $i -lt $BIG_MB ]; do cat /var/tmp/p_cmp1m >> $CMPSRC; i=$((i + 1)); done
+    rm -f /var/tmp/p_cmp1m
+fi
 
-# P1: large incompressible write
-setup_fresh full
-check_v3
-sync; sleep 2
-ds_snap /var/tmp/p_b1
-dd if=$BIGSRC of=$MNTPT/big bs=1048576 2>/dev/null
-sync; sync; sleep 2
-ds_snap /var/tmp/p_a1
-ds_report "P1" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
-teardown "P1"
+# P1: large incompressible write; P1c: compressible (about 2x)
+big_write P1 $BIGSRC
+P1_COLS=$BW_COLS; P1_MBS=$BW_MBS; P1_WRT=$BW_WRT
+big_write P1c $CMPSRC
+P1C_COLS=$BW_COLS; P1C_MBS=$BW_MBS; P1C_WRT=$BW_WRT
+echo "  P1c vs P1: columns $P1C_COLS vs $P1_COLS, throughput $P1C_MBS vs $P1_MBS MB/s," \
+     "written $((P1C_WRT / 1048576)) MB vs $((P1_WRT / 1048576)) MB"
+p5_target "P1c" $(awk -v c=$P1C_COLS -v p=$P1_COLS 'BEGIN { print (c <= 0.6 * p) }') \
+    "columns reserved $P1C_COLS vs P1 $P1_COLS (target <= 0.6x)"
+p5_target "P1c" $(awk -v c=$P1C_MBS -v p=$P1_MBS 'BEGIN { print (c >= 0.9 * p) }') \
+    "throughput $P1C_MBS vs P1 $P1_MBS MB/s (target >= 90%)"
 
 # P3 first needs P1's file, so run it before P2 re-creates the array.
 setup_fresh full
@@ -138,16 +279,7 @@ echo "  INFO: P3 cold read: $((rd / 1048576)) MB read from members for $BIG_MB M
 teardown "P3"
 
 # P2: many small files
-setup_fresh full
-check_v3
-sync; sleep 2
-ds_snap /var/tmp/p_b2
-P2C0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
-P2R0=$(sysctl -n vfs.hammer2.rz_rewrite_slots 2>/dev/null)
-cp -R $SMALLSRC $MNTPT/small
-sync; sync; sleep 2
-ds_snap /var/tmp/p_a2
-echo "    P2: columns reserved +$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - P2C0 )), rewrite slots +$(( $(sysctl -n vfs.hammer2.rz_rewrite_slots) - P2R0 ))"
+small_write P2 $SMALLSRC
 # Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
 # P5), about 32x the user bytes.  Measured 35.0-35.7x on h2dev and the Pi,
 # but once 41.3x on the Pi (kernel #20, full run: one extra syncer pass
@@ -157,6 +289,12 @@ echo "    P2: columns reserved +$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - P2C
 # Metadata primaries all live on disk 0 (oct-review P4) and the syncer
 # rewrites them a varying number of times, so allow 25% imbalance.
 ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 45 0.25
+P2_COLS=$SW_COLS; P2_RATIO=$LAST_RATIO
+echo "    P2: df used +$((SW_USED_KB / 1024)) MB for $((NFILES * 4 / 1024)) MB of files," \
+     "space ratio $(awk -v u=$SW_USED_KB -v b=$((NFILES * 4)) 'BEGIN { printf "%.2f", u / b }')"
+p5_target "P2" $(awk -v r=$P2_RATIO 'BEGIN { print (r <= 8) }') "write amplification $P2_RATIO (target <= 8)"
+p5_target "P2" $(awk -v u=$SW_USED_KB -v b=$((NFILES * 4)) 'BEGIN { print (u <= 2 * b) }') \
+    "df space $SW_USED_KB KB for $((NFILES * 4)) KB of files (target <= 2x)"
 n=$(ls $MNTPT/small | wc -l | tr -d ' ')
 if [ "$n" = "$NFILES" ]; then
     result PASS "P2: $n files present"
@@ -230,5 +368,21 @@ else
     cat /var/tmp/p5_err.txt
 fi
 teardown "P2"
+
+# P2c: the same count of compressible files (LZ4: 4 KB -> about 1 KB).
+# Compression saves nothing on v3 today (a column per chain either way).
+small_write P2c $SMALLCSRC
+ds_report "P2c" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 45 0.25
+echo "    P2c vs P2: columns $SW_COLS vs $P2_COLS, write-amp $LAST_RATIO vs $P2_RATIO," \
+     "df used +$((SW_USED_KB / 1024)) MB"
+p5_target "P2c" $(awk -v c=$SW_COLS -v p=$P2_COLS 'BEGIN { print (c <= p / 3) }') \
+    "columns reserved $SW_COLS vs P2 $P2_COLS (target <= 1/3)"
+n=$(ls $MNTPT/small | wc -l | tr -d ' ')
+if [ "$n" = "$NFILES" ]; then
+    result PASS "P2c: $n files present"
+else
+    result FAIL "P2c: $n of $NFILES files present"
+fi
+teardown "P2c"
 
 summary
