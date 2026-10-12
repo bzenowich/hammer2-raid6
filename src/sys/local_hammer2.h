@@ -2341,6 +2341,7 @@ extern int hammer2_inject_eio_autofail;
 extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
+extern int hammer2_raid6_put_stall_ms;
 
 /* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */

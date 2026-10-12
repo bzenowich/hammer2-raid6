@@ -91,6 +91,7 @@ uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 int hammer2_raid6_pack_open_rows = 1;	/* v3: enable 6C packing */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
+int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
 int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;
 long hammer2_rz_open_high;
@@ -180,6 +181,9 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 	   "v3 RAID6: skip unallocated stripe slots during resilver "
 	   "(default 1).  Set 0 to force full-iteration baseline for "
 	   "regression timing.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_put_stall_ms, CTLFLAG_RW,
+	   &hammer2_raid6_put_stall_ms, 0,
+	   "test hook: stall the next v3 data write (ms) between reserve and put");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_gen_wait_ms, CTLFLAG_RW,
 	   &hammer2_raid6_gen_wait_ms, 0,
 	   "v3 RAID6: how long (ms, without progress) a flush waits for the "

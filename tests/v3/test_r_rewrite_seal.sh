@@ -12,6 +12,7 @@
 #       correct kernel: A reads back as the new data, cold, and
 #       h2stripe_check finds P/Q correct.
 #   R2  Same, rewriting A twice after the seal.
+#   R4a/R4b  put-stall hook: sync waits for a stalled column / times out.
 #   R3  Control, runs first: as R1 but A is fsync'd after its first write,
 #       which clears MODIFIED, so the rewrite takes a new slot.
 
@@ -132,6 +133,74 @@ remount
 check_a R2 Z
 parity_ok R2
 teardown R2
+
+# R4: a strategy write holds its row reservation (raid6_put_stall_ms)
+# while sync runs.  The flush must wait for the column (oct-review.md
+# §10), seal the row once, and leave exact parity.  The free slots are
+# first filled with garbage by a write/rm/bulkfree cycle, so a zero-fill
+# seal that races the arriving column would show as a parity error.
+r4_prep() {
+    setup_fresh
+    check_v3
+    local k=0
+    while [ "$k" -lt 40 ]; do
+        dd if=/dev/urandom of=$MNTPT/g_$k bs=65536 count=2 2>/dev/null
+        k=$((k + 1))
+    done
+    sync
+    rm -f $MNTPT/g_*
+    sync
+    hammer2 bulkfree $MNTPT > /dev/null 2>&1
+    hammer2 bulkfree $MNTPT > /dev/null 2>&1
+}
+
+# R4a: stall shorter than the wait; sync waits, then everything is exact.
+r4_prep
+sysctl vfs.hammer2.raid6_gen_wait_ms=5000 > /dev/null
+sysctl vfs.hammer2.raid6_put_stall_ms=3000 > /dev/null
+( $H2WR $MNTPT/S 4 4096 ) &
+WPID=$!
+sleep 1
+T0=$(date +%s)
+sync
+T1=$(date +%s)
+wait $WPID
+if [ $((T1 - T0)) -ge 1 ]; then
+    result PASS "R4a: sync waited for the stalled column ($((T1 - T0 + 1))s after arming)"
+else
+    result FAIL "R4a: sync did not wait ($((T1 - T0))s)"
+fi
+[ "$(sysctl -n vfs.hammer2.rz_gen_wait_fail)" = 0 ] &&
+    result PASS "R4a: no failed gen wait" || result FAIL "R4a: gen wait failed"
+H=$(head -c 4096 /dev/zero | tr '\0' 4 | sha256 -q)
+[ "$(sha256 -q $MNTPT/S)" = "$H" ] &&
+    result PASS "R4a: stalled write intact" || result FAIL "R4a: stalled write wrong"
+parity_ok R4a
+teardown R4a
+
+# R4b: stall longer than the wait.  The flush fails (counter), the
+# previous TXG stays committed, and a later sync succeeds.
+r4_prep
+sysctl vfs.hammer2.raid6_gen_wait_ms=1000 > /dev/null
+sysctl vfs.hammer2.raid6_put_stall_ms=4000 > /dev/null
+( $H2WR $MNTPT/S 5 4096 ) &
+WPID=$!
+sleep 1
+sync
+sleep 5
+wait $WPID
+sync
+if [ "$(sysctl -n vfs.hammer2.rz_gen_wait_fail)" -ge 1 ]; then
+    result PASS "R4b: failed gen wait counted"
+else
+    result FAIL "R4b: no failed gen wait counted"
+fi
+sysctl vfs.hammer2.raid6_gen_wait_ms=5000 > /dev/null
+H=$(head -c 4096 /dev/zero | tr '\0' 5 | sha256 -q)
+[ "$(sha256 -q $MNTPT/S)" = "$H" ] &&
+    result PASS "R4b: write intact after the retry" || result FAIL "R4b: write wrong"
+parity_ok R4b
+teardown R4b
 
 umount $MNTPT 2>/dev/null
 summary
