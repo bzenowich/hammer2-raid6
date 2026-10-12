@@ -92,6 +92,7 @@ uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
+int hammer2_raid6_subcol_test;	/* test hook: place chains inside their column */
 int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;
 long hammer2_rz_open_high;
@@ -188,6 +189,11 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_put_stall_ms, CTLFLAG_RW,
 	   &hammer2_raid6_put_stall_ms, 0,
 	   "test hook: stall the next v3 data write (ms) between reserve and put");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_subcol_test, CTLFLAG_RW,
+	   &hammer2_raid6_subcol_test, 0,
+	   "test hook: place new v3 data chains smaller than 64 KB at a "
+	   "non-zero offset inside their private column (1 = end of the "
+	   "column, 2 = varied); 0 = offset 0");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_gen_wait_ms, CTLFLAG_RW,
 	   &hammer2_raid6_gen_wait_ms, 0,
 	   "v3 RAID6: how long (ms, without progress) a flush waits for the "

@@ -2063,7 +2063,8 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 		 */
 		uint64_t stripe_slot;
 
-		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK;
+		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK &
+			      ~(hammer2_off_t)(stripe_unit - 1);
 		stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
 		hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
 		target_col = hammer2_raid6_lcol(data_disk_idx, p_disk, q_disk,

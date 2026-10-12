@@ -2288,6 +2288,7 @@ void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 int  hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp);
 int  hammer2_raid6_col_arrived(hammer2_dev_t *hmp,
 			       const hammer2_blockref_t *bref);
+int  hammer2_raid6_col_rewrite(hammer2_dev_t *hmp, hammer2_chain_t *chain);
 void hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			       int disk_idx);
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
@@ -2368,6 +2369,7 @@ extern int hammer2_inject_eio_autofail;
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;
+extern int hammer2_raid6_subcol_test;
 
 /* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */

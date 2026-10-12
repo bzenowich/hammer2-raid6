@@ -1173,6 +1173,15 @@ typedef struct hammer2_inode_data hammer2_inode_data_t;
 #define HAMMER2_RAID6_PHYS_MASK		(~HAMMER2_RAID6_DISK_MASK & ~HAMMER2_OFF_MASK_RADIX)
 
 /*
+ * A v3 DATA blockref's data_off is column base + sub-offset + radix.  The
+ * sub-offset is a multiple of HAMMER2_ALLOC_MIN (1 KB) below
+ * HAMMER2_PBUFSIZE, so it lives in bits 10-15 and never meets the radix
+ * in bits 0-5.  COLUMN_MASK keeps the per-disk column base only.
+ */
+#define HAMMER2_RAID6_COLUMN_MASK	(HAMMER2_RAID6_PHYS_MASK &	\
+					 ~(hammer2_off_t)(HAMMER2_PBUFSIZE - 1))
+
+/*
  * Maximum number of volumes in a HAMMER2 filesystem (defined early
  * so hammer2_raid_config can use it before hammer2_volume_data).
  */

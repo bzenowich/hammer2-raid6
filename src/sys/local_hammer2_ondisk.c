@@ -2722,6 +2722,73 @@ hammer2_raid6_find_free_slot(hammer2_dev_t *hmp, uint64_t from, uint64_t to,
 }
 
 /*
+ * Sub-offset of a chain of `bytes` inside its column, for the test hook
+ * vfs.hammer2.raid6_subcol_test (oct-review.md section 11.5 step 2).  The
+ * column stays private to the chain; only data_off gains an offset, so
+ * the read, scrub, degraded read, self-heal and resilver paths see what
+ * a shared column will give them.  A power-of-two size is placed at a
+ * multiple of itself, as the packing allocator will place it.  64 KB
+ * chains, and everything when the hook is off, stay at 0.
+ */
+static uint32_t
+hammer2_raid6_test_off(uint64_t slot, size_t bytes)
+{
+	uint32_t n;
+
+	if (hammer2_raid6_subcol_test == 0 || bytes >= HAMMER2_PBUFSIZE ||
+	    bytes < HAMMER2_ALLOC_MIN)
+		return 0;
+	n = (uint32_t)(HAMMER2_PBUFSIZE / bytes);
+	if (hammer2_raid6_subcol_test == 1)
+		return (uint32_t)(HAMMER2_PBUFSIZE - bytes);
+	return (uint32_t)(bytes * (1 + (slot * 2654435761U + bytes) % (n - 1)));
+}
+
+/*
+ * The chain's column is still pending and private (nothing else lives in
+ * it), so a resize may move the chain inside it.  Keep the offset if the
+ * new size is aligned to it and fits, else pick a new one.  Only the
+ * offset bits of data_off change; the caller sets the radix.
+ */
+static void
+hammer2_raid6_replace_private(hammer2_chain_t *chain)
+{
+	hammer2_blockref_t *bref = &chain->bref;
+	hammer2_off_t cur;
+	hammer2_off_t base;
+	uint64_t slot;
+	size_t nbytes = chain->bytes;
+
+	if (!hammer2_raid6_bref_slot(chain->hmp, bref, &slot))
+		return;
+	base = bref->data_off & ~(hammer2_off_t)(HAMMER2_PBUFSIZE - 1);
+	cur = bref->data_off & (HAMMER2_PBUFSIZE - 1) &
+	      ~(hammer2_off_t)HAMMER2_OFF_MASK_RADIX;
+	if (nbytes == 0 || nbytes > HAMMER2_PBUFSIZE ||
+	    ((cur % nbytes) == 0 && cur + nbytes <= HAMMER2_PBUFSIZE))
+		return;
+	cur = hammer2_raid6_test_off(slot, nbytes);
+	bref->data_off = base | cur | (bref->data_off & HAMMER2_OFF_MASK_RADIX);
+}
+
+/*
+ * A chain modified again while MODIFIED: should it take a fresh slot
+ * (return 1) or reuse its column (0)?  The column of a chain that has
+ * arrived, or whose row has sealed, is not ours any more
+ * (hammer2_raid6_col_arrived).  A pending one is, and the chain may
+ * have a new size (hammer2_chain_resize sets chain->bytes first), so it
+ * is re-placed inside the column.
+ */
+int
+hammer2_raid6_col_rewrite(hammer2_dev_t *hmp, hammer2_chain_t *chain)
+{
+	if (hammer2_raid6_col_arrived(hmp, &chain->bref))
+		return 1;
+	hammer2_raid6_replace_private(chain);
+	return 0;
+}
+
+/*
  * Allocate a physical stripe slot for a RAIDZ2-native (v3) data column.
  * Sets chain->bref.data_off to the physical column offset on the chosen disk
  * and chain->bref.copyid to the disk index (0..ndisks-1).
@@ -2781,8 +2848,9 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 		kfree(newrow, M_HAMMER2);
 		prc_radix = 0;
 		while (prc_n > 1) { prc_n >>= 1; prc_radix++; }
-		chain->bref.data_off =
-		    pack_off | (hammer2_off_t)prc_radix;
+		chain->bref.data_off = pack_off |
+		    hammer2_raid6_test_off(slot, chain->bytes) |
+		    (hammer2_off_t)prc_radix;
 		chain->bref.copyid   = (uint8_t)pack_disk_idx;
 		atomic_add_long(&hammer2_rz_cols_alloc, 1);
 		return 0;
@@ -2850,7 +2918,8 @@ found:
 	 * synthesizes a (disk_idx<<56)|phys_off key at lookup time to keep
 	 * per-disk entries distinct.
 	 */
-	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
+	chain->bref.data_off = phys_off |
+	    hammer2_raid6_test_off(slot, chain->bytes) | (hammer2_off_t)radix;
 	chain->bref.copyid   = (uint8_t)disk_idx;
 	atomic_add_long(&hammer2_rz_cols_alloc, 1);
 

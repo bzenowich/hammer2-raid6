@@ -1645,7 +1645,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		if (hammer2_raid6_v3(hmp) && chain->bytes &&
 		    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
 		     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT) &&
-		    hammer2_raid6_col_arrived(hmp, &chain->bref)) {
+		    hammer2_raid6_col_rewrite(hmp, chain)) {
 			newmod = 1;
 			atomic_add_long(&hammer2_rz_rewrite_slots, 1);
 		}
@@ -1947,8 +1947,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
 				hammer2_raid6_col_release(hmp,
 				    chain->bref.data_off &
-				    HAMMER2_RAID6_PHYS_MASK &
-				    ~(hammer2_off_t)HAMMER2_OFF_MASK_RADIX,
+				    HAMMER2_RAID6_COLUMN_MASK,
 				    chain->bref.copyid);
 			}
 			break;
