@@ -208,6 +208,7 @@ fi
 echo "--- J3: resize leaves no open row ---"
 setup_fresh
 check_v3
+cols0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
 k=0
 while [ "$k" -lt 40 ]; do
     dd if=/dev/urandom of=$MNTPT/g_$k bs=4096 count=1 2>/dev/null
@@ -233,6 +234,15 @@ if [ "$left" = "0" ]; then
     result PASS "J3: no open rows after resizes"
 else
     result FAIL "J3: $left rows still open after sync (leaked reservations)"
+fi
+# Each of the 3 passes writes one data chain per file, so 120 columns.
+# A resize used to reserve a second slot (and write the first), 200 in all.
+cols=$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - cols0 ))
+echo "    rz_cols_alloc +$cols rz_resize_inplace=$(sysctl -n vfs.hammer2.rz_resize_inplace)"
+if [ "$cols" -le 130 ]; then
+    result PASS "J3: a resize reserves one column ($cols for 120 chains)"
+else
+    result FAIL "J3: $cols columns reserved for 120 chain writes (resize allocates twice)"
 fi
 scrub_clean "J3"
 teardown "J3"

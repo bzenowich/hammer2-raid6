@@ -1399,6 +1399,51 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 		return (chain->error);
 
 	/*
+	 * v3 DATA/DIRENT: a column is always the full 64 KB, the size only
+	 * lives in the radix of bref.data_off, and the caller has the new
+	 * data in hand, so there is nothing to read or copy.  Resolve the
+	 * slot with one chain_modify:
+	 *
+	 *	not MODIFIED, or its column has already reached its row
+	 *	(hammer2_raid6_col_arrived): modify takes a fresh slot, with
+	 *	the radix of the new size because chain->bytes is set first.
+	 *
+	 *	MODIFIED and the column still pending: modify keeps it, and
+	 *	only the radix changes (oct-review.md P5, section 10.3).
+	 *
+	 * The old path called modify with flags 0, which read the old block,
+	 * copied it into a slot of its own and wrote that slot out, and then
+	 * allocated a second slot.
+	 */
+	if (hammer2_raid6_v3(hmp) && nbytes &&
+	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
+	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
+		if (chain->dio) {
+			hammer2_io_brelse(&chain->dio);
+			chain->data = NULL;
+		}
+		chain->bytes = nbytes;
+		error = hammer2_chain_modify(chain, mtid, dedup_off,
+					     HAMMER2_MODIFY_OPTDATA);
+		if (error) {
+			chain->bytes = obytes;
+			return error;
+		}
+		if ((chain->bref.data_off & HAMMER2_OFF_MASK_RADIX) !=
+		    (hammer2_off_t)nradix) {
+			chain->bref.data_off =
+			    (chain->bref.data_off & ~HAMMER2_OFF_MASK_RADIX) |
+			    (hammer2_off_t)nradix;
+			atomic_add_long(&hammer2_rz_resize_inplace, 1);
+		}
+		if (chain->dio) {
+			hammer2_io_brelse(&chain->dio);
+			chain->data = NULL;
+		}
+		return (chain->error);
+	}
+
+	/*
 	 * Make sure the old data is instantiated so we can copy it.  If this
 	 * is a data block, the device data may be superfluous since the data
 	 * might be in a logical block, but compressed or encrypted data is
@@ -1418,21 +1463,7 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 	 *	 to resize data blocks in-place, or directory entry blocks
 	 *	 which are about to be modified in some manner.
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
-	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
-	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
-		/*
-		 * stripe_alloc derives the radix in bref.data_off from
-		 * chain->bytes, so it must hold the new size by now.
-		 */
-		chain->bytes = nbytes;
-		error = hammer2_raid6_stripe_alloc(hmp, chain);
-		if (error)
-			chain->bytes = obytes;
-	} else {
-		error = hammer2_freemap_alloc(chain, nbytes);
-	}
+	error = hammer2_freemap_alloc(chain, nbytes);
 	if (error)
 		return error;
 

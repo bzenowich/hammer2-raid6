@@ -142,9 +142,12 @@ setup_fresh full
 check_v3
 sync; sleep 2
 ds_snap /var/tmp/p_b2
+P2C0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
+P2R0=$(sysctl -n vfs.hammer2.rz_rewrite_slots 2>/dev/null)
 cp -R $SMALLSRC $MNTPT/small
 sync; sync; sleep 2
 ds_snap /var/tmp/p_a2
+echo "    P2: columns reserved +$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - P2C0 )), rewrite slots +$(( $(sysctl -n vfs.hammer2.rz_rewrite_slots) - P2R0 ))"
 # Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
 # P5), about 32x the user bytes.  Measured 35.0-35.7x on h2dev and the Pi,
 # but once 41.3x on the Pi (kernel #20, full run: one extra syncer pass

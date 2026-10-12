@@ -2792,6 +2792,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
 			chain->bref.data_off =
 			    pack_off | (hammer2_off_t)prc_radix;
 			chain->bref.copyid   = (uint8_t)pack_disk_idx;
+			atomic_add_long(&hammer2_rz_cols_alloc, 1);
 			return 0;
 		}
 	}
@@ -2870,6 +2871,7 @@ have_disk:
 	 */
 	chain->bref.data_off = phys_off | (hammer2_off_t)radix;
 	chain->bref.copyid   = (uint8_t)disk_idx;
+	atomic_add_long(&hammer2_rz_cols_alloc, 1);
 
 	return 0;
 }

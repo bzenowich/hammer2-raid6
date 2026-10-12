@@ -2366,6 +2366,8 @@ extern int hammer2_raid6_put_stall_ms;
 /* v3 open-row statistics (vfs.hammer2.rz_*), all hmps together */
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */
 extern long hammer2_rz_open_high;	/* peak open rows */
+extern long hammer2_rz_resize_inplace;	/* v3 resizes that kept the column */
+extern long hammer2_rz_cols_alloc;	/* v3 columns reserved by stripe_alloc */
 extern long hammer2_rz_rewrite_slots;	/* rewrites that took a fresh slot */
 extern long hammer2_rz_col_released;
 extern long hammer2_rz_put_anomaly;	/* second put on an arrived column */
