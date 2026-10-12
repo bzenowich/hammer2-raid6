@@ -1583,7 +1583,15 @@ hammer2_raid6_replace_check(hammer2_dev_t *hmp, int slot,
 			return EBUSY;
 		}
 	}
-	if (vfs_mountedon(new_devvp)) {
+	/*
+	 * Our own mount marks every member's device mounted, so the
+	 * failed slot's own device (a replug, or a failed disk replaced
+	 * onto itself) is mounted by us and fine.
+	 */
+	dev = hmp->volumes[slot].dev;
+	if (vfs_mountedon(new_devvp) &&
+	    !(dev && dev->devvp && dev->devvp->v_rdev &&
+	      dev->devvp->v_rdev == new_devvp->v_rdev)) {
 		kprintf("hammer2: raid replace: %s is mounted\n", new_path);
 		return EBUSY;
 	}
