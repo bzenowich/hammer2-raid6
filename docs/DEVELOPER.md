@@ -75,18 +75,19 @@ logical address space; striping is invisible above the I/O layer.
   efficiency from 1/4 to 1/2.  At NDISKS≥6 it recovers most of the
   ZFS-style `(ndata)/(ndisks)` ratio.  See §6.
 - **Metadata is N-way mirrored**, not parity-protected — INODE /
-  INDIRECT / FREEMAP_NODE / FREEMAP_LEAF / DIRENT chains land on
-  the same per-disk byte offset on *every* disk.  Reads pick any
+  INDIRECT / FREEMAP_NODE / FREEMAP_LEAF chains land on the same
+  per-disk byte offset on *every* disk.  DIRENT is not metadata in
+  this sense: like DATA it is striped with P/Q.  Reads pick any
   surviving sibling.  See §8.
 - **In-memory stripe bitmap** — one bit per stripe slot, persisted
   to a dedicated zone on disk 0; if invalid at mount the H4-deep
   walker rebuilds it from the chain tree.  See §7.
-- **Synchronous P/Q on seal** — `hammer2_io_raid6_write_row` issues
-  `bwrite` (not `bawrite`) for P and Q.  The seal_row caller also
-  zero-writes any data-disk column not in the row's `alloc_mask`
-  before invoking write_row (see §6).  An earlier async P/Q
-  attempt deadlocked the buffer cache under virtio-blk load;
-  revisit if Phase 3 hardware perf needs it.
+- **Parallel P/Q on seal** — `hammer2_io_raid6_write_row` starts the
+  P and Q writes together (`hammer2_bwrite_start`) and then waits for
+  both (`hammer2_bwrite_wait`); the caller still blocks until they are
+  done.  The parity buffers are `B_RELBUF | B_NOCACHE`.  Moving the
+  seal off the putblk path (async sealing) is an open item in
+  `docs/outstanding.md`.
 - **COW** — every write goes to a freshly allocated stripe slot.
   No in-place update, no RMW parity.
 
@@ -110,11 +111,11 @@ WRITE DATA/DIRENT
     hammer2_raid6_open_row_add_data → tracker buffers them.
 
   At seal (n_alloc==ndata OR TXG flush):
+    (seal_row first zero-writes the data columns no chain reserved)
     hammer2_io_raid6_write_row(hmp, phys_off, cols[], ncols, bytes)
-      For d in data disks not in cols[]:  bwrite(zeros)
       P = XOR(cols[].data)
       Q = sum(gf_coeff_i * cols[i].data)
-      bwrite(P), bwrite(Q)
+      bwrite_start(P), bwrite_start(Q), then wait for both
 
 WRITE INODE/INDIRECT/FREEMAP_*
   hammer2_io_putblk (metadata branch):
@@ -383,15 +384,18 @@ int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
                                int ncols, size_t bytes);
 ```
 
-- Zero-writes any data-disk column not represented in `cols[]`.
-  Without this, parity reconstruction on a later read/scrub
-  yields wrong data — see §6 *Partial-row parity fix* and §15.
+- Assumes any data-disk column not represented in `cols[]` is zero
+  on disk.  The seal step (not `write_row`) zero-writes those
+  columns first; without it parity reconstruction on a later
+  read/scrub yields wrong data — see §6 *Partial-row parity fix*
+  and §15.
 - Allocates P / Q bufs (one per surviving parity disk; failed
   disks are skipped).
 - XOR-accumulates into P; GF-multiply-accumulates into Q with
   per-column coefficient `gf_exp[my_col % 255]` where `my_col`
   counts data-disk positions less than `col->disk_idx`.
-- Synchronous `bwrite` on the P and Q buffers.
+- Starts the P and Q writes together (`bwrite_start`) and waits for
+  both before returning.
 
 ### Write path (metadata)
 
@@ -451,19 +455,22 @@ Under the bitmap spinlock:
    free slot, open a new `open_row` entry, claim the first data
    disk.  Returns 0; sets bref likewise.
 
-Sysctl bisect knob: `vfs.hammer2.raid6_pack_open_rows` (default
-1) — set 0 to force single-chain-per-row while keeping the
-deferred-P/Q seal hook.
+Packing is always on; the former `raid6_pack_open_rows` bisect
+knob was removed.
 
 ### Sealing
 
 `hammer2_raid6_seal_all_open_rows` (called from
-`hammer2_flush.c` at every TXG commit):
+`hammer2_flush.c` at every TXG commit, before the volume header):
 
-- Walks the open_rows TAILQ via repeated `TAILQ_FIRST`,
-  calling `hammer2_raid6_seal_row_locked_to_unlocked` for each
-  entry (seal_row removes itself from the TAILQ, freeing its
-  metadata and col_data buffers).
+- Advances `rz_gen`, which closes every existing row to new
+  reservations (packing takes only rows of the current generation),
+  then seals each older row once all its reserved columns have
+  arrived.  It does *not* seal every row: rows of the new
+  generation stay open and keep packing.  See `oct-review.md` §10.
+- If a reserved column does not arrive within
+  `vfs.hammer2.raid6_gen_wait_ms` the flush fails with `EAGAIN` and
+  the header is not written.
 
 A row also seals from inside `add_data` when packing fills it
 (`n_alloc == ndata` *and* all data cols have received their
@@ -1012,14 +1019,23 @@ Groups currently in the suite:
 | I | 4 | unclean unmount + bulkfree after crash |
 | J | 2 | packed-row delete + snapshot pinning (M1/6C-6D) |
 | K | 9 | **scrub (M3)** — K1 clean, K2 corrupt + parity-repair, K3 concurrent writes during scrub |
+| L | | read-path self-heal: corrupt a column while unmounted, read, and the data is healed in memory and on disk |
+| M | | silent corruption in more than one column (two erasures); runs last, can hang the guest |
+| N | | capacity and freeing: fill past 2 GB per disk, delete, two bulkfree passes (`docs/capacity.md`) |
+| P | | I/O shape with devstat (`h2devstat`): no array reads on a write, even per-disk write bytes, write amplification bounds |
+| R | | rewrite after a row seal, then `h2stripe_check` (opt-in: not in the default list) |
+| S | | split volume headers: a crash part-way through the header loop; quorum and rollback |
+| T | | disks reused from an earlier filesystem, refused mount |
+
+Run `sh run_all.sh` with no arguments for A..L, N, P, S, T and then M;
+name groups to run only those (`sh run_all.sh A B R`).
 
 Substrate is virtio-blk (`/dev/vbd*`); see `docs/workflow.md` for
 the harness details.  No vn-backed runs are supported.
 
 ### Unit tests
 
-`src/diag/test_raid6.c` (built by `deploy.sh tests`, runs on the
-VM) verifies GF(2^8) math against a reference table — ~135 k
+`src/diag/h2raid6_test.c` (run it on the VM from `/root/h2diag`) verifies GF(2^8) math against a reference table — ~135 k
 tests covering every dual-recov combination.
 
 ### EIO injection
@@ -1036,10 +1052,11 @@ surfacing.
 See `docs/outstanding.md` for the full list.  RAID6-specific
 items:
 
-- **Async P/Q writes.**  `write_row` issues synchronous `bwrite`
-  for P and Q (and zero-fill cols).  An earlier `bawrite`
-  attempt deadlocked the buffer cache under virtio-blk; revisit
-  on Phase 3 hardware where the throttling story differs.
+- **Async P/Q sealing.**  `write_row` starts P and Q together but
+  the caller waits for them.  An earlier `bawrite` attempt
+  deadlocked the buffer cache under virtio-blk; a throttled
+  per-mount seal path is the plan (blocked by `read_sibling`'s raw
+  fallback; see `docs/outstanding.md`).
 - **DTL (Dirty Time Log).**  After a fail-disk + replace, the
   current resilver re-syncs every live slot.  ZFS's DTL would
   let us re-sync only slots written *while* the disk was down.

@@ -1095,8 +1095,7 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
 		hmp = pmp->pfs_hmps[i];
 		if (hmp == NULL)
 			continue;
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		if (hammer2_raid6_v3(hmp))
 			return (EOPNOTSUPP);
 	}
 	if (mode) {
@@ -1982,9 +1981,7 @@ hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data)
 	hmp = ip->pmp->pfs_hmps[0];
 	if (hmp == NULL)
 		return EINVAL;
-	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
-		return ENOTSUP;
-	if (hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2)
+	if (!hammer2_raid6_v3(hmp))
 		return ENOTSUP;
 
 	/* hammer2_io_raid6_scrub() atomically serializes concurrent runs */

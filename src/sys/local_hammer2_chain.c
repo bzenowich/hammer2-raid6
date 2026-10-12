@@ -1418,8 +1418,7 @@ hammer2_chain_resize(hammer2_chain_t *chain,
 	 *	 to resize data blocks in-place, or directory entry blocks
 	 *	 which are about to be modified in some manner.
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	if (hammer2_raid6_v3(hmp) &&
 	    (chain->bref.type == HAMMER2_BREF_TYPE_DATA ||
 	     chain->bref.type == HAMMER2_BREF_TYPE_DIRENT)) {
 		/*
@@ -1589,8 +1588,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		 * columns of a new stripe slot are zero; in-place overwrite
 		 * violates that invariant and would require RMW delta parity.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		if (hammer2_raid6_v3(hmp))
 			newmod = 1;
 	} else if (chain->flags & HAMMER2_CHAIN_DEDUPABLE) {
 		/*
@@ -1739,10 +1737,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				 * and surface the original allocation error.
 				 */
 				if (error && (hmp->hflags & HMNT2_EMERG) &&
-				    !(hmp->raid_type ==
-					HAMMER2_RAID_TYPE_RAID6 &&
-				      hmp->voldata.version >=
-					HAMMER2_VOL_VERSION_RAIDZ2)) {
+				    !hammer2_raid6_v3(hmp)) {
 					error = 0;
 					chain->bref.flags |=
 						HAMMER2_BREF_FLAG_EMERG_MIP;
@@ -5820,9 +5815,7 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 	int disk_idx;
 	int error;
 
-	if (hmp == NULL || hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
-		return HAMMER2_ERROR_CHECK;
-	if (hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2)
+	if (hmp == NULL || !hammer2_raid6_v3(hmp))
 		return HAMMER2_ERROR_CHECK;
 	if (dio == NULL)
 		return HAMMER2_ERROR_CHECK;

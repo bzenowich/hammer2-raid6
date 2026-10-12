@@ -46,18 +46,8 @@
 #define HAMMER2_RAID6_MIN_DISKS	4	/* minimum: 2 data + 2 parity */
 
 /*
- * RAID 6 disk states
+ * Disk states and array flags are persisted: see hammer2_disk.h.
  */
-#define HAMMER2_RAID6_DISK_ONLINE	0
-#define HAMMER2_RAID6_DISK_FAILED	1
-#define HAMMER2_RAID6_DISK_REBUILDING	2
-#define HAMMER2_RAID6_DISK_SPARE	3
-
-/*
- * RAID 6 array flags
- */
-#define HAMMER2_RAID6_FLAG_DEGRADED	0x0001
-#define HAMMER2_RAID6_FLAG_REBUILDING	0x0002
 
 /*
  * GF(2^8) lookup tables.
@@ -110,6 +100,69 @@ hammer2_gf_pow(uint8_t base, uint8_t exp)
 		return 0;
 	log_base = hammer2_gf_log[base];
 	return hammer2_gf_exp[((int)log_base * exp) % 255];
+}
+
+/*
+ * v3 stripe-row layout.  A row is one stripe_unit-sized slot at the same
+ * per-disk physical offset on every disk.  P lives on disk slot % ndisks,
+ * Q on the next disk, and the remaining disks hold data columns in
+ * disk-index order.  Keep every use of this rotation behind these inlines.
+ */
+static __inline uint64_t
+hammer2_raid6_slot(hammer2_off_t phys_off, uint64_t stripe_unit)
+{
+	return (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
+}
+
+static __inline void
+hammer2_raid6_pq(uint64_t slot, int ndisks, int *p_disk, int *q_disk)
+{
+	*p_disk = (int)(slot % ndisks);
+	*q_disk = (*p_disk + 1) % ndisks;
+}
+
+/*
+ * Logical column of physical disk d: data columns count the non-P/Q
+ * disks below d, P is column ndata and Q is column ndata + 1.
+ */
+static __inline int
+hammer2_raid6_lcol(int d, int p_disk, int q_disk, int ndata)
+{
+	int di, col = 0;
+
+	if (d == p_disk)
+		return ndata;
+	if (d == q_disk)
+		return ndata + 1;
+	for (di = 0; di < d; di++) {
+		if (di != p_disk && di != q_disk)
+			col++;
+	}
+	return col;
+}
+
+/*
+ * Round-robin data disk picker: advances hmp->stripe_next_disk and
+ * returns the first disk that is neither P, Q nor in skip_mask, or -1.
+ * Caller holds stripe_bitmap_spin.
+ */
+static __inline int
+hammer2_raid6_pick_data_disk(hammer2_dev_t *hmp, int p_disk, int q_disk,
+			     uint32_t skip_mask)
+{
+	int ndisks = hmp->raid_config.ndisks;
+	int candidate, tries;
+
+	for (tries = 0; tries < ndisks; tries++) {
+		candidate = hmp->stripe_next_disk % ndisks;
+		hmp->stripe_next_disk++;
+		if (candidate == p_disk || candidate == q_disk)
+			continue;
+		if (skip_mask & (1U << candidate))
+			continue;
+		return candidate;
+	}
+	return -1;
 }
 
 /*

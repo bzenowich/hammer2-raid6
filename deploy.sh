@@ -150,7 +150,25 @@ do_tests() {
     ssh $VM_SSH_OPTS "$VM" mkdir -p /root/h2diag
     tar -C "$DIR/src" -cf - diag | ssh $VM_SSH_OPTS "$VM" tar -xf - -C /root/h2diag --strip-components=1
     echo "    Diagnostics synced to /root/h2diag/"
+
+    # F2 and R need h2stripe_check; build it when missing or stale.
+    ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
+cd /root/h2diag
+if [ ! -x h2stripe_check ] || [ h2stripe_check.c -nt h2stripe_check ]; then
+    echo "==> Building h2stripe_check"
+    cc -O2 -o h2stripe_check h2stripe_check.c || echo "    WARNING: h2stripe_check build failed (F2/R will fail)"
+fi
+ENDSSH
 }
+
+# hammer2_raid6.patch is generated (bin/mkpatch) and only used by
+# install_raid6.sh; deploy.sh ships src/ directly.  Warn when it lags.
+check_patch_stale() {
+    if [ -n "$(find "$DIR/src/sys" "$DIR/src/sbin" -type f -newer "$DIR/hammer2_raid6.patch" 2>/dev/null | head -1)" ]; then
+        echo "WARNING: src/ is newer than hammer2_raid6.patch; run bin/mkpatch to regenerate it" >&2
+    fi
+}
+check_patch_stale
 
 ACTION="${1:-all}"
 

@@ -126,8 +126,7 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 	hammer2_volume_t *vol;
 	int disk_idx = -1;
 
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+	if (hammer2_raid6_v3(hmp) &&
 	    bref != NULL &&
 	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
 	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
@@ -149,8 +148,7 @@ hammer2_dio_key(hammer2_dev_t *hmp, hammer2_key_t data_off,
 		 * putblk can mirror the write to surviving siblings, and
 		 * getblk can read from a sibling if this disk is failed.
 		 */
-		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+		if (hammer2_raid6_v3(hmp))
 			disk_idx = vol->id;
 	}
 
@@ -280,8 +278,7 @@ hammer2_io_meta_spread_read(hammer2_io_t *dio, hammer2_off_t dev_pbase)
 	int error;
 
 	if (hammer2_md_read_spread == 0 ||
-	    hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
-	    hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2 ||
+	    !hammer2_raid6_v3(hmp) ||
 	    dio->disk_idx < 0 || dio->psize != HAMMER2_PBUFSIZE ||
 	    (dio->btype != HAMMER2_BREF_TYPE_INODE &&
 	     dio->btype != HAMMER2_BREF_TYPE_INDIRECT &&
@@ -408,17 +405,13 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	 * the I/O.
 	 */
 	/*
-	 * A failed I/O leaves its buffer (or absent_data) on the dio with
+	 * A failed I/O leaves its buffer on the dio with
 	 * GOOD clear, and a ref holder that waited on INPROG ends up
 	 * here.  Nothing in it is valid; discard it.
 	 */
 	if (dio->bp) {
 		brelse(dio->bp);
 		dio->bp = NULL;
-	}
-	if (dio->absent_data) {
-		kfree(dio->absent_data, M_HAMMER2);
-		dio->absent_data = NULL;
 	}
 	KKASSERT(dio->bp == NULL);
 	dio->rdisk = -1;
@@ -445,21 +438,14 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	    hmp->raid_failed[dio->disk_idx]) {
 		char *preempt_data;
 
-		if (dio->devvp) {
-			dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
-					 GETBLK_KVABIO, 0);
-			preempt_data = dio->bp ? dio->bp->b_data : NULL;
-		} else {
-			/*
-			 * Absent disk (no devvp): cannot call getblk()
-			 * without a valid vnode.  Allocate a kmalloc buffer
-			 * for the reconstruction data; callers access it
-			 * via hammer2_io_data() which checks absent_data.
-			 */
-			dio->absent_data = kmalloc(dio->psize, M_HAMMER2,
-						   M_INTWAIT | M_ZERO);
-			preempt_data = dio->absent_data;
-		}
+		/*
+		 * An absent disk has a dummy vnode (see
+		 * hammer2_add_absent_devvp()), so devvp is never NULL.
+		 */
+		KKASSERT(dio->devvp != NULL);
+		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+				 GETBLK_KVABIO, 0);
+		preempt_data = dio->bp ? dio->bp->b_data : NULL;
 		if (preempt_data) {
 			int is_meta = (dio->btype ==
 				    HAMMER2_BREF_TYPE_INODE ||
@@ -569,8 +555,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			break;
 		}
 	} else if ((op == HAMMER2_DOP_NEW || op == HAMMER2_DOP_NEWNZ) &&
-		   hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		   hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		   hammer2_raid6_v3(hmp) &&
 		   (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 		    dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
 		/*
@@ -863,7 +848,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	bp = dio->bp;
 	dio->bp = NULL;
 
-	if ((orefs & HAMMER2_DIO_GOOD) && (bp || dio->absent_data)) {
+	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
 		/*
 		 * Non-errored disposal of bp
 		 */
@@ -886,20 +871,13 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * we capture for the N-way mirror write to sibling
 			 * disks (I5).
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+			if (hammer2_raid6_v3(hmp)) {
 				if (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 				    dio->btype == HAMMER2_BREF_TYPE_DIRENT) {
-					if (bp) {
-						bkvasync(bp);
-						raid6_data = kmalloc(psize,
-						    M_HAMMER2, M_WAITOK);
-						bcopy(bp->b_data, raid6_data,
-						    psize);
-					} else if (dio->absent_data) {
-						raid6_data = dio->absent_data;
-						dio->absent_data = NULL;
-					}
+					bkvasync(bp);
+					raid6_data = kmalloc(psize,
+					    M_HAMMER2, M_WAITOK);
+					bcopy(bp->b_data, raid6_data, psize);
 				} else if (dio->btype ==
 					    HAMMER2_BREF_TYPE_INODE ||
 					   dio->btype ==
@@ -909,17 +887,11 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					   dio->btype ==
 					    HAMMER2_BREF_TYPE_FREEMAP_LEAF) {
 					rz_meta = 1;
-					if (bp) {
-						bkvasync(bp);
-						md_mirror_data = kmalloc(psize,
-						    M_HAMMER2, M_WAITOK);
-						bcopy(bp->b_data,
-						    md_mirror_data, psize);
-					} else if (dio->absent_data) {
-						md_mirror_data =
-						    dio->absent_data;
-						dio->absent_data = NULL;
-					}
+					bkvasync(bp);
+					md_mirror_data = kmalloc(psize,
+					    M_HAMMER2, M_WAITOK);
+					bcopy(bp->b_data, md_mirror_data,
+					    psize);
 				}
 			}
 
@@ -1056,8 +1028,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		 * arrived, so release it as a zero column.
 		 */
 		if ((orefs & HAMMER2_DIO_DIRTY) &&
-		    hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-		    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2 &&
+		    hammer2_raid6_v3(hmp) &&
 		    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
 		     dio->btype == HAMMER2_BREF_TYPE_DIRENT)) {
 			hammer2_raid6_col_release(hmp,
@@ -1065,10 +1036,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		}
 	}
 
-	if (dio->absent_data) {
-		kfree(dio->absent_data, M_HAMMER2);
-		dio->absent_data = NULL;
-	}
 
 	/*
 	 * Update iofree_count before disposing of the dio
@@ -1116,17 +1083,7 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
 	struct buf *bp;
 	int off;
 
-	lbase -= dio->dbase;
-	off = (int)((lbase & ~HAMMER2_OFF_MASK_RADIX) -
-		    (off_t)(dio->pbase - dio->dbase));
-
-	/*
-	 * Absent disk (no devvp): data is in a kmalloc buffer.
-	 */
-	if (dio->absent_data) {
-		KKASSERT(off >= 0 && off < dio->psize);
-		return (dio->absent_data + off);
-	}
+	off = hammer2_io_boff(dio, lbase);
 
 	bp = dio->bp;
 	KKASSERT(bp != NULL);
@@ -1265,6 +1222,8 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
 	int lsize;
 	int isgood;
 
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, bref->data_off, bref->type, 1, &isgood, NULL);
 	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
 		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
@@ -1300,6 +1259,8 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 		return;
 	if (btype != HAMMER2_BREF_TYPE_DATA)
 		return;
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, data_off, btype, 0, &isgood, NULL);
 	if (dio) {
 		if (data_off < dio->pbase ||
@@ -1326,6 +1287,8 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
 	hammer2_io_t *dio;
 	int isgood;
 
+	if (hammer2_raid6_v3(hmp))
+		return;
 	dio = hammer2_io_alloc(hmp, data_off, HAMMER2_BREF_TYPE_DATA,
 			       0, &isgood, NULL);
 	if (dio) {
@@ -1352,8 +1315,6 @@ dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
 void
 hammer2_io_bkvasync(hammer2_io_t *dio)
 {
-	if (dio->absent_data)
-		return;	/* kmalloc buffer is always CPU-accessible, no KVABIO needed */
 	KKASSERT(dio->bp != NULL);
 	bkvasync(dio->bp);
 }
@@ -1977,8 +1938,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	int i;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	copy = kmalloc(psize, M_HAMMER2, M_WAITOK);
 	for (i = 0; i < hmp->raid_config.ndisks; i++) {
@@ -2081,8 +2041,7 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 	bzero(col_bufs, sizeof(col_bufs));
 
 	KKASSERT(bytes == stripe_unit);
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 	if (is_physical) {
 		/*
 		 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
@@ -2103,26 +2062,12 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 		 *   otherwise count data disks below data_disk_idx.
 		 */
 		uint64_t stripe_slot;
-		int d_col;
 
 		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK;
-		stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
-		p_disk      = (int)(stripe_slot % ndisks);
-		q_disk      = (p_disk + 1) % ndisks;
-
-		if (data_disk_idx == p_disk) {
-			target_col = ndata;
-		} else if (data_disk_idx == q_disk) {
-			target_col = ndata + 1;
-		} else {
-			/* Count data disks with index < data_disk_idx */
-			d_col = 0;
-			for (di = 0; di < data_disk_idx; di++) {
-				if (di != p_disk && di != q_disk)
-					d_col++;
-			}
-			target_col = d_col;
-		}
+		stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
+		hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
+		target_col = hammer2_raid6_lcol(data_disk_idx, p_disk, q_disk,
+						ndata);
 
 		di = 0;
 		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
@@ -2437,10 +2382,11 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 * Issue every read of the pass.
 	 */
 	for (s = 0; s < nslots; s++) {
-		int p_disk = (int)(slots[s] % ndisks);
-		int q_disk = (p_disk + 1) % ndisks;
+		int p_disk, q_disk;
 		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
 		int second = 0;
+
+		hammer2_raid6_pq(slots[s], ndisks, &p_disk, &q_disk);
 
 		for (d = 0; d < ndisks; d++) {
 			if (d != failed_disk_idx && hmp->raid_failed[d])
@@ -2478,25 +2424,19 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 * Rebuild each slot's column into outs[s].
 	 */
 	for (s = 0; s < nslots && error == 0; s++) {
-		int p_disk = (int)(slots[s] % ndisks);
-		int q_disk = (p_disk + 1) % ndisks;
+		int p_disk, q_disk;
 		hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slots[s] * su;
 		int phys_to_lcol[HAMMER2_MAX_VOLUMES];
 		void *ptrs[HAMMER2_MAX_VOLUMES];
 		int have[HAMMER2_MAX_VOLUMES];	/* ptrs[col] is read */
 		int failed_col, other_col = -1;
 		void *out = outs[s];
-		int di = 0;
 
+		hammer2_raid6_pq(slots[s], ndisks, &p_disk, &q_disk);
 		bzero(phys_to_lcol, sizeof(phys_to_lcol));
-		for (d = 0; d < ndisks; d++) {
-			if (d == p_disk)
-				phys_to_lcol[d] = ndata;
-			else if (d == q_disk)
-				phys_to_lcol[d] = ndata + 1;
-			else
-				phys_to_lcol[d] = di++;
-		}
+		for (d = 0; d < ndisks; d++)
+			phys_to_lcol[d] = hammer2_raid6_lcol(d, p_disk, q_disk,
+							     ndata);
 		failed_col = phys_to_lcol[failed_disk_idx];
 		for (d = 0; d < ndisks; d++) {
 			if (d != failed_disk_idx && hmp->raid_failed[d])
@@ -3529,8 +3469,7 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	hammer2_chain_t *vsnap;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	/* Serialize concurrent scrub invocations */
 	if (atomic_cmpset_int((volatile u_int *)&hmp->scrub_running, 0, 1) == 0)

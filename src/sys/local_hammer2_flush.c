@@ -824,8 +824,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			 * most-recent durable volhdr by max(seqno) across
 			 * disks (docs/volhdr_quorum.md).
 			 */
-			if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-			    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+			if (hammer2_raid6_v3(hmp)) {
 				hmp->voldata.raid_config.rz_txg_seq++;
 			}
 
@@ -1548,8 +1547,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	 * columns, which is the COW invariant.  Waits for columns still
 	 * in flight (oct-review.md §10).
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2) {
+	if (hammer2_raid6_v3(hmp)) {
 		error = hammer2_raid6_seal_all_open_rows(hmp);
 		if (error) {
 			/*
@@ -1569,8 +1567,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	 * Metadata mirror copies deferred by putblk: write each block once,
 	 * before the drain and the volume header below.
 	 */
-	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
-	    hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2)
+	if (hammer2_raid6_v3(hmp))
 		hammer2_io_metadata_mirror_flush(hmp);
 
 	/*

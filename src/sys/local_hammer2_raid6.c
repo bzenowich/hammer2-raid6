@@ -551,15 +551,14 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	uint8_t *p_dst = NULL;
 	uint8_t *q_dst = NULL;
 	int error = 0;
-	int c, d;
+	int c;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(bytes == (size_t)stripe_unit);
 	KKASSERT(ncols >= 1 && ncols <= ndata);
 
-	stripe_slot = (phys_off - HAMMER2_ZONE_SEG64) / stripe_unit;
-	p_disk      = (int)(stripe_slot % ndisks);
-	q_disk      = (p_disk + 1) % ndisks;
+	stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
+	hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
 
 	/*
 	 * Allocate the P column buffer up-front and accumulate XOR into it.
@@ -610,15 +609,13 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	for (c = 0; c < ncols; c++) {
 		const hammer2_row_col_t *col = &cols[c];
 		uint8_t *src = (uint8_t *)col->data;
-		int my_col = 0;
+		int my_col;
 
 		KKASSERT(col->disk_idx != p_disk &&
 			 col->disk_idx != q_disk);
 
-		for (d = 0; d < col->disk_idx; d++) {
-			if (d != p_disk && d != q_disk)
-				my_col++;
-		}
+		my_col = hammer2_raid6_lcol(col->disk_idx, p_disk, q_disk,
+					    ndata);
 
 		if (p_dst)
 			hammer2_raid6_xor(p_dst, src, stripe_unit);
@@ -673,25 +670,6 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
- * Single-column convenience wrapper preserved for the current
- * one-chain-per-row putblk path.  6C-2 packing will convert call sites
- * to hammer2_io_raid6_write_row() directly.
- */
-int
-hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp, hammer2_off_t pbase,
-			       int data_disk_idx, void *data, size_t bytes)
-{
-	hammer2_row_col_t col = {
-		.disk_idx = data_disk_idx,
-		.data = data,
-		.bytes = bytes,
-	};
-	hammer2_off_t phys_off = pbase & HAMMER2_RAID6_PHYS_MASK;
-
-	return hammer2_io_raid6_write_row(hmp, phys_off, &col, 1, bytes);
-}
-
-/*
  * v3 RAIDZ2-native: mirror a metadata block to every
  * surviving disk at the same per-disk byte offset.  No parity — the
  * N-way mirror is its own redundancy.
@@ -724,8 +702,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 	int last_err = 0;
 	int wrote_any = 0;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	/* the copies are asynchronous: keep a big queue from piling up */
 	waitrunningbufspace();
@@ -925,8 +902,7 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 	hammer2_volume_t *vol;
 	int error;
 
-	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
-	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
+	KKASSERT(hammer2_raid6_v3(hmp));
 
 	if (hmp->mirror_pend_count || hmp->mirror_inflight) {
 		struct hammer2_mirror_pend *mp;

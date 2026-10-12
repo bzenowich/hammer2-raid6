@@ -281,7 +281,6 @@ struct hammer2_io {
 	int		error;
 	int		disk_idx;	/* RAID6: physical disk index (-1 if N/A) */
 	int		rdisk;		/* v3 metadata: mirror the last read came from (-1 = disk_idx) */
-	char		*absent_data;	/* RAID6 absent disk: kmalloc'd reconstruction buffer */
 #ifdef HAMMER2_IO_DEBUG
 	int		debug_index;
 #endif
@@ -1504,6 +1503,20 @@ MPTOPMP(struct mount *mp)
 #define HAMMER2_DEDUP_FRAG      (HAMMER2_PBUFSIZE / 64)
 #define HAMMER2_DEDUP_FRAGRADIX (HAMMER2_PBUFRADIX - 6)
 
+/*
+ * Byte offset of data_off within the dio's buffer.  A v3 DATA/DIRENT dio
+ * carries its disk index in the top bits of pbase (hammer2_dio_key), which
+ * data_off does not, so compare the two without those bits.
+ */
+static __inline
+int
+hammer2_io_boff(const hammer2_io_t *dio, hammer2_off_t data_off)
+{
+	return (int)((data_off & ~HAMMER2_OFF_MASK_RADIX &
+		      ~HAMMER2_RAID6_DISK_MASK) -
+		     (dio->pbase & ~HAMMER2_RAID6_DISK_MASK));
+}
+
 static __inline
 uint64_t
 hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
@@ -1512,8 +1525,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
 	int bits;
 	uint64_t mask;
 
-	bbeg = (int)((data_off & ~HAMMER2_OFF_MASK_RADIX) - dio->pbase) >>
-	       HAMMER2_DEDUP_FRAGRADIX;
+	bbeg = hammer2_io_boff(dio, data_off) >> HAMMER2_DEDUP_FRAGRADIX;
 	bits = (int)((bytes + (HAMMER2_DEDUP_FRAG - 1)) >>
 	       HAMMER2_DEDUP_FRAGRADIX);
 	if (bbeg + bits == 64)
@@ -2220,10 +2232,6 @@ void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
 		struct vnode *devvp);
 
 /*
- * A disk takes writes if it is not failed, or if it is the disk an
- * online rebuild is filling.
- */
-/*
  * v3 RAIDZ2-native array.  Live dedup is off here: a dedup'd bref would
  * reference a stripe column without a row refcount, and the dedup heap
  * keys on data_off alone, which does not name the disk (bref.copyid).
@@ -2239,6 +2247,10 @@ hammer2_raid6_v3(hammer2_dev_t *hmp)
 #define HAMMER2_FAIL_DEFER	0x0001	/* may not sleep: record via a task */
 #define HAMMER2_FAIL_FORCE	0x0002	/* mount: exceed the two-disk cap */
 
+/*
+ * A disk takes writes if it is not failed, or if it is the disk an
+ * online rebuild is filling.
+ */
 static __inline int
 hammer2_raid6_disk_writable(hammer2_dev_t *hmp, int disk_idx)
 {
@@ -2259,9 +2271,6 @@ typedef struct hammer2_row_col {
 int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, const hammer2_row_col_t *cols,
 		int ncols, size_t bytes);
-int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
-		hammer2_off_t pbase, int data_disk_idx,
-		void *data, size_t bytes);
 
 /*
  * Open-row packing (6C).  See struct hammer2_open_row in
@@ -2273,8 +2282,6 @@ int hammer2_io_raid6_write_scratch(hammer2_dev_t *hmp,
 struct hammer2_open_row;
 void hammer2_raid6_open_rows_init(hammer2_dev_t *hmp);
 void hammer2_raid6_open_rows_free(hammer2_dev_t *hmp);
-int  hammer2_raid6_open_row_pick(hammer2_dev_t *hmp,
-		hammer2_off_t *phys_off_out, int *disk_idx_out);
 void hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, int disk_idx,
 		void *data /* takes ownership */, size_t bytes, int dropped);
@@ -2358,7 +2365,6 @@ int hammer2_bref_check_match(const hammer2_blockref_t *bref,
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_inject_eio_autofail;
-extern int hammer2_raid6_pack_open_rows;
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;

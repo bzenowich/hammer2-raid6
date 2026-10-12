@@ -4,7 +4,6 @@
 *~
 session-*.json
 mnt/
-src/diag/diag_map
 src/diag/h2raid6_test
 
 # Harness SSH identity: a copy of the key the base image was built with, so

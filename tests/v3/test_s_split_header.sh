@@ -164,7 +164,7 @@ split_case() {
     # Data of the chosen TXG.
     sha256 $MNTPT/base_a > /var/tmp/s_chk.txt 2>&1
     sha256 $MNTPT/base_b >> /var/tmp/s_chk.txt 2>&1
-    if diff -q /var/tmp/v4_base.txt /var/tmp/s_chk.txt > /dev/null 2>&1; then
+    if diff -q /var/tmp/v3_base.txt /var/tmp/s_chk.txt > /dev/null 2>&1; then
         result PASS "$label: synced base data intact"
     else
         result FAIL "$label: synced base data wrong or missing"
