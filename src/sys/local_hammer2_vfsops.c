@@ -100,6 +100,9 @@ long hammer2_rz_rewrite_slots;
 long hammer2_rz_put_anomaly;
 long hammer2_rz_col_released;
 long hammer2_rz_gen_wait_fail;
+long hammer2_rz_seal_full;
+long hammer2_rz_seal_flush;
+long hammer2_rz_seal_flush_short;
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -209,6 +212,14 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_col_released, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_gen_wait_fail, CTLFLAG_RD,
 	   &hammer2_rz_gen_wait_fail, 0,
 	   "v3 RAID6: flushes failed by a row-generation wait");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_full, CTLFLAG_RD,
+	   &hammer2_rz_seal_full, 0,
+	   "v3 RAID6: rows sealed by the put that filled them");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush, CTLFLAG_RD,
+	   &hammer2_rz_seal_flush, 0, "v3 RAID6: rows sealed by a flush");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
+	   &hammer2_rz_seal_flush_short, 0,
+	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
 	   &hammer2_chain_allocs, 0, "");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,
