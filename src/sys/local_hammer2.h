@@ -1157,7 +1157,10 @@ struct hammer2_mirror_pend {
 #define HAMMER2_MIRROR_MAXPEND	256	/* 16 MB of 64 KB blocks */
 
 struct hammer2_open_row {
-	TAILQ_ENTRY(hammer2_open_row) entry;
+	TAILQ_ENTRY(hammer2_open_row) entry;	/* all open rows, by registration */
+	TAILQ_ENTRY(hammer2_open_row) pentry;	/* packable rows */
+	RB_ENTRY(hammer2_open_row) rbnode;	/* by row_id */
+	int		packable;	/* on hmp->open_rows_pack */
 	hammer2_off_t	phys_off;	/* per-disk byte offset for this row */
 	uint64_t	row_id;		/* slot index */
 	int		p_disk, q_disk;
@@ -1169,6 +1172,8 @@ struct hammer2_open_row {
 	uint32_t	gen;		/* hmp->rz_gen at registration */
 	void		*col_data[HAMMER2_MAX_VOLUMES];
 };
+
+RB_HEAD(hammer2_orow_tree, hammer2_open_row);
 
 struct hammer2_dev {
 	struct vnode	*devvp;		/* device vnode for root volume */
@@ -1271,7 +1276,9 @@ struct hammer2_dev {
 	 * for col_data buffers, briefly at TXG flush.  Row metadata
 	 * itself is ~160 bytes per entry.
 	 */
-	TAILQ_HEAD(, hammer2_open_row) open_rows;
+	TAILQ_HEAD(, hammer2_open_row) open_rows;	/* by registration (so by gen) */
+	TAILQ_HEAD(, hammer2_open_row) open_rows_pack;	/* current gen, can take a column */
+	struct hammer2_orow_tree open_rows_tree;	/* by row_id */
 	int		open_rows_inited;	/* TAILQ_INIT done */
 	long		open_rows_count;	/* current entry count (diag) */
 	long		open_rows_high;		/* peak entry count (diag) */

@@ -1957,12 +1957,43 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
  * incomplete row.
  */
 
+static int hammer2_orow_cmp(struct hammer2_open_row *, struct hammer2_open_row *);
+RB_PROTOTYPE_STATIC(hammer2_orow_tree, hammer2_open_row, rbnode,
+		    hammer2_orow_cmp);
+
+static int
+hammer2_orow_cmp(struct hammer2_open_row *a, struct hammer2_open_row *b)
+{
+	if (a->row_id < b->row_id)
+		return -1;
+	if (a->row_id > b->row_id)
+		return 1;
+	return 0;
+}
+
+RB_GENERATE_STATIC(hammer2_orow_tree, hammer2_open_row, rbnode, hammer2_orow_cmp);
+
+/*
+ * The open row of slot `row_id`, or NULL.  Caller holds
+ * stripe_bitmap_spin.
+ */
+static struct hammer2_open_row *
+hammer2_raid6_open_row_find(hammer2_dev_t *hmp, uint64_t row_id)
+{
+	struct hammer2_open_row key;
+
+	key.row_id = row_id;
+	return RB_FIND(hammer2_orow_tree, &hmp->open_rows_tree, &key);
+}
+
 void
 hammer2_raid6_open_rows_init(hammer2_dev_t *hmp)
 {
 	if (hmp->open_rows_inited)
 		return;
 	TAILQ_INIT(&hmp->open_rows);
+	TAILQ_INIT(&hmp->open_rows_pack);
+	RB_INIT(&hmp->open_rows_tree);
 	hmp->open_rows_inited = 1;
 	hmp->open_rows_count = 0;
 	hmp->open_rows_high = 0;
@@ -1981,6 +2012,7 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 			"(columns not committed)\n", hmp->open_rows_count);
 	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL) {
 		TAILQ_REMOVE(&hmp->open_rows, r, entry);
+		RB_REMOVE(hammer2_orow_tree, &hmp->open_rows_tree, r);
 		if (hmp->stripe_open)
 			clrbit(hmp->stripe_open, r->row_id);
 		for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
@@ -1991,6 +2023,7 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 		}
 		kfree(r, M_HAMMER2);
 	}
+	TAILQ_INIT(&hmp->open_rows_pack);
 	hmp->open_rows_count = 0;
 	hmp->open_rows_inited = 0;
 }
@@ -2126,16 +2159,30 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
- * Seal a row: build cols[] from in-memory col_data, write it, free
- * col data, remove the entry from the open_rows TAILQ and free the
- * entry itself.  Caller holds stripe_bitmap_spin and has checked that
- * every reserved column has its data (or that the row is being
- * dropped); this function releases the spin around the (sleeping)
- * I/O and re-acquires it before returning.
+ * Take a row off every list and index.  Caller holds stripe_bitmap_spin.
+ * The row's entry is free for the caller to reuse; its columns stay in
+ * col_data[] for hammer2_raid6_row_write_free().
  */
 static void
-hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
-					  struct hammer2_open_row *r)
+hammer2_raid6_open_row_unlink_locked(hammer2_dev_t *hmp,
+				     struct hammer2_open_row *r)
+{
+	TAILQ_REMOVE(&hmp->open_rows, r, entry);
+	RB_REMOVE(hammer2_orow_tree, &hmp->open_rows_tree, r);
+	if (r->packable) {
+		TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+		r->packable = 0;
+	}
+	hmp->open_rows_count--;
+	clrbit(hmp->stripe_open, r->row_id);
+}
+
+/*
+ * Write an unlinked row's columns and P/Q, free the columns and the
+ * row.  Called without the spin; sleeps.
+ */
+static void
+hammer2_raid6_row_write_free(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 {
 	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
 	void *to_free[HAMMER2_MAX_VOLUMES];
@@ -2154,18 +2201,26 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 		r->col_data[d] = NULL;
 		ncols++;
 	}
-	TAILQ_REMOVE(&hmp->open_rows, r, entry);
-	hmp->open_rows_count--;
-	clrbit(hmp->stripe_open, r->row_id);
-	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
-
 	hammer2_raid6_row_io(hmp, r->phys_off, r->row_id, r->alloc_mask,
 			     r->dropped_mask, r->p_disk, r->q_disk,
 			     cols, ncols, r->bytes);
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
 	kfree(r, M_HAMMER2);
+}
 
+/*
+ * Seal a row: unlink it and write it.  Caller holds stripe_bitmap_spin
+ * and has checked that every reserved column has its data; the spin is
+ * released around the (sleeping) I/O and re-acquired before returning.
+ */
+static void
+hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
+					  struct hammer2_open_row *r)
+{
+	hammer2_raid6_open_row_unlink_locked(hmp, r);
+	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+	hammer2_raid6_row_write_free(hmp, r);
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 }
 
@@ -2187,13 +2242,24 @@ hammer2_raid6_row_complete(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 }
 
 /*
- * Walk open_rows for an entry with at least one free data disk that
- * isn't p_disk/q_disk/failed/already-allocated.  On success, mark the
- * disk as allocated, return phys_off + disk_idx.  Caller already holds
- * stripe_bitmap_spin.
+ * Can the row take another column?  Used for the packable list and by
+ * the put that fills a row.
+ */
+static int
+hammer2_raid6_row_can_take(hammer2_dev_t *hmp, struct hammer2_open_row *r)
+{
+	return r->n_alloc < hmp->raid_config.ndata;
+}
+
+/*
+ * Walk the packable rows (current generation, room for a column) for
+ * one with a free data disk that isn't p_disk/q_disk/failed/already
+ * allocated.  On success, mark the disk as allocated, return
+ * phys_off + disk_idx.  Caller already holds stripe_bitmap_spin.
  *
  * Returns 1 on success, 0 if no open row could absorb.  next_disk is
- * advanced on success to spread chains across disks.
+ * advanced on success to spread chains across disks.  A row that
+ * cannot take a column leaves the list.
  */
 static int
 hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
@@ -2202,16 +2268,19 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
-	int ndata = rc->ndata;
 	struct hammer2_open_row *r;
+	struct hammer2_open_row *nr;
 	int t, candidate;
 
 	if (!hmp->open_rows_inited)
 		return 0;
 
-	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		if (r->n_alloc >= ndata || r->gen != hmp->rz_gen)
+	TAILQ_FOREACH_MUTABLE(r, &hmp->open_rows_pack, pentry, nr) {
+		if (!hammer2_raid6_row_can_take(hmp, r)) {
+			TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+			r->packable = 0;
 			continue;
+		}
 		for (t = 0; t < ndisks; t++) {
 			candidate = hmp->stripe_next_disk % ndisks;
 			hmp->stripe_next_disk++;
@@ -2223,6 +2292,10 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 				continue;
 			r->alloc_mask |= (1U << candidate);
 			r->n_alloc++;
+			if (!hammer2_raid6_row_can_take(hmp, r)) {
+				TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+				r->packable = 0;
+			}
 			*phys_off_out = r->phys_off;
 			*disk_idx_out = candidate;
 			return 1;
@@ -2267,6 +2340,11 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	r->bytes      = rc->stripe_unit;
 
 	TAILQ_INSERT_TAIL(&hmp->open_rows, r, entry);
+	RB_INSERT(hammer2_orow_tree, &hmp->open_rows_tree, r);
+	if (hammer2_raid6_row_can_take(hmp, r)) {
+		TAILQ_INSERT_TAIL(&hmp->open_rows_pack, r, pentry);
+		r->packable = 1;
+	}
 	setbit(hmp->stripe_open, row_id);
 	hmp->open_rows_count++;
 	if (hmp->open_rows_count > hmp->open_rows_high)
@@ -2296,12 +2374,9 @@ hammer2_raid6_col_arrived(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 		return 0;
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	if (isset(hmp->stripe_open, slot)) {
-		TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-			if (r->row_id != slot)
-				continue;
+		r = hammer2_raid6_open_row_find(hmp, slot);
+		if (r)
 			arrived = (r->col_data[bref->copyid] != NULL);
-			break;
-		}
 	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	return arrived;
@@ -2332,16 +2407,14 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	KKASSERT(hmp->open_rows_inited);
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		if (r->phys_off == phys_off)
-			break;
-	}
+	r = hammer2_raid6_open_row_find(hmp, (phys_off - HAMMER2_ZONE_SEG64) /
+					     hmp->raid_config.stripe_unit);
 	if (r == NULL) {
 		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 		panic("hammer2: v3 putblk for a row not open: phys %016jx "
 		      "disk %d", (uintmax_t)phys_off, disk_idx);
 	}
-	KKASSERT(r->bytes == bytes);
+	KKASSERT(r->phys_off == phys_off && r->bytes == bytes);
 	KKASSERT(r->alloc_mask & (1U << disk_idx));
 
 	/*
@@ -2404,13 +2477,11 @@ hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	bytes = hmp->raid_config.stripe_unit;
 	zero = kmalloc(bytes, M_HAMMER2, M_WAITOK | M_ZERO);
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-	TAILQ_FOREACH(r, &hmp->open_rows, entry) {
-		if (r->phys_off != phys_off)
-			continue;
+	r = hammer2_raid6_open_row_find(hmp, (phys_off - HAMMER2_ZONE_SEG64) /
+					     bytes);
+	if (r)
 		need = ((r->alloc_mask & (1U << disk_idx)) &&
 			r->col_data[disk_idx] == NULL);
-		break;
-	}
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 	if (need) {
 		hammer2_rz_col_released++;
@@ -2438,13 +2509,17 @@ hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
  * fails with EAGAIN: the caller must not write the volume header.  The
  * rows stay on the list and the next flush waits for them again.
  *
- * Each seal drops the spinlock, so the list is rescanned from the head
- * after every seal.
+ * One pass over the older rows (they are the head of open_rows, which
+ * is in registration order) moves every complete one to a private
+ * list; they are then written with the spinlock dropped.  Writing a
+ * row counts as progress and restarts the wait.
  */
 int
 hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 {
+	TAILQ_HEAD(, hammer2_open_row) sealq = TAILQ_HEAD_INITIALIZER(sealq);
 	struct hammer2_open_row *r;
+	struct hammer2_open_row *nr;
 	struct hammer2_open_row *stuck;
 	int deadline;
 	int d;
@@ -2454,22 +2529,34 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	hmp->rz_gen++;
+	while ((r = TAILQ_FIRST(&hmp->open_rows_pack)) != NULL) {
+		TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+		r->packable = 0;
+	}
 	deadline = ticks + (int)((long)hz * hammer2_raid6_gen_wait_ms / 1000);
 	for (;;) {
 		stuck = NULL;
-		TAILQ_FOREACH(r, &hmp->open_rows, entry) {
+		TAILQ_FOREACH_MUTABLE(r, &hmp->open_rows, entry, nr) {
 			if (r->gen == hmp->rz_gen)
-				continue;
-			if (hammer2_raid6_row_complete(hmp, r))
 				break;
-			if (stuck == NULL)
-				stuck = r;
-		}
-		if (r != NULL) {
+			if (!hammer2_raid6_row_complete(hmp, r)) {
+				if (stuck == NULL)
+					stuck = r;
+				continue;
+			}
 			hammer2_rz_seal_flush++;
 			if (r->n_alloc < r->ndata)
 				hammer2_rz_seal_flush_short++;
-			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
+			hammer2_raid6_open_row_unlink_locked(hmp, r);
+			TAILQ_INSERT_TAIL(&sealq, r, entry);
+		}
+		if (!TAILQ_EMPTY(&sealq)) {
+			hammer2_spin_unex(&hmp->stripe_bitmap_spin);
+			while ((r = TAILQ_FIRST(&sealq)) != NULL) {
+				TAILQ_REMOVE(&sealq, r, entry);
+				hammer2_raid6_row_write_free(hmp, r);
+			}
+			hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 			/* progress: the wait starts over */
 			deadline = ticks +
 			    (int)((long)hz * hammer2_raid6_gen_wait_ms / 1000);
