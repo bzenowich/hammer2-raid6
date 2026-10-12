@@ -1623,6 +1623,8 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 				     M_WAITOK | M_ZERO);
 	hmp->stripe_bf_staged = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
 					M_WAITOK | M_ZERO);
+	hmp->stripe_open = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
+				   M_WAITOK | M_ZERO);
 	hmp->stripe_bf_active = 0;
 	hmp->stripe_bf_complete = 0;
 	hmp->stripe_cursor = 0;
@@ -1637,10 +1639,10 @@ void
 hammer2_raid6_sm_destroy(hammer2_dev_t *hmp)
 {
 	uint8_t **bfp[] = { &hmp->stripe_bf_seen, &hmp->stripe_bf_new,
-			    &hmp->stripe_bf_staged };
+			    &hmp->stripe_bf_staged, &hmp->stripe_open };
 	int c;
 
-	for (c = 0; c < 3; c++) {
+	for (c = 0; c < 4; c++) {
 		if (*bfp[c]) {
 			kfree(*bfp[c], M_HAMMER2);
 			*bfp[c] = NULL;
@@ -1949,6 +1951,8 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
 		return;
 	while ((r = TAILQ_FIRST(&hmp->open_rows)) != NULL) {
 		TAILQ_REMOVE(&hmp->open_rows, r, entry);
+		if (hmp->stripe_open)
+			clrbit(hmp->stripe_open, r->row_id);
 		for (d = 0; d < HAMMER2_MAX_VOLUMES; d++) {
 			if (r->col_data[d]) {
 				kfree(r->col_data[d], M_HAMMER2);
@@ -2122,6 +2126,7 @@ hammer2_raid6_seal_row_locked_to_unlocked(hammer2_dev_t *hmp,
 	}
 	TAILQ_REMOVE(&hmp->open_rows, r, entry);
 	hmp->open_rows_count--;
+	clrbit(hmp->stripe_open, r->row_id);
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
 	hammer2_raid6_row_io(hmp, r->phys_off, r->row_id, r->alloc_mask,
@@ -2297,6 +2302,7 @@ hammer2_raid6_open_row_register_locked(hammer2_dev_t *hmp,
 	r->bytes      = rc->stripe_unit;
 
 	TAILQ_INSERT_TAIL(&hmp->open_rows, r, entry);
+	setbit(hmp->stripe_open, row_id);
 	hmp->open_rows_count++;
 	if (hmp->open_rows_count > hmp->open_rows_high)
 		hmp->open_rows_high = hmp->open_rows_count;
@@ -2756,6 +2762,13 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 		for (slot = base; slot < end; slot++) {
 			uint8_t *rc = &hmp->stripe_row_refcount[slot];
 
+			/*
+			 * A row that is still open has columns in flight
+			 * that no committed tree references yet: neither
+			 * free it nor stage it.
+			 */
+			if (isset(hmp->stripe_open, slot))
+				continue;
 			if (isset(hmp->stripe_bf_seen, slot) ||
 			    isset(hmp->stripe_bf_new, slot)) {
 				clrbit(hmp->stripe_bf_staged, slot);

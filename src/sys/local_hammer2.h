@@ -1247,6 +1247,7 @@ struct hammer2_dev {
 	uint8_t		*stripe_bf_seen;	/* referenced in this pass's scan */
 	uint8_t		*stripe_bf_new;		/* allocated during this pass */
 	uint8_t		*stripe_bf_staged;	/* unreferenced in the last pass */
+	uint8_t		*stripe_open;		/* slot has an open row (bit per slot) */
 	int		stripe_bf_active;	/* stripe_alloc sets stripe_bf_new */
 	int		stripe_bf_complete;	/* scan covered the whole tree */
 
