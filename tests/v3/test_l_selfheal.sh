@@ -16,6 +16,10 @@
 #      disk, remount, walk the tree (find + stat).  All files must be
 #      reachable (mirror-copy failover) and no CHECK errors may leak to
 #      userspace.
+# L5 — P4: cold metadata reads are spread over the mirrors, so a bad
+#      copy on disk 2 (not the primary) is what a read finds first for
+#      the blocks disk 2 serves.  The tree must read, and the repair
+#      must go to disk 2.
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
@@ -215,5 +219,49 @@ if fail_disk 0 "L4"; then
 fi
 kmsg_clear
 teardown "L4"
+
+# L5: P4.  Corrupt a mirror's metadata zone, not the primary's.
+setup_fresh
+check_v3
+mkdir -p $MNTPT/l5
+i=0
+while [ $i -lt 200 ]; do
+    mkdir -p $MNTPT/l5/dir$i
+    echo "content-$i" > $MNTPT/l5/dir$i/file
+    i=$((i + 1))
+done
+sync; sync
+FCOUNT_REF=$(find $MNTPT/l5 | wc -l | tr -d ' ')
+umount $MNTPT
+corrupt_disk 2 $((MD_BLK + 16)) $((DATA_BLK - MD_BLK - 16))
+if mount -t hammer2 $PFSPATH $MNTPT; then
+    kmsg_clear
+    FCOUNT=$(find $MNTPT/l5 2>/var/tmp/l5_find_err.txt | wc -l | tr -d ' ')
+    CATFAIL=0
+    i=0
+    while [ $i -lt 200 ]; do
+        C=$(cat $MNTPT/l5/dir$i/file 2>/dev/null)
+        [ "$C" = "content-$i" ] || CATFAIL=$((CATFAIL + 1))
+        i=$((i + 10))
+    done
+    if [ "$FCOUNT" = "$FCOUNT_REF" ] && [ "$CATFAIL" = "0" ] && \
+       [ ! -s /var/tmp/l5_find_err.txt ]; then
+        result PASS "L5: tree reachable over corrupt mirror metadata ($FCOUNT nodes)"
+    else
+        result FAIL "L5: tree walk degraded (count=$FCOUNT/$FCOUNT_REF catfail=$CATFAIL)"
+        cat /var/tmp/l5_find_err.txt
+    fi
+    sleep 2
+    if kmsg | grep -q 'selfheal: repair write disk 2'; then
+        result PASS "L5: bad mirror copy on disk 2 repaired"
+    else
+        result FAIL "L5: no repair write to disk 2"
+        kmsg | tail -15
+    fi
+else
+    result FAIL "L5: remount refused"
+fi
+kmsg_clear
+teardown "L5"
 
 summary

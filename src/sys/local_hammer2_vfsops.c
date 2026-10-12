@@ -75,6 +75,7 @@ int hammer2_xop_xbase;
 int hammer2_xop_mod;
 long hammer2_debug_inode;
 int hammer2_cluster_meta_read = 1;	/* physical read-ahead */
+int hammer2_md_read_spread = 1;		/* v3: cold metadata reads use all mirrors */
 int hammer2_cluster_data_read = 4;	/* physical read-ahead */
 int hammer2_cluster_write = 0;		/* physical write clustering */
 int hammer2_dedup_enable = 1;
@@ -145,6 +146,8 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
 	   &hammer2_spread_workers, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
 	   &hammer2_cluster_meta_read, 0, "");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, md_read_spread, CTLFLAG_RW,
+	   &hammer2_md_read_spread, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read, CTLFLAG_RW,
 	   &hammer2_cluster_data_read, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_write, CTLFLAG_RW,

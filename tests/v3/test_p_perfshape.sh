@@ -160,6 +160,31 @@ if [ "$n" = "$NFILES" ]; then
 else
     result FAIL "P2: $n of $NFILES files present"
 fi
+
+# P4: metadata reads spread over the mirrors (oct-review P4).  A cold
+# walk of the P2 tree touches inode and directory blocks only; their
+# copies sit on every member, so no member should serve most of them.
+remount
+sleep 2
+ds_snap /var/tmp/p_b4
+ls -lR $MNTPT/small > /dev/null
+ds_snap /var/tmp/p_a4
+join /var/tmp/p_b4 /var/tmp/p_a4 | awk '
+    { rd = $7 - $3; t += rd; n++; r[n] = rd; nm[n] = $1; if (rd > mx) mx = rd
+      if (rd > 0) nz++ }
+    END {
+        for (i = 1; i <= n; i++)
+            printf "  %s: read %.2f MB\n", nm[i], r[i] / 1048576 > "/dev/stderr"
+        printf "%d %d %d %.3f\n", t, nz, n, (t ? mx / t : 1)
+    }' > /var/tmp/p_ds.txt
+set -- $(cat /var/tmp/p_ds.txt)
+echo "  P4: cold metadata walk read $1 B from $2 of $3 members, busiest share $4"
+if [ "$1" -ge 1048576 ] && [ "$2" -ge 2 ] && \
+   awk -v s="$4" 'BEGIN { exit !(s <= 0.60) }'; then
+    result PASS "P4: metadata reads spread (busiest member $4 of $1 B)"
+else
+    result FAIL "P4: metadata reads not spread (busiest member $4 of $1 B, $2 members)"
+fi
 teardown "P2"
 
 summary

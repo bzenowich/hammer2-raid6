@@ -225,6 +225,7 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 		dio->devvp = devvp;
 		dio->dbase = dbase;
 		dio->disk_idx = disk_idx;
+		dio->rdisk = -1;
 		/* dbase must be 1GB-aligned for JBOD; RAID6 uses stripe offsets */
 		KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 ||
 			 (dio->dbase & HAMMER2_FREEMAP_LEVEL1_MASK) == 0);
@@ -250,6 +251,76 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 		++dio->act;
 
 	return dio;
+}
+
+/*
+ * v3 metadata cold read, spread over the mirrors (oct-review P4).
+ *
+ * The dio stays what it always was: one per block, keyed and buffered on
+ * the primary's (disk 0) vnode, so writes, bdwrite coalescing and the
+ * deferred mirror copies (hammer2_io_metadata_mirror_defer) are
+ * unchanged.  Only the physical read on a buffer cache miss may come
+ * from another member, chosen per 64 KB block.  A buffer the cache has
+ * (B_CACHE, dirty ones included) is always the freshest copy and is
+ * used as is; on a miss every older copy is on the mirrors, or in the
+ * deferred queue, which hammer2_io_metadata_read_one() looks at first.
+ *
+ * Returns 1 with dio->bp set (valid, locked) if the block was read here,
+ * 0 if the caller should read it from the primary as before: wrong kind
+ * of dio, the chosen member is the primary, is down, or fails, or the
+ * rebuild lock is not free.  The mirror read never fails the member; the
+ * primary read that follows finds out if the disk is bad.
+ */
+static int
+hammer2_io_meta_spread_read(hammer2_io_t *dio, hammer2_off_t dev_pbase)
+{
+	hammer2_dev_t *hmp = dio->hmp;
+	struct buf *bp;
+	int m;
+	int error;
+
+	if (hammer2_md_read_spread == 0 ||
+	    hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
+	    hmp->voldata.version < HAMMER2_VOL_VERSION_RAIDZ2 ||
+	    dio->disk_idx < 0 || dio->psize != HAMMER2_PBUFSIZE ||
+	    (dio->btype != HAMMER2_BREF_TYPE_INODE &&
+	     dio->btype != HAMMER2_BREF_TYPE_INDIRECT &&
+	     dio->btype != HAMMER2_BREF_TYPE_FREEMAP_NODE &&
+	     dio->btype != HAMMER2_BREF_TYPE_FREEMAP_LEAF)) {
+		return 0;
+	}
+	m = hammer2_io_metadata_read_disk(hmp, dev_pbase);
+	if (m == dio->disk_idx || hmp->raid_failed[m])
+		return 0;
+	if (lockmgr(&hmp->rebuild_lk, LK_SHARED | LK_NOWAIT) != 0)
+		return 0;
+
+	bp = getblk(dio->devvp, dev_pbase, dio->psize, GETBLK_KVABIO, 0);
+	if (bp == NULL) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		return 0;
+	}
+	if (bp->b_flags & B_CACHE) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		dio->bp = bp;
+		return 1;
+	}
+	bkvasync(bp);
+	error = hammer2_io_metadata_read_one(hmp, m, dev_pbase, bp->b_data,
+					     dio->psize);
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	if (error) {
+		/* nothing valid in it: let the primary read start over */
+		bp->b_flags |= B_INVAL;
+		brelse(bp);
+		return 0;
+	}
+	bp->b_flags &= ~(B_INVAL | B_ERROR);
+	bp->b_flags |= B_CACHE;
+	bp->b_resid = 0;
+	dio->bp = bp;
+	dio->rdisk = m;
+	return 1;
 }
 
 /*
@@ -350,6 +421,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		dio->absent_data = NULL;
 	}
 	KKASSERT(dio->bp == NULL);
+	dio->rdisk = -1;
 	if (btype == HAMMER2_BREF_TYPE_DATA)
 		hce = hammer2_cluster_data_read;
 	else
@@ -474,7 +546,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		case HAMMER2_DOP_READ:
 		default:
 			KKASSERT(dio->bp == NULL);
-			if (hce > 0) {
+			if (hammer2_io_meta_spread_read(dio, dev_pbase)) {
+				/* read from a mirror, or cached */
+			} else if (hce > 0) {
 				/*
 				 * Synchronous cluster I/O for now.
 				 */
@@ -529,7 +603,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				dio->bp->b_flags |= B_NOTMETA;
 		}
 	} else {
-		if (hce > 0) {
+		if (hammer2_io_meta_spread_read(dio, dev_pbase)) {
+			/* read from a mirror, or cached */
+		} else if (hce > 0) {
 			/*
 			 * Synchronous cluster I/O for now.
 			 */
@@ -1772,7 +1848,7 @@ hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
 	return error;
 }
 
-static int
+int
 hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
 			      void *dst, int bytes, int nocache)
 {
@@ -1891,10 +1967,17 @@ hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
  * against the bref CHECK code, and on the first verifying copy fixes
  * *bdata in place and queues a patch-repair of the primary disk.
  *
+ * bad_disk_idx is the dio's own disk, whose buffer the caller holds.  A
+ * cold read may have come from another mirror (hammer2_io_meta_spread_read),
+ * or the cached buffer may have been filled from one; alt_disk_idx (or -1)
+ * is that mirror, and gets the repair too unless it supplied the copy.
+ * The repair thread leaves a copy that is already good alone.
+ *
  * Returns 0 on success, EIO if no sibling has a verifying copy.
  */
 int
 hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
+				int alt_disk_idx,
 				hammer2_off_t dev_pbase, int psize, int off,
 				const hammer2_blockref_t *bref,
 				void *bdata, size_t bytes)
@@ -1930,6 +2013,16 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 			badhash = hammer2_io_repair_hash(bdata, bytes);
 			bcopy(copy + off, bdata, bytes);
 			kfree(copy, M_HAMMER2);
+			if (alt_disk_idx >= 0 && alt_disk_idx != i &&
+			    alt_disk_idx != bad_disk_idx &&
+			    !hmp->raid_failed[alt_disk_idx]) {
+				patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
+				bcopy(bdata, patch, bytes);
+				hammer2_io_repair_enqueue_chk(hmp,
+				    alt_disk_idx, dev_pbase, psize, off,
+				    (int)bytes, patch, off, (int)bytes,
+				    badhash);
+			}
 			if (hmp->raid_failed[bad_disk_idx])
 				return 0;
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);

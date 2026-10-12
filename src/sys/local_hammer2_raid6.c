@@ -920,28 +920,25 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 }
 
 /*
- * v3 RAIDZ2-native: read a metadata block from the first surviving
- * mirror copy.  Used when the primary disk for a metadata DIO is
- * failed.  Iterates disks in index order, skipping skip_disk_idx and
- * any disk marked failed/closed, until one bread succeeds.
- *
- * Returns 0 on success and copies bytes into buf; EIO if no surviving
- * disk has a usable copy.
+ * v3 RAIDZ2-native metadata read from one member.  Returns 0 with the
+ * copy in buf, ENXIO if the member cannot be read (failed, absent or
+ * closed; a member being rebuilt counts as failed until it is done), or
+ * the read error.  A copy queued for the next sync is newer than the
+ * disks' and is returned instead.  The copy is not kept in the member's
+ * buffer cache unless it was there already: the dio that asks keeps the
+ * block, and a second copy in the cache is a waste of RAM.
  */
 int
-hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
-				hammer2_off_t per_disk_off,
-				void *buf, size_t bytes)
+hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
+			     hammer2_off_t per_disk_off,
+			     void *buf, size_t bytes)
 {
 	hammer2_volume_t *vol;
-	struct buf *bp;
-	int i;
-	int last_err = 0;
+	int error;
 
 	KKASSERT(hmp->raid_type == HAMMER2_RAID_TYPE_RAID6);
 	KKASSERT(hmp->voldata.version >= HAMMER2_VOL_VERSION_RAIDZ2);
 
-	/* a copy queued for the next sync is newer than the disks' */
 	if (hmp->mirror_pend_count || hmp->mirror_inflight) {
 		struct hammer2_mirror_pend *mp;
 
@@ -958,29 +955,64 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_spin_unex(&hmp->mirror_spin);
 	}
 
-	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+	if (hmp->raid_failed[disk_idx])
+		return ENXIO;
+	vol = &hmp->volumes[disk_idx];
+	if (vol->dev == NULL || vol->dev->devvp == NULL || !vol->dev->open)
+		return ENXIO;
+	error = hammer2_inject_eio(disk_idx);
+	if (error == 0)
+		error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
+		    per_disk_off, buf, (int)bytes, 1);
+	return error;
+}
+
+/*
+ * The member that serves a cold read of the metadata block at
+ * per_disk_off: one per 64 KB block, round robin, so a walk of the
+ * metadata zone uses every disk.  All copies are identical (see
+ * hammer2_io_metadata_mirror_defer), so the choice only spreads the
+ * load.
+ */
+int
+hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, hammer2_off_t per_disk_off)
+{
+	return (int)((per_disk_off >> 16) % hmp->raid_config.ndisks);
+}
+
+/*
+ * v3 RAIDZ2-native: read a metadata block from a surviving mirror copy.
+ * Used when the primary disk for a metadata DIO is failed.  Tries the
+ * disk that hammer2_io_metadata_read_disk() names first, then the others
+ * in index order, skipping skip_disk_idx and any disk marked failed or
+ * closed, until one read succeeds.
+ *
+ * Returns 0 on success and copies bytes into buf; EIO if no surviving
+ * disk has a usable copy.
+ */
+int
+hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
+				hammer2_off_t per_disk_off,
+				void *buf, size_t bytes)
+{
+	int ndisks = hmp->raid_config.ndisks;
+	int start;
+	int i;
+	int k;
+	int error;
+	int last_err = 0;
+
+	start = hammer2_io_metadata_read_disk(hmp, per_disk_off);
+	for (k = 0; k < ndisks; k++) {
+		i = (start + k) % ndisks;
 		if (i == skip_disk_idx)
 			continue;
-		if (hmp->raid_failed[i])
-			continue;
-		vol = &hmp->volumes[i];
-		if (vol->dev == NULL || vol->dev->devvp == NULL ||
-		    !vol->dev->open)
-			continue;
-
-		bp = NULL;
-		last_err = hammer2_inject_eio(i);
-		if (last_err == 0)
-			last_err = bread(vol->dev->devvp, per_disk_off,
-					 (int)bytes, &bp);
-		if (last_err == 0 && bp) {
-			bkvasync(bp);
-			bcopy(bp->b_data, buf, bytes);
-			brelse(bp);
+		error = hammer2_io_metadata_read_one(hmp, i, per_disk_off,
+						     buf, bytes);
+		if (error == 0)
 			return 0;
-		}
-		if (bp)
-			brelse(bp);
+		if (error != ENXIO)
+			last_err = error;
 	}
 
 	return last_err ? last_err : EIO;
