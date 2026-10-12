@@ -876,7 +876,20 @@ of §9. File:line references are to this tree.
   metadata (P10). Space: each 4 KB file reserves 64 KB of data column, **16x** the user bytes, 24x
   with parity.
 - **Compression saves nothing on v3.** A block LZ4-compressed to 4 KB still takes a column
-  (`stripe_alloc` at `ondisk.c:2738` takes a whole slot or column per chain).
+  (`stripe_alloc` at `ondisk.c:2738` takes a whole slot or column per chain). LZ4 is the newfs
+  default (`HAMMER2_COMP_DEFAULT`), so v3 pays the CPU for it and gets nothing back.
+- **Data chain sizes are powers of two, and nothing lies between 32 and 64 KB.** A compressed
+  block is stored only if LZ4 fits it in `pblksize / 2` and is rounded up to 1, 2, 4, 8, 16 or 32 KB
+  (`strategy.c:970-1039`); otherwise it is stored whole at 64 KB. A file tail is rounded up to a
+  power of two by `hammer2_calc_physical`; files <= 512 bytes live in the inode. So a threshold of
+  "anything under 64 KB" is the same as 32 KB.
+- **Measured on the Pi (Cortex-A72, one core, 64 KB blocks, 2026-10-12):** LZ4 compresses C headers
+  and text at ~115 MB/s and decompresses at ~420 MB/s; incompressible data is rejected at
+  ~800-1000 MB/s. Stored sizes of 241 text blocks: 1 KB 6, 4 KB 19, 8 KB 103, 16 KB 1, **32 KB 105**,
+  64 KB 7. A 16 KB threshold would pack 129 of them, 32 KB 234. Of 30 blocks of the kernel binary,
+  25 do not halve and stay 64 KB (ZFS keeps a block that saves 1/8; HAMMER2 needs 1/2).
+  LZ4 1.10 is within 2-9% of the 2013 code in the tree (kernel flags, `-mgeneral-regs-only`), and
+  LZ4 has no SIMD path to gain from NEON, so the compressor stays as it is.
 - **Targets (P2, 6-disk 4+2):** data and parity 16.4 MB x 1.5 = ~25 MB (16 chains per column, 64
   per row), plus the ~25-70 MB metadata of P10 gives **60-95 MB, 4-6x; assert <= 8x** (was 45x).
   Space: 4000 files reserve ~1.5-2x user bytes (was 24x). 4000 compressible 4 KB files (1 KB after
@@ -948,10 +961,19 @@ of §9. File:line references are to this tree.
 ### 11.4 Recommendation: (a), with a pinned open column
 
 **Allocation.** `stripe_alloc` for a v3 DATA chain of `bytes <= vfs.hammer2.raid6_subcol_max`
-(default 16384; 0 = off, which is today's behaviour) takes the next 1 KB-aligned range of the
-*open sub-column*; if none fits it takes a new column (as now) and opens a sub-column in it.
+(default 32768, decided 2026-10-12, see 11.6; 0 = off, which is today's behaviour) takes the next
+range of the *open sub-column*, aligned to the chain's own size; if none fits it takes a new column
+(as now) and opens a sub-column in it. **Size-aligned placement:** every data chain is a power of
+two (11.1), so the open sub-column keeps a 64-bit occupancy mask (one bit per 1 KB) instead of a
+bump cursor, and a chain takes the first free range aligned to its size (a buddy layout without a
+free list; the scan is at most 64 / size positions). A 32 KB chain lands at 0 or 32 KB; a 4 KB
+chain followed by a 32 KB one puts the 32 KB at 32 and leaves 4-32 KB for later small chains,
+instead of closing the column with 28 KB unused. The column closes when a chain finds no aligned
+range (the new chain opens the next column), when it is full, or at gen advance. Filling a gap is
+safe: the column is still open and pinned, nothing has been written, so it is not RMW. Once closed,
+holes are never reused (11.6 Q5).
 `data_off = phys_off + off | radix` (`bref_slot` unchanged). A sub-column is
-`{row, disk, gen, next_off, npending, dio}`; there is one per (current gen, data disk) at most
+`{row, disk, gen, used_mask, npending, dio}`; there is one per (current gen, data disk) at most
 and it lives on the open row (`struct hammer2_open_row`, `local_hammer2.h:1160`).
 
 **The pin.** The sub-column holds one dio reference (`io_getblk` of the whole pbase, NEW, so the
@@ -972,7 +994,7 @@ bounded by `raid6_gen_wait_ms`; a timeout fails the flush as for rows), then wai
 A partly filled column is written at its full 64 KB, so an `fsync` of one 4 KB file costs what it
 costs today. Open columns are pinned memory: <= 64 KB x (data disks) x 1 per gen.
 
-**Rows.** A row still holds up to `ndata` columns, now of up to 16 chains each; `row_complete`,
+**Rows.** A row still holds up to `ndata` columns, now of up to 64 chains each (1 KB each); `row_complete`,
 P/Q, `dropped_mask` and `col_released` count columns and are untouched. `col_release`
 (`ondisk.c`, §10.6) on a failed put zeroes the column: it must also drop every sub-block, so the
 release is per column and the chains see EIO on read (same as a lost column today).
@@ -1003,10 +1025,13 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
 2. **Sub-offset plumbing, off by default:** `raid6_subcol_max=0`. A test hook places a chain at an
    offset (`vfs.hammer2.raid6_subcol_test`) to exercise `data_off` with offset on read, scrub,
    degraded read, self-heal patch and resilver. Tests: L, K, D, B, C with the hook.
-3. **Open sub-column + pin + close in `seal_gen`**, with `npending` and the timeout. Default still 0.
-   Tests: J, R (rewrites across sub-columns), F, I and `crash_host.sh` (kill with an open column).
-4. **Turn on at 16 KB.** P2 asserts: write amp <= 8x, balance as now, space <= 2x user, P2c
-   columns <= 1/3. New group Q: 4000 files, remove half, bulkfree x2, remount, every file verified;
+3. **Open sub-column + pin + close in `seal_gen`**, with `npending`, the timeout and size-aligned
+   placement (`used_mask`). Default still 0. Tests: J, R (rewrites across sub-columns), F, I and
+   `crash_host.sh` (kill with an open column); a placement unit test of mixed 1-32 KB sizes (no
+   overlap, alignment, gap fill).
+4. **Turn on at 32 KB.** P2 asserts: write amp <= 8x, balance as now, space <= 2x user, P2c
+   columns <= 1/3. New P1c: P1 with compressible data (text, ~2x LZ4) must reserve <= 0.6x the
+   columns of P1 and keep >= 90% of P1's throughput (the whole stream now goes through the pin). New group Q: 4000 files, remove half, bulkfree x2, remount, every file verified;
    two-disk failure with reads; corrupt one sub-block, scrub finds and repairs exactly it; overwrite
    in the same TXG (pending and closed). N and T (reuse) for capacity.
 5. **Bulkfree per column** (`bf_mark`/`bf_end`), still with the v1 map (refcount byte becomes a
@@ -1015,8 +1040,12 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
 
 ### 11.6 Open questions
 
-- Threshold: 16 KB, or 32 KB (4 chains per column)? Larger blocks waste less per column but more
-  blocks go through the pin.
+- ~~Threshold: 16 KB or 32 KB?~~ **Decided 2026-10-12: 32 KB** (all sub-64 KB chains; 11.1 shows
+  the two are the same, since no chain lies between 32 and 64 KB). At 16 KB a 64 KB block that LZ4
+  halves (the common 2-3x case lands in the 32 KB bucket: 105 of 241 text blocks on the Pi) still
+  takes a whole column, so compression would keep saving nothing. Pinned memory is the same for
+  both. The cost is that compressible streams go through the pin (P1c) and 32 KB chains need the
+  size-aligned placement of 11.4.
 - Is an `fsync` of a tiny file allowed to cost a full column plus P/Q (as today), or must a sync write
   only the touched 4 KB (that needs RMW parity and returns the write hole)?
 - Is the all-disk metadata mirror intended for data in (b1), or is 3 copies acceptable? (Only matters if
