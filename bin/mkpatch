@@ -1,0 +1,46 @@
+#!/bin/sh
+# mkpatch — regenerate hammer2_raid6.patch from src/.
+#
+# Usage: bin/mkpatch [-o OUTFILE]
+#
+# The patch is `git diff` between the pristine DragonFly base and the same
+# tree after bin/apply-overlay (src/sys/local_* -> sys/vfs/hammer2/*,
+# src/sbin/local_* -> sbin/hammer2 and sbin/newfs_hammer2, plus the
+# sys/conf/files, arm64 files and sbin/hammer2/Makefile edits).  The base
+# is only read (git archive); nothing in it is modified.
+#
+# Environment:
+#   DFLY_BASE_REPO  git repo holding the base (default: ../dragonfly
+#                   next to this checkout's parent directory)
+#   DFLY_BASE_REV   base revision (default: arm64-base = 48147b0412,
+#                   the revision install_raid6.sh documents)
+set -e
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$DIR/hammer2_raid6.patch"
+[ "$1" = -o ] && { OUT="$2"; shift 2; }
+REPO="${DFLY_BASE_REPO:-}"
+if [ -z "$REPO" ]; then
+    for c in "$DIR/../dragonfly" "$DIR/../../dragonfly" "$DIR/../../../dragonfly"; do
+        [ -d "$c/.git" ] && { REPO="$c"; break; }
+    done
+fi
+[ -n "$REPO" ] || { echo "mkpatch: set DFLY_BASE_REPO" >&2; exit 1; }
+REV="${DFLY_BASE_REV:-48147b0412}"
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/mkpatch.XXXXXX")
+trap 'rm -rf "$T"' EXIT INT TERM
+# The base has no arm64 platform; include its files list only if it does.
+PATHS="sbin/hammer2 sbin/newfs_hammer2 sys/vfs/hammer2 sys/conf/files"
+if git -C "$REPO" cat-file -e "$REV:sys/platform/arm64/conf/files" 2>/dev/null; then
+    PATHS="$PATHS sys/platform/arm64/conf/files"
+fi
+git -C "$REPO" archive "$REV" $PATHS | tar -x -C "$T"
+cd "$T"
+git init -q .
+git add -A
+git -c user.name=mkpatch -c user.email=mkpatch@localhost commit -q -m base
+sh "$DIR/bin/apply-overlay" "$T"
+git add -A
+git diff --cached --no-color > "$OUT.new"
+mv "$OUT.new" "$OUT"
+echo "mkpatch: wrote $OUT ($(wc -l < "$OUT") lines, base $REV)"
