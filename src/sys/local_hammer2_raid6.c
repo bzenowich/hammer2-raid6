@@ -475,8 +475,8 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  * bwrite() in two halves, so that the writes of a row's P and Q columns,
  * or of a metadata block's mirror copies, are all in flight at once
  * instead of one disk after another.  The buffers stay in the buffer
- * cache (other readers of those device offsets see the new data).
- * Returns 0 if the buffer was B_INVAL and released without a write.
+ * cache (other readers of those device offsets see the new data) unless
+ * the caller set B_NOCACHE, which drops them at the wait.  Returns 0 if the buffer was B_INVAL and released without a write.
  */
 int
 hammer2_bwrite_start(struct buf *bp)
@@ -629,10 +629,17 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	}
 
 	/* P and Q go out together; the rebuild-target copies below too. */
-	if (pbp && !hammer2_bwrite_start(pbp))
-		pbp = NULL;
-	if (qbp && !hammer2_bwrite_start(qbp))
-		qbp = NULL;
+	if (pbp) {
+		/* parity is never read back on the normal path: drop it */
+		pbp->b_flags |= B_RELBUF | B_NOCACHE;
+		if (!hammer2_bwrite_start(pbp))
+			pbp = NULL;
+	}
+	if (qbp) {
+		qbp->b_flags |= B_RELBUF | B_NOCACHE;
+		if (!hammer2_bwrite_start(qbp))
+			qbp = NULL;
+	}
 	if (p_mem) {
 		int e = hammer2_io_raid6_write_nowait(
 		    hmp->volumes[p_disk].dev->devvp, phys_off,
@@ -747,6 +754,8 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		}
 		bkvasync(bp);
 		bcopy(data, bp->b_data, bytes);
+		/* only the failover read wants a mirror, and it re-reads */
+		bp->b_flags |= B_RELBUF | B_NOCACHE;
 		if (hammer2_bwrite_start(bp)) {
 			bps[i] = bp;
 		} else {
