@@ -567,9 +567,7 @@ disk 0 and, for every allocated slot, reads all data columns, recomputes P (XOR)
 and Q (GF(2⁸) syndrome), and compares against the on-disk P and Q. Exit 0 if
 every checked stripe is consistent, 1 on any parity or read error.
 
-`src/diag/h2parity_fix.c` also exists but is a narrow one-off: it is hardcoded to
-a 4-disk `diskN.img` layout and was written to repair parity damaged by a
-specific historical `GETBLK_NOWAIT` bug. It is not a general repair tool.
+There is no offline parity repair tool; the earlier one-off (`h2parity_fix`) was removed.
 
 ### 7.6 A defensible operating regimen
 

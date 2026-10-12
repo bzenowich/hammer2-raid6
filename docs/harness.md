@@ -264,7 +264,7 @@ A background process `bin/watcher`:
 `bin/run-test <script>`:
 1. `qmp quit` (in case a VM is already up; ignore error).
 2. `rm overlay-system.qcow2; qemu-img create ... -b base ...`
-3. Regenerate RAID disks via `fresh_disks.sh`.
+3. Regenerate RAID disks (`bin/run-test`; the old `fresh_disks.sh` is gone).
 4. `launch-dfly.sh` (now headless, daemonized).
 5. Wait for SSH (poll with 60 s timeout).
 6. `bin/push` to sync the working tree to `/root/h2`.

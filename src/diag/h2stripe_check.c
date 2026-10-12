@@ -1,5 +1,5 @@
 /*
- * h2stripe_check - HAMMER2 RAIDZ2-native (format version 4) stripe checker.
+ * h2stripe_check - HAMMER2 RAIDZ2-native (volume version 3, RAIDZ2-native) stripe checker.
  *
  * Opens a HAMMER2 RAID6 array from raw device paths, reads the space map
  * (docs/capacity.md) committed by the newest volume header, and verifies
