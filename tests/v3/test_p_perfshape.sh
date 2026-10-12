@@ -160,6 +160,72 @@ if [ "$n" = "$NFILES" ]; then
 else
     result FAIL "P2: $n of $NFILES files present"
 fi
+
+# P4: metadata reads spread over the mirrors (oct-review P4).  A cold
+# walk of the P2 tree touches inode and directory blocks only; their
+# copies sit on every member, so no member should serve most of them.
+remount
+sleep 2
+ds_snap /var/tmp/p_b4
+ls -lR $MNTPT/small > /dev/null
+ds_snap /var/tmp/p_a4
+join /var/tmp/p_b4 /var/tmp/p_a4 | awk '
+    { rd = $7 - $3; t += rd; n++; r[n] = rd; nm[n] = $1; if (rd > mx) mx = rd
+      if (rd > 0) nz++ }
+    END {
+        for (i = 1; i <= n; i++)
+            printf "  %s: read %.2f MB\n", nm[i], r[i] / 1048576 > "/dev/stderr"
+        printf "%d %d %d %.3f\n", t, nz, n, (t ? mx / t : 1)
+    }' > /var/tmp/p_ds.txt
+set -- $(cat /var/tmp/p_ds.txt)
+echo "  P4: cold metadata walk read $1 B from $2 of $3 members, busiest share $4"
+if [ "$1" -ge 1048576 ] && [ "$2" -ge 2 ] && \
+   awk -v s="$4" 'BEGIN { exit !(s <= 0.60) }'; then
+    result PASS "P4: metadata reads spread (busiest member $4 of $1 B)"
+else
+    result FAIL "P4: metadata reads not spread (busiest member $4 of $1 B, $2 members)"
+fi
+
+# P5: cold metadata reads against mirror copies being written.  A writer
+# churns metadata and syncs (the sync issues the mirror copies without
+# waiting) while the tree is walked again and again, remounting between
+# rounds so the reads miss the cache.  A read that took a mirror's old
+# media contents would fail its CHECK: no member may count an error.
+(
+    j=0
+    while [ -f /var/tmp/p5_run ]; do
+        mkdir -p $MNTPT/churn$((j % 8))
+        k=0
+        while [ $k -lt 200 ]; do
+            echo $j.$k > $MNTPT/churn$((j % 8))/f$k
+            k=$((k + 1))
+        done
+        sync
+        j=$((j + 1))
+    done
+) &
+P5PID=$!
+: > /var/tmp/p5_run
+P5ERR=0
+r=0
+while [ $r -lt 6 ]; do
+    ls -lR $MNTPT/small > /dev/null 2>>/var/tmp/p5_err.txt || P5ERR=1
+    ls -lR $MNTPT/churn0 > /dev/null 2>>/var/tmp/p5_err.txt
+    r=$((r + 1))
+done
+rm -f /var/tmp/p5_run
+wait $P5PID
+hammer2 -s $MNTPT raid status > /var/tmp/p5_status.txt 2>&1
+remount
+ls -lR $MNTPT/small > /dev/null 2>>/var/tmp/p5_err.txt || P5ERR=1
+hammer2 -s $MNTPT raid status >> /var/tmp/p5_status.txt 2>&1
+CK=$(grep '^disk\[' /var/tmp/p5_status.txt | awk '{ for (i = 1; i < NF; i++) if ($i == "cksum_err") t += $(i+1) } END { print t + 0 }')
+if [ "$P5ERR" = 0 ] && [ "$CK" = 0 ]; then
+    result PASS "P5: metadata walks during mirror writes, cksum errors $CK"
+else
+    result FAIL "P5: walk error $P5ERR, cksum errors $CK"
+    cat /var/tmp/p5_err.txt
+fi
 teardown "P2"
 
 summary

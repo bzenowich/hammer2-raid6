@@ -5857,7 +5857,7 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 			if (moff >= 0 &&
 			    moff + (int)chain->bytes <= dio->psize &&
 			    hammer2_io_metadata_mirror_heal(hmp, disk_idx,
-				dev_pbase, dio->psize, moff, bref, bdata,
+				-1, dev_pbase, dio->psize, moff, bref, bdata,
 				chain->bytes) == 0) {
 				krateprintf(&krate_h2heal,
 				    "hammer2: selfheal: read-path repair "
@@ -5891,7 +5891,13 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 
 		if (off < 0 || off + (int)chain->bytes > dio->psize)
 			break;
+		/*
+		 * The bad bytes came from the member that read the block,
+		 * or from the cached buffer a read from it filled.
+		 */
 		error = hammer2_io_metadata_mirror_heal(hmp, disk_idx,
+		    (dio->rdisk >= 0) ? dio->rdisk :
+		     hammer2_io_metadata_read_disk(hmp, dev_pbase),
 		    dev_pbase, dio->psize, off, bref, bdata, chain->bytes);
 		if (error == 0) {
 			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
