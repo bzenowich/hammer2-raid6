@@ -639,6 +639,7 @@ ioctl and printed by `hammer2 raid stats`:
    - `NDISKS=6` in a periodic matrix;
    - `raid6_simd=0` vs `1` parity cross-check on arm64.
 6. **Seen once, not reproduced (2026-10-11):** page fault in `hammer2_characterize_failed_chain+0xd6` (deref of `chain->dio->bp`) from `hammer2_chain_testcheck`, during group B on h2dev, a degraded 3-disk mount with a concurrent read-path self-heal repair write. The function is marked "not really MPSAFE". vmcore.9 had no module symbols, so the line was not confirmed. Group B passed 13/13 in the two reruns. Suspect: the repair path releases or replaces `chain->dio` while the CHECK FAIL report reads it. Build the module with debug info for h2dev runs so the next dump is usable.
+7. **Seen during R8 work (2026-10-11), not fixed:** when a mount is refused after the super-root fails its check, the unwind can panic in `hammer2_pfsfree_scan` → `hammer2_inode_drop` ("page fault ... panic with 1 spinlocks held"). It was triggered by L4 before the `TESTEDGOOD` fix in ccdda50, and probably affects any mount refused at that stage. Repro: corrupt the super-root on every copy and mount; the mount must fail with an error, not a panic.
 
 ---
 
