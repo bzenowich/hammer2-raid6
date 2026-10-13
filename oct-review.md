@@ -616,6 +616,25 @@ unchanged); the 1 run per mode is not enough to call P2 a regression. The async=
 Group O (new, 37 checks) and A B C D F K L R W X Y Z pass with async_seal=1; see the commit message
 for counts.
 
+*Pi results (k43, 75a8cdb, 4 x USB SSD, 2026-10-13).* async_seal=0 / 1:
+
+| | 0 | 1 |
+|---|---|---|
+| P1 | 18.7 MB/s, P/Q wait 2114 ms (15.5% of wall) | 43.4 MB/s, wait 0 ms |
+| P1c | 32.1 MB/s, wait 1309 ms (16.4%) | 32.7 MB/s, wait 0 ms |
+| write-amp P2 / P2c | 4.69 / 3.96 | 5.48 / 3.60 |
+
+X 107/107 and W 44/44 pass with async on. O failed O2 twice only because the Pi's sed was broken
+(arm64 TRE regex, fixed in the fork as c026f0c124 and deployed to the Pi on 2026-10-13); the data
+checked out (deg crc == col crc, reader waited 4901 ms).
+
+*Open: P1c is the limit once parity is async.* On the Pi P1c does not gain (32 MB/s either way), so the
+"P1c >= 90% of P1" target fails with async on (32.7 vs 43.4). With the wait gone, the compressed write
+path itself bounds it; LZ4 on a Cortex-A72 core is far faster than 33 MB/s, so look at where the
+compression runs (single thread per flush? the logical-buffer copy?) before making async the default.
+P2 write-amp was higher with async on in both the h2dev and the Pi run (1 run per mode each) -- also
+to explain before the default changes.
+
 ### P4. All metadata reads go to disk 0 [V2]
 **Where:** `hammer2_dio_key` (`io.c:143–154`): metadata uses `vol->id`, which is always 0 because `md_extents[0]` lives in volume 0.
 
