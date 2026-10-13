@@ -1499,9 +1499,8 @@ hammer2_raid6_sm_touch(hammer2_dev_t *hmp, uint64_t slot)
  */
 /*
  * Per-bref accounting at walker time.  Each live DATA/DIRENT bref
- * contributes one column to its row, so refcount = count of live
- * brefs sharing the slot.  Bitmap bit is the union (set iff any
- * bref).  6C packing depends on this — under-counting would let the
+ * contributes one column to its row; the bitmap bit is set iff any
+ * bref uses the slot.  6C packing depends on this — under-counting would let the
  * allocator reuse a slot that still has live cols.
  */
 /*
@@ -1538,8 +1537,6 @@ hammer2_raid6_record_bref(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	hmp->stripe_bitmap[slot / 8] |= (uint8_t)(1 << (slot % 8));
-	if (hmp->stripe_row_refcount[slot] < 0xff)
-		hmp->stripe_row_refcount[slot]++;
 	if (slot >= hmp->stripe_cursor)
 		hmp->stripe_cursor = slot + 1;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
@@ -1588,8 +1585,6 @@ hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp)
 	KKASSERT(hmp->stripe_bitmap != NULL);
 
 	bzero(hmp->stripe_bitmap, hmp->stripe_bitmap_size);
-	bzero(hmp->stripe_row_refcount,
-	      (size_t)hmp->sm_npages * HAMMER2_SM_PAGE);
 	hmp->stripe_cursor = 0;
 
 	hammer2_chain_lock(&hmp->vchain, HAMMER2_RESOLVE_ALWAYS);
@@ -1648,8 +1643,6 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 			++hmp->stripe_data_slots;
 		}
 	}
-	hmp->stripe_row_refcount = kmalloc((size_t)npages * HAMMER2_SM_PAGE,
-					   M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->sm_dirty = kmalloc((size_t)npages, M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->sm_crc[0] = kmalloc((size_t)npages * sizeof(uint32_t),
 				 M_HAMMER2, M_WAITOK | M_ZERO);
@@ -1694,10 +1687,6 @@ hammer2_raid6_sm_destroy(hammer2_dev_t *hmp)
 	if (hmp->stripe_data_mask) {
 		kfree(hmp->stripe_data_mask, M_HAMMER2);
 		hmp->stripe_data_mask = NULL;
-	}
-	if (hmp->stripe_row_refcount) {
-		kfree(hmp->stripe_row_refcount, M_HAMMER2);
-		hmp->stripe_row_refcount = NULL;
 	}
 	if (hmp->sm_dirty) {
 		kfree(hmp->sm_dirty, M_HAMMER2);
@@ -1776,7 +1765,7 @@ hammer2_raid6_sm_read(hammer2_dev_t *hmp)
 	uint64_t slot;
 	uint32_t p;
 	int found = 0;
-	int i;
+	int i, j;
 
 	for (i = 0; i < hmp->nvolumes && !found; i++) {
 		devvp = hammer2_raid6_sm_devvp(hmp, i);
@@ -1812,8 +1801,6 @@ hammer2_raid6_sm_read(hammer2_dev_t *hmp)
 	}
 
 	for (p = 0; p < npages; p++) {
-		uint8_t *dst = hmp->stripe_row_refcount +
-			       (size_t)p * HAMMER2_SM_PAGE;
 		int ok = 0;
 
 		for (i = 0; i < hmp->nvolumes && !ok; i++) {
@@ -1825,7 +1812,15 @@ hammer2_raid6_sm_read(hammer2_dev_t *hmp)
 				  HAMMER2_SM_PAGE, &bp) == 0 &&
 			    hammer2_icrc32(bp->b_data, HAMMER2_SM_PAGE) ==
 			    crcs[p]) {
-				bcopy(bp->b_data, dst, HAMMER2_SM_PAGE);
+				/* one byte per slot, nonzero: in use */
+				for (j = 0; j < HAMMER2_SM_PAGE_SLOTS; j++) {
+					slot = (uint64_t)p *
+					    HAMMER2_SM_PAGE_SLOTS + j;
+					if (slot < hmp->stripe_num_slots &&
+					    ((uint8_t *)bp->b_data)[j])
+						setbit(hmp->stripe_bitmap,
+						    slot);
+				}
 				ok = 1;
 			}
 			if (bp)
@@ -1838,11 +1833,6 @@ hammer2_raid6_sm_read(hammer2_dev_t *hmp)
 		}
 	}
 
-	for (slot = 0; slot < hmp->stripe_num_slots; slot++) {
-		if (hmp->stripe_row_refcount[slot])
-			hmp->stripe_bitmap[slot / 8] |=
-			    (uint8_t)(1 << (slot % 8));
-	}
 	hmp->stripe_cursor = cursor;
 
 	/*
@@ -1853,7 +1843,7 @@ hammer2_raid6_sm_read(hammer2_dev_t *hmp)
 	return;
 
 invalid:
-	bzero(hmp->stripe_row_refcount, (size_t)npages * HAMMER2_SM_PAGE);
+	bzero(hmp->stripe_bitmap, hmp->stripe_bitmap_size);
 	hmp->stripe_bitmap_invalid = 1;
 }
 
@@ -1907,7 +1897,7 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 	char *pbuf;
 	uint32_t p;
 	int perr;
-	int i;
+	int i, j;
 
 	bzero(derr, sizeof(derr));
 	pbuf = kmalloc(HAMMER2_SM_PAGE, M_HAMMER2, M_WAITOK);
@@ -1924,8 +1914,12 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 		if ((hmp->sm_dirty[p] & bit) == 0)
 			continue;
 		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
-		bcopy(hmp->stripe_row_refcount + (size_t)p * HAMMER2_SM_PAGE,
-		      pbuf, HAMMER2_SM_PAGE);
+		for (j = 0; j < HAMMER2_SM_PAGE_SLOTS; j++) {
+			uint64_t slot = (uint64_t)p * HAMMER2_SM_PAGE_SLOTS + j;
+
+			pbuf[j] = (slot < hmp->stripe_num_slots &&
+			    isset(hmp->stripe_bitmap, slot)) ? 1 : 0;
+		}
 		hmp->sm_dirty[p] &= ~bit;
 		hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 		hmp->sm_crc[c][p] = hammer2_icrc32(pbuf, HAMMER2_SM_PAGE);
@@ -3086,13 +3080,7 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 	 */
 	if (hammer2_raid6_open_row_pack_locked(hmp, &pack_off,
 	    &pack_disk_idx, rowp)) {
-		/*
-		 * One more live column in the row: freeing any one
-		 * of them must not free the row.
-		 */
 		slot = hammer2_raid6_slot(pack_off, stripe_unit);
-		if (hmp->stripe_row_refcount[slot] < 0xff)
-			hmp->stripe_row_refcount[slot]++;
 		hammer2_raid6_sm_touch(hmp, slot);
 		if (hmp->stripe_bf_active)
 			setbit(hmp->stripe_bf_new, slot);
@@ -3113,7 +3101,6 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 	byte_idx = slot / 8;
 	bit_idx  = (int)(slot % 8);
 	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
-	hmp->stripe_row_refcount[slot] = 1;
 	hammer2_raid6_sm_touch(hmp, slot);
 	if (hmp->stripe_bf_active)
 		setbit(hmp->stripe_bf_new, slot);
@@ -3128,7 +3115,6 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 	if (disk_idx < 0) {
 		/* All disks are P or Q: can't happen for ndisks >= 4 */
 		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
-		hmp->stripe_row_refcount[slot] = 0;
 		return ENOSPC;
 	}
 	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
@@ -3469,7 +3455,7 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
  * stages again.
  *
  * Liveness is kept per column.  The space map stays per row (one
- * refcount byte per slot, v1 format, unchanged), because a sealed row's
+ * in-use byte per slot, v1 format, unchanged), because a sealed row's
  * P/Q cover all its columns and a dead column cannot be reused without
  * a read-modify-write; so a row is freed when no column of it is live,
  * exactly as before.  Several chains share a column (sub-columns), and
@@ -3542,8 +3528,6 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 			end = nslots;
 		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 		for (slot = base; slot < end; slot++) {
-			uint8_t *rc = &hmp->stripe_row_refcount[slot];
-
 			/*
 			 * A row that is still open has columns in flight
 			 * that no committed tree references yet: neither
@@ -3563,22 +3547,20 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 				 * Referenced by the committed tree but
 				 * free in the map: take it back.
 				 */
-				if (*rc == 0 &&
+				if (isclr(hmp->stripe_bitmap, slot) &&
 				    isclr(hmp->stripe_bf_new, slot) &&
 				    hammer2_raid6_slot_is_data(hmp, slot)) {
-					*rc = 1;
 					setbit(hmp->stripe_bitmap, slot);
 					hammer2_raid6_sm_touch(hmp, slot);
 					++nfixed;
 				}
 				continue;
 			}
-			if (*rc == 0) {
+			if (isclr(hmp->stripe_bitmap, slot)) {
 				clrbit(hmp->stripe_bf_staged, slot);
 				continue;
 			}
 			if (isset(hmp->stripe_bf_staged, slot)) {
-				*rc = 0;
 				clrbit(hmp->stripe_bitmap, slot);
 				hmp->rz_free_epoch++;
 				clrbit(hmp->stripe_bf_staged, slot);
