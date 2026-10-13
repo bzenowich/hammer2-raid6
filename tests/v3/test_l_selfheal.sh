@@ -16,6 +16,8 @@
 #      disk, remount, walk the tree (find + stat).  All files must be
 #      reachable (mirror-copy failover) and no CHECK errors may leak to
 #      userspace.
+# L7 — every failure point of the first mount unwinds completely and
+#      the same mount works afterwards (inject_mount_fail).
 # L5 — P4: cold metadata reads are spread over the mirrors, so a bad
 #      copy on disk 2 (not the primary) is what a read finds first for
 #      the blocks disk 2 serves.  The tree must read, and the repair
@@ -319,5 +321,147 @@ else
 fi
 kmsg_clear
 teardown "L6"
+
+# L7: every failure point of the first mount of a device must unwind
+# completely.  vfs.hammer2.inject_mount_fail=N makes point N fail once
+# (see hammer2_mount_inject(); 1 init_devvp, 2 open_devvp, 3 init_volumes,
+# 4/5 sm_init before/after its allocations, 6 space map rebuild, 7/8
+# super-root lookup/check, 9 PFS lookup, 10 PFS acquire).  For each
+# point, three times: the mount is refused, the injection is consumed, no
+# panic; then the same mount works, the data verifies and the members
+# can be closed again (a leaked open makes the next open fail EBUSY, and
+# vmstat -m must not show HAMMER2-mount objects or vnodes growing).
+l7_h2_mem() {
+    vmstat -m | awk '$1 == "HAMMER2-mount" { print $2 }'
+}
+l7_vnodes() {
+    sysctl -n debug.numvnodes 2>/dev/null || sysctl -n vfs.numvnodes
+}
+setup_fresh
+check_v3
+write_ref_data l7
+umount $MNTPT
+# warm up: clean mount cycles so lazily created state is not a "leak",
+# and a control: the same cycles without a refusal must not grow either
+l7_i=0
+while [ $l7_i -lt 3 ]; do
+    mount -t hammer2 $PFSPATH $MNTPT && sha256 $MNTPT/l7_a > /dev/null && umount $MNTPT
+    l7_i=$((l7_i + 1))
+done
+L7_MEM0=$(l7_h2_mem)
+L7_VN0=$(l7_vnodes)
+l7_i=0
+while [ $l7_i -lt 10 ]; do
+    mount -t hammer2 $PFSPATH $MNTPT && sha256 $MNTPT/l7_a > /dev/null && umount $MNTPT
+    l7_i=$((l7_i + 1))
+done
+echo "  control: 10 clean cycles: HAMMER2-mount objects $L7_MEM0 -> $(l7_h2_mem), vnodes $L7_VN0 -> $(l7_vnodes)"
+L7_MEM0=$(l7_h2_mem)
+L7_VN0=$(l7_vnodes)
+l7_bad=0
+L7_GROW=0
+L7_MEMLAST=$L7_MEM0
+for p in 1 2 3 4 5 6 7 8 9 10; do
+    n=0
+    while [ $n -lt 3 ]; do
+        kmsg_clear
+        sysctl vfs.hammer2.inject_mount_fail=$p > /dev/null
+        if mount -t hammer2 $PFSPATH $MNTPT 2>/var/tmp/l7_mount.txt; then
+            result FAIL "L7: point $p: mount succeeded"
+            umount $MNTPT 2>/dev/null || umount -f $MNTPT 2>/dev/null
+            l7_bad=1
+        elif ! kmsg | grep -q "injected failure at point $p\$"; then
+            result FAIL "L7: point $p: mount refused but not at the point"
+            kmsg | grep hammer2 | tail -5
+            l7_bad=1
+        elif [ "$(sysctl -n vfs.hammer2.inject_mount_fail)" != 0 ]; then
+            result FAIL "L7: point $p: injection not consumed"
+            l7_bad=1
+        fi
+        if kmsg | grep -q "left hanging\|left over after final"; then
+            result FAIL "L7: point $p: unwind left I/Os or chains behind"
+            l7_bad=1
+        fi
+        sysctl vfs.hammer2.inject_mount_fail=0 > /dev/null
+        if mount -t hammer2 $PFSPATH $MNTPT 2>/var/tmp/l7_mount2.txt; then
+            verify_ref "L7: point $p round $n: data intact after refusal" l7
+            umount $MNTPT
+        else
+            result FAIL "L7: point $p round $n: mount after refusal failed"
+            cat /var/tmp/l7_mount2.txt
+            l7_bad=1
+        fi
+        l7_m=$(l7_h2_mem)
+        [ "$l7_m" -gt "$L7_MEMLAST" ] && L7_GROW=$((L7_GROW + 1))
+        L7_MEMLAST=$l7_m
+        n=$((n + 1))
+    done
+    [ $l7_bad = 0 ] && result PASS "L7: point $p refused and unwound 3 times"
+    echo "  point $p: HAMMER2-mount objects $(l7_h2_mem), vnodes $(l7_vnodes)"
+    l7_bad=0
+done
+L7_MEM1=$(l7_h2_mem)
+L7_VN1=$(l7_vnodes)
+# HAMMER2-mount objects also step up now and then (6 or 12 at a time) in
+# plain mount + read + dmesg cycles with no refusal at all (mount/umount
+# alone stay flat), so a leak is judged by growth that keeps coming: a
+# leak per refusal would grow on most of the 30 rounds.
+if [ "$L7_GROW" -le 5 ]; then
+    result PASS "L7: HAMMER2-mount objects $L7_MEM0 -> $L7_MEM1 (grew $L7_GROW times in 30)"
+else
+    result FAIL "L7: HAMMER2-mount objects leaked $L7_MEM0 -> $L7_MEM1 (grew $L7_GROW times in 30)"
+fi
+if [ "$L7_VN1" -le $((L7_VN0 + 16)) ]; then
+    result PASS "L7: vnodes $L7_VN0 -> $L7_VN1"
+else
+    result FAIL "L7: vnodes leaked $L7_VN0 -> $L7_VN1"
+fi
+
+# A refused RO mount after a failed rebuild is allowed; the mount must
+# work and unmount cleanly.
+kmsg_clear
+sysctl vfs.hammer2.inject_mount_fail=6 > /dev/null
+if mount -t hammer2 -r $PFSPATH $MNTPT 2>/dev/null; then
+    verify_ref "L7: RO mount with a failed space map rebuild reads" l7
+    umount $MNTPT
+    result PASS "L7: RO mount survives a failed space map rebuild"
+else
+    result FAIL "L7: RO mount refused after a failed space map rebuild"
+fi
+sysctl vfs.hammer2.inject_mount_fail=0 > /dev/null
+
+# A second mount of a PFS that is already mounted is refused and leaves
+# the first one alone.
+mount -t hammer2 $PFSPATH $MNTPT
+mkdir -p ${MNTPT}2
+if mount -t hammer2 $PFSPATH ${MNTPT}2 2>/dev/null; then
+    result FAIL "L7: second mount of a mounted PFS succeeded"
+    umount ${MNTPT}2
+else
+    result PASS "L7: second mount of a mounted PFS refused"
+fi
+verify_ref "L7: first mount intact after the refused second" l7
+umount $MNTPT
+
+# Members closable: raw writes and a fresh newfs work after all of it.
+l7_dd=0
+for d in $DEVS; do
+    dd if=/dev/zero of=$d bs=512 count=1 seek=100000 2>/dev/null || l7_dd=1
+done
+if [ $l7_dd = 0 ]; then
+    result PASS "L7: members writable (not left open) after the refusals"
+else
+    result FAIL "L7: raw write to a member failed"
+fi
+setup_fresh
+echo ok > $MNTPT/l7_after
+sync
+if [ "$(cat $MNTPT/l7_after)" = ok ]; then
+    result PASS "L7: newfs + mount after the refusals"
+else
+    result FAIL "L7: newfs + mount after the refusals unusable"
+fi
+kmsg_clear
+teardown "L7"
 
 summary
