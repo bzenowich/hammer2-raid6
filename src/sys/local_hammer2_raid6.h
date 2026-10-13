@@ -166,6 +166,60 @@ hammer2_raid6_pick_data_disk(hammer2_dev_t *hmp, int p_disk, int q_disk,
 }
 
 /*
+ * v3 metadata copy placement (oct-review 12).  A metadata block at
+ * per-disk offset off is written to its primary (the disk the dio is
+ * keyed on, always disk 0 today) and to `ncopies - 1` mirrors; ncopies
+ * is 3 on a layout 3 array and ndisks on a layout 2 one (every disk
+ * mirrors).  Copy k = 0 is the primary.  Mirrors are picked among the
+ * other ndisks - 1 disks, in order primary + 1 ..., from the 64 KB
+ * block number b: copy 1 is the (b % n1)th, copy 2 is s further on,
+ * s in 1..n1-1 stepped by b / n1, so the two are distinct and every
+ * ordered pair of disks occurs.  Keep every use of this rule behind
+ * these inlines.
+ */
+#define HAMMER2_MD_COPIES	3
+
+static __inline int
+hammer2_md_ncopies(int ndisks, int layout)
+{
+	if (layout >= 3 && ndisks > HAMMER2_MD_COPIES)
+		return HAMMER2_MD_COPIES;
+	return ndisks;
+}
+
+static __inline int
+hammer2_md_copy_disk(int ndisks, int ncopies, int primary, uint64_t off,
+		     int k)
+{
+	uint64_t b = off >> 16;
+	int n1 = ndisks - 1;
+	int j;
+
+	if (k == 0)
+		return primary;
+	if (ncopies >= ndisks)
+		return (primary + k) % ndisks;
+	j = (int)(b % n1);
+	if (k == 2)
+		j = (j + 1 + (int)((b / n1) % (n1 - 1))) % n1;
+	return (primary + 1 + j) % ndisks;
+}
+
+static __inline int
+hammer2_md_is_copy(int ndisks, int ncopies, int primary, uint64_t off,
+		   int disk)
+{
+	int k;
+
+	for (k = 0; k < ncopies; k++) {
+		if (hammer2_md_copy_disk(ndisks, ncopies, primary, off,
+					 k) == disk)
+			return 1;
+	}
+	return 0;
+}
+
+/*
  * Function prototypes are declared in hammer2.h (which all kernel
  * files include) to avoid redundant-declaration warnings.
  */

@@ -52,7 +52,11 @@ fi
 teardown "F1"
 
 # F2: h2stripe_check parity verification
-if ! command -v h2stripe_check > /dev/null 2>&1; then
+# the one deploy.sh builds from this tree comes first: an older copy in
+# /usr/local/bin may not know the current stripe layout
+if [ -x /root/h2diag/h2stripe_check ]; then
+    H2CHECK=/root/h2diag/h2stripe_check
+elif ! command -v h2stripe_check > /dev/null 2>&1; then
     H2CHECK=$(find /usr/local/bin /usr/bin /root /var/tmp -name h2stripe_check 2>/dev/null | head -1)
 else
     H2CHECK=h2stripe_check

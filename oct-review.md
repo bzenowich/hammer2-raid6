@@ -1162,7 +1162,7 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
    mirror blocks per pass against about 41 on h2dev at the same limit (5 passes, 207): the slow cp
    leaves more inode blocks dirty per pass. Over k32-k35 the Pi gave 11.7, 8.2, 8.6, 8.5x.
    **Decided:** P2/P2c allow 12x when `limit_dirty_chains` < 5000, 8x otherwise (test_p).
-   **Next lever (not started):** metadata goes to the primary plus N-1 mirrors, 4 copies on
+   **Next lever (done 2026-10-13, see section 12):** metadata goes to the primary plus N-1 mirrors, 4 copies on
    4 disks, where RAID6 needs 3 to survive any 2 failures. 3 copies (2 mirrors) cut mirror
    writes by 1/3 on 4 disks and by 1/2 on 6 (Pi P2 about 6.7x: 422 x 64 KB x 3 = 83 MB of mirrors, 28 MB less); it needs a placement rule for
    the two mirror disks used by write, failover read, resilver and scrub, and arrays that
@@ -1193,3 +1193,108 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
   reused and there is no repack pass; the worst case is a column pinned by one live chain (status
   quo). Group Q gets a churn variant (create, delete half, repeat) to measure dead columns; a repack
   design is revisited only if they pile up.
+
+## 12. Metadata on 3 copies (2026-10-13)
+
+**Problem.** A v3 metadata block was written to its primary (the dio's disk, always disk 0, P4)
+and to every other member, N copies. RAID6 only has to survive two failures, so three copies on
+three distinct disks are enough, and the other N-3 writes are pure cost (P10, section 11.5 "Next lever").
+
+**Placement rule** (`hammer2_md_copy_disk()` and friends in `local_hammer2_raid6.h`, the one place
+that knows it). For a block at per-disk offset `off`, `b = off >> 16`, `n1 = ndisks - 1`, primary `p`
+(the disk the dio is keyed on):
+
+| copy | disk |
+|---|---|
+| 0 | `p` |
+| 1 | `p + 1 + (b % n1)` mod ndisks |
+| 2 | `p + 1 + ((b % n1) + 1 + ((b / n1) % (n1 - 1))) % n1` mod ndisks |
+
+Copy 2 is `1 .. n1-1` places after copy 1 among the other disks, so the three are distinct for
+any ndisks >= 4 (n1 >= 3, so `n1 - 1 >= 2`). Checked by a host program over 100000 blocks for
+N = 4..8: no collision, every mirror disk gets the same number of copies (4 disks: 66667/66666/66667),
+and all ordered mirror pairs occur (N = 4: 16666-16667 blocks each). So mirror load is spread over
+disks 1..N-1 and any 3-subset of 4 disks, minus the primary, is used; any 2 failed disks leave a copy
+(on 4 disks every 3-set misses just one disk). `hammer2_md_ncopies(ndisks, layout)` is
+`HAMMER2_MD_COPIES` (3) for layout 3 with more than 3 disks, else ndisks: with ndisks <= 3
+(unsupported) or on a layout 2 array the rule degenerates to "every disk", copy k = `p + k`. The count is
+`hmp->md_ncopies`, set at mount.
+
+**Consumers** (each now iterates the copy set, not all disks):
+- `hammer2_io_metadata_mirror_write` (the deferred queue of P10 is unchanged, it queues the block once
+  per TXG and the flush calls this with the block's primary; a down primary is skipped, a rebuilding
+  member among the copies still gets the copy, unwaited under `rebuild_lk`).
+- `hammer2_io_metadata_read_disk` (cold read spread): copy `b % ncopies` of the block's copies;
+  `meta_spread_read` passes the dio's primary.
+- `hammer2_io_metadata_mirror_read` (failed primary): the other copies, starting at that same copy,
+  two passes (the second waits for busy buffers) as before.
+- `hammer2_io_metadata_mirror_heal` (check-failed block): candidates are the block's copies only.
+  A disk without a copy would hold zeros or an older block of the same offset; the CHECK would reject it
+  but it is wasted I/O and, for an old kernel's mirrors, a silent-wrong-source risk.
+- Resilver Phase A: copies a chunk only if the target holds a copy of it (the metadata extents and
+  the reserved zone segments both), so a non-primary disk gets about 2/(N-1) of the zone (4 disks:
+  two thirds; X8b measured 69.9 of 100.7 MB with `resilver_skip_unalloc=0`, the extra over 2/3 is the zone
+  segments). The source is any other copy that is not the primary (the primary's newest copy may be a
+  delayed write), then the serial fallback over the copies (`hammer2_resilver_md_read`).
+  The P6 resume cursor is about stripe slots (Phase 3) and Phase A reruns whole on resume, so it is
+  unaffected.
+- Scrub: the tree-walk checks DATA and DIRENT brefs; metadata is checked when the walk loads the chains,
+  through the read path above, so nothing to change. A bad copy that is never read is not found by it
+  (same as before, and the same as a mirror on a disk that was never read in the all-disk scheme).
+- Degraded writes: a copy on a failed, non-rebuilding disk is not written; the block keeps its other
+  copies (two after one failure, one after two). A block written while mirror disk D was down has
+  no copy on D; the later resilver of D copies only blocks D is designated for, from a copy that
+  exists (the write path and the resilver apply the same rule, and D was in the block's set at write
+  time or it was not). Tests Z4, Z5.
+- Replace is the resilver. fsck/diag tools: `h2stripe_check` only needed the layout number.
+
+**Compatibility.** An older kernel (layout 2) assumes a mirror on every disk: its cold read spread
+`b % ndisks` may pick a disk that has no copy and take it unchecked as the dio's buffer, its resilver
+Phase A reads "any survivor" and would write a never-written or stale block to the new disk, and its
+failover tries siblings in index order. The CHECK catches most of the first, nothing catches the
+second. So an array written with 3 copies must not mount on that kernel: `rz_layout` goes 2 -> 3
+(`HAMMER2_RZ_LAYOUT`), which the old `hammer2_raid6_sm_init` already refuses with "stripe layout 3,
+this kernel needs 2" and EINVAL (clean, nothing written). Downgrade is therefore not supported once
+a layout 3 array is written (it would be cheap only by keeping layout 2 and so never converting);
+re-making the array is the way back.
+
+The new kernel accepts layout 2 and 3 (`HAMMER2_RZ_LAYOUT_MIN` = 2):
+- **layout 2 array** (made before): `md_ncopies = ndisks`; it keeps writing all-disk mirrors, an older
+  kernel still mounts it, nothing changes. Pure compatibility.
+- **conversion** is explicit: `sysctl vfs.hammer2.md_3copy_upgrade=1` at a read-write mount sets
+  layout 3 in the in-memory and sync volume headers (written by the first flush) and logs
+  "metadata converted to 3 copies". Blocks written earlier stay on every disk (the extra copies are
+  simply never read: they lie on disks the rule does not name, the rule names only disks that have one);
+  later ones get 3. Irreversible for older kernels. Group Z6 tests both.
+- **new arrays** (`newfs_hammer2 -R 6`) are layout 3. `HAMMER2_MKFS_LAYOUT2=1` in the environment makes
+  newfs write layout 2 (test knob: also the baseline for the P2 comparison).
+
+**Risks.** (1) Only 2 copies after one disk failure and 1 after two: a bitrot hit in that window on
+the last copy is unrecoverable, as for the data columns (RAID6 with two failed has no redundancy
+either). All-disk mirrors would have had N-2 left. (2) Heal when the cold read came from a mirror
+(`alt_disk`) skips the primary (its cached buffer holds the bad bytes), so a block whose read copy and
+its other mirror are both bad is not healed from a good primary; before, N-2 other disks were tried.
+Left alone, noted. (3) Distribution: disk 0 holds the primary of every block (`bdwrite`, coalesced),
+mirrors are spread: on 4 disks disk 0 now writes less than the others (P2 per-disk deviation rose
+from ~0.13-0.3 to ~0.3-0.45, informational only).
+
+**Tests.** Group Z (`test_z_meta3copy.sh`):
+- Z1: raw media: every metadata block disk 0 holds is on exactly 3 disks, mirrors on disks 1..3.
+- Z2: all 6 pairs failed (their metadata and data zones wiped): mount, read 302 files cold, scrub clean.
+- Z3: the primary and one mirror of every metadata block corrupt (random 64 KB): reads, scrub, no unrepairable.
+- Z4: each disk position resilvered (with files written while it was down), then the next two disks
+  failed and wiped: reads and scrub.
+- Z5: mirror disk 1 fails during writes, then disk 0 (the primary) or 2 fails: reads, scrub.
+- Z6: layout 2 array mounts, keeps N copies, reads, survives disks 1+2 failed; conversion sysctl,
+  3-copy writes, old and new files survive disks 0+3 failed.
+- X8b changed: with the target a copy holder only for 2/(N-1) of the zone, `skip_unalloc=0` copies that, not the zone.
+- R/F: `h2stripe_check` prefers `/root/h2diag` (deploy builds it from this tree) over a stale `/usr/local/bin` copy.
+
+**Results (h2dev, 4 disks, 2026-10-13).** A B C D G K L M P R X Y Z all pass (F 4/4, R 18/18, X 83/83,
+M 5/5, Y 26/26, Z 42/42). P2 write amplification, same build, layout 3 vs `HAMMER2_MKFS_LAYOUT2=1`
+(five runs each, noisy through the flush pass count `mf_sync` 3-5 and `mf_blocks` 113-215):
+layout 2 (all-disk) 5.85 4.35 5.77 4.73 5.49, mean 5.24x (mean 81 MB written, 174 mirror blocks);
+layout 3 4.08 4.66 4.26 5.06 4.60, mean 4.53x (mean 70 MB, 173 blocks). The saving, 11 MB, is one third
+of the 33 MB the mirrors cost (174 blocks x 64 KB x 3), as the model says (base cost, everything but
+the mirrors, is 47-50 MB in every run). On the Pi (4 disks, 422 blocks x 64 KB) that is 79 MB -> 53 MB,
+26 MB less: P2 8.5x -> about 6.9x, to be measured. A 6-disk array would save half of the mirror cost.

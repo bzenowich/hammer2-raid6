@@ -1607,10 +1607,13 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 	uint64_t npages;
 	uint64_t slot;
 
-	if (rc->rz_layout != HAMMER2_RZ_LAYOUT) {
+	if (rc->rz_layout < HAMMER2_RZ_LAYOUT_MIN ||
+	    rc->rz_layout > HAMMER2_RZ_LAYOUT) {
 		kprintf("hammer2: RAID6 v3 volume has stripe layout %u, "
-			"this kernel needs %u; re-run newfs_hammer2\n",
-			rc->rz_layout, HAMMER2_RZ_LAYOUT);
+			"this kernel handles %u..%u; re-run newfs_hammer2 "
+			"or use a newer kernel\n",
+			rc->rz_layout, HAMMER2_RZ_LAYOUT_MIN,
+			HAMMER2_RZ_LAYOUT);
 		return EINVAL;
 	}
 	npages = (nslots + HAMMER2_SM_PAGE_SLOTS - 1) / HAMMER2_SM_PAGE_SLOTS;
