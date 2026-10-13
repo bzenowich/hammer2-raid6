@@ -13,9 +13,12 @@
 #       back, delete + two bulkfree passes give the space back, writes
 #       succeed again, scrub clean
 #   X5  raid6_simd 0/1 parity cross-check: encode with one setting and
-#       reconstruct (two data disks failed) with the other, both ways;
-#       and the same data written under each setting leaves identical
-#       bytes on every disk.  Only the arm64 build has a SIMD path
+#       reconstruct (two data disks failed) with the other, both ways.
+#       Two erasures need both P and Q, so each direction checks both
+#       syndromes of one setting against the other.  (Comparing raw disk
+#       bytes does not work: which row a column lands in depends on
+#       flush timing, so on the Pi two identical runs lay the same data
+#       out differently.)  Only the arm64 build has a SIMD path
 #       (NEON); on other builds the two settings run the same code
 #       and the test says so.
 #   X6  disk count: the number of vbd test disks the guest has against
@@ -534,22 +537,12 @@ fi
             result FAIL "$label: $bad files wrong"
         fi
     }
-    # raw bytes of every disk across the data zone
-    x5_raw() {
-        local j=0
-        while [ "$j" -lt "$NDISKS" ]; do
-            dd if=$(disk_dev $j) bs=65536 skip=$DATA_BLK count=$1 2>/dev/null | sha256 -q
-            j=$((j + 1))
-        done
-    }
-
     for enc in 0 1; do
         dec=$((1 - enc))
         setup_fresh $X_SIZE
         check_v3
         sysctl -w vfs.hammer2.raid6_simd=$enc > /dev/null 2>&1
         x5_write
-        eval "RAW$enc=\$(x5_raw 512)"
         # decode with the other setting: fail two disks (not disk 0),
         # so some data columns come from P/Q
         sysctl -w vfs.hammer2.raid6_simd=$dec > /dev/null 2>&1
@@ -575,13 +568,6 @@ fi
         teardown "X5 enc=$enc"
     done
     sysctl -w vfs.hammer2.raid6_simd=1 > /dev/null 2>&1
-    if [ "$RAW0" = "$RAW1" ]; then
-        result PASS "X5: identical bytes on all disks written under raid6_simd=0 and 1"
-    else
-        result FAIL "X5: disk bytes differ between raid6_simd=0 and 1"
-        echo "      simd=0: $(echo $RAW0)"
-        echo "      simd=1: $(echo $RAW1)"
-    fi
     rm -f /var/tmp/x_pat /var/tmp/x_tail
 }
 
