@@ -19,6 +19,11 @@
 #       continue, the data reads back degraded (cold), raid replace
 #       resilvers it to a clean scrub
 #   W5  the same for reads of cold data
+#   W6  a driver that returns its bios 8 s late (inject_hold_ms): the
+#       timed waits give up after 2 s and abandon the buffers, the member
+#       is auto-failed, and the late completions release the abandoned
+#       buffers from another thread (no panic); the array replaces and
+#       scrubs clean and unmounts
 #
 # A QMP device_del test of disk_gone is not here: DISK_GONE is compiled
 # only into the Pi (arm64) kernel config, not the h2dev x86 guest.
@@ -34,6 +39,7 @@ IO_TIMEOUT_DEF=$(sysctl -n vfs.hammer2.io_timeout_ms 2>/dev/null)
 inject_off() {
     sysctl -w vfs.hammer2.inject_wio_disk_mask=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.inject_delay_ms_disk_mask=0 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.inject_hold_ms_disk_mask=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.io_timeout_ms=${IO_TIMEOUT_DEF:-30000} \
         > /dev/null 2>&1
 }
@@ -181,6 +187,7 @@ whang_wait() {
 whang_finish() {
     local label="$1" d="$2"
     sysctl -w vfs.hammer2.inject_delay_ms_disk_mask=0 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.inject_hold_ms_disk_mask=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.io_timeout_ms=${IO_TIMEOUT_DEF:-30000} \
         > /dev/null 2>&1
     sleep 12
@@ -264,5 +271,29 @@ else
     result FAIL "W5: hanging disk${W5_DISK} not failed after ${dt}s"
 fi
 whang_finish "W5" "$W5_DISK"
+
+# W6: the member's timed bios (P/Q, headers, flushes) complete 8 s late
+W6_DISK=1
+setup_fresh
+check_v3
+write_ref_data "before"
+rm -f /var/tmp/v3_during.txt
+sysctl -w vfs.hammer2.io_timeout_ms=2000 > /dev/null 2>&1
+sysctl -w vfs.hammer2.inject_hold_ms=8000 > /dev/null 2>&1
+sysctl -w vfs.hammer2.inject_hold_ms_disk_mask=$((1 << W6_DISK)) > /dev/null 2>&1
+t0=$(date +%s)
+if guarded 300 write_ref_data "during"; then
+    dt=$(($(date +%s) - t0))
+    result PASS "W6: writes, sync and headers with disk${W6_DISK} returning late completed (${dt}s)"
+else
+    result FAIL "W6: writes with a late-returning disk hung"
+fi
+dt=$(whang_wait "$W6_DISK" 20)
+if disk_state_is "$W6_DISK" FAILED; then
+    result PASS "W6: late-returning disk${W6_DISK} auto-failed"
+else
+    result FAIL "W6: late-returning disk${W6_DISK} not failed"
+fi
+whang_finish "W6" "$W6_DISK"
 
 summary

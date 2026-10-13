@@ -93,6 +93,8 @@ int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 uint32_t hammer2_inject_wio_disk_mask = 0; /* write EIO injection bitmask */
 uint32_t hammer2_inject_delay_ms_disk_mask = 0; /* late-I/O injection bitmask */
 int hammer2_inject_delay_ms = 3000;	/* ... by this many ms */
+uint32_t hammer2_inject_hold_ms_disk_mask = 0; /* late-completion injection */
+int hammer2_inject_hold_ms = 8000;	/* ... by this many ms */
 int hammer2_io_timeout_ms = 30000;	/* fail a member silent this long */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
@@ -203,6 +205,15 @@ SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_delay_ms_disk_mask, CTLFLAG_RW,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_delay_ms, CTLFLAG_RW,
 	   &hammer2_inject_delay_ms, 0,
 	   "v3 RAID6 fault injection: delay in ms (default 3000).");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_hold_ms_disk_mask, CTLFLAG_RW,
+	   &hammer2_inject_hold_ms_disk_mask, 0,
+	   "v3 RAID6 fault injection: bitmask of disk indices whose timed "
+	   "bios (P/Q, header, flush, space map) complete inject_hold_ms "
+	   "late, like a driver that returns a command after the waiter "
+	   "gave up.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_hold_ms, CTLFLAG_RW,
+	   &hammer2_inject_hold_ms, 0,
+	   "v3 RAID6 fault injection: completion hold in ms (default 8000).");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, io_timeout_ms, CTLFLAG_RW,
 	   &hammer2_io_timeout_ms, 0,
 	   "RAID6: a member with I/O outstanding that completes none for "

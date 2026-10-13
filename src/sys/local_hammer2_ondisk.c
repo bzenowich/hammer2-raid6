@@ -219,7 +219,7 @@ hammer2_close_devvp(hammer2_dev_t *hmp, const hammer2_devvp_list_t *devvpl,
 				bp->b_bufsize = 0;
 				bp->b_bcount = 0;
 				bp->b_cmd = BUF_CMD_FLUSH;
-				hammer2_bio_timed_init(bp, 1);
+				hammer2_bio_timed_init(bp, 1, -1);
 				vn_strategy(devvp, &bp->b_bio1);
 				if (hammer2_biowait_timed(bp, "h2cls") ==
 				    ETIMEDOUT) {

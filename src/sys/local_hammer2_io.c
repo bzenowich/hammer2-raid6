@@ -2016,7 +2016,7 @@ hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1);
+	hammer2_bio_timed_init(bp, 1, disk_idx);
 	vn_strategy(devvp, &bp->b_bio1);
 	error = hammer2_biowait_timed(bp, "h2sib");
 	if (error == ETIMEDOUT)
@@ -2060,7 +2060,7 @@ hammer2_io_raid6_write_flags(struct vnode *devvp, off_t off,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1);
+	hammer2_bio_timed_init(bp, 1, -1);
 	vn_strategy(devvp, &bp->b_bio1);
 	error = hammer2_biowait_timed(bp, "h2rbw");
 	if (error != ETIMEDOUT)
@@ -2502,7 +2502,7 @@ hammer2_resilver_write_start(struct vnode *devvp, off_t off,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1);
+	hammer2_bio_timed_init(bp, 1, -1);
 	vn_strategy(devvp, &bp->b_bio1);
 	*pbufp = 1;
 	return bp;

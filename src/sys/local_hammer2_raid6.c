@@ -41,6 +41,7 @@
  * This allows recovery from any combination of up to 2 disk failures.
  */
 
+#include <sys/kthread.h>
 #include "hammer2.h"
 #include "hammer2_raid6.h"
 
@@ -483,18 +484,45 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  * abandoned (the completion releases).  bio_caller_info2 says whether the
  * buffer is a pbuf (else a buffer cache buffer).
  */
+/* Test-only: complete a masked disk's timed bio late (inject_hold_ms). */
+static void hammer2_biodone_timed(struct bio *bio);
+
+static void
+hammer2_hold_thread(void *arg)
+{
+	struct bio *bio = arg;
+
+	tsleep(bio, 0, "h2hold", hammer2_inject_hold_ms * hz / 1000 + 1);
+	hammer2_biodone_timed(bio);
+	kthread_exit();
+}
+
 static void
 hammer2_biodone_timed(struct bio *bio)
 {
 	struct buf *bp = bio->bio_buf;
 	int pbuf = bio->bio_caller_info2.index;
+	int di = bio->bio_caller_info1.index;
+
+	if (di >= 0 && di < 32 && hammer2_inject_hold_ms > 0 &&
+	    (hammer2_inject_hold_ms_disk_mask & (1U << di))) {
+		bio->bio_caller_info1.index = -1;
+		kthread_create(hammer2_hold_thread, bio, NULL, "h2hold");
+		return;
+	}
 
 	if (atomic_cmpset_int(&bio->bio_caller_info3.value, 0, 1)) {
 		biodone_sync(bio);
 		return;
 	}
-	/* abandoned by its waiter */
+	/*
+	 * Abandoned by its waiter.  biowait() would have cleared BIO_DONE
+	 * and BIO_SYNC; nobody will now, and the buffer (or pbuf) is
+	 * recycled with b_bio1.bio_flags as it is left, so a stale
+	 * BIO_DONE would trip the assertion in the next vn_strategy().
+	 */
 	biodone_sync(bio);
+	atomic_clear_int(&bio->bio_flags, BIO_DONE | BIO_SYNC);
 	if (pbuf) {
 		relpbuf(bp, NULL);
 	} else {
@@ -504,7 +532,7 @@ hammer2_biodone_timed(struct bio *bio)
 }
 
 void
-hammer2_bio_timed_init(struct buf *bp, int pbuf)
+hammer2_bio_timed_init(struct buf *bp, int pbuf, int disk_idx)
 {
 	/*
 	 * The completion may release the buffer from the driver's thread,
@@ -514,6 +542,7 @@ hammer2_bio_timed_init(struct buf *bp, int pbuf)
 	BUF_KERNPROC(bp);
 	bp->b_bio1.bio_done = hammer2_biodone_timed;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
+	bp->b_bio1.bio_caller_info1.index = disk_idx;
 	bp->b_bio1.bio_caller_info2.index = pbuf;
 	bp->b_bio1.bio_caller_info3.value = 0;
 }
@@ -566,7 +595,7 @@ hammer2_bwrite_start(struct buf *bp, int disk_idx)
 	bp->b_flags |= B_CACHE;
 	bp->b_cmd = BUF_CMD_WRITE;
 	bp->b_error = 0;
-	hammer2_bio_timed_init(bp, 0);
+	hammer2_bio_timed_init(bp, 0, disk_idx);
 	vfs_busy_pages(bp->b_vp, bp);
 	bsetrunningbufspace(bp, bp->b_bufsize);
 	hammer2_inject_delay(disk_idx);

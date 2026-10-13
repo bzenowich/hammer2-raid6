@@ -1336,7 +1336,7 @@ hammer2_flush_member_idx(hammer2_dev_t *hmp, hammer2_devvp_t *e)
  * hammer2_flush_cache_wait().
  */
 static struct buf *
-hammer2_flush_cache_start(struct vnode *devvp)
+hammer2_flush_cache_start(struct vnode *devvp, int disk_idx)
 {
 	struct buf *bp;
 
@@ -1345,7 +1345,7 @@ hammer2_flush_cache_start(struct vnode *devvp)
 	bp->b_bufsize = 0;
 	bp->b_bcount = 0;
 	bp->b_cmd = BUF_CMD_FLUSH;
-	hammer2_bio_timed_init(bp, 1);
+	hammer2_bio_timed_init(bp, 1, disk_idx);
 	vn_strategy(devvp, &bp->b_bio1);
 	return bp;
 }
@@ -1823,7 +1823,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * Phase 1.
 		 */
 		for (k = 0; k < nm; k++) {
-			mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+			mbp[k] = hammer2_flush_cache_start(me[k]->devvp, mdi[k]);
 		}
 		for (k = 0; k < nm; k++) {
 			vol_error = hammer2_flush_cache_wait(mbp[k]);
@@ -1989,7 +1989,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 */
 		for (k = 0; k < nm; k++) {
 			if (me[k] != NULL)
-				mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+				mbp[k] = hammer2_flush_cache_start(me[k]->devvp, mdi[k]);
 		}
 		for (k = 0; k < nm; k++) {
 			if (mbp[k] == NULL)
