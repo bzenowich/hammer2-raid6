@@ -635,6 +635,19 @@ compression runs (single thread per flush? the logical-buffer copy?) before maki
 P2 write-amp was higher with async on in both the h2dev and the Pi run (1 run per mode each) -- also
 to explain before the default changes.
 
+*P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
+runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
+P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs
+were a clean deploy (P2 4.57 / 4.58, P2c 3.22 / 3.20); runs 5-8 shared the guest with another
+agent's kernel and are only supporting. Every counter is identical between modes: columns reserved
+251 / 63-64 (P2 / P2c), seal rows 126 / 32-33, mf_sync 4 (3 once, async), mf_defers about 24.5k;
+dc_trigger differs only in the first pass of a run. What moves the bytes is mf_blocks (the metadata
+mirror copies of the TXG passes, 155-222 per run in both modes): written MB tracks it, and it
+varies 40% run to run with when the syncer and the dirty-chain trigger fire against the copy. Rows
+are sealed identically (same count, same columns), so rz_sealing, pq_count and the reaper change
+nothing about what is written; they only remove the P/Q wait (0 ms vs 11-170 ms). The earlier
+single-run differences (3.77 vs 5.05 etc.) lie inside this spread. Not a bug; no code change.
+
 ### P4. All metadata reads go to disk 0 [V2]
 **Where:** `hammer2_dio_key` (`io.c:143–154`): metadata uses `vol->id`, which is always 0 because `md_extents[0]` lives in volume 0.
 
