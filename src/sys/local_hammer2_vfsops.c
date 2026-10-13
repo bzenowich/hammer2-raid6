@@ -433,7 +433,6 @@ static int hammer2_vfs_init(struct vfsconf *conf);
 static int hammer2_vfs_uninit(struct vfsconf *vfsp);
 static void hammer2_persist_task_fn(void *arg, int pending);
 static struct task hammer2_persist_task;
-#ifdef DISK_GONE
 static void hammer2_disk_gone(void *arg, struct disk *dp);
 static void hammer2_disk_gone_task(void *arg, int pending);
 
@@ -447,6 +446,7 @@ static TAILQ_HEAD(, hammer2_gone) hammer2_gone_list =
 static struct spinlock hammer2_gone_spin;
 static struct task hammer2_gone_task;
 static struct taskqueue *hammer2_gone_tq;
+#ifdef DISK_GONE
 static eventhandler_tag hammer2_gone_tag;
 #endif
 static int hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
@@ -613,7 +613,6 @@ hammer2_vfs_init(struct vfsconf *conf)
 	hammer2_raid6_init();
 	TASK_INIT(&hammer2_persist_task, 0, hammer2_persist_task_fn, NULL);
 
-#ifdef DISK_GONE
 	spin_init(&hammer2_gone_spin, "h2gone");
 	TASK_INIT(&hammer2_gone_task, 0, hammer2_disk_gone_task, NULL);
 	hammer2_gone_tq = taskqueue_create("h2gone", M_WAITOK,
@@ -621,6 +620,7 @@ hammer2_vfs_init(struct vfsconf *conf)
 					   &hammer2_gone_tq);
 	taskqueue_start_threads(&hammer2_gone_tq, 1, TDPRI_KERN_DAEMON, -1,
 				"h2gone");
+#ifdef DISK_GONE
 	hammer2_gone_tag = EVENTHANDLER_REGISTER(disk_gone, hammer2_disk_gone,
 						 NULL, EVENTHANDLER_PRI_ANY);
 #endif
@@ -634,9 +634,9 @@ hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
 {
 #ifdef DISK_GONE
 	EVENTHANDLER_DEREGISTER(disk_gone, hammer2_gone_tag);
+#endif
 	taskqueue_drain(hammer2_gone_tq, &hammer2_gone_task);
 	taskqueue_free(hammer2_gone_tq);
-#endif
 	taskqueue_drain(taskqueue_thread[0], &hammer2_persist_task);
 	objcache_destroy(cache_buffer_read);
 	objcache_destroy(cache_buffer_write);
@@ -665,7 +665,6 @@ hammer2_raid6_persist_kick(void)
 	taskqueue_enqueue(taskqueue_thread[0], &hammer2_persist_task);
 }
 
-#ifdef DISK_GONE
 /*
  * A RAID6 member whose device went away (unplugged) is failed and closed
  * right away, not when an I/O to it next errors out, which an idle array
@@ -755,7 +754,10 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 		}
 		error = hammer2_raid6_close_member_locked(hmp, i, devvp);
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-		if (error == EBUSY) {
+		if (error == EAGAIN) {
+			/* writes to it are still in the driver */
+			again = 1;
+		} else if (error == EBUSY) {
 			/* its writes fail, and with them the resilver */
 			kprintf("hammer2: RAID6 disk %d (%s) is gone while "
 				"resilvering\n", i, dev->path);
@@ -797,7 +799,48 @@ hammer2_disk_gone_task(void *arg __unused, int pending __unused)
 		kfree(g, M_HAMMER2);
 	}
 }
-#endif /* DISK_GONE */
+
+/*
+ * Test-only: write a member index to make the handler above run for that
+ * member's disk, as if the driver had called disk_gone() (the h2dev guest
+ * kernel has no such event; only the Pi's does).  The disk is not really
+ * gone, so the close can be undone with raid replace onto the same path.
+ */
+static int
+sysctl_hammer2_inject_gone(SYSCTL_HANDLER_ARGS)
+{
+	hammer2_dev_t *hmp;
+	struct vnode *devvp;
+	struct disk *dp = NULL;
+	int idx = -1;
+	int error;
+
+	error = sysctl_handle_int(oidp, &idx, 0, req);
+	if (error || req->newptr == NULL)
+		return error;
+	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
+	TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry) {
+		if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
+		    idx < 0 || idx >= hmp->nvolumes ||
+		    hmp->volumes[idx].dev == NULL ||
+		    !hmp->volumes[idx].dev->open)
+			continue;
+		devvp = hmp->volumes[idx].dev->devvp;
+		if (devvp && devvp->v_rdev)
+			dp = devvp->v_rdev->si_disk;
+		break;
+	}
+	lockmgr(&hammer2_mntlk, LK_RELEASE);
+	if (dp == NULL)
+		return ENOENT;
+	hammer2_disk_gone(NULL, dp);
+	return 0;
+}
+SYSCTL_PROC(_vfs_hammer2, OID_AUTO, inject_gone,
+	    CTLTYPE_INT | CTLFLAG_WR, NULL, 0,
+	    sysctl_hammer2_inject_gone, "I",
+	    "Test only: treat the device of this RAID6 member as gone "
+	    "(disk_gone), failing and closing it.");
 
 /*
  * Core PFS allocator.  Used to allocate or reference the pmp structure

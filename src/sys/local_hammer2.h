@@ -2373,6 +2373,7 @@ int hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		uint32_t flags);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
 int hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags);
+int hammer2_devvp_purge(struct vnode *devvp);
 int hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
 			struct vnode *expect_devvp);
 int hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,

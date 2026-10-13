@@ -1703,6 +1703,7 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	 * Taking rebuild_lk exclusive waits out writers that already
 	 * decided to skip this disk.
 	 */
+again:
 	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
 	if (!hmp->raid_failed[failed_disk_idx] || hmp->rebuild_active) {
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
@@ -1727,8 +1728,17 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	}
 	dev = hmp->volumes[failed_disk_idx].dev;
 	old_devvp = dev->devvp;
-	/* failed but never closed (auto-fail): release it now */
-	hammer2_raid6_close_member_locked(hmp, failed_disk_idx, NULL);
+	/*
+	 * Failed but never closed (auto-fail): release it now.  EAGAIN
+	 * (I/O in the driver, or the device vnode locked by a thread that
+	 * needs rebuild_lk): not with the lock held, and look again.
+	 */
+	if (hammer2_raid6_close_member_locked(hmp, failed_disk_idx,
+					      NULL) == EAGAIN) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		tsleep(hmp, 0, "h2close", hz / 10 + 1);
+		goto again;
+	}
 	if (hmp->stripe_bitmap_size)
 		hmp->rebuild_done = kmalloc(hmp->stripe_bitmap_size,
 					    M_HAMMER2, M_WAITOK | M_ZERO);
