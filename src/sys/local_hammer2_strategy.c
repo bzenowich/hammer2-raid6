@@ -529,6 +529,28 @@ static void zero_write(char *data, hammer2_inode_t *ip,
 				hammer2_key_t lbase,
 				hammer2_tid_t mtid, int *errorp);
 static void hammer2_put_stall(void);
+
+/*
+ * hammer2_lz4.c exports the caller-supplied-table entry points;
+ * LZ4_compress_limitedOutput() kmalloc()s and frees a 16 KB table per
+ * call, which is a kmem_slab (VM map) round trip for every 64 KB block.
+ */
+int LZ4_compress64k_heap_limitedOutput(void *ctx, char *source, char *dest,
+				int inputSize, int maxOutputSize);
+
+/* ns since *ts0, advancing *ts0 to now (write path stage timing) */
+static __inline long
+cw_lap(struct timespec *ts0)
+{
+	struct timespec ts1;
+	long ns;
+
+	nanouptime(&ts1);
+	ns = (ts1.tv_sec - ts0->tv_sec) * 1000000000L +
+	     (ts1.tv_nsec - ts0->tv_nsec);
+	*ts0 = ts1;
+	return ns;
+}
 static void hammer2_write_bp(hammer2_chain_t *chain, char *data,
 				int ioflag, int pblksize,
 				hammer2_tid_t mtid, int *errorp,
@@ -932,6 +954,10 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	int comp_block_size;
 	char *comp_buffer;
 	char *bdata;
+	struct timespec cwts;
+
+	nanouptime(&cwts);
+	atomic_add_long(&hammer2_cw_cnt, 1);
 
 	/*
 	 * An all-zeros write creates a hole unless the check code
@@ -946,6 +972,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 		zero_write(data, ip, parentp, lbase, mtid, errorp);
 		return;
 	}
+	atomic_add_long(&hammer2_cw_zero_ns, cw_lap(&cwts));
 
 	/*
 	 * Compression requested.  Try to compress the block.  We store
@@ -967,6 +994,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 		int comp_level;
 		int ret;
 
+		atomic_add_long(&hammer2_cw_lz4_cnt, 1);
 		switch(HAMMER2_DEC_ALGO(comp_algo)) {
 		case HAMMER2_COMP_LZ4:
 			/*
@@ -981,7 +1009,9 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			 */
 			comp_buffer = objcache_get(cache_buffer_write,
 						   M_INTWAIT);
-			comp_size = LZ4_compress_limitedOutput(
+			KKASSERT(pblksize <= 65536);
+			comp_size = LZ4_compress64k_heap_limitedOutput(
+					comp_buffer + 32768,
 					data,
 					&comp_buffer[sizeof(int)],
 					pblksize,
@@ -1027,6 +1057,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 		}
 	}
 
+	atomic_add_long(&hammer2_cw_lz4_ns, cw_lap(&cwts));
 	if (comp_size == 0) {
 		/*
 		 * compression failed or turned off
@@ -1075,6 +1106,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	bdata = comp_size ? comp_buffer : data;
 	chain = hammer2_assign_physical(ip, parentp, lbase, comp_block_size,
 					mtid, &bdata, errorp);
+	atomic_add_long(&hammer2_cw_assign_ns, cw_lap(&cwts));
 
 	if (*errorp) {
 		goto done;
@@ -1195,11 +1227,13 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 		}
 	}
 done:
+	atomic_add_long(&hammer2_cw_io_ns, cw_lap(&cwts));
 	if (chain) {
 		hammer2_raid6_subcol_done(chain);
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
 	}
+	atomic_add_long(&hammer2_cw_done_ns, cw_lap(&cwts));
 	if (comp_buffer)
 		objcache_put(cache_buffer_write, comp_buffer);
 }

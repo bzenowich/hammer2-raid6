@@ -2531,6 +2531,14 @@ extern long hammer2_rz_pq_wait_ns;	/* ns spent waiting for P/Q writes */
 extern long hammer2_rz_pq_wait_cnt;
 extern long hammer2_rz_seal_ns;		/* ns inside row_io, total */
 extern long hammer2_rz_seal_cnt;
+#define HAMMER2_LZ4_CTXSIZE	16384	/* hammer2_lz4.c HASHTABLESIZE */
+extern long hammer2_cw_cnt;		/* blocks through compress_and_write */
+extern long hammer2_cw_zero_ns;		/* ... ns in the zero test */
+extern long hammer2_cw_lz4_cnt;		/* ... compression attempts */
+extern long hammer2_cw_lz4_ns;		/* ... ns compressing */
+extern long hammer2_cw_assign_ns;	/* ... ns in assign_physical */
+extern long hammer2_cw_done_ns;		/* ... ns in subcol_done (row seal) */
+extern long hammer2_cw_io_ns;		/* ... ns loading/copying/queueing the buffer */
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
 extern int hammer2_async_seal;		/* seal without waiting for P/Q */
 extern int hammer2_async_seal_max;	/* rows with parity in flight */

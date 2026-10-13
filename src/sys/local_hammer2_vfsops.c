@@ -138,6 +138,13 @@ long hammer2_rz_pq_hdr_viol;
 long hammer2_rz_pq_wait_cnt;
 long hammer2_rz_seal_ns;
 long hammer2_rz_seal_cnt;
+long hammer2_cw_cnt;
+long hammer2_cw_zero_ns;
+long hammer2_cw_lz4_cnt;
+long hammer2_cw_lz4_ns;
+long hammer2_cw_assign_ns;
+long hammer2_cw_done_ns;
+long hammer2_cw_io_ns;
 long hammer2_rz_bf_rows_freed;
 long hammer2_rz_bf_reclaimed;
 long hammer2_rz_bf_rows_live;
@@ -425,6 +432,20 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_ns, CTLFLAG_RW,
 	   &hammer2_rz_seal_ns, 0, "v3 RAID6: ns inside row seal I/O, total");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_cnt, CTLFLAG_RW,
 	   &hammer2_rz_seal_cnt, 0, "v3 RAID6: rows sealed (timed)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_cnt, CTLFLAG_RW,
+	   &hammer2_cw_cnt, 0, "write path: blocks through compress_and_write");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_zero_ns, CTLFLAG_RW,
+	   &hammer2_cw_zero_ns, 0, "write path: ns in the zero-block test");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_lz4_cnt, CTLFLAG_RW,
+	   &hammer2_cw_lz4_cnt, 0, "write path: compression attempts");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_lz4_ns, CTLFLAG_RW,
+	   &hammer2_cw_lz4_ns, 0, "write path: ns compressing");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_assign_ns, CTLFLAG_RW,
+	   &hammer2_cw_assign_ns, 0, "write path: ns in assign_physical");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_io_ns, CTLFLAG_RW,
+	   &hammer2_cw_io_ns, 0, "write path: ns filling and queueing the buffer");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_done_ns, CTLFLAG_RW,
+	   &hammer2_cw_done_ns, 0, "write path: ns in subcol_done/unlock (row seal)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush_short, 0,
 	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");
@@ -612,7 +633,11 @@ hammer2_vfs_init(struct vfsconf *conf)
 	margs_read.objsize = 65536;
 	margs_read.mtype = M_HAMMER2_DEBUFFER;
 
-	margs_write.objsize = 32768;
+	/*
+	 * 32 KB of compressed output plus the LZ4 hash table
+	 * (HAMMER2_LZ4_CTXSIZE), so compression needs no allocation.
+	 */
+	margs_write.objsize = 32768 + HAMMER2_LZ4_CTXSIZE;
 	margs_write.mtype = M_HAMMER2_CBUFFER;
 
 	margs_vop.objsize = sizeof(hammer2_xop_t);

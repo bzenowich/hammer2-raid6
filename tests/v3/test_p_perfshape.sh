@@ -44,9 +44,9 @@ SCRIPTDIR=$(dirname "$0")
 
 kldstat -q -m hammer2 || kldload hammer2
 
-BIGSRC=/var/tmp/p_rand256
+BIGSRC=${BIGSRC:-/var/tmp/p_rand256}
 SMALLSRC=/var/tmp/p_small
-CMPSRC=/var/tmp/p_cmp256
+CMPSRC=${CMPSRC:-/var/tmp/p_cmp256}
 SMALLCSRC=/var/tmp/p_smallc
 BIG_MB=256
 P5_ASSERT=${P5_ASSERT:-1}
@@ -204,6 +204,27 @@ seal_report() {
          "wall $2 s ($(awk -v w=$w -v s="$2" 'BEGIN { printf "%.1f", (s > 0) ? w / 1e7 / s : 0 }')% of wall)"
 }
 
+# Write path stage timing (oct-review P3, P1c): ns per 64 KB block in each
+# stage of hammer2_compress_and_write, summed over all writer threads.
+cw_get() { sysctl -n vfs.hammer2.$1 2>/dev/null || echo 0; }
+cw_snap() {
+    CW_N=$(cw_get cw_cnt); CW_L=$(cw_get cw_lz4_cnt)
+    CW_Z=$(cw_get cw_zero_ns); CW_C=$(cw_get cw_lz4_ns)
+    CW_A=$(cw_get cw_assign_ns); CW_I=$(cw_get cw_io_ns)
+    CW_D=$(cw_get cw_done_ns)
+}
+cw_report() {
+    local n l
+    n=$(( $(cw_get cw_cnt) - CW_N )); l=$(( $(cw_get cw_lz4_cnt) - CW_L ))
+    [ $n -gt 0 ] || return 0
+    echo "    INFO $1 write path: $n blocks ($l compressed), ns/block:" \
+         "zero $(( ($(cw_get cw_zero_ns) - CW_Z) / n ))," \
+         "lz4 $(( ($(cw_get cw_lz4_ns) - CW_C) / n ))," \
+         "assign $(( ($(cw_get cw_assign_ns) - CW_A) / n ))," \
+         "buffer $(( ($(cw_get cw_io_ns) - CW_I) / n ))," \
+         "done $(( ($(cw_get cw_done_ns) - CW_D) / n ))"
+}
+
 # big_write <label> <src>: P1-style write of a 256 MB file into a fresh
 # array; sets BW_COLS BW_SECS BW_MBS BW_USED_KB BW_WRT.
 big_write() {
@@ -215,6 +236,7 @@ big_write() {
     u0=$(used_kb)
     ds_snap /var/tmp/p_b1
     seal_snap
+    cw_snap
     c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
     # /usr/bin/time -p gives the elapsed time to 10 ms (date has no %N).
     /usr/bin/time -p sh -c "dd if=$src of=$MNTPT/big bs=1048576 2>/dev/null; sync; sync" \
@@ -227,10 +249,18 @@ big_write() {
     BW_SECS=$(awk '$1 == "real" { print $2 }' /var/tmp/p_time.txt)
     BW_MBS=$(awk -v s="$BW_SECS" -v m=$BIG_MB 'BEGIN { printf "%.1f", (s > 0) ? m / s : 0 }')
     seal_report "$label" "$BW_SECS"
+    cw_report "$label"
     ds_report "$label" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
     BW_WRT=$LAST_WRT
     echo "    $label: columns reserved +$BW_COLS, df used +$((BW_USED_KB / 1024)) MB," \
          "$BW_SECS s (write+sync) = $BW_MBS MB/s"
+    # Content check from the media (the compressed path has its own copy
+    # and checksum code).
+    if remount && cmp -s $src $MNTPT/big; then
+        result PASS "$label: data identical after remount"
+    else
+        result FAIL "$label: data differs after remount"
+    fi
     teardown "$label"
 }
 
@@ -341,6 +371,11 @@ if [ ! -s $CMPSRC ] || [ "$(stat -f %z $CMPSRC)" != "$((BIG_MB * 1048576))" ]; t
     i=0
     while [ $i -lt $BIG_MB ]; do cat /var/tmp/p_cmp1m >> $CMPSRC; i=$((i + 1)); done
     rm -f /var/tmp/p_cmp1m
+    if [ "$(stat -f %z $CMPSRC)" != "$((BIG_MB * 1048576))" ]; then
+        echo "  ERROR: P1c source $CMPSRC is short (disk full?); P1c numbers are invalid"
+        rm -f $CMPSRC
+        exit 1
+    fi
 fi
 
 # P1: large incompressible write; P1c: compressible (about 2x)
