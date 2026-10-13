@@ -1385,6 +1385,7 @@ struct hammer2_dev {
 	volatile int	repair_thread_running;	/* 1 while kthread alive */
 	volatile int	repair_thread_exit;	/* request kthread exit */
 	struct thread	*repair_td;
+	volatile int	repair_busy;		/* kthread is executing a request */
 	volatile uint64_t repair_writes_done;	/* completed repair writes */
 	volatile uint64_t repair_writes_dropped; /* queue-full drops */
 
@@ -2368,6 +2369,7 @@ typedef struct hammer2_repair_req hammer2_repair_req_t;
 
 void hammer2_io_repair_start(hammer2_dev_t *hmp);
 void hammer2_io_repair_stop(hammer2_dev_t *hmp);
+void hammer2_io_repair_drain(hammer2_dev_t *hmp);
 void hammer2_io_repair_enqueue(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t base, int bufsize, int patch_off,
 		int patch_len, char *data);
@@ -2380,6 +2382,9 @@ int hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		int alt_disk_idx,
 		hammer2_off_t dev_pbase, int psize, int off,
 		const hammer2_blockref_t *bref, void *bdata, size_t bytes);
+int hammer2_raid6_selfheal_data(hammer2_dev_t *hmp,
+		const hammer2_blockref_t *bref, void *bdata, int bytes,
+		int disk_idx);
 int hammer2_bref_check_match(const hammer2_blockref_t *bref,
 		const void *data, size_t bytes);
 

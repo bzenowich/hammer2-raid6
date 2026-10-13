@@ -87,4 +87,47 @@ fi
 kmsg_clear
 teardown "M2"
 
+# M3: as M2 but healed by the scrub.  Each bad block's row-mate on the
+# other disk is also bad, so the scrub needs the second erasure (the
+# read-path self-heal helper); a single-erasure scrub reports these
+# unrepairable.
+M3_A=0
+M3_B=3
+setup_fresh
+check_v3
+write_ref_data "m3"
+umount $MNTPT
+corrupt_data_zone "$M3_A"
+corrupt_data_zone "$M3_B"
+if mount -t hammer2 $PFSPATH $MNTPT; then
+    hammer2 -s $MNTPT raid scrub > /var/tmp/m3_scrub.txt 2>&1
+    M3_BAD=$(awk '$1 == "brefs_bad:" { print $2 }' < /var/tmp/m3_scrub.txt)
+    M3_REP=$(awk '$1 == "brefs_repaired:" { print $2 }' < /var/tmp/m3_scrub.txt)
+    M3_UNREP=$(awk '$1 == "brefs_unrepairable:" { print $2 }' < /var/tmp/m3_scrub.txt)
+    if [ "${M3_BAD:-0}" -gt 0 ] && [ "${M3_REP:-x}" = "${M3_BAD:-y}" ] && \
+       [ "${M3_UNREP:-x}" = "0" ]; then
+        result PASS "M3: scrub repaired two silently corrupt disks ($M3_REP/$M3_BAD)"
+    else
+        result FAIL "M3: scrub bad=$M3_BAD repaired=$M3_REP unrep=$M3_UNREP"
+    fi
+    kmsg_clear
+    hammer2 -s $MNTPT raid scrub > /var/tmp/m3_scrub2.txt 2>&1
+    M3_BAD2=$(awk '$1 == "brefs_bad:" { print $2 }' < /var/tmp/m3_scrub2.txt)
+    if [ "${M3_BAD2:-x}" = "0" ]; then
+        result PASS "M3: follow-up scrub clean"
+    else
+        result FAIL "M3: follow-up scrub bad=$M3_BAD2"
+    fi
+    m_verify m3 "M3: data correct after scrub"
+    if [ $? = 124 ]; then
+        result FAIL "M3: read hung (kernel deadlock); reboot the guest"
+        summary
+        exit 1
+    fi
+else
+    result FAIL "M3: mount refused"
+fi
+kmsg_clear
+teardown "M3"
+
 summary

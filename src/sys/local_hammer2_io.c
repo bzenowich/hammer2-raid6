@@ -1631,6 +1631,7 @@ hammer2_io_repair_thread(void *arg)
 		if (req) {
 			TAILQ_REMOVE(&hmp->repair_queue, req, entry);
 			hmp->repair_queue_count--;
+			hmp->repair_busy = 1;
 		}
 		hammer2_spin_unex(&hmp->repair_spin);
 
@@ -1638,6 +1639,8 @@ hammer2_io_repair_thread(void *arg)
 			hammer2_io_repair_execute(hmp, req);
 			kfree(req->data, M_HAMMER2);
 			kfree(req, M_HAMMER2);
+			hmp->repair_busy = 0;
+			wakeup(__DEVOLATILE(void *, &hmp->repair_busy));
 			continue;
 		}
 		if (hmp->repair_thread_exit)
@@ -1647,6 +1650,23 @@ hammer2_io_repair_thread(void *arg)
 	hmp->repair_thread_running = 0;
 	wakeup(__DEVOLATILE(void *, &hmp->repair_thread_running));
 	kthread_exit();
+}
+
+/*
+ * Wait until every queued repair write has been executed.  The caller
+ * must not hold a buf the queued writes may need (the scrub drops its
+ * dio first).
+ */
+void
+hammer2_io_repair_drain(hammer2_dev_t *hmp)
+{
+	while (hmp->repair_thread_running) {
+		tsleep_interlock(__DEVOLATILE(void *, &hmp->repair_busy), 0);
+		if (hmp->repair_queue_count == 0 && hmp->repair_busy == 0)
+			break;
+		tsleep(__DEVOLATILE(void *, &hmp->repair_busy), PINTERLOCKED,
+		       "h2drn", hz);
+	}
 }
 
 void
@@ -3141,9 +3161,10 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
  *
  * Walks every live DATA/DIRENT blockref in the chain tree, verifies the
  * data on its primary disk against the bref's CHECK code, and on
- * mismatch reconstructs the column from P+Q parity.  If the
- * reconstruction's CHECK matches, writes the corrected column back to
- * the corrupt disk.
+ * mismatch heals the column with the read-path self-heal helper
+ * (hammer2_raid6_selfheal_data()): P/Q reconstruction verified against
+ * the CHECK code, with a second erasure for a second bad column, and
+ * the corrected columns written back by the repair kthread.
  *
  * Concurrency model (mirrors bulkfree): operates on a chain snapshot
  * taken via hammer2_chain_bulksnap() so live writes proceed unimpeded.
@@ -3154,11 +3175,10 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
  * since then aren't visible to this scrub but will be covered by the
  * next one.
  *
- * Repair side: the scrub repair-write goes raw against the failed
- * disk's devvp (see hammer2_scrub_verify_bref) and the slots it
- * touches are always "old" (already on disk before the scrub started),
- * so it never collides with the new chains that concurrent writers
- * land in fresh slots from COW.
+ * Repair side: the repair writes go raw against the failed disk's
+ * devvp and the slots they touch are always "old" (already on disk
+ * before the scrub started), so they never collide with the new chains
+ * that concurrent writers land in fresh slots from COW.
  */
 struct hammer2_scrub_ctx {
 	hammer2_dev_t	*hmp;
@@ -3194,15 +3214,11 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	hammer2_dev_t *hmp = ctx->hmp;
 	hammer2_io_t *dio = NULL;
 	hammer2_off_t lbase;
-	hammer2_off_t pbase;
 	void *bdata;
-	void *recon;
-	uint64_t stripe_unit;
-	size_t off;
+	uint64_t dropped;
 	int lsize;
 	int disk_idx;
 	int error;
-	int repaired = 0;
 
 	if (bref->type != HAMMER2_BREF_TYPE_DATA &&
 	    bref->type != HAMMER2_BREF_TYPE_DIRENT)
@@ -3213,7 +3229,6 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	lbase = bref->data_off & ~HAMMER2_OFF_MASK_RADIX;
 	lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
 	disk_idx = (int)bref->copyid;
-	stripe_unit = hmp->raid_config.stripe_unit;
 
 	/*
 	 * The scrub reads every live block once, so it must not leave
@@ -3268,71 +3283,37 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	}
 
 	/*
-	 * CHECK FAIL on the disk-resident column.  Try a parity
-	 * reconstruction over the whole stripe_unit column (treating this
-	 * disk as failed), and if the reconstruction's CHECK matches the
-	 * bref, write the reconstructed column back to disk *directly*
-	 * via raw getblk/bwrite on the failed disk's devvp.
-	 *
-	 * Two reasons to bypass hammer2_io_bwrite():
-	 *
-	 *  1. Under v3 the DIO putblk path for DATA/DIRENT btypes hands the
-	 *     payload to hammer2_raid6_open_row_add_data() — a repair routed
-	 *     through the DIO write API would land in an open packed-row
-	 *     tracker with ncols=1 and at seal would zero the surviving
-	 *     sibling data column, silently corrupting the row.
-	 *
-	 *  2. We must release the read-side dio *before* the write-side
-	 *     getblk on the same (devvp, phys_off).  The dio holds the buf
-	 *     busy via its internal getblk; a second getblk on the same
-	 *     key would deadlock waiting for that ref to drop.
+	 * CHECK FAIL on the disk-resident column.  The read-path self-heal
+	 * helper reconstructs it from P/Q (also retrying with a second
+	 * silently-bad column erased, and when disk_idx itself is failed),
+	 * verifies against the bref CHECK, and queues the repair writes to
+	 * the repair kthread.  Drop the dio and wait for the queue to
+	 * drain before counting the block repaired: the kthread's write
+	 * needs the buf this dio holds busy, and the next scrub pass (or
+	 * the unmount) must see the correction on media.
 	 */
 	ctx->bad++;
 	if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks)
 		atomic_add_64(&hmp->raid_cksum_errors[disk_idx], 1);
+	dropped = hmp->repair_writes_dropped;
+	error = HAMMER2_ERROR_CHECK;
+	if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks) {
+		error = hammer2_raid6_selfheal_data(hmp, bref, bdata, lsize,
+						    disk_idx);
+	}
 	hammer2_io_putblk(&dio);
-
-	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
-	pbase = lbase & ~(hammer2_off_t)(stripe_unit - 1);
-	error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
-					       recon, (size_t)stripe_unit, 1);
 	if (error == 0) {
-		off = (size_t)(lbase - pbase);
-		if (hammer2_scrub_check_match(bref,
-		    (uint8_t *)recon + off, lsize)) {
-			struct vnode *devvp;
-			struct buf *wbp;
-			int werr;
-
-			devvp = hmp->volumes[disk_idx].dev->devvp;
-			wbp = getblk(devvp, pbase, (int)stripe_unit,
-				     GETBLK_KVABIO, 0);
-			if (wbp) {
-				if ((wbp->b_flags & (B_CACHE | B_DELWRI)) == 0)
-					wbp->b_flags |= B_RELBUF | B_DIRECT;
-				bkvasync(wbp);
-				bcopy(recon, wbp->b_data, (size_t)stripe_unit);
-				werr = bwrite(wbp);
-				if (werr == 0) {
-					ctx->repaired++;
-					repaired = 1;
-					if (disk_idx >= 0 &&
-					    disk_idx < hmp->raid_config.ndisks) {
-						atomic_add_64(
-						    &hmp->raid_cksum_healed[
-							disk_idx], 1);
-					}
-					kprintf("hammer2: scrub: repaired "
-					    "data_off %016jx disk %d\n",
-					    (uintmax_t)bref->data_off,
-					    disk_idx);
-				} else {
-					error = werr;
-				}
-			}
+		hammer2_io_repair_drain(hmp);
+		if (hmp->repair_thread_running &&
+		    hmp->repair_writes_dropped == dropped) {
+			ctx->repaired++;
+			kprintf("hammer2: scrub: repaired data_off %016jx "
+			    "disk %d\n", (uintmax_t)bref->data_off, disk_idx);
+		} else {
+			error = EIO;	/* healed in memory only */
 		}
 	}
-	if (!repaired) {
+	if (error) {
 		ctx->unrepairable++;
 		if (disk_idx >= 0 && disk_idx < hmp->raid_config.ndisks) {
 			atomic_add_64(&hmp->raid_cksum_unrepairable[disk_idx],
@@ -3342,7 +3323,6 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 		    "(parity could not repair, err=%d)\n",
 		    (uintmax_t)bref->data_off, disk_idx, error);
 	}
-	kfree(recon, M_HAMMER2);
 	ctx->done++;
 	return 0;
 }
