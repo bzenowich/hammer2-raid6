@@ -1764,6 +1764,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			}
 			hmp->voldata.raid_config.rz_sm_gen = sm_gen;
 			hmp->volsync.raid_config.rz_sm_gen = sm_gen;
+			hmp->voldata.raid_config.rz_rb_wgen = hmp->rb_wgen;
+			hmp->volsync.raid_config.rz_rb_wgen = hmp->rb_wgen;
 			hmp->volsync.icrc_volheader =
 			    hammer2_icrc32((char *)&hmp->volsync +
 					   HAMMER2_VOLUME_ICRCVH_OFF,

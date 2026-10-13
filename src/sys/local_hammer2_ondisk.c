@@ -1667,6 +1667,7 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 	hmp->stripe_bf_complete = 0;
 	hmp->stripe_cursor = 0;
 	hmp->stripe_generation = hmp->voldata.raid_config.rz_sm_gen;
+	hmp->rb_wgen = hmp->voldata.raid_config.rz_rb_wgen;
 	hmp->stripe_bitmap_invalid = 0;
 	spin_init(&hmp->stripe_bitmap_spin, "h2smap");
 	hmp->stripe_next_disk = 0;
@@ -2130,6 +2131,16 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	 * writes every column of the rebuilding disk.
 	 */
 	lockmgr(&hmp->rebuild_lk, LK_SHARED);
+	/*
+	 * A member that does not take this row misses it: a resume cursor
+	 * for that member's rebuild is then stale (rz_rb_wgen).
+	 */
+	for (d = 0; d < ndisks; d++) {
+		if (hmp->raid_failed[d] && !hammer2_raid6_disk_writable(hmp, d)) {
+			atomic_add_64(&hmp->rb_wgen, 1);
+			break;
+		}
+	}
 	if (hmp->rebuild_active && hmp->rebuild_done &&
 	    row_id / 8 < hmp->stripe_bitmap_size) {
 		hammer2_spin_ex(&hmp->stripe_bitmap_spin);

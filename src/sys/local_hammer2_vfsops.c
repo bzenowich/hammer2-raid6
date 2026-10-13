@@ -97,6 +97,10 @@ uint32_t hammer2_inject_hold_ms_disk_mask = 0; /* late-completion injection */
 int hammer2_inject_hold_ms = 8000;	/* ... by this many ms */
 int hammer2_io_timeout_ms = 30000;	/* fail a member silent this long */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
+int hammer2_raid6_resilver_ckpt_slots = 2048;	/* slots between cursor commits */
+uint64_t hammer2_raid6_resilver_md_bytes;	/* last resilver: metadata copied */
+uint64_t hammer2_raid6_resilver_resume_slot;	/* last resilver: cursor resumed at */
+int hammer2_raid6_resilver_stop_slots;		/* test hook: stop after this many slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
 int hammer2_raid6_subcol_max = 32768;	/* v3: chains up to this size share a column (0 = off) */
 int hammer2_raid6_subcol_test;	/* test hook: place chains inside their column */
@@ -240,6 +244,20 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 	   "v3 RAID6: skip unallocated stripe slots during resilver "
 	   "(default 1).  Set 0 to force full-iteration baseline for "
 	   "regression timing.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_ckpt_slots, CTLFLAG_RW,
+	   &hammer2_raid6_resilver_ckpt_slots, 0,
+	   "v3 RAID6: commit the resilver resume cursor every this many "
+	   "stripe slots (0 = never)");
+SYSCTL_QUAD(_vfs_hammer2, OID_AUTO, resilver_md_bytes, CTLFLAG_RD,
+	   &hammer2_raid6_resilver_md_bytes, 0,
+	   "v3 RAID6: bytes of metadata the last resilver copied (Phase A)");
+SYSCTL_QUAD(_vfs_hammer2, OID_AUTO, resilver_resume_slot, CTLFLAG_RD,
+	   &hammer2_raid6_resilver_resume_slot, 0,
+	   "v3 RAID6: stripe slot the last resilver resumed at (0 = fresh)");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_stop_slots, CTLFLAG_RW,
+	   &hammer2_raid6_resilver_stop_slots, 0,
+	   "test hook: the resilver stops with EINTR after this many "
+	   "slots (0 = off), as a crash would");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, raid6_put_stall_ms, CTLFLAG_RW,
 	   &hammer2_raid6_put_stall_ms, 0,
 	   "test hook: stall the next v3 data write (ms) between reserve and put");

@@ -471,6 +471,53 @@ failed disks) with a per-disk cache key. Writes stay primary plus mirrors.
 - Copy only the freemap-allocated metadata segments.
 - Add a row-ordered parity sweep (S6).
 
+**Outcome, resume cursor and allocated-only Phase A (branch fix/p6-resume).** The batching, XOR
+and windowed Phase A part is in `e098809`; this finishes the other two items.
+- **Resume cursor.** A *resume record* lives in `raid_config` (carved from `reserved[]`, header
+  stays 512 bytes): `rz_rb_id` (random id of the target being filled, 0 = none), `rz_rb_disk`,
+  `rz_rb_cursor` (first slot not rebuilt), `rz_rb_cwgen`, and `rz_rb_wgen`. It is in the volume
+  header, so the normal sync writes it to every writable member, the target included. The
+  resilver commits it every `vfs.hammer2.resilver_ckpt_slots` slots (default 2048) by setting the
+  cursor in `voldata` and calling `sync_pmp(MNT_WAIT)`.
+  - *Durability order.* The cursor is set only after the pass's target writes have completed
+    (`write_wait`), and it reaches media only in a volume header write, which the sync issues
+    after FLUSH CACHE on every writable member (the target is one while `rebuild_active`; same
+    ordering as R1/P10). So a cursor on media means the slots below it are durable on the target.
+    Rows sealed during the resilver write the target's column themselves, also before that flush.
+  - *Invalidation.* (1) Same target: Phase 1 stamps `rz_rb_id` into the target's four volume
+    headers; the replace reads the target's header 0 and resumes only if its id equals the
+    array's. A wiped or different disk has none (or an older id) and starts at 0 under a new id
+    (X7d). (2) Array generation: `hmp->rb_wgen` counts rows sealed (`row_io`) while a member is
+    failed and not being rebuilt: writes the target would have missed, possibly below the
+    cursor. It is persisted with the header (`rz_rb_wgen`, written next to `rz_sm_gen`) and
+    the record is valid only if `rz_rb_cwgen == rb_wgen`. A write while the disk is out
+    therefore restarts at 0 (X7c). Over-counting (two failed members) only invalidates.
+    Frees do not matter (they write nothing to the slot); a reused slot is a new seal.
+  - *Trigger.* Automatic at the next `raid replace` of that slot with the same device: no mount
+    time work, no new ioctl. Phase A is not resumed (it is now small, see below) and always
+    reruns; Phase 3 starts at the cursor. Progress (`stripes_done`) starts at the cursor and the
+    log says `resilver disk N resumes at slot S of T`.
+  - *Cleared* when the replace completes (`rz_rb_id = 0`). It is left as is after a failed or
+    aborted resilver. `DISK_REBUILDING` / `FLAG_REBUILDING` stay unused on purpose: the disk
+    stays FAILED until complete (reads and the allocator treat it as failed), and the record,
+    not a state, says "partly rebuilt". S-e can drop them.
+  - *Test hooks:* `resilver_stop_slots` (EINTR after N slots, as a crash would; the disk stays
+    FAILED) and `resilver_ckpt_slots`; counters `resilver_resume_slot`, `resilver_md_bytes`.
+- **Phase A, allocated metadata only.** `resilver_skip_unalloc` covered only Phase 3 (unallocated
+  data slots); Phase A copied the whole zone. It now also gates Phase A: new
+  `hammer2_freemap_md_alloc_map()` reads the freemap leaves for each metadata extent and returns a
+  bit per 64 KB chunk with any allocated (non-free, so POSSIBLY FREE too) 16 KB block; space below
+  `allocator_beg` (static newfs blocks) and unreadable leaves count as allocated, a missing leaf
+  as free. Only those chunks are copied (the per-zone reserved segments, which hold the freemap
+  blocks, are still copied whole). `skip_unalloc=0` copies everything, as before. Blocks allocated
+  after the map is taken are written to the new disk by their own flush (`rebuild_active` is set
+  before Phase A), so the map need not be exact. Unallocated chunks on the target hold whatever
+  the disk had: nothing reaches them (failover reads, mirror reads and scrub follow blockrefs,
+  and a new allocation is written before it is read), which X8 checks by growing the tree on the
+  rebuilt disk and reading all metadata with another disk out.
+- **Results (h2dev):** metadata zone 96 MB, Phase A copied 8.4 MB (skip_unalloc=1) vs the whole zone (skip_unalloc=0). X 83/83, R 18/18, D 44/44, G 10/10, K 10/10, A 5/5. X7a/b resumed at slot 3280 after 1504 rebuilt; X7c/d restarted at 0. A real `umount -f` (X2) hit the resilver before its first checkpoint, so resume after umount -f is covered by the stop hook plus X7b (umount, mount), not by X2.
+  X7a-d (resume, remount, stale cursor, wiped disk) and X8/X8b added to group X.
+
 ### P7. Degraded reads [V2]
 **Where:** `read_degraded_x` (`io.c:1808–1887`).
 

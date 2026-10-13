@@ -1299,7 +1299,22 @@ struct hammer2_raid_config {
 	uint64_t	rz_sm_copy;	/* bytes per copy; B follows A */
 	uint64_t	rz_sm_gen;	/* space map generation committed */
 
-	uint8_t		reserved[216];	/* pad to 512 bytes total */
+	/*
+	 * Resilver resume record (oct-review P6).  rz_rb_id names the
+	 * target disk of a resilver that has not finished (0: none);
+	 * the same id is stamped into the target's volume headers.
+	 * Slots below rz_rb_cursor are on the target, durably, provided
+	 * rz_rb_cwgen == rz_rb_wgen: rz_rb_wgen counts the rows sealed
+	 * while a member was failed and not being rebuilt, writes the
+	 * target would have missed.
+	 */
+	uint64_t	rz_rb_id;
+	uint64_t	rz_rb_cursor;	/* first slot not yet rebuilt */
+	uint64_t	rz_rb_cwgen;	/* rz_rb_wgen when the cursor was set */
+	uint64_t	rz_rb_wgen;	/* unapplied degraded seals, ever */
+	uint8_t		rz_rb_disk;	/* disk being rebuilt */
+
+	uint8_t		reserved[183];	/* pad to 512 bytes total */
 } __packed;
 
 typedef struct hammer2_raid_config hammer2_raid_config_t;
