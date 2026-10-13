@@ -1243,9 +1243,10 @@ typedef struct hammer2_sm_header hammer2_sm_header_t;
  * v3 RAIDZ2-native metadata zone (see docs/metadata_zone.md).
  *
  * INODE / INDIRECT / FREEMAP_NODE / FREEMAP_LEAF blocks live in a
- * dedicated per-disk LBA range that is N-way mirrored across every
- * disk in the array.  The same content lands at the same per-disk
- * byte offset on all N disks; no parity is required.
+ * dedicated per-disk LBA range.  The same content lands at the same
+ * per-disk byte offset on 3 disks (the primary and two mirrors,
+ * hammer2_md_copy_disk() in hammer2_raid6.h; every disk on a layout 2
+ * array); no parity is required.
  *
  * Each `hammer2_md_extent` describes one contiguous LBA range on a
  * disk.  Extent 0 is laid down by `newfs_hammer2 -R 6` after the

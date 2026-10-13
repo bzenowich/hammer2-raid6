@@ -4,8 +4,8 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs A B C D E F G H I J K L N P Q S T U V W X,
-#   then M (last: it can hang the guest).
+#   If no groups are specified, runs A B C D E F G H I J K L N P Q S T U V W X Y Z,
+#   then M (last: it can hang the guest).  R is not in the default list.
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #   Groups: A basic, B single failure, C dual failure, D resilver,
 #   E EIO injection, F COW invariant, G auto-fail, H snapshots degraded,
@@ -16,7 +16,9 @@
 #   X lifecycle (umount during resilver/scrub, ENOSPC, simd parity),
 #   Y parity scrub (row-ordered P/Q check, localise, repair),
 #   Z metadata on 3 copies (placement, any 2 failures, heal, resilver, layout 2),
-#   T slot reuse, U sub-column offsets (test hook raid6_subcol_test), V sub-column allocation (raid6_subcol_max), Q small files on sub-columns.  Run R with: sh run_all.sh R
+#   T slot reuse, U sub-column offsets (test hook raid6_subcol_test),
+#   V sub-column allocation (raid6_subcol_max), Q small files on sub-columns.
+#   Run R with: sh run_all.sh R
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
