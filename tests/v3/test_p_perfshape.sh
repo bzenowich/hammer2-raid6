@@ -21,6 +21,7 @@
 #   P2  write amp <= 8x, df space <= 2x user bytes
 #   P2c columns reserved <= 1/3 of P2
 #   P1c columns reserved <= 0.6x P1, throughput >= 90% of P1
+# P_ONLY=P2 skips P1/P1c/P3/P4/P5 (A/B runs of the small-file part).
 # P5_ASSERT=0 only prints them (for a kernel with raid6_subcol_max=0, or
 # when the throughput ratio is too noisy on a loaded host).
 #
@@ -343,6 +344,7 @@ if [ ! -s $CMPSRC ] || [ "$(stat -f %z $CMPSRC)" != "$((BIG_MB * 1048576))" ]; t
 fi
 
 # P1: large incompressible write; P1c: compressible (about 2x)
+if [ "$P_ONLY" != P2 ]; then
 big_write P1 $BIGSRC
 P1_COLS=$BW_COLS; P1_MBS=$BW_MBS; P1_WRT=$BW_WRT
 big_write P1c $CMPSRC
@@ -367,6 +369,7 @@ rd=$(join /var/tmp/p_b3 /var/tmp/p_a3 | awk '{ t += $7 - $3 } END { print t + 0 
 echo "  INFO: P3 cold read: $((rd / 1048576)) MB read from members for $BIG_MB MB file," \
      "ratio $(awk -v r=$rd -v b=$((BIG_MB * 1048576)) 'BEGIN { printf "%.2f", r / b }')"
 teardown "P3"
+fi
 
 # P2: many small files
 small_write P2 $SMALLSRC
@@ -391,6 +394,7 @@ else
     result FAIL "P2: $n of $NFILES files present"
 fi
 
+if [ "$P_ONLY" != P2 ]; then
 # P4: metadata reads spread over the mirrors (oct-review P4).  A cold
 # walk of the P2 tree touches inode and directory blocks only; their
 # copies sit on every member, so no member should serve most of them.
@@ -455,6 +459,7 @@ if [ "$P5ERR" = 0 ] && [ "$CK" = 0 ]; then
 else
     result FAIL "P5: walk error $P5ERR, cksum errors $CK"
     cat /var/tmp/p5_err.txt
+fi
 fi
 teardown "P2"
 
