@@ -628,10 +628,33 @@ X 107/107 and W 44/44 pass with async on. O failed O2 twice only because the Pi'
 (arm64 TRE regex, fixed in the fork as c026f0c124 and deployed to the Pi on 2026-10-13); the data
 checked out (deg crc == col crc, reader waited 4901 ms).
 
-*Open: P1c is the limit once parity is async.* On the Pi P1c does not gain (32 MB/s either way), so the
-"P1c >= 90% of P1" target fails with async on (32.7 vs 43.4). With the wait gone, the compressed write
-path itself bounds it; LZ4 on a Cortex-A72 core is far faster than 33 MB/s, so look at where the
-compression runs (single thread per flush? the logical-buffer copy?) before making async the default.
+*P1c: where the time goes (h2dev, ns per 64 KB block, summed over the writer thread; new counters
+vfs.hammer2.cw_*, printed as "INFO ... write path" in group P).* The compressed path runs in the
+per-inode strategy xop thread (one thread for a single file), serially per block: zero test, LZ4,
+`hammer2_assign_physical`, `io_newnz` + copy + setcheck + dedup record + bdwrite, `subcol_done`
+(row seal submit). Before: P1c zero 15 us, **lz4 254 us**, assign 43, buffer 22, done 156 (async 1).
+P1 skips LZ4 after the heuristic trips (548 of 4096 blocks tried) and pays 27 us for it.
+`LZ4_compress_limitedOutput()` does a `kmalloc(16 KB)` + `kfree` of the hash table on every call; 16 KB
+is above the slab zone limit, so every block is a kmem_slab (VM map, pmap) round trip. That was about
+a third of the LZ4 time on x86 (254 -> 170 us after the fix) and more on a 4-core A72 where the
+cross-CPU part of a map operation is slower. The rest of the 170 us is LZ4 itself (about 385 MB/s on
+this host). Compressed blocks do not defeat row packing (1024 rows for 4096 x 32 KB chains, 2 per
+column, balanced); the extra "done" time per block is the row seal (4 blocks per row instead of 2).
+Fix: the hash table now lives in the tail of the compression buffer (`cache_buffer_write` objects are
+32 KB + `HAMMER2_LZ4_CTXSIZE`) and `LZ4_compress64k_heap_limitedOutput()` is called directly; no
+allocation per block, on-disk format unchanged. h2dev before/after, async_seal=1: P1c 56.3 -> 74.2-80.5
+MB/s (P1 42-55 in the same runs); async_seal=0: 65.3 -> 65-67.5 (P1 52-66). Group P also checks now that
+P1/P1c read back identical after a remount, and fails instead of measuring when the source file could
+not be written (the guest's / filled up and P1c once "ran" at 400 MB/s on a 9 MB file).
+
+*Open: compression is still serial and on the critical path.* After the fix the writer thread spends
+about 430 us per block (x86) on a P1c block, 51% of the wall time; at 3x slower per block (A72) it is
+the limit again if the fix does not remove enough. If the Pi still shows P1c < 90% of P1, the next step
+is a design, not a tweak: compress on a small per-mount worker pool (or per CPU) ahead of
+`assign_physical`, keeping chain allocation and the row fill in the xop thread so ordering and the
+sub-column layout stay as they are. Measure with the "write path" INFO line first (lz4 ns/block vs
+the wall time per block: 8 s / 4096 = 1.9 ms on the Pi).
+
 P2 write-amp was higher with async on in both the h2dev and the Pi run (1 run per mode each) -- also
 to explain before the default changes.
 

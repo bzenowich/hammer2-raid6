@@ -43,8 +43,8 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
   `vfs.hammer2.async_seal=1` (fdd42c1) hands P/Q writes to a per-mount
   reaper; parity readers wait per row, the flush drains first (group O).
   On the Pi it takes P1 from 18.7 to 43.4 MB/s. Before turning it on by
-  default: P1c (LZ4) does not gain at all on the Pi (32 MB/s either way,
-  so the compressed write path is the next limit), and P2 write-amp was
+  default: P1c (LZ4) did not gain at all on the Pi (32 MB/s either way);
+  fix/p1c-comp removes a per-block 16 KB kmalloc in LZ4 (re-measure on the Pi), and P2 write-amp was
   higher with it on in single runs on h2dev and the Pi (oct-review P3,
   "Pi results").
 - **P8: seal a degraded row once every writable data disk is
