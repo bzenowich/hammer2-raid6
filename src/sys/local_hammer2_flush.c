@@ -1336,7 +1336,7 @@ hammer2_flush_member_idx(hammer2_dev_t *hmp, hammer2_devvp_t *e)
  * hammer2_flush_cache_wait().
  */
 static struct buf *
-hammer2_flush_cache_start(struct vnode *devvp)
+hammer2_flush_cache_start(struct vnode *devvp, int disk_idx)
 {
 	struct buf *bp;
 
@@ -1345,19 +1345,23 @@ hammer2_flush_cache_start(struct vnode *devvp)
 	bp->b_bufsize = 0;
 	bp->b_bcount = 0;
 	bp->b_cmd = BUF_CMD_FLUSH;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
+	hammer2_bio_timed_init(bp, 1, disk_idx);
 	vn_strategy(devvp, &bp->b_bio1);
 	return bp;
 }
 
+/*
+ * ETIMEDOUT: the flush did not complete in io_timeout_ms and the
+ * buffer is the completion's now (see hammer2_biowait_timed).
+ */
 static int
 hammer2_flush_cache_wait(struct buf *bp)
 {
 	int error;
 
-	error = biowait(&bp->b_bio1, "h2volf");
-	relpbuf(bp, NULL);
+	error = hammer2_biowait_timed(bp, "h2volf");
+	if (error != ETIMEDOUT)
+		relpbuf(bp, NULL);
 	return error;
 }
 
@@ -1635,10 +1639,38 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 			}
 		}
 		if (di >= 0 && !hammer2_raid6_disk_writable(hmp, di)) {
-			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-			vinvalbuf(devvp, 0, 0, 0);
-			vn_unlock(devvp);
+			/*
+			 * Not while writes to a hung member are still in the
+			 * driver: vinvalbuf would wait for their buffers.
+			 */
+			if (!bio_track_active(&devvp->v_track_write) &&
+			    !bio_track_active(&devvp->v_track_read)) {
+				vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
+				vinvalbuf(devvp, 0, 0, 0);
+				vn_unlock(devvp);
+			}
 			continue;
+		}
+
+		/*
+		 * VOP_FSYNC(MNT_WAIT) cannot be given up on, so wait for the
+		 * writes the MNT_NOWAIT pass started ourselves, and stop
+		 * when the watchdog fails the member (a hung drive): the
+		 * sync goes on without it.
+		 */
+		if (di >= 0 && hammer2_io_timeout_ms > 0) {
+			int gen = hammer2_iowd_begin(hmp, di);
+
+			while (hammer2_raid6_disk_writable(hmp, di) &&
+			       bio_track_active(&devvp->v_track_write)) {
+				bio_track_wait(&devvp->v_track_write, 0, hz);
+			}
+			hammer2_iowd_end(hmp, di, gen);
+			if (!hammer2_raid6_disk_writable(hmp, di)) {
+				kprintf("hammer2: RAID6 disk %d: sync does "
+					"not wait for a failed member\n", di);
+				continue;
+			}
 		}
 
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
@@ -1791,7 +1823,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 * Phase 1.
 		 */
 		for (k = 0; k < nm; k++) {
-			mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+			mbp[k] = hammer2_flush_cache_start(me[k]->devvp, mdi[k]);
 		}
 		for (k = 0; k < nm; k++) {
 			vol_error = hammer2_flush_cache_wait(mbp[k]);
@@ -1957,7 +1989,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		 */
 		for (k = 0; k < nm; k++) {
 			if (me[k] != NULL)
-				mbp[k] = hammer2_flush_cache_start(me[k]->devvp);
+				mbp[k] = hammer2_flush_cache_start(me[k]->devvp, mdi[k]);
 		}
 		for (k = 0; k < nm; k++) {
 			if (mbp[k] == NULL)

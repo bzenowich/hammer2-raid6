@@ -252,6 +252,40 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 }
 
 /*
+ * Read the dio's buffer from its member.  The buffer is locked first, so
+ * that only the wait for the device counts for the hung-disk watchdog
+ * (hammer2_iowd_begin).
+ */
+static int
+hammer2_io_devread(hammer2_io_t *dio, off_t dev_pbase, int bflags, int hce)
+{
+	off_t peof;
+	int gen;
+	int error;
+
+	if (dio->bp == NULL) {
+		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
+				 (bflags & B_KVABIO) ? GETBLK_KVABIO : 0, 0);
+	}
+	gen = hammer2_iowd_begin(dio->hmp, dio->disk_idx);
+	if (hce > 0) {
+		/*
+		 * Synchronous cluster I/O for now.
+		 */
+		peof = (dio->pbase + HAMMER2_SEGMASK64) & ~HAMMER2_SEGMASK64;
+		peof -= dio->dbase;
+		error = cluster_readx(dio->devvp, peof, dev_pbase,
+				      dio->psize, bflags, dio->psize,
+				      HAMMER2_PBUFSIZE * hce, &dio->bp);
+	} else {
+		error = breadnx(dio->devvp, dev_pbase, dio->psize, bflags,
+				NULL, NULL, 0, &dio->bp);
+	}
+	hammer2_iowd_end(dio->hmp, dio->disk_idx, gen);
+	return error;
+}
+
+/*
  * v3 metadata cold read, spread over the mirrors (oct-review P4).
  *
  * The dio stays what it always was: one per block, keyed and buffered on
@@ -331,7 +365,6 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 {
 	hammer2_io_t *dio;
 	hammer2_off_t dev_pbase;
-	off_t peof;
 	uint64_t orefs;
 	uint64_t nrefs;
 	int isgood;
@@ -422,7 +455,10 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 
 	error = 0;
 	dev_pbase = dio->pbase - dio->dbase;
-	hammer2_inject_delay(dio->disk_idx);
+	/* a failed member gets no I/O, so nothing to be late */
+	if (dio->disk_idx < 0 || hmp->raid_type != HAMMER2_RAID_TYPE_RAID6 ||
+	    !hmp->raid_failed[dio->disk_idx])
+		hammer2_inject_delay(dio->disk_idx);
 
 	/*
 	 * RAID6 degraded pre-emption: if this disk is already marked
@@ -535,23 +571,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			KKASSERT(dio->bp == NULL);
 			if (hammer2_io_meta_spread_read(dio, dev_pbase)) {
 				/* read from a mirror, or cached */
-			} else if (hce > 0) {
-				/*
-				 * Synchronous cluster I/O for now.
-				 */
-				peof = (dio->pbase + HAMMER2_SEGMASK64) &
-				       ~HAMMER2_SEGMASK64;
-				peof -= dio->dbase;
-				error = cluster_readx(dio->devvp,
-						     peof, dev_pbase,
-						     dio->psize, bflags,
-						     dio->psize,
-						     HAMMER2_PBUFSIZE*hce,
-						     &dio->bp);
 			} else {
-				error = breadnx(dio->devvp, dev_pbase,
-						dio->psize, bflags,
-					        NULL, NULL, 0, &dio->bp);
+				error = hammer2_io_devread(dio, dev_pbase,
+							   bflags, hce);
 			}
 			break;
 		}
@@ -591,22 +613,8 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	} else {
 		if (hammer2_io_meta_spread_read(dio, dev_pbase)) {
 			/* read from a mirror, or cached */
-		} else if (hce > 0) {
-			/*
-			 * Synchronous cluster I/O for now.
-			 */
-			peof = (dio->pbase + HAMMER2_SEGMASK64) &
-			       ~HAMMER2_SEGMASK64;
-			peof -= dio->dbase;
-			error = cluster_readx(dio->devvp,
-					      peof, dev_pbase, dio->psize,
-					      bflags,
-					      dio->psize, HAMMER2_PBUFSIZE*hce,
-					      &dio->bp);
 		} else {
-			error = breadnx(dio->devvp, dev_pbase,
-				        dio->psize, bflags,
-					NULL, NULL, 0, &dio->bp);
+			error = hammer2_io_devread(dio, dev_pbase, bflags, hce);
 		}
 		if (dio->bp) {
 			/*
@@ -1432,8 +1440,128 @@ hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags)
 	return 0;
 }
 
+static int hammer2_inject_nsleep[32];
+static int hammer2_inject_stamp[32];
+
 /*
- * Test-only: sleep like a hung disk, see inject_delay_ms_disk_mask.
+ * Hung-disk watchdog (R11).
+ *
+ * A USB bridge that hangs holds commands forever without detaching,
+ * so no error ever reaches us.  Reads that wait inside the buffer cache
+ * (cluster_readx, breadnx) cannot be given a timeout, nor can the bio be
+ * taken back from the driver; what we can do is notice that a member has
+ * waiters and no progress, and fail it, after which new I/O goes around
+ * it (degraded reads, writes skip it).  The waiters already in the
+ * driver come back when the driver gives up (da: 60 s per attempt).
+ *
+ * Per member, iowd.nwait counts such reads in flight and every completion
+ * refreshes iowd.stamp.  The once-a-second tick fails a member that has
+ * nwait > 0, bios outstanding on its device vnode (a waiter that is only
+ * queued behind a buffer lock does not count) and no completion for
+ * io_timeout_ms.  A reader that merely waits for a buffer lock is not
+ * counted: callers getblk() first and count only the device wait.
+ */
+int
+hammer2_iowd_begin(hammer2_dev_t *hmp, int disk_idx)
+{
+	struct hammer2_iowd *w;
+
+	if (disk_idx < 0 || disk_idx >= HAMMER2_MAX_VOLUMES)
+		return -1;
+	w = &hmp->iowd[disk_idx];
+	if (atomic_fetchadd_int(&w->nwait, 1) <= 0)
+		w->stamp = ticks;
+	return w->gen;
+}
+
+void
+hammer2_iowd_end(hammer2_dev_t *hmp, int disk_idx, int gen)
+{
+	struct hammer2_iowd *w;
+
+	if (disk_idx < 0 || disk_idx >= HAMMER2_MAX_VOLUMES)
+		return;
+	w = &hmp->iowd[disk_idx];
+	if (gen != w->gen)
+		return;		/* the disk was replaced meanwhile */
+	w->stamp = ticks;
+	atomic_add_int(&w->nwait, -1);
+}
+
+/* The member at disk_idx is a new disk: forget the old one's waiters. */
+void
+hammer2_iowd_reset(hammer2_dev_t *hmp, int disk_idx)
+{
+	struct hammer2_iowd *w = &hmp->iowd[disk_idx];
+
+	atomic_add_int(&w->gen, 1);
+	w->nwait = 0;
+	w->stamp = ticks;
+}
+
+static void
+hammer2_iowd_tick(void *arg)
+{
+	hammer2_dev_t *hmp = arg;
+	hammer2_devvp_t *dev;
+	struct hammer2_iowd *w;
+	struct vnode *devvp;
+	int lim;
+	int stalled;
+	int i;
+
+	if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6 &&
+	    hammer2_io_timeout_ms > 0 &&
+	    lockmgr(&hmp->rebuild_lk, LK_SHARED | LK_NOWAIT) == 0) {
+		lim = (int)((int64_t)hammer2_io_timeout_ms * hz / 1000) + 1;
+		for (i = 0; i < hmp->nvolumes && i < HAMMER2_MAX_VOLUMES; i++) {
+			if (hmp->raid_failed[i])
+				continue;
+			dev = hmp->volumes[i].dev;
+			if (dev == NULL || !dev->open || dev->devvp == NULL)
+				continue;
+			devvp = dev->devvp;
+			w = &hmp->iowd[i];
+			stalled = 0;
+			if (w->nwait > 0) {
+				if (bio_track_active(&devvp->v_track_read) ||
+				    bio_track_active(&devvp->v_track_write))
+					stalled = ((int)(ticks - w->stamp) > lim);
+				else
+					w->stamp = ticks;
+			}
+			if (i < 32 && hammer2_inject_nsleep[i] > 0 &&
+			    (int)(ticks - hammer2_inject_stamp[i]) > lim)
+				stalled = 1;
+			if (!stalled)
+				continue;
+			kprintf("hammer2: RAID6 disk %d (%s): no I/O completed "
+				"in %d ms, failing it\n", i, dev->path,
+				hammer2_io_timeout_ms);
+			w->stamp = ticks;
+			hammer2_raid6_mark_failed(hmp, i, HAMMER2_FAIL_DEFER);
+		}
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	}
+	callout_reset(&hmp->io_wd_co, hz, hammer2_iowd_tick, hmp);
+}
+
+void
+hammer2_iowd_start(hammer2_dev_t *hmp)
+{
+	callout_init_mp(&hmp->io_wd_co);
+	callout_reset(&hmp->io_wd_co, hz, hammer2_iowd_tick, hmp);
+}
+
+void
+hammer2_iowd_stop(hammer2_dev_t *hmp)
+{
+	callout_terminate(&hmp->io_wd_co);
+}
+
+/*
+ * Test-only: sleep like a hung disk, see inject_delay_ms_disk_mask.  The
+ * sleep counts as an I/O that does not complete, for the watchdog above.
  */
 void
 hammer2_inject_delay_slow(int disk_idx)
@@ -1443,7 +1571,11 @@ hammer2_inject_delay_slow(int disk_idx)
 	if (disk_idx < 0 || disk_idx >= 32 || ms <= 0 ||
 	    (hammer2_inject_delay_ms_disk_mask & (1U << disk_idx)) == 0)
 		return;
+	if (atomic_fetchadd_int(&hammer2_inject_nsleep[disk_idx], 1) <= 0)
+		hammer2_inject_stamp[disk_idx] = ticks;
 	tsleep(&hammer2_inject_delay_ms, 0, "h2injd", ms * hz / 1000 + 1);
+	atomic_add_int(&hammer2_inject_nsleep[disk_idx], -1);
+	hammer2_inject_stamp[disk_idx] = ticks;
 }
 
 /*
@@ -1841,10 +1973,12 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
  * that was cached stays cached.
  */
 int
-hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
+hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
+			       struct vnode *devvp, off_t off,
 			       void *dst, int bytes, int nocache)
 {
 	struct buf *bp;
+	int gen;
 	int error;
 
 	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT, 0);
@@ -1852,7 +1986,9 @@ hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
 		return EWOULDBLOCK;
 	if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
 		bp->b_flags |= B_RELBUF | B_DIRECT;
+	gen = hammer2_iowd_begin(hmp, disk_idx);
 	error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
+	hammer2_iowd_end(hmp, disk_idx, gen);
 	if (error == 0) {
 		bkvasync(bp);
 		bcopy(bp->b_data, dst, bytes);
@@ -1862,14 +1998,15 @@ hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
 }
 
 int
-hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
+hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
+			      struct vnode *devvp, off_t off,
 			      void *dst, int bytes, int nocache)
 {
 	struct buf *bp;
 	int error;
 
-	error = hammer2_io_raid6_read_bufcache(devvp, off, dst, bytes,
-					       nocache);
+	error = hammer2_io_raid6_read_bufcache(hmp, disk_idx, devvp, off,
+					       dst, bytes, nocache);
 	if (error != EWOULDBLOCK)
 		return error;
 
@@ -1879,10 +2016,11 @@ hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
+	hammer2_bio_timed_init(bp, 1, disk_idx);
 	vn_strategy(devvp, &bp->b_bio1);
-	error = biowait(&bp->b_bio1, "h2sib");
+	error = hammer2_biowait_timed(bp, "h2sib");
+	if (error == ETIMEDOUT)
+		return error;	/* the buffer is the completion's now */
 	if (error == 0)
 		bcopy(bp->b_data, dst, bytes);
 	relpbuf(bp, NULL);
@@ -1910,7 +2048,9 @@ hammer2_io_raid6_write_flags(struct vnode *devvp, off_t off,
 			bp->b_flags |= B_RELBUF | B_DIRECT;
 		bkvasync(bp);
 		bcopy(data, bp->b_data, bytes);
-		return bwrite(bp);
+		if (hammer2_bwrite_start(bp, -1) == 0)
+			return 0;
+		return hammer2_bwrite_wait(bp);
 	}
 
 	bp = getpbuf_mem(NULL);
@@ -1920,11 +2060,11 @@ hammer2_io_raid6_write_flags(struct vnode *devvp, off_t off,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
+	hammer2_bio_timed_init(bp, 1, -1);
 	vn_strategy(devvp, &bp->b_bio1);
-	error = biowait(&bp->b_bio1, "h2rbw");
-	relpbuf(bp, NULL);
+	error = hammer2_biowait_timed(bp, "h2rbw");
+	if (error != ETIMEDOUT)
+		relpbuf(bp, NULL);
 	return error;
 }
 
@@ -1956,6 +2096,7 @@ hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,
 		}
 		hammer2_spin_unex(&hash->spin);
 	}
+	hammer2_iowd_reset(hmp, disk_idx);
 }
 
 /*
@@ -2005,8 +2146,8 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 
 		error = hammer2_inject_eio(i);
 		if (error == 0)
-			error = hammer2_io_raid6_read_sibling(vol->dev->devvp,
-			    dev_pbase, copy, psize, 0);
+			error = hammer2_io_raid6_read_sibling(hmp, i,
+			    vol->dev->devvp, dev_pbase, copy, psize, 0);
 		if (error)
 			continue;
 		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
@@ -2176,8 +2317,8 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 			vol = &hmp->volumes[phys_disk];
 			lerror = hammer2_inject_eio(phys_disk);
 			if (lerror == 0)
-				lerror = hammer2_io_raid6_read_sibling(
-				    vol->dev->devvp, phys_off,
+				lerror = hammer2_io_raid6_read_sibling(hmp,
+				    phys_disk, vol->dev->devvp, phys_off,
 				    col_bufs[col], (int)stripe_unit, 0);
 			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
@@ -2322,6 +2463,7 @@ hammer2_resilver_read_start(struct vnode *devvp, off_t off, int bytes)
 	return bp;
 }
 
+/* Not timed: the callers relpbuf() the buffer whatever happens. */
 static int
 hammer2_resilver_read_wait(struct buf *bp)
 {
@@ -2360,8 +2502,7 @@ hammer2_resilver_write_start(struct vnode *devvp, off_t off,
 	bp->b_bcount = bytes;
 	bp->b_resid = bytes;
 	bp->b_bio1.bio_offset = off;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
+	hammer2_bio_timed_init(bp, 1, -1);
 	vn_strategy(devvp, &bp->b_bio1);
 	*pbufp = 1;
 	return bp;
@@ -2376,8 +2517,9 @@ hammer2_resilver_write_wait(struct buf *bp, int ispbuf)
 		return 0;
 	if (!ispbuf)
 		return hammer2_bwrite_wait(bp);
-	error = biowait(&bp->b_bio1, "h2rsvw");
-	relpbuf(bp, NULL);
+	error = hammer2_biowait_timed(bp, "h2rsvw");
+	if (error != ETIMEDOUT)
+		relpbuf(bp, NULL);
 	return error;
 }
 
@@ -2566,7 +2708,7 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 				continue;
 			lerror = hammer2_inject_eio(d);
 			if (lerror == 0)
-				lerror = hammer2_io_raid6_read_sibling(
+				lerror = hammer2_io_raid6_read_sibling(hmp, d,
 				    hmp->volumes[d].dev->devvp, phys_off,
 				    xbufs[1 + col - ndata], (int)su, 1);
 			if (lerror) {
@@ -2651,7 +2793,7 @@ hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx, int surv,
 			vol = &hmp->volumes[i];
 			lerror = hammer2_inject_eio(i);
 			if (lerror == 0)
-				lerror = hammer2_io_raid6_read_sibling(
+				lerror = hammer2_io_raid6_read_sibling(hmp, i,
 				    vol->dev->devvp, off, buf, bytes, 1);
 			if (lerror == 0)
 				break;
@@ -3284,7 +3426,7 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	    hmp->volumes[disk_idx].dev != NULL &&
 	    hmp->volumes[disk_idx].dev->devvp != NULL &&
 	    hmp->volumes[disk_idx].dev->open &&
-	    hammer2_io_raid6_read_bufcache(
+	    hammer2_io_raid6_read_bufcache(hmp, disk_idx,
 	     hmp->volumes[disk_idx].dev->devvp,
 	     (off_t)(lbase & ~HAMMER2_PBUFMASK64), ctx->rbuf,
 	     HAMMER2_PBUFSIZE, 1) == 0) {
