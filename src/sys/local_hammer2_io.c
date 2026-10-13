@@ -499,10 +499,10 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			    hmp->voldata.version >=
 			     HAMMER2_VOL_VERSION_RAIDZ2) {
 				/*
-				 * I5: metadata is N-way-mirrored, so a
-				 * failed primary disk falls back to any
-				 * surviving sibling at the same per-disk
-				 * byte offset — no parity reconstruction.
+				 * I5: metadata is mirrored, so a failed
+				 * primary disk falls back to a surviving
+				 * copy at the same per-disk byte offset —
+				 * no parity reconstruction.
 				 */
 				error = hammer2_io_metadata_mirror_read(hmp,
 				    dio->disk_idx, dev_pbase,
@@ -550,11 +550,14 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		case HAMMER2_DOP_NEW:
 		case HAMMER2_DOP_NEWNZ:
 			/*
-			 * COW writes go to fresh stripe slots whose other
-			 * data columns are guaranteed zero (newplan.md
-			 * §5.4), so no pre-read is needed for any RAID6
-			 * write path.  Just getblk() and zero the buffer
-			 * for DOP_NEW.
+			 * lsize == psize: the caller replaces the whole
+			 * buffer (DOP_NEW is zeroed here, DOP_NEWNZ is
+			 * filled by the caller), so whatever the media
+			 * holds is never used and reading it first would
+			 * only cost an I/O.  Whatever shares the row is
+			 * in other columns (other dios), not in this
+			 * buffer.  Just getblk() and zero the buffer for
+			 * DOP_NEW.
 			 *
 			 * A failed disk never gets here: the degraded
 			 * pre-emption above has taken every op on it.
@@ -878,7 +881,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * contend with this bp.
 			 *
 			 * For metadata btypes (INODE/INDIRECT/FREEMAP_*)
-			 * we capture for the N-way mirror write to sibling
+			 * we capture for the mirror copies on the sibling
 			 * disks (I5).
 			 */
 			if (hammer2_raid6_v3(hmp)) {
@@ -996,7 +999,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			 * v3 RAIDZ2-native metadata mirror (I5).  After the
 			 * primary bp has been disposed above (bdwrite /
 			 * cluster_write / bawrite to dio->devvp), the same
-			 * payload goes to every surviving sibling disk at the
+			 * payload goes to the block's other copies at the
 			 * same per-disk byte offset.  The primary's bdwrite
 			 * coalesces repeated releases of a block; the copies
 			 * are queued the same way and written by the sync
@@ -3126,11 +3129,11 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	/*
 	 * Phase A: Metadata-zone sequential copy (metadata_zone.md §Resilver).
 	 *
-	 * Metadata blocks (INODE/INDIRECT/FREEMAP_*) are an N-way mirror at
-	 * the same per-disk byte offset on every disk; reconstructing the
-	 * failed disk's copy is a straight sequential bulk read from any
-	 * surviving disk followed by a bulk write to new_devvp at the same
-	 * offset.  No parity, no GF math.  Order of magnitude minutes vs the
+	 * Metadata blocks (INODE/INDIRECT/FREEMAP_*) are mirrored at
+	 * the same per-disk byte offset (3 copies, every disk on layout 2);
+	 * reconstructing the failed disk's copy is a straight sequential
+	 * bulk read from a surviving copy followed by a bulk write to
+	 * new_devvp at the same offset.  No parity, no GF math.  Order of magnitude minutes vs the
 	 * hours a blockref walk of metadata used to take.
 	 *
 	 * Done before Phase 3 so the stripe loop has up-to-date freemap and

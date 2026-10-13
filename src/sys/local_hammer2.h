@@ -1324,7 +1324,7 @@ struct hammer2_dev {
 	struct hammer2_mirror_pend *mirror_inflight;
 	int		mirror_pend_count;
 
-	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
+	/* RAIDZ2-native metadata zone (3 copies, see metadata_zone.md) */
 	int		md_ncopies;	/* v3 metadata copies (hammer2_md_ncopies) */
 	uint32_t	md_nextents;
 	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];

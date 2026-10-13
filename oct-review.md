@@ -728,28 +728,30 @@ ioctl and printed by `hammer2 raid stats`:
 
 ## 8. Docs and hygiene
 
-- **`hammer2_raid6.patch` lags `src/`**: it lacks `035b1b7` and today's fix. `install_raid6.sh` uses the patch, `deploy.sh` uses the overlay, and no script regenerates the patch. Add `bin/mkpatch`, and have `deploy.sh` warn when `src/` is newer than the patch.
-- **`docs/outstanding.md`** is from May (44/44, "I/O timeouts not implemented", "blocked on hardware"). Rewrite it as the current gap list, which this file can seed.
-- **`DEVELOPER.md`** has several stale claims:
-  - DIRENT is listed as mirrored; it is striped.
-  - P/Q writes are described as synchronous `bwrite`; they are parallel `bwrite_start`/`wait`.
-  - `seal_all` is said to seal every row; partial seals remain open.
-  - It names `test_raid6.c`; the file is `h2raid6_test.c`, and `deploy.sh` doesn't build `h2stripe_check`, so F2 fails on a fresh guest.
-  - The test table stops at K.
-- **`newplan.md §5.4/§5.6`** still describe one slot per write and "no P/Q ever overwritten". Packing and re-sealing changed both; see R4. `io.c:445` cites §5.4 as the reason no pre-read is needed.
-- **`tests/v3`:**
-  - `run_all.sh:79` omits N from the usage text;
-  - temp files are still named `v4_*`;
-  - the K2 comment cites a nonexistent "open_rows cap = 16".
-- **Remove:**
-  - `hammer2_raid6_patch.sh`: a February `sed -i '124,150c…'` hotfix that would corrupt today's file;
-  - `fresh_disks.sh` (vn images, unsupported);
-  - `tests/other/` (17 of 18 scripts use vnconfig);
-  - the obsolete v1/v2 tools in `src/diag` (`h2parity_fix`, `h2diag*`, `diag_map`);
-  - `hammer2_raid6.patch.backup`;
-  - the 3 MB session JSON.
+Status as of 2026-10-13 (each bullet checked against the tree):
 
-  Also fix the "format version 4" string in `h2stripe_check.c`.
+- **`hammer2_raid6.patch` lags `src/`**: it lacks `035b1b7` and today's fix. `install_raid6.sh` uses the patch, `deploy.sh` uses the overlay, and no script regenerates the patch. Add `bin/mkpatch`, and have `deploy.sh` warn when `src/` is newer than the patch. **Done** (850818f: `bin/mkpatch`, `deploy.sh` `check_patch_stale`). The patch itself was last regenerated at 850818f and lags `src/` again (about 30 commits); run `bin/mkpatch` before it is used.
+- **`docs/outstanding.md`** is from May (44/44, "I/O timeouts not implemented", "blocked on hardware"). Rewrite it as the current gap list, which this file can seed. **Done** (89be3cd; updated again 2026-10-13).
+- **`DEVELOPER.md`** has several stale claims. **Done**: all five below fixed (5a78818), and on 2026-10-13 it was brought in line with layout 3, the space map, the resume cursor, scrub and hung-disk handling:
+  - DIRENT is listed as mirrored; it is striped. **Done.**
+  - P/Q writes are described as synchronous `bwrite`; they are parallel `bwrite_start`/`wait`. **Done.**
+  - `seal_all` is said to seal every row; partial seals remain open. **Done.**
+  - It names `test_raid6.c`; the file is `h2raid6_test.c`, and `deploy.sh` doesn't build `h2stripe_check`, so F2 fails on a fresh guest. **Done.**
+  - The test table stops at K. **Done** (covers A-Z, marks R as opt-in).
+- **`newplan.md §5.4/§5.6`** still describe one slot per write and "no P/Q ever overwritten". Packing and re-sealing changed both; see R4. `io.c:445` cites §5.4 as the reason no pre-read is needed. **Done**: `newplan.md` carries a HISTORICAL header note naming §5.4/§5.6 as superseded, and the `io.c` comment no longer cites it (it now says why a whole-buffer NEW/NEWNZ needs no pre-read).
+- **`tests/v3`:**
+  - `run_all.sh:79` omits N from the usage text; **Done** (usage text now lists the whole default list, A..Z, and says R is opt-in);
+  - temp files are still named `v4_*`; **Done** (`test_v_subcol_alloc.sh` uses `vr_*`);
+  - the K2 comment cites a nonexistent "open_rows cap = 16". **Done** (no such text remains).
+- **Remove:** **Done**, except the two items marked *kept*:
+  - `hammer2_raid6_patch.sh`: removed (6494a87);
+  - `fresh_disks.sh` (vn images, unsupported): removed;
+  - `tests/other/` (17 of 18 scripts use vnconfig): removed;
+  - the obsolete v1/v2 tools in `src/diag` (`h2parity_fix`, `h2diag*`, `diag_map`): removed;
+  - `hammer2_raid6.patch.backup`: **kept** (untracked file in the main checkout; deleting it is not approved yet);
+  - the 3 MB session JSON (`session-2026-02-26T03-52-3a68a4e6.json`): **kept**, same reason.
+
+  Also fix the "format version 4" string in `h2stripe_check.c`. **Done** (6494a87).
 
 ---
 

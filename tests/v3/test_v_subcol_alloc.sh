@@ -207,19 +207,19 @@ setup_fresh
 check_v3
 i=0
 while [ $i -lt 24 ]; do
-    dd if=/dev/urandom of=$MNTPT/v4_$i bs=1k count=$((1 << (i % 4))) 2>/dev/null
-    dd if=/dev/urandom of=$MNTPT/v4_$i bs=1k count=$((1 << ((i + 2) % 6))) 2>/dev/null
-    dd if=/dev/urandom of=$MNTPT/v4_$i bs=1k count=1 conv=notrunc 2>/dev/null
+    dd if=/dev/urandom of=$MNTPT/vr_$i bs=1k count=$((1 << (i % 4))) 2>/dev/null
+    dd if=/dev/urandom of=$MNTPT/vr_$i bs=1k count=$((1 << ((i + 2) % 6))) 2>/dev/null
+    dd if=/dev/urandom of=$MNTPT/vr_$i bs=1k count=1 conv=notrunc 2>/dev/null
     i=$((i + 1))
 done
 sync
 i=0
 while [ $i -lt 24 ]; do
-    dd if=/dev/urandom of=$MNTPT/v4_$i bs=1k count=$((1 << ((i + 1) % 5))) \
+    dd if=/dev/urandom of=$MNTPT/vr_$i bs=1k count=$((1 << ((i + 1) % 5))) \
         seek=$((i % 3)) conv=notrunc 2>/dev/null
     i=$((i + 1))
 done
-sums v4
+sums vr
 sync
 BAD=$(layout_bad)
 if [ -z "$BAD" ]; then
@@ -229,7 +229,7 @@ else
     echo "$BAD" | sed 's/^/      /'
 fi
 remount
-verify "V4: rewritten files read back" v4
+verify "V4: rewritten files read back" vr
 scrub_clean "V4"
 balanced "V4"
 P4=$(ctr rz_put_anomaly)
