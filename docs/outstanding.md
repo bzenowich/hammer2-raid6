@@ -39,13 +39,14 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
 
 ## Performance
 
-- **Async P/Q sealing (P3 step 3).** Row sealing still waits for the P
-  and Q writes in putblk. Moving it to an async per-mount path is
-  blocked by `read_sibling`'s raw fallback, which reads the disk
-  directly and would see a row whose parity is still in flight.
-  Measured on h2dev (oct-review P3 "Step 3 measurement"): the P/Q wait
-  is 3-6% of write wall time, so not worth building; re-measure on the
-  Pi with `vfs.hammer2.rz_pq_wait_ns` before deciding.
+- **Async P/Q sealing (P3 step 3): built, off by default.**
+  `vfs.hammer2.async_seal=1` (fdd42c1) hands P/Q writes to a per-mount
+  reaper; parity readers wait per row, the flush drains first (group O).
+  On the Pi it takes P1 from 18.7 to 43.4 MB/s. Before turning it on by
+  default: P1c (LZ4) does not gain at all on the Pi (32 MB/s either way,
+  so the compressed write path is the next limit), and P2 write-amp was
+  higher with it on in single runs on h2dev and the Pi (oct-review P3,
+  "Pi results").
 - **P8: seal a degraded row once every writable data disk is
   allocated** (f4d39b0 on branch `fix/p8-alloc`) was deliberately not
   merged: the measured gain is about nothing. Degraded rows still stay
