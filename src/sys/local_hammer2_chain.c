@@ -5583,14 +5583,34 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 }
 
 /*
+ * Print the in-kernel buffer state of a chain's DIO for a CHECK FAIL
+ * report.  Snapshots dio and bp once; a RAID6 DIO for a column on a
+ * failed disk is served by reconstruction and may carry no buffer.
+ */
+static void
+hammer2_chain_print_dio(hammer2_chain_t *chain, void *bdata)
+{
+	hammer2_io_t *dio = chain->dio;
+	struct buf *bp = dio ? dio->bp : NULL;
+
+	kprintf("   chain %p bdata %p dio %p bp %p ", chain, bdata, dio, bp);
+	if (bp) {
+		kprintf("bp_loff %016jx,%d bdata %p/%p",
+			(intmax_t)bp->b_loffset, bp->b_bufsize,
+			bdata, bp->b_data);
+	}
+	kprintf("\n");
+}
+
+/*
  * Characterize a failed check code and try to trace back to the inode.
  */
 static void
 hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 				  int bits, void *bdata)
 {
-	hammer2_chain_t *lchain;
 	hammer2_chain_t *ochain;
+	hammer2_key_t lkey;
 	int did;
 
 	did = krateprintf(&krate_h2chk,
@@ -5615,43 +5635,46 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 	}
 
 	/*
-	 * In-kernel memory information
+	 * In-kernel memory information.  Snapshot dio and bp once: the
+	 * chain is locked so its dio is stable, but a RAID6 DIO for a
+	 * column on a failed disk is served by reconstruction and may
+	 * carry no buffer.
 	 */
-	kprintf("   chain %p bdata %p dio %p bp %p ",
-		chain,
-		bdata,
-		chain->dio,
-		(chain->dio ? chain->dio->bp : NULL));
-
-	/*
-	 * A RAID6 DIO for a column on a failed disk is served by
-	 * reconstruction and carries no buffer.
-	 */
-	if (chain->dio && chain->dio->bp) {
-		kprintf("bp_loff %016jx,%d bdata %p/%p",
-			(intmax_t)chain->dio->bp->b_loffset,
-			chain->dio->bp->b_bufsize,
-			bdata,
-			chain->dio->bp->b_data);
-	}
-	kprintf("\n");
+	hammer2_chain_print_dio(chain, bdata);
 
 	/*
 	 * Run up the chains to try to find the governing inode so we
-	 * can report it.
-	 *
-	 * XXX This error reporting is not really MPSAFE
+	 * can report it.  chain->parent is only stable under the
+	 * child's core spinlock, so hop upward holding a ref on each
+	 * step; a parent cannot be freed while it still has the child
+	 * in its rbtree.
 	 */
 	ochain = chain;
-	lchain = chain;
-	while (chain && chain->bref.type != HAMMER2_BREF_TYPE_INODE) {
-		lchain = chain;
-		chain = chain->parent;
+	lkey = chain->bref.key;
+	hammer2_chain_ref(chain);
+	for (;;) {
+		hammer2_chain_t *parent;
+
+		if (chain->bref.type == HAMMER2_BREF_TYPE_INODE)
+			break;
+		hammer2_spin_sh(&chain->core.spin);
+		parent = chain->parent;
+		if (parent)
+			hammer2_chain_ref(parent);
+		hammer2_spin_unsh(&chain->core.spin);
+		if (parent == NULL) {
+			hammer2_chain_drop(chain);
+			chain = NULL;
+			break;
+		}
+		lkey = chain->bref.key;
+		hammer2_chain_drop(chain);
+		chain = parent;
 	}
 
 	if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
 	    ((chain->bref.flags & HAMMER2_BREF_FLAG_PFSROOT) == 0 ||
-	     (lchain->bref.key & HAMMER2_DIRHASH_VISIBLE))) {
+	     (lkey & HAMMER2_DIRHASH_VISIBLE))) {
 		kprintf("   Resides at/in inode %ld\n",
 			(long)chain->bref.key);
 	} else if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
@@ -5659,6 +5682,8 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 	} else {
 		kprintf("   Resides in root index - CRITICAL!!!\n");
 	}
+	if (chain)
+		hammer2_chain_drop(chain);
 	if (ochain->hmp) {
 		const char *pfsname = "UNKNOWN";
 		int i;
@@ -6027,15 +6052,7 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
 					chain->bref.check.freemap.icrc32,
 					hammer2_icrc32(bdata, chain->bytes),
 					chain->bytes);
-				if (chain->dio) {
-					kprintf("dio %p buf %016jx,%d "
-						"bdata %p/%p\n",
-						chain->dio,
-						(intmax_t)chain->dio->bp->b_loffset,
-						chain->dio->bp->b_bufsize,
-						bdata,
-						chain->dio->bp->b_data);
-				}
+				hammer2_chain_print_dio(chain, bdata);
 			}
 		}
 		break;
