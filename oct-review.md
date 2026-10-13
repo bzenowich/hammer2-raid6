@@ -568,7 +568,7 @@ a 40x limit for P2. An R1 pass count does not change this (a clean run with P1+R
   - the `absent_data` path (if R10/U confirms it is unreachable);
   - unused `DISK_REBUILDING/SPARE/ABSENT` and `FLAG_REBUILDING` constants (either persist REBUILDING during a resilver or drop them);
   - the `raid6_pack_open_rows` bisect knob, whose 0 mode is untested.
-- **S-f. Scrub should call the self-heal helper** instead of its own weaker reconstruction (R-minor). That removes one of the three repair implementations.
+- **S-f. Scrub should call the self-heal helper** instead of its own weaker reconstruction (R-minor). That removes one of the three repair implementations. **Done 2026-10-12 (a05155e):** scrub calls `hammer2_raid6_selfheal_data` and waits for the repair thread (`hammer2_io_repair_drain`); the old one only reconstructed one erasure, wrote raw to a failed disk and did not check the slot. M3 (two disks corrupted) failed before (bad=96 repaired=24) and passes now. Scrub still never checks P/Q (S6).
 - **S-g. Dedup on v3.** `hammer2_io_dedup_*` run on every destroyed v3 DATA chain against the wrong (disk-0) dio, harmlessly. Return early on v3. `hammer2_io_data`/`dedup_mask` are correct only because the `(int)` cast drops the disk bits; compute the in-buffer offset explicitly.
 
 ---
