@@ -1927,7 +1927,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 					break;
 				}
 			}
-			if (hammer2_bwrite_start(bp))
+			if (hammer2_bwrite_start(bp, mdi[k]))
 				mbp[k] = bp;
 			else
 				me[k] = NULL;

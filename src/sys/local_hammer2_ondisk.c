@@ -2136,7 +2136,7 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			bzero(zbp->b_data, bytes);
 			zbp->b_flags |= B_RELBUF | B_NOCACHE;
 			/* a column left non-zero makes P/Q wrong for it */
-			if (hammer2_bwrite_start(zbp)) {
+			if (hammer2_bwrite_start(zbp, d)) {
 				zdisk[nz] = d;
 				zbps[nz++] = zbp;
 			}

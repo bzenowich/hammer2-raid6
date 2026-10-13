@@ -4,7 +4,7 @@
 # supported per newplan.md §8.
 #
 # Usage: sh run_all.sh [group ...]
-#   If no groups are specified, runs A B C D E F G H I J K L N P S T U V,
+#   If no groups are specified, runs A B C D E F G H I J K L N P S T U V W,
 #   then M (last: it can hang the guest).
 #   Specify group letters to run only those tests, e.g.: sh run_all.sh A B
 #   Groups: A basic, B single failure, C dual failure, D resilver,
@@ -12,6 +12,7 @@
 #   I unclean unmount, J packed rows, K scrub, L self-heal,
 #   M multi-corrupt, N capacity, P performance shape (devstat),
 #   R rewrite/seal (opt-in, not in the default list), S split header,
+#   W write-side fault injection (vfs.hammer2.inject_wio/delay),
 #   T slot reuse, U sub-column offsets (test hook raid6_subcol_test), V sub-column allocation (raid6_subcol_max).  Run R with: sh run_all.sh R
 #
 # Environment:
@@ -62,7 +63,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L N P S T U V M}"
+GROUPS="${*:-A B C D E F G H I J K L N P S T U V W M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -86,7 +87,8 @@ for GROUP in $GROUPS; do
     T) run_group "Group T" "$SCRIPTDIR/test_t_reuse.sh"        ;;
     U) run_group "Group U" "$SCRIPTDIR/test_u_subcol_offset.sh" ;;
     V) run_group "Group V" "$SCRIPTDIR/test_v_subcol_alloc.sh" ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S T U V)" ;;
+    W) run_group "Group W" "$SCRIPTDIR/test_w_writefault.sh"   ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P R S T U V W)" ;;
     esac
 done
 
