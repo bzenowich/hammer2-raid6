@@ -677,7 +677,20 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		kprintf("xop_strategy_write: error %d loff=%016jx\n",
 			error, (intmax_t)bp->b_loffset);
 		bp->b_flags |= B_ERROR;
-		bp->b_error = EIO;
+		if (error & HAMMER2_ERROR_ENOSPC) {
+			/*
+			 * Out of space.  bpdone() re-dirties a failed write
+			 * unless B_INVAL is set, so a retry would fail the
+			 * same way forever (and the writer would block in
+			 * the buffer cache).  Throw the data away and report
+			 * ENOSPC.  hammer2_vfs_enospace() normally keeps us
+			 * from getting here.
+			 */
+			bp->b_flags |= B_INVAL;
+			bp->b_error = ENOSPC;
+		} else {
+			bp->b_error = EIO;
+		}
 		biodone(bio);
 	}
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);

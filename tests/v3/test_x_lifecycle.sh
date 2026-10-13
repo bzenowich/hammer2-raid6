@@ -12,6 +12,7 @@
 #   X4  fill to ENOSPC: writes fail cleanly, what was written reads
 #       back, delete + two bulkfree passes give the space back, writes
 #       succeed again, scrub clean
+#   X4b the same to the very end: write(2) must return ENOSPC (no hang)
 #   X5  raid6_simd 0/1 parity cross-check: encode with one setting and
 #       reconstruct (two data disks failed) with the other, both ways;
 #       and the same data written under each setting leaves identical
@@ -359,8 +360,7 @@ x4() {
 setup_fresh $X_SIZE
 check_v3
 cap=$(df -m $MNTPT | awk 'NR == 2 { print $2 }')
-# Fill to X4_RESERVE MB from the end.  Going all the way (x4b) wedges
-# the kernel today: see x4b.
+# Fill to X4_RESERVE MB from the end; x4b goes all the way.
 nmax=$(( cap / 64 + 16 ))
 i=0
 while [ "$i" -lt "$nmax" ]; do
@@ -464,38 +464,117 @@ teardown "X4"
 }
 
 # ----------------------------------------------------------------
-# X4b: real ENOSPC (opt-in: X_TESTS=x4b).  KNOWN FAILURE: when the
-# freemap runs out, hammer2_xop_strategy_write completes the bio with
-# B_ERROR, and bpdone() re-dirties a failed write, so the buffer is
-# written again forever ("xop_strategy_write: error 28" at hundreds per
-# second) and the writer blocks in write(2) instead of getting ENOSPC.
-# The guest then needs a reset.  Hence not in the default list.
+# X4b: fill the array until write(2) fails.  A true ENOSPC used to wedge
+# the guest: the allocation failed at flush time, the buffer completed
+# with B_ERROR, bpdone() re-dirtied it and it was written again forever
+# ("xop_strategy_write: error 28" hundreds of times a second), with the
+# writer stuck in write(2).  Now hammer2_vfs_enospace() knows the v3 free
+# space, so the writer gets ENOSPC, the flush always finds room, and an
+# ENOSPC at flush time invalidates the buffer instead of retrying it.
 # ----------------------------------------------------------------
 x4b() {
 setup_fresh $X_SIZE
 check_v3
 cap=$(df -m $MNTPT | awk 'NR == 2 { print $2 }')
 nmax=$(( cap / 64 + 16 ))
+kmsg_clear
+rm -f /var/tmp/x_enospc.txt /var/tmp/x_enospc.n
 (
     i=0
     while [ "$i" -lt "$nmax" ]; do
-        cp $CHUNK $MNTPT/e$i || exit 1
+        cp $CHUNK $MNTPT/e$i || { echo "cp e$i failed"; echo $i > /var/tmp/x_enospc.n; exit 1; }
         i=$((i + 1))
     done
-    sync
+    echo $i > /var/tmp/x_enospc.n
+    exit 2
 ) > /var/tmp/x_enospc.txt 2>&1 &
 EPID=$!
-n=0
-while kill -0 $EPID 2>/dev/null && [ "$n" -lt 240 ]; do
-    sleep 1
-    n=$((n + 1))
-done
-if kill -0 $EPID 2>/dev/null; then
-    result FAIL "X4b: KNOWN FAILURE: the writer is still blocked 240 s into ENOSPC ($(kmsg | grep -c 'xop_strategy_write: error 28') failed buffer writes logged); reset the guest"
+if wait_gone $EPID 240; then
+    nfull=$(cat /var/tmp/x_enospc.n 2>/dev/null)
+    if [ "$WRC" = "1" ] && grep -q "No space left" /var/tmp/x_enospc.txt; then
+        result PASS "X4b: write(2) returned ENOSPC after $nfull x 64 MB files ($(tail -1 /var/tmp/x_enospc.txt))"
+    else
+        result FAIL "X4b: the fill ended with rc=$WRC after ${nfull:-?} files, not ENOSPC: $(head -2 /var/tmp/x_enospc.txt)"
+    fi
 else
-    result PASS "X4b: the writer got ENOSPC and returned: $(head -1 /var/tmp/x_enospc.txt)"
-    teardown "X4b"
+    result FAIL "X4b: the writer is still blocked 240 s into ENOSPC ($(kmsg | grep -c 'xop_strategy_write: error') failed buffer writes logged); reset the guest"
+    return
 fi
+# a flush that cannot allocate must not happen; and sync must return
+sync &
+if wait_gone $! 120; then
+    result PASS "X4b: sync returns on the full array"
+else
+    result FAIL "X4b: sync did not return on the full array"
+fi
+if kmsg | grep -q 'xop_strategy_write: error'; then
+    result FAIL "X4b: a flush hit an allocation error ($(kmsg | grep -c 'xop_strategy_write: error') logged): the free-space check let too much through"
+else
+    result PASS "X4b: no flush ran out of space"
+fi
+echo "  info: df on the full array: $(df -m $MNTPT | awk 'NR == 2 { print "size", $2, "used", $3, "avail", $4, $5 }')"
+rm -f $MNTPT/e$nfull        # the partial file of the failed cp
+if remount; then
+    bad=0; j=0
+    while [ "$j" -lt "$nfull" ]; do
+        [ "$(sha256 -q $MNTPT/e$j 2>/dev/null)" = "$CH" ] || bad=$((bad + 1))
+        j=$((j + 1))
+    done
+    if [ "$nfull" -gt 0 ] && [ "$bad" = "0" ]; then
+        result PASS "X4b: array mounts, all $nfull files written before ENOSPC verify (cold)"
+    else
+        result FAIL "X4b: $bad of $nfull files wrong after ENOSPC (cold)"
+    fi
+else
+    result FAIL "X4b: remount of the full array failed"
+    return
+fi
+# delete the even files, reclaim, write again
+j=0; ndel=0
+while [ "$j" -lt "$nfull" ]; do
+    [ $((j % 2)) -ne 0 ] || { rm -f $MNTPT/e$j || break; ndel=$((ndel + 1)); }
+    j=$((j + 1))
+done
+sync; sync
+k=0
+while [ "$k" -lt 2 ]; do
+    hammer2 bulkfree $MNTPT > /var/tmp/x_bulkfree.txt 2>&1 ||
+        { result FAIL "X4b: bulkfree pass $k failed"; sed 's/^/      /' /var/tmp/x_bulkfree.txt; }
+    k=$((k + 1))
+done
+sleep 2
+nnew=$((ndel - 2)); [ "$nnew" -ge 1 ] || nnew=1
+k=0; werr=""
+while [ "$k" -lt "$nnew" ]; do
+    cp $CHUNK $MNTPT/h$k 2>/var/tmp/x_cp.txt || { werr=$(head -1 /var/tmp/x_cp.txt); break; }
+    k=$((k + 1))
+done
+sync
+if [ "$k" = "$nnew" ]; then
+    result PASS "X4b: deleted $ndel files, bulkfree, wrote $nnew x 64 MB again"
+else
+    result FAIL "X4b: write after reclaim stopped at file $k of $nnew: $werr"
+fi
+remount
+bad=0; j=0
+while [ "$j" -lt "$nfull" ]; do
+    if [ $((j % 2)) -eq 1 ]; then
+        [ "$(sha256 -q $MNTPT/e$j 2>/dev/null)" = "$CH" ] || bad=$((bad + 1))
+    fi
+    j=$((j + 1))
+done
+j=0
+while [ "$j" -lt "$k" ]; do
+    [ "$(sha256 -q $MNTPT/h$j 2>/dev/null)" = "$CH" ] || bad=$((bad + 1))
+    j=$((j + 1))
+done
+if [ "$bad" = "0" ]; then
+    result PASS "X4b: survivors and new files intact (cold)"
+else
+    result FAIL "X4b: $bad files wrong after reclaim (cold)"
+fi
+scrub_clean "X4b"
+teardown "X4b"
 }
 
 # ----------------------------------------------------------------
@@ -597,7 +676,7 @@ done
 echo "  info: X6: ${DISK_PREFIX}${DISK_BASE}.. present: $n disks (NDISKS=$NDISKS); NDISKS=6 needs 6"
 }
 
-for t in ${X_TESTS:-x1 x2 x3 x4 x5 x6}; do
+for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6}; do
     $t
 done
 

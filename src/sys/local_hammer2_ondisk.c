@@ -2734,6 +2734,23 @@ void
 hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 		    hammer2_off_t *freep)
 {
+	hammer2_off_t dtotal, dfree, mtotal, mfree;
+
+	hammer2_raid6_space_split(hmp, &dtotal, &dfree, &mtotal, &mfree);
+	*totalp = dtotal + mtotal;
+	*freep = dfree + mfree;
+}
+
+/*
+ * The same, split into the data rows and the (mirrored) metadata zone.
+ * Both limits matter: a flush that cannot get a metadata block fails just
+ * as a data write that finds no free row does.
+ */
+void
+hammer2_raid6_space_split(hammer2_dev_t *hmp, hammer2_off_t *dtotalp,
+		    hammer2_off_t *dfreep, hammer2_off_t *mtotalp,
+		    hammer2_off_t *mfreep)
+{
 	hammer2_off_t row_bytes;
 	hammer2_off_t md_size = 0;
 	hammer2_off_t md_used;
@@ -2747,8 +2764,10 @@ hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 		md_size += hmp->md_extents[ex].md_size;
 
 	if (hmp->stripe_bitmap == NULL) {
-		*totalp = md_size;
-		*freep = 0;
+		*dtotalp = 0;
+		*dfreep = 0;
+		*mtotalp = md_size;
+		*mfreep = 0;
 		return;
 	}
 	if (hmp->stripe_data_slots == 0) {
@@ -2781,9 +2800,10 @@ hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 	if (md_used > md_size)
 		md_used = md_size;
 
-	*totalp = hmp->stripe_data_slots * row_bytes + md_size;
-	*freep = (hmp->stripe_data_slots - used) * row_bytes +
-		 (md_size - md_used);
+	*dtotalp = hmp->stripe_data_slots * row_bytes;
+	*dfreep = (hmp->stripe_data_slots - used) * row_bytes;
+	*mtotalp = md_size;
+	*mfreep = md_size - md_used;
 }
 
 /*

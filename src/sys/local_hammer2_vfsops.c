@@ -3839,6 +3839,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
 			    pmp->pfs_types[i] != HAMMER2_PFSTYPE_SOFT_MASTER)
 				continue;
 
+			if (hammer2_raid6_v3(hmp)) {
+				/*
+				 * On v3 allocator_free is the metadata zone
+				 * over the raw size of every disk, it says
+				 * nothing about the data rows.  Use the free
+				 * data rows against 5% of the data space (as
+				 * statfs does).  A flush that cannot get a
+				 * metadata block is as bad as a data write
+				 * that finds no row, so a metadata zone
+				 * under its own 5% reads as full.
+				 */
+				hammer2_off_t dt, df, mt, mf;
+
+				hammer2_raid6_space_split(hmp, &dt, &df,
+							  &mt, &mf);
+				if (mf < mt / 20)
+					df = 0;
+				if (free_nominal > df)
+					free_nominal = df;
+				if (free_reserved < dt / 20)
+					free_reserved = dt / 20;
+				continue;
+			}
 			if (free_nominal > hmp->voldata.allocator_free)
 				free_nominal = hmp->voldata.allocator_free;
 			if (free_reserved < hmp->free_reserved)
