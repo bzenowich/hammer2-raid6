@@ -848,7 +848,7 @@ teardown "X7d"
 # pair failed), then scrub.
 # ----------------------------------------------------------------
 x8() {
-local mdbytes skipped full
+local mdbytes skipped full want
 setup_fresh $X_SIZE
 check_v3
 mdbytes=$(((DATA_BLK - MD_BLK) * 65536))
@@ -908,8 +908,16 @@ sysctl -w vfs.hammer2.resilver_skip_unalloc=0 > /dev/null
 if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
         "$(disk_dev $X_DISK)" > /var/tmp/x_replace.txt 2>&1; then
     full=$(sysctl -n vfs.hammer2.resilver_md_bytes)
-    if [ "${full:-0}" -ge "$mdbytes" ]; then
-        result PASS "X8b: skip_unalloc=0 copies the whole zone ($full bytes)"
+    # only the blocks the target holds a copy of (oct-review 12): all of
+    # them for disk 0, 2 of every N-1 for the others
+    if [ "$X_DISK" = 0 ]; then
+        want=$mdbytes
+    else
+        want=$((mdbytes * 2 / (NDISKS - 1)))
+    fi
+    want=$((want * 95 / 100))
+    if [ "${full:-0}" -ge "$want" ]; then
+        result PASS "X8b: skip_unalloc=0 copies the whole zone ($full bytes, at least $want)"
     else
         result FAIL "X8b: skip_unalloc=0 copied $full of $mdbytes bytes"
     fi

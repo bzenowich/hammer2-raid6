@@ -5946,7 +5946,7 @@ hammer2_chain_selfheal(hammer2_chain_t *chain, void *bdata)
 		 */
 		error = hammer2_io_metadata_mirror_heal(hmp, disk_idx,
 		    (dio->rdisk >= 0) ? dio->rdisk :
-		     hammer2_io_metadata_read_disk(hmp, dev_pbase),
+		     hammer2_io_metadata_read_disk(hmp, disk_idx, dev_pbase),
 		    dev_pbase, dio->psize, off, bref, bdata, chain->bytes);
 		if (error == 0) {
 			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);

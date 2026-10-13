@@ -15,6 +15,7 @@
 #   W write-side fault injection (vfs.hammer2.inject_wio/delay),
 #   X lifecycle (umount during resilver/scrub, ENOSPC, simd parity),
 #   Y parity scrub (row-ordered P/Q check, localise, repair),
+#   Z metadata on 3 copies (placement, any 2 failures, heal, resilver, layout 2),
 #   T slot reuse, U sub-column offsets (test hook raid6_subcol_test), V sub-column allocation (raid6_subcol_max), Q small files on sub-columns.  Run R with: sh run_all.sh R
 #
 # Environment:
@@ -65,7 +66,7 @@ run_group() {
 }
 
 # Determine which groups to run
-GROUPS="${*:-A B C D E F G H I J K L N P Q S T U V W X Y M}"
+GROUPS="${*:-A B C D E F G H I J K L N P Q S T U V W X Y Z M}"
 
 for GROUP in $GROUPS; do
     case $GROUP in
@@ -93,7 +94,8 @@ for GROUP in $GROUPS; do
     W) run_group "Group W" "$SCRIPTDIR/test_w_writefault.sh"   ;;
     X) run_group "Group X" "$SCRIPTDIR/test_x_lifecycle.sh"    ;;
     Y) run_group "Group Y" "$SCRIPTDIR/test_y_parity_scrub.sh" ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P Q R S T U V W X Y)" ;;
+    Z) run_group "Group Z" "$SCRIPTDIR/test_z_meta3copy.sh" ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P Q R S T U V W X Y Z)" ;;
     esac
 done
 

@@ -1290,7 +1290,7 @@ struct hammer2_raid_config {
 
 	/*
 	 * Stripe layout (docs/capacity.md).  A v3 volume whose rz_layout
-	 * is not HAMMER2_RZ_LAYOUT predates it and must be re-made.
+	 * is outside HAMMER2_RZ_LAYOUT_MIN..HAMMER2_RZ_LAYOUT predates it and must be re-made.
 	 */
 	uint32_t	rz_layout;	/* HAMMER2_RZ_LAYOUT */
 	uint32_t	rz_sm_pages;	/* data pages per space map copy */
@@ -1319,7 +1319,13 @@ struct hammer2_raid_config {
 
 typedef struct hammer2_raid_config hammer2_raid_config_t;
 
-#define HAMMER2_RZ_LAYOUT		2
+/*
+ * Layout 2: every disk mirrors each metadata block.  Layout 3: a metadata
+ * block has 3 copies (primary and 2 mirrors, oct-review 12).  A kernel
+ * that knows only layout 2 refuses a layout 3 array at mount.
+ */
+#define HAMMER2_RZ_LAYOUT_MIN		2
+#define HAMMER2_RZ_LAYOUT		3
 
 #define HAMMER2_VOLUME_ID_HBO	0x48414d3205172011LLU
 #define HAMMER2_VOLUME_ID_ABO	0x11201705324d4148LLU

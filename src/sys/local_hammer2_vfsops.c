@@ -75,6 +75,7 @@ int hammer2_xop_xbase;
 int hammer2_xop_mod;
 long hammer2_debug_inode;
 int hammer2_cluster_meta_read = 1;	/* physical read-ahead */
+int hammer2_md_3copy_upgrade;		/* mount: layout 2 -> 3 copies */
 int hammer2_md_read_spread = 1;		/* v3: cold metadata reads use all mirrors */
 int hammer2_cluster_data_read = 4;	/* physical read-ahead */
 int hammer2_cluster_write = 0;		/* physical write clustering */
@@ -184,6 +185,10 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
 	   &hammer2_spread_workers, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
 	   &hammer2_cluster_meta_read, 0, "");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, md_3copy_upgrade, CTLFLAG_RW,
+	   &hammer2_md_3copy_upgrade, 0,
+	   "Mount converts a layout 2 (all-disk metadata mirror) array to 3 "
+	   "copies; older kernels then refuse it");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, md_read_spread, CTLFLAG_RW,
 	   &hammer2_md_read_spread, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read, CTLFLAG_RW,
@@ -1792,6 +1797,28 @@ next_hmp:
 			hmp->raid_type = hmp->voldata.raid_config.raid_type;
 			bcopy(&hmp->voldata.raid_config, &hmp->raid_config,
 			      sizeof(hmp->raid_config));
+
+			/*
+			 * Metadata copies: 3 on layout 3, every disk on
+			 * layout 2.  A layout 2 array is converted only on
+			 * request (a layout 3 array is refused by a kernel
+			 * that predates it); the copies already on the
+			 * other disks are then simply never read.
+			 */
+			if (hmp->raid_config.rz_layout == 2 &&
+			    hammer2_md_3copy_upgrade &&
+			    !(mp->mnt_flag & MNT_RDONLY)) {
+				hmp->raid_config.rz_layout = HAMMER2_RZ_LAYOUT;
+				hmp->voldata.raid_config.rz_layout =
+				    HAMMER2_RZ_LAYOUT;
+				hmp->volsync.raid_config.rz_layout =
+				    HAMMER2_RZ_LAYOUT;
+				kprintf("hammer2: metadata converted to %d "
+				    "copies (layout %d)\n", HAMMER2_MD_COPIES,
+				    HAMMER2_RZ_LAYOUT);
+			}
+			hmp->md_ncopies = hammer2_md_ncopies(
+			    hmp->raid_config.ndisks, hmp->raid_config.rz_layout);
 
 			/*
 			 * Restore failed disk state from on-disk config.

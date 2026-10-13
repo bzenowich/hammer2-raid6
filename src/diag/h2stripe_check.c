@@ -50,7 +50,8 @@
 #define HAMMER2_NUM_VOLHDRS		4
 
 /* Space map (docs/capacity.md) */
-#define HAMMER2_RZ_LAYOUT		2
+#define HAMMER2_RZ_LAYOUT_MIN		2
+#define HAMMER2_RZ_LAYOUT		3
 #define HAMMER2_SM_MAGIC		0x48324d5053325248ULL
 #define HAMMER2_SM_PAGE_SLOTS		HAMMER2_PBUFSIZE
 
@@ -364,9 +365,9 @@ read_space_map(int ndisks, uint64_t *nslots_out)
 	memcpy(&sm_copy, volhdr + RAIDCFG_RZ_SM_COPY_OFF, 8);
 	memcpy(&gen, volhdr + RAIDCFG_RZ_SM_GEN_OFF, 8);
 
-	if (layout != HAMMER2_RZ_LAYOUT) {
-		fprintf(stderr, "stripe layout %u, this tool reads %u\n",
-		    layout, HAMMER2_RZ_LAYOUT);
+	if (layout < HAMMER2_RZ_LAYOUT_MIN || layout > HAMMER2_RZ_LAYOUT) {
+		fprintf(stderr, "stripe layout %u, this tool reads %u..%u\n",
+		    layout, HAMMER2_RZ_LAYOUT_MIN, HAMMER2_RZ_LAYOUT);
 		return NULL;
 	}
 	base = sm_off + (gen & 1) * sm_copy;

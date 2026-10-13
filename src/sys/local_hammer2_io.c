@@ -320,7 +320,7 @@ hammer2_io_meta_spread_read(hammer2_io_t *dio, hammer2_off_t dev_pbase)
 	     dio->btype != HAMMER2_BREF_TYPE_FREEMAP_LEAF)) {
 		return 0;
 	}
-	m = hammer2_io_metadata_read_disk(hmp, dev_pbase);
+	m = hammer2_io_metadata_read_disk(hmp, dio->disk_idx, dev_pbase);
 	if (m == dio->disk_idx || hmp->raid_failed[m])
 		return 0;
 	if (lockmgr(&hmp->rebuild_lk, LK_SHARED | LK_NOWAIT) != 0)
@@ -2181,13 +2181,21 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	char *patch;
 	uint64_t badhash;
 	int i;
+	int k;
 	int error;
 
 	KKASSERT(hammer2_raid6_v3(hmp));
 
 	copy = kmalloc(psize, M_HAMMER2, M_WAITOK);
-	for (i = 0; i < hmp->raid_config.ndisks; i++) {
-		if (i == bad_disk_idx)
+	for (k = 0; k < hmp->md_ncopies; k++) {
+		i = hammer2_md_copy_disk(hmp->raid_config.ndisks,
+		    hmp->md_ncopies, bad_disk_idx, dev_pbase, k);
+		/*
+		 * Skip the copy that supplied the bad bytes: the mirror a
+		 * cold read came from, else the primary.  When it was a
+		 * mirror the primary's media copy may still be good.
+		 */
+		if (i == ((alt_disk_idx >= 0) ? alt_disk_idx : bad_disk_idx))
 			continue;
 		if (hmp->raid_failed[i])
 			continue;
@@ -2216,7 +2224,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 				    (int)bytes, patch, off, (int)bytes,
 				    badhash);
 			}
-			if (hmp->raid_failed[bad_disk_idx])
+			if (i == bad_disk_idx || hmp->raid_failed[bad_disk_idx])
 				return 0;
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 			bcopy(bdata, patch, bytes);
@@ -2745,32 +2753,48 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 }
 
 /*
- * Read one chunk of the metadata mirror from any survivor, trying each
+ * The volume that holds global offset off, the primary of a metadata
+ * block there (as hammer2_get_volume() finds it, -1 for none).
+ */
+static int
+hammer2_resilver_md_prim(hammer2_dev_t *hmp, off_t off)
+{
+	hammer2_volume_t *vol;
+	int i;
+
+	for (i = 0; i < hmp->nvolumes; i++) {
+		vol = &hmp->volumes[i];
+		if (off >= (off_t)vol->offset &&
+		    off < (off_t)(vol->offset + vol->size))
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * Read one chunk of the metadata from a surviving copy, trying each
  * in turn; the serial path of the resilver's metadata copy.  Mirror
  * copies are written synchronously, so read those first (pass 0): the
  * primary's newest copy may still be a delayed write held by a DIO, and
  * read_sibling then reads the media.  Caller holds rebuild_lk exclusive.
  */
 static int
-hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx, int surv,
+hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx,
 			 off_t off, void *buf, int bytes)
 {
 	hammer2_volume_t *vol;
 	int ndisks = hmp->raid_config.ndisks;
 	int prim = -1;		/* as hammer2_get_volume() */
 	int lerror = EIO;
-	int pass, i;
+	int pass, i, k;
 
-	for (i = 0; i < hmp->nvolumes; i++) {
-		vol = &hmp->volumes[i];
-		if (off >= (off_t)vol->offset &&
-		    off < (off_t)(vol->offset + vol->size)) {
-			prim = i;
-			break;
-		}
-	}
+	prim = hammer2_resilver_md_prim(hmp, off);
+	if (prim < 0)
+		return EIO;
 	for (pass = 0; pass < 2 && lerror; pass++) {
-		for (i = surv; i < ndisks; i++) {
+		for (k = 0; k < hmp->md_ncopies; k++) {
+			i = hammer2_md_copy_disk(ndisks, hmp->md_ncopies, prim,
+			    off - hmp->volumes[prim].offset, k);
 			if (i == failed_disk_idx || hmp->raid_failed[i] ||
 			    hmp->volumes[i].dev == NULL ||
 			    hmp->volumes[i].dev->devvp == NULL ||
@@ -3103,7 +3127,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				struct buf *wbp[MD_WINDOW];
 				int wpb[MD_WINDOW];
 				size_t clen[MD_WINDOW];
-				int nch, c;
+				int nch, c, k;
 
 				/* forced unmount (hammer2_vfs_unmount) */
 				if (hmp->raid_abort) {
@@ -3118,10 +3142,20 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					hammer2_off_t coff = off;
 					size_t this_chunk;
 					size_t ci = (size_t)(off / MD_CHUNK);
+					int cprim;
 
 					off += MD_CHUNK;
 					if (amap &&
 					    (amap[ci / 8] & (1 << (ci % 8))) == 0)
+						continue;
+					/* only blocks the target holds a copy of */
+					cprim = hammer2_resilver_md_prim(hmp,
+					    mo + coff);
+					if (cprim >= 0 && !hammer2_md_is_copy(
+					    ndisks, hmp->md_ncopies, cprim,
+					    mo + coff -
+					    hmp->volumes[cprim].offset,
+					    failed_disk_idx))
 						continue;
 					this_chunk = (size_t)((ms - coff >
 					    MD_CHUNK) ? MD_CHUNK : (ms - coff));
@@ -3193,17 +3227,14 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					rbp[c] = NULL;
 					wbp[c] = NULL;
 					wpb[c] = 0;
-					prim = -1;
-					for (i = 0; i < hmp->nvolumes; i++) {
-						vol = &hmp->volumes[i];
-						if (coff >= vol->offset &&
-						    coff < vol->offset +
-							   vol->size) {
-							prim = i;
-							break;
-						}
-					}
-					for (i = surv; i < ndisks; i++) {
+					prim = hammer2_resilver_md_prim(hmp,
+					    coff);
+					for (k = 0; prim >= 0 &&
+					    k < hmp->md_ncopies; k++) {
+						i = hammer2_md_copy_disk(ndisks,
+						    hmp->md_ncopies, prim,
+						    coff - hmp->volumes[prim].
+						    offset, k);
 						if (i == failed_disk_idx ||
 						    i == prim ||
 						    hmp->raid_failed[i] ||
@@ -3242,7 +3273,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					}
 					if (lerror)
 						lerror = hammer2_resilver_md_read(
-						    hmp, failed_disk_idx, surv,
+						    hmp, failed_disk_idx,
 						    (off_t)coff,
 						    md_buf + (size_t)c * MD_CHUNK,
 						    (int)clen[c]);

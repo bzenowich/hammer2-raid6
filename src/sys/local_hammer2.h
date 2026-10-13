@@ -1325,6 +1325,7 @@ struct hammer2_dev {
 	int		mirror_pend_count;
 
 	/* RAIDZ2-native metadata zone (N-way mirror, see metadata_zone.md) */
+	int		md_ncopies;	/* v3 metadata copies (hammer2_md_ncopies) */
 	uint32_t	md_nextents;
 	hammer2_md_extent_t md_extents[HAMMER2_MD_MAX_EXTENTS];
 
@@ -1691,6 +1692,7 @@ extern int hammer2_xop_mod;
 extern long hammer2_debug_inode;
 extern int hammer2_cluster_meta_read;
 extern int hammer2_md_read_spread;
+extern int hammer2_md_3copy_upgrade;
 extern int hammer2_cluster_data_read;
 extern int hammer2_cluster_write;
 extern int hammer2_dedup_enable;
@@ -2266,7 +2268,8 @@ void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
 int hammer2_bwrite_start(struct buf *bp, int disk_idx);
 int hammer2_bwrite_wait(struct buf *bp);
-int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
+int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int primary,
+		int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
 void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 		hammer2_off_t per_disk_off, char *data, int bytes);
@@ -2281,7 +2284,8 @@ int hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 		void *dst, int bytes, int nocache);
 int hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes, int block);
-int hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, hammer2_off_t per_disk_off);
+int hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, int primary,
+		hammer2_off_t per_disk_off);
 int hammer2_io_raid6_write_nowait(struct vnode *devvp, off_t off,
 		const void *data, int bytes);
 void hammer2_io_retarget_disk(hammer2_dev_t *hmp, int disk_idx,

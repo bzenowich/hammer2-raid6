@@ -789,13 +789,15 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 }
 
 /*
- * v3 RAIDZ2-native: mirror a metadata block to every
- * surviving disk at the same per-disk byte offset.  No parity — the
- * N-way mirror is its own redundancy.
+ * v3 RAIDZ2-native: write a metadata block to its copies, at the same
+ * per-disk byte offset on each: the primary and the mirrors that
+ * hammer2_md_copy_disk() names (3 copies, or every disk on a layout 2
+ * array).  No parity — the copies are their own redundancy.
  *
+ * primary: the disk the block's dio is keyed on.
  * skip_disk_idx: if >= 0, don't write to this disk (the caller has
  * already issued the primary bdwrite/bwrite to it through the buffer
- * cache).  Pass -1 to mirror to every healthy disk.
+ * cache).  Pass -1 to write every healthy copy, the primary's included.
  *
  * The copies are started with bawrite() and not waited for; the caller
  * (the sync) gets its completion from VOP_FSYNC(MNT_WAIT) on each member,
@@ -810,10 +812,12 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
  * disk was either failed or could not be given a buffer.
  */
 int
-hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
+hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int primary,
+				 int skip_disk_idx,
 				 hammer2_off_t per_disk_off,
 				 void *data, size_t bytes)
 {
+	int k;
 	hammer2_volume_t *vol;
 	struct buf *bp;
 	int i;
@@ -826,7 +830,9 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 	/* the copies are asynchronous: keep a big queue from piling up */
 	waitrunningbufspace();
 	lockmgr(&hmp->rebuild_lk, LK_SHARED);
-	for (i = 0; i < hmp->raid_config.ndisks; i++) {
+	for (k = 0; k < hmp->md_ncopies; k++) {
+		i = hammer2_md_copy_disk(hmp->raid_config.ndisks,
+		    hmp->md_ncopies, primary, per_disk_off, k);
 		if (i == skip_disk_idx)
 			continue;
 		if (!hammer2_raid6_disk_writable(hmp, i))
@@ -998,6 +1004,7 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 		 * goes to every disk, a rebuilding one included.
 		 */
 		hammer2_io_metadata_mirror_write(hmp,
+		    mp->primary >= 0 ? mp->primary : 0,
 		    (mp->primary >= 0 && !hmp->raid_failed[mp->primary]) ?
 		    mp->primary : -1, mp->off, mp->data, mp->bytes);
 
@@ -1079,24 +1086,28 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 }
 
 /*
- * The member that serves a cold read of the metadata block at
- * per_disk_off: one per 64 KB block, round robin, so a walk of the
- * metadata zone uses every disk.  All copies are identical (see
- * hammer2_io_metadata_mirror_defer), so the choice only spreads the
- * load.
+ * The copy that serves a cold read of the metadata block at
+ * per_disk_off: one per 64 KB block, round robin over the block's
+ * copies, so a walk of the metadata zone uses every disk.  All copies
+ * are identical (see hammer2_io_metadata_mirror_defer), so the choice
+ * only spreads the load.
  */
 int
-hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, hammer2_off_t per_disk_off)
+hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, int primary,
+			      hammer2_off_t per_disk_off)
 {
-	return (int)((per_disk_off >> 16) % hmp->raid_config.ndisks);
+	return hammer2_md_copy_disk(hmp->raid_config.ndisks, hmp->md_ncopies,
+	    primary, per_disk_off,
+	    (int)((per_disk_off >> 16) % hmp->md_ncopies));
 }
 
 /*
- * v3 RAIDZ2-native: read a metadata block from a surviving mirror copy.
- * Used when the primary disk for a metadata DIO is failed.  Tries the
- * disk that hammer2_io_metadata_read_disk() names first, then the others
- * in index order, skipping skip_disk_idx and any disk marked failed or
- * closed, until one read succeeds.
+ * v3 RAIDZ2-native: read a metadata block from a surviving copy.
+ * Used when the primary disk for a metadata DIO is failed (skip_disk_idx
+ * is that primary).  Tries the copy that hammer2_io_metadata_read_disk()
+ * names first, then the others of the block in copy order, skipping
+ * skip_disk_idx and any disk marked failed or closed, until one read
+ * succeeds.  Disks that do not hold a copy of the block are never tried.
  *
  * Returns 0 on success and copies bytes into buf; EIO if no surviving
  * disk has a usable copy.
@@ -1107,6 +1118,7 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 				void *buf, size_t bytes)
 {
 	int ndisks = hmp->raid_config.ndisks;
+	int ncopies = hmp->md_ncopies;
 	int start;
 	int i;
 	int k;
@@ -1114,10 +1126,12 @@ hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 	int error;
 	int last_err = 0;
 
-	start = hammer2_io_metadata_read_disk(hmp, per_disk_off);
+	/* the primary is the disk the caller skips (it is the failed one) */
+	start = (int)((per_disk_off >> 16) % ncopies);
 	for (pass = 0; pass < 2; pass++) {
-		for (k = 0; k < ndisks; k++) {
-			i = (start + k) % ndisks;
+		for (k = 0; k < ncopies; k++) {
+			i = hammer2_md_copy_disk(ndisks, ncopies, skip_disk_idx,
+			    per_disk_off, (start + k) % ncopies);
 			if (i == skip_disk_idx)
 				continue;
 			error = hammer2_io_metadata_read_one(hmp, i,

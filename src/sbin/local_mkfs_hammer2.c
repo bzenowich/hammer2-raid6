@@ -703,6 +703,9 @@ format_hammer2(hammer2_ondisk_t *fso, hammer2_mkfs_options_t *opt, int index)
 			rc->md_extents[0].md_size = Raid6.md_size;
 
 			rc->rz_layout = HAMMER2_RZ_LAYOUT;
+			/* test knob: an array with all-disk metadata mirrors */
+			if (getenv("HAMMER2_MKFS_LAYOUT2") != NULL)
+				rc->rz_layout = HAMMER2_RZ_LAYOUT_MIN;
 			rc->rz_num_slots = Raid6.num_slots;
 			rc->rz_sm_pages = Raid6.sm_pages;
 			rc->rz_sm_off = Raid6.sm_off;
