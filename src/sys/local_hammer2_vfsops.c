@@ -129,6 +129,11 @@ long hammer2_rz_subcol_chains;
 long hammer2_rz_subcol_nofit;
 long hammer2_rz_subcol_inplace;
 long hammer2_rz_subcol_stale;
+long hammer2_scrub_pq_rows;
+long hammer2_scrub_pq_bad;
+long hammer2_scrub_pq_repaired;
+long hammer2_scrub_pq_unloc;
+long hammer2_scrub_pq_skipped;
 long hammer2_chain_allocs;
 long hammer2_limit_saved_chains;
 long hammer2_limit_dirty_chains;
@@ -328,6 +333,22 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_inplace, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_stale, CTLFLAG_RD,
 	   &hammer2_rz_subcol_stale, 0,
 	   "v3 RAID6: sub-column tickets released by a safety net (a leak)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_rows, CTLFLAG_RD,
+	   &hammer2_scrub_pq_rows, 0,
+	   "scrub parity pass: rows whose P and Q were recomputed (cumulative)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_bad, CTLFLAG_RD,
+	   &hammer2_scrub_pq_bad, 0,
+	   "scrub parity pass: rows where P or Q disagreed");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_repaired, CTLFLAG_RD,
+	   &hammer2_scrub_pq_repaired, 0,
+	   "scrub parity pass: inconsistent rows rewritten");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_unlocatable, CTLFLAG_RD,
+	   &hammer2_scrub_pq_unloc, 0,
+	   "scrub parity pass: inconsistent rows left alone (no single bad "
+	   "column, checksum conflict, or repair dropped)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_skipped, CTLFLAG_RD,
+	   &hammer2_scrub_pq_skipped, 0,
+	   "scrub parity pass: rows skipped (open, busy, unreadable)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush_short, 0,
 	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");

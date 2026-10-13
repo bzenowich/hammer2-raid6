@@ -1968,7 +1968,8 @@ hammer2_ioctl_resilver_status(hammer2_inode_t *ip, void *data)
 /*
  * Run a RAID6 scrub: walks every live DATA/DIRENT bref, verifies its
  * CHECK code against the on-disk data, and on mismatch attempts parity
- * repair.  Blocks until the walk completes.  Concurrent
+ * repair; then (unless HAMMER2_SCRUB_NOPARITY) checks P and Q of every
+ * allocated row.  Blocks until the scrub completes.  Concurrent
  * HAMMER2IOC_RAID_SCRUB_STATUS calls can poll progress.
  */
 static int
@@ -1985,7 +1986,7 @@ hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data)
 		return ENOTSUP;
 
 	/* hammer2_io_raid6_scrub() atomically serializes concurrent runs */
-	error = hammer2_io_raid6_scrub(hmp);
+	error = hammer2_io_raid6_scrub(hmp, ip->pmp, rs->flags);
 
 	rs->running		= 0;
 	rs->error		= error;
@@ -1993,6 +1994,11 @@ hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data)
 	rs->brefs_bad		= hmp->scrub_brefs_bad;
 	rs->brefs_repaired	= hmp->scrub_brefs_repaired;
 	rs->brefs_unrepairable	= hmp->scrub_brefs_unrepairable;
+	rs->rows_checked	= hmp->scrub_rows_checked;
+	rs->parity_bad		= hmp->scrub_parity_bad;
+	rs->parity_repaired	= hmp->scrub_parity_repaired;
+	rs->parity_unlocatable	= hmp->scrub_parity_unlocatable;
+	rs->rows_skipped	= hmp->scrub_rows_skipped;
 	return error;
 }
 
@@ -2018,5 +2024,10 @@ hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data)
 	rs->brefs_bad		= hmp->scrub_brefs_bad;
 	rs->brefs_repaired	= hmp->scrub_brefs_repaired;
 	rs->brefs_unrepairable	= hmp->scrub_brefs_unrepairable;
+	rs->rows_checked	= hmp->scrub_rows_checked;
+	rs->parity_bad		= hmp->scrub_parity_bad;
+	rs->parity_repaired	= hmp->scrub_parity_repaired;
+	rs->parity_unlocatable	= hmp->scrub_parity_unlocatable;
+	rs->rows_skipped	= hmp->scrub_rows_skipped;
 	return 0;
 }
