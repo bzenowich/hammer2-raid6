@@ -452,6 +452,34 @@ through `bwrite_start`/`bwrite_wait`.
 - `bdwrite` the mirror copies, or queue them for the flush. The R1 ordering already makes them durable before the header.
 - Move row sealing to an async per-mount seal path (`bwrite_start` + `biodone`, throttled by `runningbufspace`).
 
+**Step 3 measurement (async sealing; branch fix/async-seal, h2dev 4 x virtio, 2+2).** Counters
+`vfs.hammer2.rz_pq_wait_ns/_cnt` (time `write_row` waits for the P and Q writes) and
+`rz_seal_ns/_cnt` (time inside `row_io`, rebuild_lk included) are summed over all threads; test P
+prints them per workload and `tests/v3/seal_par.sh` runs N parallel writers.
+
+| workload | rows | P/Q wait | in seal | wall | wait / wall |
+|---|---|---|---|---|---|
+| P1 256 MB seq | 2048 | 366 ms | 1524 ms | 8.0 s (4.6-5.3 s in two later runs) | 4.6% (up to 7%) |
+| P1c 256 MB, LZ4 2x | 1024 | 442 ms | 710 ms | 3.7 s | 12% (one run) |
+| P2 4000 x 4 KB | 125 | 273 ms | 307 ms | 5 s | 5.5% |
+| P2c | 33 | 8 ms | 20 ms | 4 s | 0.2% |
+| 1 writer, 128 MB | 1024 | 185 ms | 449 ms | 3.25 s | 5.7% |
+| 4 writers x 64 MB | 2048 | 630 ms | 1173 ms | 3.29 s | 19% summed, 4.8% per thread |
+| 8 writers x 32 MB | 2048 | 990 ms | 1559 ms | 3.60 s | 27% summed, 3.4% per thread |
+
+Per row the wait is 0.18-0.45 ms on virtio. Wait is a thread-time sum, so it is an upper bound on
+what async sealing can win and only if the disks would otherwise sit idle: while a sealing thread
+waits, the other columns' bdwrites and other writers' rows are still in flight, so wall time is set
+by the devices. On h2dev the share is under 10% for every workload except one P1c run (12%, wall
+3.7 s; the same workload gave 3.3-3.4 s in later runs), so **the recommendation is not to build it
+here**. On the Pi the P/Q write queues behind the data columns of the same and earlier rows on a
+slow USB disk, so the absolute wait per row grows with the disk's service time; but the same holds
+for the bytes, which the devices must write either way (P1 ~18 MB/s is the USB disks' limit).
+Async sealing would only remove thread stalls, not device time, and costs the `read_sibling` raw
+fallback, scrub, resilver, bulkfree and flush interlocks that this item was blocked on. Measure on
+the Pi with `sysctl vfs.hammer2.rz_pq_wait_ns` over P1 first: build it only if the wait exceeds
+about 10% of wall *and* per-disk utilization (devstat busy) is well under 100% during P1.
+
 ### P4. All metadata reads go to disk 0 [V2]
 **Where:** `hammer2_dio_key` (`io.c:143–154`): metadata uses `vol->id`, which is always 0 because `md_extents[0]` lives in volume 0.
 

@@ -186,6 +186,23 @@ set_lz4() {
     echo "  comp: $(hammer2 stat $MNTPT 2>&1 | sed -n 2p)"
 }
 
+# Seal timing (oct-review P3 step 3): time row sealing spends in total and
+# waiting for P/Q writes, summed over all threads.  Informational.
+seal_snap() {
+    SL_W=$(sysctl -n vfs.hammer2.rz_pq_wait_ns 2>/dev/null || echo 0)
+    SL_T=$(sysctl -n vfs.hammer2.rz_seal_ns 2>/dev/null || echo 0)
+    SL_N=$(sysctl -n vfs.hammer2.rz_seal_cnt 2>/dev/null || echo 0)
+}
+# seal_report <label> <wall seconds>
+seal_report() {
+    local w t n
+    w=$(( $(sysctl -n vfs.hammer2.rz_pq_wait_ns 2>/dev/null || echo 0) - SL_W ))
+    t=$(( $(sysctl -n vfs.hammer2.rz_seal_ns 2>/dev/null || echo 0) - SL_T ))
+    n=$(( $(sysctl -n vfs.hammer2.rz_seal_cnt 2>/dev/null || echo 0) - SL_N ))
+    echo "    INFO $1 seal: $n rows, P/Q wait $((w / 1000000)) ms, in seal $((t / 1000000)) ms," \
+         "wall $2 s ($(awk -v w=$w -v s="$2" 'BEGIN { printf "%.1f", (s > 0) ? w / 1e7 / s : 0 }')% of wall)"
+}
+
 # big_write <label> <src>: P1-style write of a 256 MB file into a fresh
 # array; sets BW_COLS BW_SECS BW_MBS BW_USED_KB BW_WRT.
 big_write() {
@@ -196,6 +213,7 @@ big_write() {
     sync; sleep 2
     u0=$(used_kb)
     ds_snap /var/tmp/p_b1
+    seal_snap
     c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
     # /usr/bin/time -p gives the elapsed time to 10 ms (date has no %N).
     /usr/bin/time -p sh -c "dd if=$src of=$MNTPT/big bs=1048576 2>/dev/null; sync; sync" \
@@ -207,6 +225,7 @@ big_write() {
     BW_USED_KB=$((u1 - u0))
     BW_SECS=$(awk '$1 == "real" { print $2 }' /var/tmp/p_time.txt)
     BW_MBS=$(awk -v s="$BW_SECS" -v m=$BIG_MB 'BEGIN { printf "%.1f", (s > 0) ? m / s : 0 }')
+    seal_report "$label" "$BW_SECS"
     ds_report "$label" $((BIG_MB * 1048576)) /var/tmp/p_b1 /var/tmp/p_a1
     BW_WRT=$LAST_WRT
     echo "    $label: columns reserved +$BW_COLS, df used +$((BW_USED_KB / 1024)) MB," \
@@ -247,6 +266,8 @@ small_write() {
     c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
     r0=$(sysctl -n vfs.hammer2.rz_rewrite_slots 2>/dev/null)
     p10_snap
+    seal_snap
+    SW_T0=$(date +%s)
     # P2_SYNC_EVERY=N: a sync every N seconds during the copy, to model a
     # slow machine whose syncer runs several passes (oct-review 11.5, P2 on the Pi).
     if [ -n "$P2_SYNC_EVERY" ]; then
@@ -260,6 +281,7 @@ small_write() {
     ds_snap /var/tmp/p_a2
     SW_COLS=$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - c0 ))
     p10_report "$label"
+    seal_report "$label" $(( $(date +%s) - SW_T0 ))
     echo "    $label: columns reserved +$SW_COLS, rewrite slots +$(( $(sysctl -n vfs.hammer2.rz_rewrite_slots) - r0 ))"
     u1=$(used_kb)
     SW_USED_KB=$((u1 - u0))

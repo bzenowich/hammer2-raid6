@@ -2481,6 +2481,10 @@ extern long hammer2_rz_put_anomaly;	/* second put on an arrived column */
 extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
 extern long hammer2_rz_seal_full;	/* rows sealed when filled */
 extern long hammer2_rz_seal_flush;	/* rows sealed by a flush */
+extern long hammer2_rz_pq_wait_ns;	/* ns spent waiting for P/Q writes */
+extern long hammer2_rz_pq_wait_cnt;
+extern long hammer2_rz_seal_ns;		/* ns inside row_io, total */
+extern long hammer2_rz_seal_cnt;
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
 extern long hammer2_rz_bf_rows_freed;	/* rows freed by bulkfree, total */
 extern long hammer2_rz_bf_reclaimed;	/* referenced rows found free (must stay 0) */

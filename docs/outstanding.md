@@ -47,6 +47,9 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
   and Q writes in putblk. Moving it to an async per-mount path is
   blocked by `read_sibling`'s raw fallback, which reads the disk
   directly and would see a row whose parity is still in flight.
+  Measured on h2dev (oct-review P3 "Step 3 measurement"): the P/Q wait
+  is 3-6% of write wall time, so not worth building; re-measure on the
+  Pi with `vfs.hammer2.rz_pq_wait_ns` before deciding.
 - **P8: seal a degraded row once every writable data disk is
   allocated** (f4d39b0 on branch `fix/p8-alloc`) was deliberately not
   merged: the measured gain is about nothing. Degraded rows still stay

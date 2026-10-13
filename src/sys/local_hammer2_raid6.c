@@ -669,6 +669,7 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	uint8_t *p_mem = NULL, *q_mem = NULL;
 	uint8_t *p_dst = NULL;
 	uint8_t *q_dst = NULL;
+	struct timespec ts0, ts1;
 	int error = 0;
 	int c;
 
@@ -772,6 +773,7 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			hammer2_raid6_write_failed(hmp, q_disk, e);
 		kfree(q_mem, M_HAMMER2);
 	}
+	nanouptime(&ts0);
 	if (pbp) {
 		int e = hammer2_bwrite_wait(pbp);
 		if (e && (e = hammer2_raid6_write_failed(hmp, p_disk, e)) &&
@@ -784,6 +786,11 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		    !error)
 			error = e;
 	}
+	nanouptime(&ts1);
+	atomic_add_long(&hammer2_rz_pq_wait_ns,
+	    (long)((ts1.tv_sec - ts0.tv_sec) * 1000000000L +
+		   (ts1.tv_nsec - ts0.tv_nsec)));
+	atomic_add_long(&hammer2_rz_pq_wait_cnt, 1);
 
 	return error;
 }

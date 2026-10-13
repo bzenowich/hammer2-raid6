@@ -2120,8 +2120,10 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	int ndisks = hmp->raid_config.ndisks;
 	int nz = 0;
 	int zdisk[HAMMER2_MAX_VOLUMES];
+	struct timespec ts0, ts1;
 	int d, i;
 
+	nanouptime(&ts0);
 	/*
 	 * Hold off the resilver's copy of this slot while we write it,
 	 * and tell it the slot is done if a rebuild is running: this seal
@@ -2242,6 +2244,11 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 	if (zbuf)
 		kfree(zbuf, M_HAMMER2);
+	nanouptime(&ts1);
+	atomic_add_long(&hammer2_rz_seal_ns,
+	    (long)((ts1.tv_sec - ts0.tv_sec) * 1000000000L +
+		   (ts1.tv_nsec - ts0.tv_nsec)));
+	atomic_add_long(&hammer2_rz_seal_cnt, 1);
 }
 
 /*
