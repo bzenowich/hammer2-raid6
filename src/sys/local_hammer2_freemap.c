@@ -212,7 +212,16 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 	if (hammer2_raid6_v3(hmp) &&
 	    (bref->type == HAMMER2_BREF_TYPE_DATA ||
 	     bref->type == HAMMER2_BREF_TYPE_DIRENT)) {
-		return hammer2_raid6_stripe_alloc(hmp, chain);
+		/*
+		 * stripe_alloc returns an errno, callers want a
+		 * HAMMER2_ERROR_* code (28 decodes as a pile of other bits).
+		 */
+		error = hammer2_raid6_stripe_alloc(hmp, chain);
+		if (error == ENOSPC)
+			error = HAMMER2_ERROR_ENOSPC;
+		else if (error > 0)
+			error = HAMMER2_ERROR_EIO;
+		return error;
 	}
 
 	KKASSERT(hmp->spmp);

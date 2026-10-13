@@ -2344,6 +2344,9 @@ void hammer2_raid6_col_release(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 int hammer2_raid6_slot_is_data(hammer2_dev_t *hmp, uint64_t slot);
 void hammer2_raid6_space(hammer2_dev_t *hmp, hammer2_off_t *totalp,
 		hammer2_off_t *freep);
+void hammer2_raid6_space_split(hammer2_dev_t *hmp, hammer2_off_t *dtotalp,
+			hammer2_off_t *dfreep, hammer2_off_t *mtotalp,
+			hammer2_off_t *mfreep);
 int hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical);
