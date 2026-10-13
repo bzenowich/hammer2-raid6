@@ -1066,6 +1066,26 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
    374 -> 361, the 13 that died are columns of only 32 KB (odd) files; Q5 churn, 370 columns
    allocated, 290 live, 54 dead in held rows, 14 rows freed (was: nothing reported). The dead
    columns cannot be reused, only reported; reclaiming them needs repack, left out (11.6).
+   **P2 on the Pi: 11.7x vs 4.2x (investigated 2026-10-13, h2dev; no fix).** New counters
+   `vfs.hammer2.p10_{mf_sync,mf_maxpend,mf_blocks,mf_defers,dc_trigger,dc_stall}` (TXG flush
+   passes, MIRROR_MAXPEND early flushes, mirror blocks written, copies queued, dirty-chain
+   syncer triggers and stalls); P2/P2c print them as an INFO line. Cause: **more flush passes**,
+   driven by the dirty-chain limit (`maxvnodes/10`: 10794 on h2dev, 4710 on the Pi), not
+   MAXPEND (`mf_maxpend` is 0 in every run: only ~119 distinct metadata blocks are ever queued,
+   256 is never reached). Every pass COWs and writes again the directory indirect blocks and the
+   freemap leaf (about 56 blocks, constant) plus the inode blocks touched since the last pass,
+   to disk 0 and N-1 mirrors, about 0.4-0.5x of the 15 MB user bytes per extra pass. h2dev,
+   P2 write amp / passes / mirror blocks: limit 10794 (default) 4.8-5.7x / 4 / 122-193 (run to run); 4710 5.5x / 5 /
+   207; 3000 6.2x / 6 / 263; 1500 9.2x / 10 / 470; 800 8.1x / 22 / 304. A sync every 1-6 s during
+   the cp gave only 4-6 passes (the cp is a few seconds on the VM), 4.2-5.5x. The Pi's cp takes
+   about 30 s on slow USB, so the syncer, triggered at limit/2 = 2355 chains, runs back to back
+   (expected ~10 passes, which matches the 1500-limit run). The passes are COW-inherent and each
+   one must mirror what it commits (R1), so there is no clean way to make a pass cheaper;
+   throttling the limit-triggered syncer (a minimum pass interval) would trade memory bounds for
+   fewer passes and was not done. Recommendation: keep the 8x assert on h2dev, check
+   `mf_sync` on the Pi (expect about 10), and if it is the limit, allow ~13x for P2 on machines
+   whose `limit_dirty_chains` is below ~5000 (or raise the limit for 2 GB machines after
+   measuring chain memory); P2c is 4-6x there.
 6. **Later: sm v2 / S1 mask** and resilver/scrub skip of dead columns (P6); S3 fold-in.
 
 ### 11.6 Open questions (all decided 2026-10-12)
