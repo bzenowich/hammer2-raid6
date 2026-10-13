@@ -1643,12 +1643,12 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		if (di >= 0 && !hammer2_raid6_disk_writable(hmp, di)) {
 			/*
 			 * Not while writes to a hung member are still in the
-			 * driver: vinvalbuf would wait for their buffers.
+			 * driver (hammer2_devvp_purge() says so).  Not
+			 * vinvalbuf(): it waits for the buffers this flush
+			 * holds, and panics if a reader makes one meanwhile.
 			 */
-			if (!bio_track_active(&devvp->v_track_write) &&
-			    !bio_track_active(&devvp->v_track_read)) {
-				vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-				vinvalbuf(devvp, 0, 0, 0);
+			if (vn_lock(devvp, LK_EXCLUSIVE | LK_NOWAIT) == 0) {
+				hammer2_devvp_purge(devvp);
 				vn_unlock(devvp);
 			}
 			continue;
@@ -1782,8 +1782,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 		/*
 		 * Shared rebuild_lk, as for any writer to a member: a disk
 		 * that goes away is failed and its buffers thrown out under
-		 * the exclusive lock (hammer2_disk_gone_hmp), and a buffer
-		 * getblk() makes here meanwhile panics vinvalbuf().  Held
+		 * the exclusive lock (hammer2_disk_gone_hmp), and a write
+		 * made here meanwhile would reach the closed device.  Held
 		 * across all three phases below.
 		 *
 		 * The header must not reach any disk before every member

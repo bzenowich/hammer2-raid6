@@ -25,6 +25,9 @@
 #   X7  an interrupted resilver resumes from its committed cursor
 #       (same mount, after a remount), and a stale cursor (a write while
 #       the disk was out) is ignored
+#   X9  a member's device goes away (inject_gone) under a heavy write and
+#       metadata load, disk 0 and another: no panic, failed and closed,
+#       data intact, replace onto the same path, scrub clean
 #   X8  Phase A copies only the freemap-allocated metadata; what it
 #       skipped is never read as metadata
 #   X6  disk count: the number of vbd test disks the guest has against
@@ -53,7 +56,7 @@ x_cleanup() {
     sysctl -w vfs.hammer2.raid6_simd=1 > /dev/null 2>&1
     sysctl -w vfs.hammer2.resilver_stop_slots=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.resilver_ckpt_slots=2048 > /dev/null 2>&1
-    rm -f $CHUNK /var/tmp/x_small
+    rm -f $CHUNK /var/tmp/x_small /var/tmp/x9.on
 }
 trap x_cleanup EXIT INT TERM
 
@@ -929,7 +932,109 @@ scrub_clean "X8b"
 teardown "X8b"
 }
 
-for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8}; do
+# ----------------------------------------------------------------
+# X9: a member's device goes away under a heavy write + metadata load
+# (the Pi's disk_gone: the member is failed and its device closed, which
+# flushes and invalidates the member's buffers; a buffer made on it
+# meanwhile used to panic vinvalbuf, "flush failed").  The guest kernel
+# has no disk_gone event, so vfs.hammer2.inject_gone runs the same
+# handler for a member.  Disk 0 holds the primary of every metadata
+# block, so the dio layer's buffers are on it.  Each round: writers,
+# small-file churn and a reader run while the member is dropped after a
+# different delay; nothing may panic, the closed member must be
+# reported, the survivors' data must read back, and the array has to
+# take the disk again (replace onto the same path) and scrub clean.
+# ----------------------------------------------------------------
+x9_round() {
+    local d="$1" delay="$2" label="X9 disk $1 +${2}s" n w alive
+    setup_fresh $X_SIZE
+    check_v3
+    write_ref_data "ref"
+    mkdir $MNTPT/churn
+    kmsg_clear
+    : > /var/tmp/x9.on
+    (
+        k=0
+        while [ -e /var/tmp/x9.on ]; do
+            dd if=$CHUNK of=$MNTPT/w$((k % 6)) bs=65536 2>/dev/null
+            k=$((k + 1))
+        done
+    ) &
+    W1=$!
+    (
+        k=0
+        while [ -e /var/tmp/x9.on ]; do
+            j=0
+            while [ "$j" -lt 100 ]; do
+                echo "$k $j" > $MNTPT/churn/c$j
+                j=$((j + 1))
+            done
+            ls -l $MNTPT/churn > /dev/null
+            rm -f $MNTPT/churn/c*
+            sync
+            k=$((k + 1))
+        done
+    ) &
+    W2=$!
+    (
+        while [ -e /var/tmp/x9.on ]; do
+            cat $MNTPT/ref_a $MNTPT/ref_b > /dev/null
+            ls -lR $MNTPT > /dev/null 2>&1
+        done
+    ) &
+    W3=$!
+    [ "$delay" = 0 ] || sleep $delay
+    sysctl -w vfs.hammer2.inject_gone=$d > /dev/null
+    n=0
+    while [ "$n" -lt 150 ]; do
+        kmsg | grep "RAID6 disk $d .* is gone" | grep -q "failed and closed" &&
+            break
+        sleep 0.2
+        n=$((n + 1))
+    done
+    if [ "$n" -ge 150 ]; then
+        # the close never ends: it waits for a buffer a writer holds
+        result FAIL "$label: member not closed after 30 s (hung): $(kmsg | grep 'is gone' | tail -1)"
+        rm -f /var/tmp/x9.on
+        return 1
+    fi
+    result PASS "$label: member failed and closed under load"
+    sleep 2
+    rm -f /var/tmp/x9.on
+    wait_gone $W1 120; wait_gone $W2 120; wait_gone $W3 120
+    alive=0
+    for w in $W1 $W2 $W3; do
+        kill -0 $w 2>/dev/null && alive=1
+    done
+    if [ "$alive" = 1 ]; then
+        result FAIL "$label: the load did not finish"
+        return 1
+    fi
+    sync
+    verify_ref "$label: reference data" "ref"
+    x_fresh_disk $d
+    sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $d)" "$(disk_dev $d)" \
+            > /var/tmp/x_replace.txt 2>&1; then
+        result PASS "$label: replace onto the same path"
+    else
+        result FAIL "$label: replace failed"
+        sed 's/^/      /' /var/tmp/x_replace.txt
+    fi
+    scrub_clean "$label"
+    teardown "$label"
+}
+
+x9() {
+    local d t
+    for d in ${X9_DISKS:-0 2}; do
+        for t in ${X9_DELAYS:-0 1 2}; do
+            x9_round $d $t || return
+        done
+    done
+}
+
+for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8 x9}; do
     $t
 done
 

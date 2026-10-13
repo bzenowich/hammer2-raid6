@@ -36,6 +36,7 @@
 #include "hammer2_raid6.h"
 
 #include <sys/kthread.h>
+#include <vm/vm_object.h>
 
 #define HAMMER2_DOP_READ	1
 #define HAMMER2_DOP_NEW		2
@@ -1603,17 +1604,94 @@ hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx)
 	return hammer2_raid6_mark_failed(hmp, disk_idx, 0);
 }
 
+struct hammer2_devvp_purge_info {
+	struct vnode *vp;
+	int clean;
+};
+
+static int
+hammer2_devvp_purge_cb(struct buf *bp, void *data)
+{
+	struct hammer2_devvp_purge_info *info = data;
+
+	if (BUF_LOCK(bp, LK_EXCLUSIVE | LK_NOWAIT))
+		return 0;
+	/* clean or dirty may have changed, or the buffer moved, unlocked */
+	if (bp->b_vp != info->vp ||
+	    (info->clean && (bp->b_flags & B_DELWRI)) ||
+	    (!info->clean && (bp->b_flags & B_DELWRI) == 0)) {
+		BUF_UNLOCK(bp);
+		return 0;
+	}
+	bremfree(bp);
+	bp->b_flags |= B_INVAL | B_NOCACHE | B_RELBUF;
+	brelse(bp);
+	return 1;
+}
+
+/*
+ * Throw out the buffers of a failed member's device vnode.  Not
+ * vinvalbuf(): that sleeps for every busy buffer and panics ("flush
+ * failed") if one is created while it frees the VM pages, and both
+ * happen here.  A buffer is created on a member's devvp by dio paths that
+ * hold no rebuild_lk (cold reads, and the degraded read of the failed
+ * disk itself, which getblk()s a scratch buffer on it), and the dirty
+ * metadata buffers a chain holds across its modification stay locked
+ * until the flush that needs rebuild_lk shared has released them, so
+ * waiting for them under rebuild_lk exclusive never ends.
+ *
+ * Buffers that are busy are skipped: the dio that holds one releases it
+ * clean (putblk never writes to a failed member), and a buffer made
+ * meanwhile is clean too, as for any failed member that is closed.  Only
+ * I/O already in the driver has to be waited for before the device is
+ * closed: EAGAIN, and nothing is done.  devvp is locked.
+ */
+int
+hammer2_devvp_purge(struct vnode *devvp)
+{
+	struct hammer2_devvp_purge_info info;
+	vm_object_t object;
+	int pass;
+	int n;
+
+	/* pages under I/O are busy: page_remove would wait for the driver */
+	if (bio_track_active(&devvp->v_track_write) ||
+	    bio_track_active(&devvp->v_track_read))
+		return EAGAIN;
+
+	info.vp = devvp;
+	lwkt_gettoken(&devvp->v_token);
+	for (pass = 0; pass < 8; pass++) {
+		info.clean = 1;
+		n = RB_SCAN(buf_rb_tree, &devvp->v_rbclean_tree, NULL,
+			    hammer2_devvp_purge_cb, &info);
+		info.clean = 0;
+		n += RB_SCAN(buf_rb_tree, &devvp->v_rbdirty_tree, NULL,
+			     hammer2_devvp_purge_cb, &info);
+		if (n == 0)
+			break;
+	}
+	lwkt_reltoken(&devvp->v_token);
+
+	/* pages left in the VM object would be found by a later getblk */
+	if ((object = devvp->v_object) != NULL)
+		vm_object_page_remove(object, 0, 0, FALSE);
+	return 0;
+}
+
 /*
  * Close a failed member's device so that the driver can free it (a
  * replugged disk then comes back under its old name).  Caller holds
- * rebuild_lk exclusive: writers to the member hold it shared, and a
- * buffer getblk()ed meanwhile would make vinvalbuf() panic.
+ * rebuild_lk exclusive, which waits out the writers.  This never sleeps
+ * for a buffer (see hammer2_devvp_purge()), as the writers that would
+ * release it may be waiting for the lock.
  *
  * Returns 0 when the member was closed or already is, EBUSY when it is
  * the resilver target, ESTALE when it is not the failed member the
  * caller meant (expect_devvp, if given, is no longer its device: a
- * replace finished while the caller waited for the lock), and EINVAL
- * if it is not failed.
+ * replace finished while the caller waited for the lock), EINVAL
+ * if it is not failed, and EAGAIN if I/O to it is still in the driver
+ * or its vnode is locked (nothing was closed; try again).
  */
 int
 hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
@@ -1621,6 +1699,7 @@ hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
 {
 	hammer2_devvp_t *dev;
 	struct vnode *devvp;
+	int error;
 
 	dev = hmp->volumes[disk_idx].dev;
 	if (dev == NULL || dev->devvp == NULL)
@@ -1634,12 +1713,21 @@ hammer2_raid6_close_member_locked(hammer2_dev_t *hmp, int disk_idx,
 	if (!dev->open)
 		return 0;
 	devvp = dev->devvp;
-	vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-	vinvalbuf(devvp, 0, 0, 0);
-	VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
+
+	/*
+	 * Not vn_lock() sleeping: the syncer holds the devvp locked while
+	 * it writes its dirty buffers, which waits for a flush, which needs
+	 * rebuild_lk shared.
+	 */
+	if (vn_lock(devvp, LK_EXCLUSIVE | LK_NOWAIT) != 0)
+		return EAGAIN;
+	error = hammer2_devvp_purge(devvp);
+	if (error == 0) {
+		VOP_CLOSE(devvp, FREAD | FWRITE, NULL);
+		dev->open = 0;
+	}
 	vn_unlock(devvp);
-	dev->open = 0;
-	return 0;
+	return error;
 }
 
 int
@@ -1648,11 +1736,15 @@ hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
 {
 	int error;
 
-	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
-	error = hammer2_raid6_close_member_locked(hmp, disk_idx,
-						  expect_devvp);
-	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
-	return error;
+	for (;;) {
+		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		error = hammer2_raid6_close_member_locked(hmp, disk_idx,
+							  expect_devvp);
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		if (error != EAGAIN)
+			return error;
+		tsleep(hmp, 0, "h2close", hz / 10 + 1);
+	}
 }
 
 /*
