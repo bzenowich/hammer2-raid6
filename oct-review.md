@@ -655,9 +655,6 @@ is a design, not a tweak: compress on a small per-mount worker pool (or per CPU)
 sub-column layout stay as they are. Measure with the "write path" INFO line first (lz4 ns/block vs
 the wall time per block: 8 s / 4096 = 1.9 ms on the Pi).
 
-P2 write-amp was higher with async on in both the h2dev and the Pi run (1 run per mode each) -- also
-to explain before the default changes.
-
 *P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
 runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
 P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs
