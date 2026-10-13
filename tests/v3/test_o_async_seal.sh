@@ -374,9 +374,13 @@ setup_fresh
 check_v3
 sysctl -w vfs.hammer2.async_seal_max=2 > /dev/null
 B0=$(ctr rz_pq_bp_wait)
-mkdata o8_a 256
+# Hold each row's parity 100 ms so rows pile up whatever the disks' speed
+# (without it, fast media can drain every row before a third is sealed).
+sysctl -w vfs.hammer2.inject_pq_defer_ms=100 > /dev/null
+mkdata o8_a 64
 sha256 $MNTPT/o8_a > /var/tmp/v3_o8.txt
 sync; sync
+sysctl -w vfs.hammer2.inject_pq_defer_ms=0 > /dev/null
 if [ "$(ctr rz_pq_bp_wait)" -gt "$B0" ]; then
     result PASS "O8: writers were held by the bound ($(( $(ctr rz_pq_bp_wait) - B0 )) waits)"
 else
