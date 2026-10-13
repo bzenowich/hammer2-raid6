@@ -1108,6 +1108,16 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
    `mf_sync` on the Pi (expect about 10), and if it is the limit, allow ~13x for P2 on machines
    whose `limit_dirty_chains` is below ~5000 (or raise the limit for 2 GB machines after
    measuring chain memory); P2c is 4-6x there.
+   **Pi measured (k35, 2026-10-13):** `mf_sync` +6, `mf_maxpend` 0, `mf_blocks` +422, `dc_trigger`
+   +447, write amp 8.53x (P2c 7.10x, 6 passes, 444 blocks). So 6 passes, not 10, but about 70
+   mirror blocks per pass against about 41 on h2dev at the same limit (5 passes, 207): the slow cp
+   leaves more inode blocks dirty per pass. Over k32-k35 the Pi gave 11.7, 8.2, 8.6, 8.5x.
+   **Decided:** P2/P2c allow 12x when `limit_dirty_chains` < 5000, 8x otherwise (test_p).
+   **Next lever (not started):** metadata goes to the primary plus N-1 mirrors, 4 copies on
+   4 disks, where RAID6 needs 3 to survive any 2 failures. 3 copies (2 mirrors) cut mirror
+   writes by 1/3 on 4 disks and by 1/2 on 6 (Pi P2 about 6.5x); it needs a placement rule for
+   the two mirror disks used by write, failover read, resilver and scrub, and arrays that
+   already have all-disk mirrors stay readable (the extra copies are just ignored).
 6. **Later: sm v2 / S1 mask** and resilver/scrub skip of dead columns (P6); S3 fold-in.
 
 ### 11.6 Open questions (all decided 2026-10-12)
