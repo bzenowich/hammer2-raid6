@@ -90,6 +90,9 @@ int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
+uint32_t hammer2_inject_wio_disk_mask = 0; /* write EIO injection bitmask */
+uint32_t hammer2_inject_delay_ms_disk_mask = 0; /* late-I/O injection bitmask */
+int hammer2_inject_delay_ms = 3000;	/* ... by this many ms */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
 int hammer2_raid6_subcol_max;	/* v3: chains up to this size share a column (0 = off) */
@@ -188,6 +191,17 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_eio_autofail, CTLFLAG_RW,
 	   &hammer2_inject_eio_autofail, 0,
 	   "v3 RAID6 fault injection: 1 = an injected read EIO fails the "
 	   "disk like a real one (persisted).  Default 0.");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_wio_disk_mask, CTLFLAG_RW,
+	   &hammer2_inject_wio_disk_mask, 0,
+	   "v3 RAID6 fault injection: bitmask of disk indices whose writes "
+	   "(data, P/Q, mirror, header) complete with EIO.  Default 0.");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_delay_ms_disk_mask, CTLFLAG_RW,
+	   &hammer2_inject_delay_ms_disk_mask, 0,
+	   "v3 RAID6 fault injection: bitmask of disk indices whose reads "
+	   "and synchronous writes are issued inject_delay_ms late.");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_delay_ms, CTLFLAG_RW,
+	   &hammer2_inject_delay_ms, 0,
+	   "v3 RAID6 fault injection: delay in ms (default 3000).");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 	   &hammer2_raid6_resilver_skip_unalloc, 0,
 	   "v3 RAID6: skip unallocated stripe slots during resilver "

@@ -422,6 +422,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 
 	error = 0;
 	dev_pbase = dio->pbase - dio->dbase;
+	hammer2_inject_delay(dio->disk_idx);
 
 	/*
 	 * RAID6 degraded pre-emption: if this disk is already marked
@@ -942,7 +943,9 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					    (intmax_t)pbase);
 				}
 
-				if (dio->refs & HAMMER2_DIO_FLUSH) {
+				if (hammer2_inject_wio(dio->disk_idx)) {
+					hammer2_inject_wio_dirty(bp);
+				} else if (dio->refs & HAMMER2_DIO_FLUSH) {
 					bp->b_flags &= ~B_CLUSTEROK;
 					if ((hce = hammer2_cluster_write)
 					    != 0) {
@@ -1427,6 +1430,35 @@ hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags)
 		}
 	}
 	return 0;
+}
+
+/*
+ * Test-only: sleep like a hung disk, see inject_delay_ms_disk_mask.
+ */
+void
+hammer2_inject_delay_slow(int disk_idx)
+{
+	int ms = hammer2_inject_delay_ms;
+
+	if (disk_idx < 0 || disk_idx >= 32 || ms <= 0 ||
+	    (hammer2_inject_delay_ms_disk_mask & (1U << disk_idx)) == 0)
+		return;
+	tsleep(&hammer2_inject_delay_ms, 0, "h2injd", ms * hz / 1000 + 1);
+}
+
+/*
+ * Test-only: dirty a buffer as a failed write leaves it (B_ERROR,
+ * still B_DELWRI), for hammer2_inject_wio() on a buffer that is released
+ * with bdwrite() instead of being written.  The sync then fails the
+ * member exactly as it does for a real async write error.
+ */
+void
+hammer2_inject_wio_dirty(struct buf *bp)
+{
+	bp->b_flags &= ~(B_RELBUF | B_NOCACHE | B_CLUSTEROK);
+	bp->b_flags |= B_ERROR;
+	bp->b_error = EIO;
+	bdwrite(bp);
 }
 
 /*
@@ -2317,7 +2349,7 @@ hammer2_resilver_write_start(struct vnode *devvp, off_t off,
 			bp->b_flags |= B_RELBUF | B_DIRECT;
 		bkvasync(bp);
 		bcopy(data, bp->b_data, bytes);
-		if (hammer2_bwrite_start(bp) == 0)
+		if (hammer2_bwrite_start(bp, -1) == 0)
 			return NULL;
 		return bp;
 	}

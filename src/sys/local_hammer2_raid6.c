@@ -479,7 +479,7 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
  * the caller set B_NOCACHE, which drops them at the wait.  Returns 0 if the buffer was B_INVAL and released without a write.
  */
 int
-hammer2_bwrite_start(struct buf *bp)
+hammer2_bwrite_start(struct buf *bp, int disk_idx)
 {
 	if (bp->b_flags & B_INVAL) {
 		brelse(bp);
@@ -493,6 +493,15 @@ hammer2_bwrite_start(struct buf *bp)
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	vfs_busy_pages(bp->b_vp, bp);
 	bsetrunningbufspace(bp, bp->b_bufsize);
+	hammer2_inject_delay(disk_idx);
+	if (hammer2_inject_wio(disk_idx)) {
+		/* complete as a failed write, as a driver would */
+		bp->b_error = EIO;
+		bp->b_flags |= B_ERROR;
+		bp->b_resid = bp->b_bcount;
+		biodone(&bp->b_bio1);
+		return 1;
+	}
 	vn_strategy(bp->b_vp, &bp->b_bio1);
 	return 1;
 }
@@ -629,12 +638,12 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	if (pbp) {
 		/* parity is never read back on the normal path: drop it */
 		pbp->b_flags |= B_RELBUF | B_NOCACHE;
-		if (!hammer2_bwrite_start(pbp))
+		if (!hammer2_bwrite_start(pbp, p_disk))
 			pbp = NULL;
 	}
 	if (qbp) {
 		qbp->b_flags |= B_RELBUF | B_NOCACHE;
-		if (!hammer2_bwrite_start(qbp))
+		if (!hammer2_bwrite_start(qbp, q_disk))
 			qbp = NULL;
 	}
 	if (p_mem) {
@@ -736,7 +745,10 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		bcopy(data, bp->b_data, bytes);
 		/* only the failover read wants a mirror, and it re-reads */
 		bp->b_flags |= B_RELBUF | B_NOCACHE;
-		bawrite(bp);		/* B_INVAL: released unwritten */
+		if (hammer2_inject_wio(i))
+			hammer2_inject_wio_dirty(bp);
+		else
+			bawrite(bp);	/* B_INVAL: released unwritten */
 		ok++;
 		wrote_any = 1;
 	}

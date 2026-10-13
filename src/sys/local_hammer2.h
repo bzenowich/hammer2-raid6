@@ -2235,7 +2235,7 @@ void hammer2_raid6_datap_recov(int ndisks, size_t bytes,
 		int faila, void **ptrs);
 void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
-int hammer2_bwrite_start(struct buf *bp);
+int hammer2_bwrite_start(struct buf *bp, int disk_idx);
 int hammer2_bwrite_wait(struct buf *bp);
 int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *data, size_t bytes);
@@ -2398,6 +2398,11 @@ int hammer2_bref_check_match(const hammer2_blockref_t *bref,
  */
 extern uint32_t hammer2_inject_eio_disk_mask;
 extern int hammer2_inject_eio_autofail;
+extern uint32_t hammer2_inject_wio_disk_mask;
+extern uint32_t hammer2_inject_delay_ms_disk_mask;
+extern int hammer2_inject_delay_ms;
+void hammer2_inject_delay_slow(int disk_idx);
+void hammer2_inject_wio_dirty(struct buf *bp);
 extern int hammer2_raid6_resilver_skip_unalloc;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;
@@ -2429,6 +2434,31 @@ hammer2_inject_eio(int disk_idx)
 	if (disk_idx < 0 || disk_idx >= 32)
 		return 0;
 	return (hammer2_inject_eio_disk_mask & (1U << disk_idx)) ? EIO : 0;
+}
+
+/*
+ * Write-side injection (test only, default off).  inject_wio_disk_mask:
+ * a write that hammer2 issues to a masked disk completes with EIO
+ * instead of reaching the device.  This is done where hammer2 submits
+ * the write (putblk's data column, P/Q, zero fill, metadata mirror
+ * copy, volume header), not in the driver, so a write the buf daemon
+ * issues by itself later is not covered.  inject_delay_ms_disk_mask:
+ * hammer2's reads and synchronous writes to a masked disk are issued
+ * inject_delay_ms late, as to a hung disk.
+ */
+static __inline int
+hammer2_inject_wio(int disk_idx)
+{
+	if (disk_idx < 0 || disk_idx >= 32)
+		return 0;
+	return (hammer2_inject_wio_disk_mask & (1U << disk_idx)) ? EIO : 0;
+}
+
+static __inline void
+hammer2_inject_delay(int disk_idx)
+{
+	if (hammer2_inject_delay_ms_disk_mask != 0)
+		hammer2_inject_delay_slow(disk_idx);
 }
 
 /*
