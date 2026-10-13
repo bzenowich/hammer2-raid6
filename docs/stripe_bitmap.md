@@ -1,6 +1,7 @@
 # HAMMER2 v3 RAIDZ2-native — Stripe Bitmap On-Disk Format
 
-**Status**: Phase 0 spec. Implementation in Phase 1.
+**Status**: Historical (Phase 0 spec). The zone-41 bitmap described here was
+replaced by the stripe space map (`capacity.md`, `DEVELOPER.md` §7).
 **Cross-refs**: `newplan.md` §5.2, §5.3, §9.3, §9.4. `metadata_zone.md`.
 
 ---

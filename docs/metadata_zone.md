@@ -1,6 +1,9 @@
 # HAMMER2 v3 RAIDZ2-native — Metadata Zone On-Disk Format
 
-**Status**: Phase 0 spec. Implementation in Phase 1.
+**Status**: Historical (Phase 0 spec). Out of date on copies: since layout 3
+(2026-10-13) a metadata block has 3 copies (primary on disk 0, 2 mirrors
+from `hammer2_md_copy_disk()`), not one per disk. The current description
+is `DEVELOPER.md` §8 and `oct-review.md` §12.
 **Supersedes**: any metadata-layout text in `archive/raidz2_in_hammer2.md` §5.
 **Cross-refs**: `newplan.md` §5.3, §9.1.
 
