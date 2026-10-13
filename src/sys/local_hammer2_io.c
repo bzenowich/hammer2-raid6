@@ -1997,6 +1997,34 @@ hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
 	return error;
 }
 
+/*
+ * Start a read of one column straight from the media, without waiting.
+ * timed: the caller waits with hammer2_biowait_timed() (disk_idx is the
+ * member charged for a timeout); otherwise it waits with biowait() and
+ * relpbuf()s whatever happens.
+ */
+static struct buf *
+hammer2_pbuf_read_start(struct vnode *devvp, off_t off, int bytes,
+			int timed, int disk_idx)
+{
+	struct buf *bp;
+
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bp->b_cmd = BUF_CMD_READ;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	if (timed) {
+		hammer2_bio_timed_init(bp, 1, disk_idx);
+	} else {
+		bp->b_bio1.bio_done = biodone_sync;
+		bp->b_bio1.bio_flags |= BIO_SYNC;
+	}
+	vn_strategy(devvp, &bp->b_bio1);
+	return bp;
+}
+
 int
 hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 			      struct vnode *devvp, off_t off,
@@ -2010,20 +2038,65 @@ hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 	if (error != EWOULDBLOCK)
 		return error;
 
-	bp = getpbuf_mem(NULL);
-	KKASSERT(bytes <= bp->b_bufsize);
-	bp->b_cmd = BUF_CMD_READ;
-	bp->b_bcount = bytes;
-	bp->b_resid = bytes;
-	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1, disk_idx);
-	vn_strategy(devvp, &bp->b_bio1);
+	bp = hammer2_pbuf_read_start(devvp, off, bytes, 1, disk_idx);
 	error = hammer2_biowait_timed(bp, "h2sib");
 	if (error == ETIMEDOUT)
 		return error;	/* the buffer is the completion's now */
 	if (error == 0)
 		bcopy(bp->b_data, dst, bytes);
 	relpbuf(bp, NULL);
+	return error;
+}
+
+/*
+ * Start a write of a column, without waiting.  Never wait for a buffer
+ * (rebuild_lk may be held): use the cached one if it is free, dropping
+ * it after the write if nocache and it was not cached already, else
+ * write the media through a pbuf.  *pbufp says which kind comes back,
+ * for hammer2_col_write_wait().  NULL: nothing to wait for.
+ */
+static struct buf *
+hammer2_col_write_start(struct vnode *devvp, off_t off, const void *data,
+			int bytes, int nocache, int *pbufp)
+{
+	struct buf *bp;
+
+	*pbufp = 0;
+	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
+	if (bp) {
+		if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
+			bp->b_flags |= B_RELBUF | B_DIRECT;
+		bkvasync(bp);
+		bcopy(data, bp->b_data, bytes);
+		if (hammer2_bwrite_start(bp, -1) == 0)
+			return NULL;
+		return bp;
+	}
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bcopy(data, bp->b_data, bytes);
+	bp->b_cmd = BUF_CMD_WRITE;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	hammer2_bio_timed_init(bp, 1, -1);
+	vn_strategy(devvp, &bp->b_bio1);
+	*pbufp = 1;
+	return bp;
+}
+
+static int
+hammer2_col_write_wait(struct buf *bp, int ispbuf)
+{
+	int error;
+
+	if (bp == NULL)
+		return 0;
+	if (!ispbuf)
+		return hammer2_bwrite_wait(bp);
+	error = hammer2_biowait_timed(bp, "h2cwr");
+	if (error != ETIMEDOUT)
+		relpbuf(bp, NULL);
 	return error;
 }
 
@@ -2040,32 +2113,11 @@ hammer2_io_raid6_write_flags(struct vnode *devvp, off_t off,
 			     const void *data, int bytes, int nocache)
 {
 	struct buf *bp;
-	int error;
+	int ispbuf;
 
-	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
-	if (bp) {
-		if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
-			bp->b_flags |= B_RELBUF | B_DIRECT;
-		bkvasync(bp);
-		bcopy(data, bp->b_data, bytes);
-		if (hammer2_bwrite_start(bp, -1) == 0)
-			return 0;
-		return hammer2_bwrite_wait(bp);
-	}
-
-	bp = getpbuf_mem(NULL);
-	KKASSERT(bytes <= bp->b_bufsize);
-	bcopy(data, bp->b_data, bytes);
-	bp->b_cmd = BUF_CMD_WRITE;
-	bp->b_bcount = bytes;
-	bp->b_resid = bytes;
-	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1, -1);
-	vn_strategy(devvp, &bp->b_bio1);
-	error = hammer2_biowait_timed(bp, "h2rbw");
-	if (error != ETIMEDOUT)
-		relpbuf(bp, NULL);
-	return error;
+	bp = hammer2_col_write_start(devvp, off, data, bytes, nocache,
+				     &ispbuf);
+	return hammer2_col_write_wait(bp, ispbuf);
 }
 
 int
@@ -2449,18 +2501,7 @@ read_degraded_done:
 static struct buf *
 hammer2_resilver_read_start(struct vnode *devvp, off_t off, int bytes)
 {
-	struct buf *bp;
-
-	bp = getpbuf_mem(NULL);
-	KKASSERT(bytes <= bp->b_bufsize);
-	bp->b_cmd = BUF_CMD_READ;
-	bp->b_bcount = bytes;
-	bp->b_resid = bytes;
-	bp->b_bio1.bio_offset = off;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
-	vn_strategy(devvp, &bp->b_bio1);
-	return bp;
+	return hammer2_pbuf_read_start(devvp, off, bytes, 0, -1);
 }
 
 /* Not timed: the callers relpbuf() the buffer whatever happens. */
@@ -2468,59 +2509,6 @@ static int
 hammer2_resilver_read_wait(struct buf *bp)
 {
 	return biowait(&bp->b_bio1, "h2rsvr");
-}
-
-/*
- * Start a write of a rebuilt column to the new disk, without waiting.
- * As hammer2_io_raid6_write_flags(): never wait for a buffer (the
- * caller holds rebuild_lk exclusive), use the cached one if it is free
- * and drop it after the write if it was not cached already, else write
- * the media through a pbuf.  *pbufp says which kind comes back, for
- * hammer2_resilver_write_wait().  NULL: nothing to wait for.
- */
-static struct buf *
-hammer2_resilver_write_start(struct vnode *devvp, off_t off,
-			     const void *data, int bytes, int *pbufp)
-{
-	struct buf *bp;
-
-	*pbufp = 0;
-	bp = getblk(devvp, off, bytes, GETBLK_NOWAIT | GETBLK_KVABIO, 0);
-	if (bp) {
-		if ((bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
-			bp->b_flags |= B_RELBUF | B_DIRECT;
-		bkvasync(bp);
-		bcopy(data, bp->b_data, bytes);
-		if (hammer2_bwrite_start(bp, -1) == 0)
-			return NULL;
-		return bp;
-	}
-	bp = getpbuf_mem(NULL);
-	KKASSERT(bytes <= bp->b_bufsize);
-	bcopy(data, bp->b_data, bytes);
-	bp->b_cmd = BUF_CMD_WRITE;
-	bp->b_bcount = bytes;
-	bp->b_resid = bytes;
-	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1, -1);
-	vn_strategy(devvp, &bp->b_bio1);
-	*pbufp = 1;
-	return bp;
-}
-
-static int
-hammer2_resilver_write_wait(struct buf *bp, int ispbuf)
-{
-	int error;
-
-	if (bp == NULL)
-		return 0;
-	if (!ispbuf)
-		return hammer2_bwrite_wait(bp);
-	error = hammer2_biowait_timed(bp, "h2rsvw");
-	if (error != ETIMEDOUT)
-		relpbuf(bp, NULL);
-	return error;
 }
 
 /*
@@ -2734,11 +2722,11 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 */
 	if (error == 0) {
 		for (s = 0; s < nslots; s++)
-			wbp[s] = hammer2_resilver_write_start(new_devvp,
+			wbp[s] = hammer2_col_write_start(new_devvp,
 			    (off_t)(HAMMER2_ZONE_SEG64 + slots[s] * su),
-			    outs[s], (int)su, &wpb[s]);
+			    outs[s], (int)su, 1, &wpb[s]);
 		for (s = 0; s < nslots; s++) {
-			lerror = hammer2_resilver_write_wait(wbp[s], wpb[s]);
+			lerror = hammer2_col_write_wait(wbp[s], wpb[s]);
 			if (lerror && !error)
 				error = lerror;
 		}
@@ -3271,7 +3259,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 							relpbuf(rbp[i], NULL);
 						}
 						for (i = 0; i < c; i++)
-							hammer2_resilver_write_wait(
+							hammer2_col_write_wait(
 							    wbp[i], wpb[i]);
 						lockmgr(&hmp->rebuild_lk,
 							LK_RELEASE);
@@ -3281,14 +3269,14 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 						hmp->resilver_running = 0;
 						return EIO;
 					}
-					wbp[c] = hammer2_resilver_write_start(
+					wbp[c] = hammer2_col_write_start(
 					    new_devvp, (off_t)coff,
 					    md_buf + (size_t)c * MD_CHUNK,
-					    (int)clen[c], &wpb[c]);
+					    (int)clen[c], 1, &wpb[c]);
 				}
 				lerror = 0;
 				for (c = 0; c < nch; c++) {
-					i = hammer2_resilver_write_wait(wbp[c],
+					i = hammer2_col_write_wait(wbp[c],
 					    wpb[c]);
 					if (i && !lerror)
 						lerror = i;
@@ -3895,26 +3883,6 @@ hammer2_scrub_find_bref(struct hammer2_scrub_ctx *ctx,
 	sc->bref = *bref;
 }
 
-/*
- * Start a timed read of one column straight from the media.  Returns
- * the pbuf, to be waited for by scrub_pq_read_wait().
- */
-static struct buf *
-scrub_pq_read_start(struct vnode *devvp, off_t off, int bytes, int disk_idx)
-{
-	struct buf *bp;
-
-	bp = getpbuf_mem(NULL);
-	KKASSERT(bytes <= bp->b_bufsize);
-	bp->b_cmd = BUF_CMD_READ;
-	bp->b_bcount = bytes;
-	bp->b_resid = bytes;
-	bp->b_bio1.bio_offset = off;
-	hammer2_bio_timed_init(bp, 1, disk_idx);
-	vn_strategy(devvp, &bp->b_bio1);
-	return bp;
-}
-
 /* Returns the I/O error; the pbuf is gone after ETIMEDOUT. */
 static int
 scrub_pq_read_wait(struct buf *bp)
@@ -4477,9 +4445,9 @@ hammer2_scrub_parity(struct hammer2_scrub_ctx *ctx)
 					rslow[i] = 1;
 					continue;
 				}
-				rb[i] = scrub_pq_read_start(
+				rb[i] = hammer2_pbuf_read_start(
 				    hmp->volumes[d].dev->devvp, (off_t)off,
-				    (int)su, d);
+				    (int)su, 1, d);
 			}
 		}
 		for (s = 0; s < n; s++) {

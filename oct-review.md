@@ -627,7 +627,7 @@ a 40x limit for P2. An R1 pass count does not change this (a clean run with P1+R
 - **S-a. One mark-failed and one close-member helper** to replace four mark-failed copies and three close copies. This fixes R3 and R7 together.
 - **S-b. Layout inlines.** `slot = (off-SEG64)/unit; p = slot%n; q = (p+1)%n` is open-coded about 5 times, and the "skip P/Q round-robin" picker twice. Add `hammer2_raid6_slot()`, `_pq()`, `_lcol()` and `pick_data_disk()` in `local_hammer2_raid6.h`. A different rotation for 5–6 disks then touches one place.
 - **S-c. `hammer2_raid6_v3(hmp)` everywhere.** `raid_type == RAID6 && version >= RAIDZ2` is spelled out at about 15 sites, and `raid_type` is only ever set for v3. Move the misplaced comment at `hammer2.h:2174`.
-- **S-d. `stripe_row_refcount` is never decremented.** It is only set to 1, ++ (saturating) or 0, and only tested for ≠ 0, so it is an 8× larger bitmap, including in the persisted space map. Persist a bitmap, or repurpose the byte (S1).
+- **S-d. `stripe_row_refcount` is never decremented.** It is only set to 1, ++ (saturating) or 0, and only tested for ≠ 0, so it is an 8× larger bitmap, including in the persisted space map. Persist a bitmap, or repurpose the byte (S1). **Done (simplify-2):** the in-memory refcount array is gone; `stripe_bitmap` was already set iff refcount != 0, so it is the only state. The persisted byte per slot (v1 format) is written as 0/1 from the bitmap and read as nonzero; no format change. The 8x larger persisted map remains until S1 (`SM_VERSION` 2).
 - **S-e. Dead code:**
   - `hammer2_io_raid6_write_scratch` (no callers);
   - the `open_row_pick` prototype;
@@ -635,6 +635,7 @@ a 40x limit for P2. An R1 pass count does not change this (a clean run with P1+R
   - the `absent_data` path (if R10/U confirms it is unreachable);
   - unused `DISK_REBUILDING/SPARE/ABSENT` and `FLAG_REBUILDING` constants (either persist REBUILDING during a resilver or drop them);
   - the `raid6_pack_open_rows` bisect knob, whose 0 mode is untested.
+  - **Status (simplify-2):** all of these are already gone from the code except the `DISK_REBUILDING/SPARE/ABSENT` and `FLAG_REBUILDING` constants, kept because they document on-disk values and `src/diag/h2stripe_check.c` decodes them. Also merged: the three pbuf read starts (`read_sibling`, resilver, scrub parity pass) into `hammer2_pbuf_read_start`, and the two column write start/wait pairs (`write_flags`, resilver) into `hammer2_col_write_start/wait`.
 - **S-f. Scrub should call the self-heal helper** instead of its own weaker reconstruction (R-minor). That removes one of the three repair implementations. **Done 2026-10-12 (a05155e):** scrub calls `hammer2_raid6_selfheal_data` and waits for the repair thread (`hammer2_io_repair_drain`); the old one only reconstructed one erasure, wrote raw to a failed disk and did not check the slot. M3 (two disks corrupted) failed before (bad=96 repaired=24) and passes now. Scrub still never checks P/Q (S6).
 - **S-g. Dedup on v3.** `hammer2_io_dedup_*` run on every destroyed v3 DATA chain against the wrong (disk-0) dio, harmlessly. Return early on v3. `hammer2_io_data`/`dedup_mask` are correct only because the `(int)` cast drops the disk bits; compute the in-buffer offset explicitly.
 

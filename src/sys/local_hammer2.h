@@ -1244,10 +1244,10 @@ struct hammer2_dev {
 	uint32_t	raid_persist_pending;	/* disks to record FAILED */
 
 	/*
-	 * RAIDZ2-native space map (v3, docs/capacity.md).  The row
-	 * refcount is the persisted state: the number of live DATA/DIRENT
-	 * chains with a column in the row.  The bitmap bit is derived
-	 * (set iff refcount > 0) and is what the allocator scans.
+	 * RAIDZ2-native space map (v3, docs/capacity.md).  The bitmap bit
+	 * is set iff a live DATA/DIRENT chain has a column in the row; it
+	 * is what the allocator scans.  It is persisted as one byte per
+	 * slot (1 = in use; v1 formats may hold a count, read as nonzero).
 	 */
 	uint8_t		*stripe_bitmap;		/* in-memory bitmap: 1 bit per stripe slot */
 	size_t		stripe_bitmap_size;	/* size of stripe_bitmap in bytes */
@@ -1255,20 +1255,19 @@ struct hammer2_dev {
 	uint64_t	stripe_cursor;		/* sequential allocator cursor */
 	uint64_t	stripe_generation;	/* space map generation last written */
 	int		stripe_bitmap_invalid;	/* 1 if no valid space map copy */
-	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk + sm_dirty */
+	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + next_disk + sm_dirty */
 	u_int		stripe_next_disk;	/* round-robin data disk counter */
 	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
 	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
 	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
 	uint8_t		*stripe_data_mask;	/* bit per slot: may hold a row (not metadata) */
-	uint8_t		*stripe_row_refcount;	/* sm_npages * HAMMER2_SM_PAGE bytes */
-	uint32_t	sm_npages;		/* refcount pages per copy */
+	uint32_t	sm_npages;		/* space map pages per copy */
 	uint8_t		*sm_dirty;		/* per page: bit c = copy c stale */
 	uint32_t	*sm_crc[2];		/* per copy: CRC of each page on disk */
 
 	/*
 	 * v3 bulkfree (docs/capacity.md, Freeing).  Data slots are freed
-	 * only here: a slot with a live refcount that two consecutive
+	 * only here: a slot in use that two consecutive
 	 * passes find unreferenced, and that was not allocated during
 	 * either, is freed by the second.  Each is 1 bit per slot, except
 	 * stripe_bf_seen: 1 byte per slot, a bit per column.
