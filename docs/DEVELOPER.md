@@ -1129,7 +1129,7 @@ that runs with no arguments):
 | I | yes | forced unmount (full flush) + bulkfree afterwards; the power-loss case is `crash_host.sh` |
 | J | yes | packed-row delete + snapshot pinning (M1/6C-6D) |
 | K | yes | **scrub (M3)** — K1 clean, K2 corrupt + parity-repair, K3 concurrent writes during scrub |
-| L | yes | read-path self-heal: corrupt a column while unmounted, read, and the data is healed in memory and on disk; metadata copy trust (L4), refused-mount unwind (L6) |
+| L | yes | read-path self-heal: corrupt a column while unmounted, read, and the data is healed in memory and on disk; metadata copy trust (L4), refused-mount unwind (L6, and L7 at each of the 10 `vfs.hammer2.inject_mount_fail` points) |
 | N | yes | capacity and freeing: fill past 2 GB per disk, delete, two bulkfree passes (`docs/capacity.md`) |
 | P | yes | I/O shape with devstat (`h2devstat`): no array reads on a write, even per-disk write bytes, write amplification bounds, P5 space targets |
 | Q | yes | 4000 small files on sub-column allocation: remove half, bulkfree, degraded reads, one corrupt sub-block, same-TXG overwrite, churn counters |

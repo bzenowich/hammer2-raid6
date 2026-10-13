@@ -8,7 +8,7 @@ P5/S9 (sub-columns, on by default at 32 KB), P6 (batching, resume
 cursor, allocated-only Phase A), P8 (up to a9bd49f), P10 (flush
 counters), scrub through the self-heal helper (S-f), the row-ordered
 parity scrub (S6), write-fault injection and the lifecycle tests
-(groups W and X), the refused-mount unwind test (L6), the ENOSPC fix,
+(groups W and X), the refused-mount unwind tests (L6, L7), the ENOSPC fix,
 and metadata on 3 copies (layout 3, section 12).  What is left:
 
 ## Needs a person at the hardware (Pi)
@@ -32,10 +32,6 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
   NULL-deref and the parent walk were hardened (516f0fb);
   `tests/v3/stress_failchain.sh` (not in `run_all.sh`) ran 53 rounds
   clean. `H2_DEBUG=1 ./deploy.sh` builds with `-g` for the next dump.
-- **Refused-mount unwinds (review 7.7).** L6 covers the super-root
-  check and a missing PFS label. The space map init, space map rebuild,
-  PFS acquire and `init_volumes` unwinds share the helper but have no
-  test.
 - **Layout 3 has no way back.** Metadata is on 3 copies on new arrays;
   a layout 2 array converts with `vfs.hammer2.md_3copy_upgrade` on a RW
   mount, and a converted (or new) array is refused by a kernel that

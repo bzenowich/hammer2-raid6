@@ -96,6 +96,7 @@ uint32_t hammer2_inject_delay_ms_disk_mask = 0; /* late-I/O injection bitmask */
 int hammer2_inject_delay_ms = 3000;	/* ... by this many ms */
 uint32_t hammer2_inject_hold_ms_disk_mask = 0; /* late-completion injection */
 int hammer2_inject_hold_ms = 8000;	/* ... by this many ms */
+int hammer2_inject_mount_fail = 0;	/* fail this mount point, once */
 int hammer2_io_timeout_ms = 30000;	/* fail a member silent this long */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_resilver_ckpt_slots = 2048;	/* slots between cursor commits */
@@ -243,6 +244,10 @@ SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_hold_ms_disk_mask, CTLFLAG_RW,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_hold_ms, CTLFLAG_RW,
 	   &hammer2_inject_hold_ms, 0,
 	   "v3 RAID6 fault injection: completion hold in ms (default 8000).");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_mount_fail, CTLFLAG_RW,
+	   &hammer2_inject_mount_fail, 0,
+	   "Test only: make the Nth failure point of the next first mount "
+	   "of a device return an error (once; see hammer2_mount_inject()).");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, io_timeout_ms, CTLFLAG_RW,
 	   &hammer2_io_timeout_ms, 0,
 	   "RAID6: a member with I/O outstanding that completes none for "
@@ -1474,6 +1479,25 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
 }
 
 /*
+ * Test only: vfs.hammer2.inject_mount_fail=N makes failure point N of
+ * the first mount of a device fail once, so the unwind of each
+ * refusal can be tested.  The points, in mount order:
+ *	1 hammer2_init_devvp	2 hammer2_open_devvp	3 init_volumes
+ *	4 sm_init, nothing allocated	5 sm_init, allocated
+ *	6 space map rebuild	7 super-root lookup	8 super-root check
+ *	9 PFS label lookup	10 PFS acquire
+ */
+static int
+hammer2_mount_inject(int point)
+{
+	if (hammer2_inject_mount_fail != point)
+		return 0;
+	hammer2_inject_mount_fail = 0;
+	kprintf("hammer2_mount: injected failure at point %d\n", point);
+	return 1;
+}
+
+/*
  * f_mntfromname is MNAMELEN; a spec that does not fit is shown as
  * its first device, the count of the others, and the label.
  */
@@ -1629,6 +1653,8 @@ hammer2_vfs_mount_spec(struct mount *mp, char *path, caddr_t data,
 	 */
 	TAILQ_INIT(&devvpl);
 	error = hammer2_init_devvp(devstr, path == NULL, &devvpl);
+	if (error == 0 && hammer2_mount_inject(1))
+		error = EIO;
 	if (error) {
 		kprintf("hammer2: failed to initialize devvp in %s\n", devstr);
 		hammer2_cleanup_devvp(&devvpl);
@@ -1735,6 +1761,8 @@ next_hmp:
 		 */
 		KKASSERT(!TAILQ_EMPTY(&devvpl));
 		error = hammer2_open_devvp(&devvpl, ronly);
+		if (error == 0 && hammer2_mount_inject(2))
+			error = EIO;
 		if (error) {
 			hammer2_close_devvp(NULL, &devvpl, ronly);
 			hammer2_cleanup_devvp(&devvpl);
@@ -1750,6 +1778,8 @@ next_hmp:
 		error = hammer2_init_volumes(mp, &devvpl, hmp->volumes,
 					     &hmp->voldata, &hmp->volhdrno,
 					     &hmp->devvp);
+		if (error == 0 && hammer2_mount_inject(3))
+			error = EIO;
 		if (error) {
 			hammer2_close_devvp(NULL, &devvpl, ronly);
 			hammer2_cleanup_devvp(&devvpl);
@@ -1935,19 +1965,26 @@ next_hmp:
 			 * blockref tree.  If that fails, refuse RW mount;
 			 * RO mount stays allowed for inspection/recovery.
 			 */
-			if (hammer2_raid6_sm_init(hmp)) {
+			if (hammer2_mount_inject(4) ||
+			    hammer2_raid6_sm_init(hmp) ||
+			    hammer2_mount_inject(5)) {
 				hammer2_unmount_helper(mp, NULL, hmp);
 				lockmgr(&hammer2_mntlk, LK_RELEASE);
 				hammer2_vfs_unmount(mp, MNT_FORCE);
 				return EINVAL;
 			}
 			hammer2_raid6_sm_read(hmp);
+			if (hammer2_mount_inject(6))
+				hmp->stripe_bitmap_invalid = 2;
 			if (hmp->stripe_bitmap_invalid) {
 				int rerr;
 
 				kprintf("hammer2: space map invalid; "
 					"walking blockref tree to rebuild...\n");
-				rerr = hammer2_raid6_rebuild_stripe_bitmap(hmp);
+				if (hmp->stripe_bitmap_invalid == 2)
+					rerr = EIO;	/* injected */
+				else
+					rerr = hammer2_raid6_rebuild_stripe_bitmap(hmp);
 				if (rerr == 0) {
 					kprintf("hammer2: space map "
 						"reconstructed from blockref "
@@ -2043,6 +2080,11 @@ next_hmp:
 				      HAMMER2_SROOT_KEY, HAMMER2_SROOT_KEY,
 				      &error, 0);
 		hammer2_chain_lookup_done(parent);
+		if (schain && hammer2_mount_inject(7)) {
+			hammer2_chain_unlock(schain);
+			hammer2_chain_drop(schain);
+			schain = NULL;
+		}
 		if (schain == NULL) {
 			kprintf("hammer2_mount: invalid super-root\n");
 			hammer2_unmount_helper(mp, NULL, hmp);
@@ -2050,7 +2092,7 @@ next_hmp:
 			hammer2_vfs_unmount(mp, MNT_FORCE);
 			return EINVAL;
 		}
-		if (schain->error) {
+		if (schain->error || hammer2_mount_inject(8)) {
 			kprintf("hammer2_mount: error %s reading super-root\n",
 				hammer2_error_str(schain->error));
 			hammer2_chain_unlock(schain);
@@ -2171,6 +2213,13 @@ next_hmp:
 	}
 	hammer2_inode_unlock(spmp->iroot);
 
+	if (chain && hammer2_mount_inject(9)) {
+		hammer2_chain_unlock(chain);
+		hammer2_chain_drop(chain);
+		chain = NULL;
+		error = EIO;
+	}
+
 	/*
 	 * PFS could not be found?
 	 */
@@ -2193,7 +2242,7 @@ next_hmp:
 	 * Acquire the pmp structure (it should have already been allocated
 	 * via hammer2_update_pmps()).
 	 */
-	if (chain->error) {
+	if (chain->error || hammer2_mount_inject(10)) {
 		kprintf("hammer2_mount: PFS label I/O error\n");
 	} else {
 		ripdata = &chain->data->ipdata;
