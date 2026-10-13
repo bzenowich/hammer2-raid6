@@ -3569,6 +3569,7 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 			if (isset(hmp->stripe_bf_staged, slot)) {
 				*rc = 0;
 				clrbit(hmp->stripe_bitmap, slot);
+				hmp->rz_free_epoch++;
 				clrbit(hmp->stripe_bf_staged, slot);
 				hammer2_raid6_sm_touch(hmp, slot);
 				++nfreed;

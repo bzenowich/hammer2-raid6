@@ -3703,6 +3703,7 @@ out:
 
 struct scrub_pq_cand {
 	uint64_t	slot;
+	uint64_t	epoch;		/* hmp->rz_free_epoch when read */
 	int		kind;		/* 0: one data column, 1: P and Q */
 	int		disk;		/* kind 0: the member holding it */
 	char		*cur;		/* kind 0: column as read */
@@ -3830,23 +3831,64 @@ scrub_pq_queue(hammer2_dev_t *hmp, int disk, uint64_t slot, char *data,
 }
 
 /*
- * Wait for n queued repairs and count them: repaired if the thread did
- * the writes, else left alone.
+ * Rewrite columns of one row, n <= 2 of them, and wait for the writes.
+ * The data buffers are consumed either way.
+ *
+ * The repair thread only compares the column with the bytes the scrub
+ * read, which is not enough on its own: the row may have been freed by
+ * bulkfree and handed out again since.  So the whole thing runs under
+ * rebuild_lk exclusive, which a seal holds shared while it writes a row
+ * (no new content can land), with the row still allocated, not open and
+ * rz_free_epoch unchanged.  Bulkfree is the only thing that clears a
+ * slot bit, and a slot must be cleared before it can be allocated again,
+ * so an unchanged epoch means the row is the one that was verified.  The
+ * drain is inside the lock for the same reason.
  */
 static void
-scrub_pq_settle(struct hammer2_scrub_ctx *ctx, int n, uint64_t dropped0)
+scrub_pq_write(struct hammer2_scrub_ctx *ctx, uint64_t slot, uint64_t epoch,
+	       int n, const int *disk, char **data, const void **bad)
 {
 	hammer2_dev_t *hmp = ctx->hmp;
+	uint64_t dropped0;
+	int tries, err, i;
 
-	if (n == 0)
-		return;
-	hammer2_io_repair_drain(hmp);
-	if (hmp->repair_thread_running &&
-	    hmp->repair_writes_dropped == dropped0) {
-		ctx->pq_repaired += n;
-	} else {
-		ctx->pq_unloc += n;
+	for (tries = 0; ; tries++) {
+		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		if (hmp->rz_sealing == 0)
+			break;
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		if (tries >= 200 || hmp->raid_abort) {
+			err = EBUSY;
+			goto skip;
+		}
+		tsleep(&ctx->pq_xp, 0, "h2pqsl", hz / 100 ? hz / 100 : 1);
 	}
+	err = 0;
+	hammer2_spin_sh(&hmp->stripe_bitmap_spin);
+	if (isclr(hmp->stripe_bitmap, slot) || isset(hmp->stripe_open, slot) ||
+	    hmp->rz_free_epoch != epoch)
+		err = ESRCH;
+	hammer2_spin_unsh(&hmp->stripe_bitmap_spin);
+	if (hmp->raid_nfailed || hmp->rebuild_active)
+		err = EBUSY;
+	if (err) {
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+skip:
+		for (i = 0; i < n; i++)
+			kfree(data[i], M_HAMMER2);
+		ctx->pq_skipped++;
+		return;
+	}
+	dropped0 = hmp->repair_writes_dropped;
+	for (i = 0; i < n; i++)
+		scrub_pq_queue(hmp, disk[i], slot, data[i], bad[i]);
+	hammer2_io_repair_drain(hmp);
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	if (hmp->repair_thread_running &&
+	    hmp->repair_writes_dropped == dropped0)
+		ctx->pq_repaired++;
+	else
+		ctx->pq_unloc++;
 }
 
 /*
@@ -3873,6 +3915,7 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 	uint8_t *xq = ctx->pq_xq;
 	uint64_t mask = 0;
 	int p_disk, q_disk;
+	uint64_t epoch;
 	int tries, d, col, z, nbad, i;
 	int err = 0;
 	int bad = 0;
@@ -3895,6 +3938,7 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 		tsleep(&ctx->pq_xp, 0, "h2pqsl", hz / 100 ? hz / 100 : 1);
 	}
 	hammer2_spin_sh(&hmp->stripe_bitmap_spin);
+	epoch = hmp->rz_free_epoch;
 	if (isclr(hmp->stripe_bitmap, slot) || isset(hmp->stripe_open, slot))
 		err = ESRCH;
 	hammer2_spin_unsh(&hmp->stripe_bitmap_spin);
@@ -3918,7 +3962,8 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 		/* a seal that began while we read would have had to wait */
 		hammer2_spin_sh(&hmp->stripe_bitmap_spin);
 		if (isclr(hmp->stripe_bitmap, slot) ||
-		    isset(hmp->stripe_open, slot) || hmp->rz_sealing)
+		    isset(hmp->stripe_open, slot) || hmp->rz_sealing ||
+		    hmp->rz_free_epoch != epoch)
 			err = ESRCH;
 		hammer2_spin_unsh(&hmp->stripe_bitmap_spin);
 	}
@@ -3988,6 +4033,7 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 			struct scrub_pq_cand *c = &cands[(*ncandp)++];
 
 			c->slot = slot;
+			c->epoch = epoch;
 			c->kind = 1;
 			c->cur = c->fix = NULL;
 			c->row = kmalloc((ndisks + 2) * su, M_HAMMER2,
@@ -4010,15 +4056,17 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 	}
 	if (col == ndata || col == ndata + 1) {
 		char *np;
+		const void *old;
 
 		d = disk_of[col];
 		np = kmalloc(su, M_HAMMER2, M_WAITOK);
 		bcopy(col == ndata ? xp : xq, np, su);
-		scrub_pq_queue(hmp, d, slot, np, ctx->pq_col[d]);
+		old = ctx->pq_col[d];
 		kprintf("hammer2: scrub: row %ju %c on disk %d inconsistent, "
 		    "rewriting\n", (uintmax_t)slot, col == ndata ? 'P' : 'Q',
 		    d);
-		return 1;
+		scrub_pq_write(ctx, slot, epoch, 1, &d, &np, &old);
+		return 0;
 	}
 	/* a data column: the chains in it must agree */
 	if (*ncandp >= SCRUB_PQ_MAXBAD) {
@@ -4029,6 +4077,7 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 		struct scrub_pq_cand *c = &cands[(*ncandp)++];
 
 		c->slot = slot;
+		c->epoch = epoch;
 		c->kind = 0;
 		c->row = NULL;
 		c->disk = disk_of[col];
@@ -4043,19 +4092,20 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 
 /*
  * A row with no single bad column: if every chain in it verifies as read,
- * rewrite P and Q from its data columns.  Counts one row in *nqp if it
- * queued anything.
+ * rewrite P and Q from its data columns.
  */
 static void
 scrub_pq_fix_pq(struct hammer2_scrub_ctx *ctx, struct hammer2_scrub_ctx *fctx,
-		struct scrub_pq_cand *c, int *okp, int *nqp)
+		struct scrub_pq_cand *c, int *okp)
 {
 	hammer2_dev_t *hmp = ctx->hmp;
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
 	size_t su = rc->stripe_unit;
 	int p_disk, q_disk;
-	char *np;
+	char *np[2];
+	const void *old[2];
+	int dk[2];
 	int j;
 
 	for (j = 0; j < fctx->nfchains; j++) {
@@ -4076,13 +4126,15 @@ scrub_pq_fix_pq(struct hammer2_scrub_ctx *ctx, struct hammer2_scrub_ctx *fctx,
 	hammer2_raid6_pq(c->slot, ndisks, &p_disk, &q_disk);
 	kprintf("hammer2: scrub: row %ju P and Q rewritten from data "
 	    "(every chain verifies)\n", (uintmax_t)c->slot);
-	np = kmalloc(su, M_HAMMER2, M_WAITOK);
-	bcopy(c->row + ndisks * su, np, su);
-	scrub_pq_queue(hmp, p_disk, c->slot, np, c->row + p_disk * su);
-	np = kmalloc(su, M_HAMMER2, M_WAITOK);
-	bcopy(c->row + (ndisks + 1) * su, np, su);
-	scrub_pq_queue(hmp, q_disk, c->slot, np, c->row + q_disk * su);
-	(*nqp)++;
+	np[0] = kmalloc(su, M_HAMMER2, M_WAITOK);
+	bcopy(c->row + ndisks * su, np[0], su);
+	np[1] = kmalloc(su, M_HAMMER2, M_WAITOK);
+	bcopy(c->row + (ndisks + 1) * su, np[1], su);
+	dk[0] = p_disk;
+	dk[1] = q_disk;
+	old[0] = c->row + p_disk * su;
+	old[1] = c->row + q_disk * su;
+	scrub_pq_write(ctx, c->slot, c->epoch, 2, dk, np, old);
 }
 
 /*
@@ -4097,8 +4149,6 @@ scrub_pq_fix_data(struct hammer2_scrub_ctx *ctx, struct scrub_pq_cand *cands,
 	hammer2_dev_t *hmp = ctx->hmp;
 	struct hammer2_scrub_ctx fctx;
 	hammer2_chain_t *vsnap;
-	uint64_t dropped0;
-	int nq = 0;
 	int i, j, ok;
 
 	if (ctx->pmp)
@@ -4130,13 +4180,12 @@ scrub_pq_fix_data(struct hammer2_scrub_ctx *ctx, struct scrub_pq_cand *cands,
 		goto out;
 	}
 
-	dropped0 = hmp->repair_writes_dropped;
 	for (i = 0; i < ncand; i++) {
 		struct scrub_pq_cand *c = &cands[i];
 
 		ok = 1;
 		if (c->kind == 1) {
-			scrub_pq_fix_pq(ctx, &fctx, c, &ok, &nq);
+			scrub_pq_fix_pq(ctx, &fctx, c, &ok);
 			continue;
 		}
 		for (j = 0; j < fctx.nfchains && ok; j++) {
@@ -4163,11 +4212,14 @@ scrub_pq_fix_data(struct hammer2_scrub_ctx *ctx, struct scrub_pq_cand *cands,
 		}
 		kprintf("hammer2: scrub: row %ju data column on disk %d "
 		    "inconsistent, rewriting\n", (uintmax_t)c->slot, c->disk);
-		scrub_pq_queue(hmp, c->disk, c->slot, c->fix, c->cur);
-		c->fix = NULL;		/* the queue owns it */
-		nq++;
+		{
+			const void *old = c->cur;
+
+			scrub_pq_write(ctx, c->slot, c->epoch, 1, &c->disk,
+			    &c->fix, &old);
+		}
+		c->fix = NULL;		/* consumed */
 	}
-	scrub_pq_settle(ctx, nq, dropped0);
 out:
 	for (i = 0; i < ncand; i++) {
 		if (cands[i].cur)
@@ -4184,14 +4236,11 @@ static void
 scrub_pq_round(struct hammer2_scrub_ctx *ctx, const uint64_t *bad, int nbad)
 {
 	struct scrub_pq_cand cands[SCRUB_PQ_MAXBAD];
-	uint64_t dropped0 = ctx->hmp->repair_writes_dropped;
 	int ncand = 0;
-	int nq = 0;
 	int i;
 
 	for (i = 0; i < nbad; i++)
-		nq += scrub_pq_verify_row(ctx, bad[i], cands, &ncand);
-	scrub_pq_settle(ctx, nq, dropped0);
+		scrub_pq_verify_row(ctx, bad[i], cands, &ncand);
 	if (ncand)
 		scrub_pq_fix_data(ctx, cands, ncand);
 }

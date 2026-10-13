@@ -14,6 +14,7 @@
 #   Y6  a data column and its P in the same row, full scrub
 #   Y7  scrub concurrent with writes and deletes: no false repairs
 #   Y8  degraded array: the parity pass is skipped
+#   Y9  scrub concurrent with bulkfree, deletes and row reuse: no false repairs
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
@@ -260,6 +261,38 @@ if fail_disk 1 "Y8"; then
     [ "${Y8R:-x}" = 0 ] && result PASS "Y8: degraded, parity pass skipped (rc=$Y8RC)" ||
         result FAIL "Y8: degraded rows_checked=$Y8R"
 fi
+teardown
+
+# Y9: rows freed by bulkfree and handed out again while scrubs run.
+setup_fresh
+check_v3
+(
+    j=0
+    while [ $j -lt 12 ]; do
+        dd if=/dev/urandom of=$MNTPT/y_b$((j % 6)) bs=65536 count=24 2>/dev/null
+        sync
+        rm -f $MNTPT/y_b$(((j + 3) % 6))
+        hammer2 bulkfree $MNTPT > /dev/null 2>&1
+        hammer2 bulkfree $MNTPT > /dev/null 2>&1
+        j=$((j + 1))
+    done
+) &
+WPID=$!
+Y9OK=1
+while kill -0 $WPID 2>/dev/null; do
+    yscrub; Y9RC=$?
+    Y9R=$(yfield parity_repaired $OUT)
+    Y9U=$(yfield parity_unlocatable $OUT)
+    if [ $Y9RC != 0 ] || [ "${Y9R:-x}" != 0 ] || [ "${Y9U:-x}" != 0 ]; then
+        Y9OK=0
+        sed 's/^/      /' $OUT
+    fi
+done
+wait $WPID
+[ $Y9OK = 1 ] && result PASS "Y9: scrubs during bulkfree and row reuse, no false repairs" ||
+    result FAIL "Y9: false repair or error while bulkfree ran"
+sync; sync
+yscrub; ycheck "Y9: quiesced scrub clean" 0 pos 0 0 0 $?
 teardown
 
 summary

@@ -1310,6 +1310,7 @@ struct hammer2_dev {
 	uint32_t	rz_gen;			/* current row generation */
 	int		rz_gen_waiting;		/* flusher sleeping on open_rows */
 	volatile int	rz_sealing;		/* rows unlinked, not yet written */
+	volatile uint64_t rz_free_epoch;	/* bumped when bulkfree frees a row */
 	struct hammer2_subcol *sc_open;		/* the open sub-column, if any */
 
 	/*
