@@ -480,6 +480,142 @@ fallback, scrub, resilver, bulkfree and flush interlocks that this item was bloc
 the Pi with `sysctl vfs.hammer2.rz_pq_wait_ns` over P1 first: build it only if the wait exceeds
 about 10% of wall *and* per-disk utilization (devstat busy) is well under 100% during P1.
 
+**Step 3 measurement on the Pi (4 USB SSDs, coordinator, kernel #16 era).** The h2dev
+recommendation above does not carry over:
+
+| workload | P/Q wait | wall | share |
+|---|---|---|---|
+| P1 256 MB seq (run 1) | 2710 ms | 13.71 s | 19.8% |
+| P1 256 MB seq (run 2, 38.1 MB/s) | 2195 ms | 6.72 s | 32.7% |
+| P1c | | | 16.8% |
+| P2 | | | 5.3% |
+| P2c | | | 1.9% |
+
+A raw sequential write to all four disks in parallel runs at ~55 MB/s per disk with the CPU about
+78% idle; during P1 the array writes ~19 MB/s per disk, a third of that. Both of the build
+conditions (wait above ~10% of wall, disks well under 100%) hold, so the synchronous P/Q wait in
+the seal path is a real throughput limit on the Pi and phase 2 is built (below).
+
+**Phase 2: seal without the writer waiting for P/Q (`vfs.hammer2.async_seal`, default 0).**
+
+*What changes, and what does not.* Today `row_io` computes P/Q, starts the P, Q and zero-column
+writes (`hammer2_bwrite_start`, already asynchronous and already in flight together) and then
+`biowait`s them under `rebuild_lk` shared. Phase 2 moves only the waiting and its error handling:
+the writer starts the same writes and hands the buffers to a per-mount *parity reaper* kthread,
+which does the timed wait (`hammer2_bwrite_wait`, so R11 timeouts apply unchanged), the `brelse`,
+and `hammer2_raid6_write_failed()` for a failed member. Computing P/Q, the zero columns, the
+rebuilding-disk copies (`p_mem`, `q_mem`, `zbuf`, `dropped` columns; all `write_nowait`, waited
+inside) and `rb_wgen`/`rebuild_done` stay in the writer under `rebuild_lk`, exactly as now. With
+`async_seal=0` the code path is the old one (`write_row` = start + wait, same order, same
+counters).
+
+*Who issues, who completes.* The writer (the putblk that completes the row, or the flusher in
+`seal_all_open_rows`) issues. The reaper, one thread per mount (as the repair kthread), completes
+in registration order. biodone is not used: `write_failed` can take locks and print, which is not
+allowed in a driver completion, and a per-bio callback could not do the R11 abandon either. The
+buffers are `BUF_KERNPROC`'d by `hammer2_bio_timed_init`, so another thread may `brelse` them, as
+the abandon path already does. P/Q/zero buffers keep `B_RELBUF|B_NOCACHE` and are released by the
+reaper (so nobody else frees them); KVABIO: the reaper never touches `b_data`, and the release
+path of a KVABIO buffer does not need the mapping on the current cpu.
+
+*Per-row tracking.* One `hammer2_pq_ent` per sealed row, kmalloc'd by the writer, holds
+`phys_off`, a sequence number and the buffers with their member indices. It is put on
+`hmp->pq_list` (spinlock `pq_spin`, registration order, `pq_seq++`) **before** any P/Q work, with
+`rebuild_lk` already held shared, and removed by the reaper after the last buffer is released, which
+then sets `pq_done_seq = seq` and wakes waiters. Completion is strictly in registration order, so
+"entry E is done" is the same as `pq_done_seq >= E.seq`. The row's `rz_sealing` reference passes to the entry
+and is dropped by the reaper, so every existing `rz_sealing == 0` interlock (S6 parity scrub) now
+also means "no parity in flight".
+
+*Primitive.* `hammer2_pq_wait_slot(hmp, phys_off)`: under `pq_spin` find the highest seq among
+entries with that `phys_off` (any member: P, Q and the zero columns are all parity-side) and sleep
+until `pq_done_seq` reaches it; no pointer is kept. `hammer2_pq_drain(hmp)` waits for
+`pq_done_seq >= pq_seq` as read at the call (no starvation). Both return at once when the list is
+empty (one unlocked load).
+
+*Back-pressure.* A writer waits (on `pq_done_seq`) before registering while `pq_count >=
+vfs.hammer2.async_seal_max` (default 16 rows, so at most 16 x (P+Q+zero columns) x 64 KB, about 3 MB;
+each buffer is also under `runningbufspace` throttling through `bsetrunningbufspace`). The reaper
+never takes a lock a writer can hold and writes complete by themselves, so the wait cannot
+deadlock (the old note about a bawrite deadlock was unbounded accumulation of buffers the writer
+itself had to release; here the writer never owns them after the hand-off).
+
+*Every reader of parity, and why it is safe.*
+- `read_sibling` (and so `read_degraded_x`, self-heal reconstruction, resilver's non-batch reads):
+  calls `pq_wait_slot` for the column's offset first, **before** both the cache path and the raw
+  pbuf fallback. The fallback is the dangerous one: an in-flight parity buffer is busy, so the
+  `GETBLK_NOWAIT` fails and the raw media read would return the *old* parity. After the wait the buffer is
+  gone (NOCACHE) and the media is current. A caller may hold a DIO buf of a sibling column or
+  `rebuild_lk` exclusive while it waits: the entry's writes need neither (the writer registered under
+  `rebuild_lk` shared, so an exclusive holder only ever sees entries whose writes are already
+  issued; the reaper takes no lock). The window between unlink and registration (writer still
+  waiting for `rebuild_lk`) exists today and is not widened: such a row is not committed and no
+  committed data depends on it.
+- Scrub parity pass (S6): the batch read is unlocked and may see stale media; the existing
+  protocol (a mismatch is verified under `rebuild_lk` exclusive with `rz_sealing == 0`, re-checked
+  after the read) is unchanged and now also covers in-flight parity because the entry holds
+  `rz_sealing`. Busy parity buffers already make `scrub_pq_col_stable` send the column through the
+  cache. Repair writes happen under the same lock and condition.
+- Resilver Phase A/B and the resume cursor: every blocking `rebuild_lk` exclusive section that reads
+  survivors (window loops, replace/close in ioctl) calls `pq_drain` right after taking the lock
+  (new rows cannot start while it is held). Rows sealed after `rebuild_active` are `rebuild_done` and
+  skipped; rows sealed before it are covered by the drain, and by the sync_pmp (flush) that precedes
+  the passes. The resume cursor is written only after the pass's writes are waited; the
+  rows-below-cursor are never parity-dependent on anything in flight because a cursor reaches
+  media only in a volume header, which is after the flush drain.
+- Bulkfree freeing a row and row reuse: bulkfree only frees what no committed tree references and
+  the flush that committed the previous TXG has drained all parity, so an in-flight row is never
+  freed; and if a slot were reused while an old entry is in flight, the new P getblk waits on the
+  old busy buffer (same offset), and `pq_wait_slot` takes the max seq. `rz_free_epoch` is untouched.
+- R1 three-phase flush: after `seal_all_open_rows` (so every row of the closing generation has been
+  issued: the writers that sealed them finished their transactions, and the flusher sealed the
+  rest itself) the flush calls `pq_drain` before the first VOP_FSYNC. The three phases then run as
+  before: parity completed, FSYNC/FLUSH CACHE on every member, volume headers. A header can therefore
+  not overtake a P/Q it commits. A test-only counter `pq_hdr_violations` is bumped if the header
+  stage finds an entry registered before the flush's drain point not done.
+- Errors: the reaper calls `hammer2_raid6_write_failed(disk, err)` for each failed buffer, ETIMEDOUT
+  included, in its own context (it holds no lock; `write_failed` was never required to be called
+  under `rebuild_lk`; `close_member` and replace wait with the drain). The member is failed a little
+  later than before, but a row that sealed with a failed-pending P/Q is still committed only after
+  the drain, i.e. after the failure was recorded, and the flush then writes the headers to the
+  surviving members, as for a sync-detected failure. Redundancy-exceeded return values were already
+  ignored (`(void)write_row`).
+- Member close/replace/disk-gone: `rebuild_lk` exclusive used to wait out writers that were waiting for
+  their P/Q. The blocking takers now drain right after acquiring; the non-blocking taker (disk_gone,
+  with `hammer2_mntlk` held) lets go and retries if entries are in flight.
+- Unmount and `umount -f`: `hammer2_pq_stop` (before the repair thread stops, after nothing more
+  can seal) drains, terminates the reaper and frees leftovers; the final flush has drained already.
+  A hung member costs at most its R11 timeout per buffer, as before.
+
+*Not changed:* open-row columns, `rz_sealing` users other than the hand-off, data columns, metadata
+mirrors, layout, on-disk format.
+
+*Test hook:* `vfs.hammer2.inject_pq_defer_ms` makes the writer hand the P/Q/zero buffers over *unissued*
+and the reaper start them after that many ms, so the media holds old parity for a controlled time
+while the entry is registered. Group O uses it (plus `pq_inflight`, `pq_probe`/`pq_read` hooks)
+for the reader, flush, error and unmount races.
+
+*Error reporting decision:* the reaper must not call `auto_fail_disk` (it takes the voldata lock, which a
+reader of the same row may hold while waiting for the reaper). A failed P/Q write therefore calls
+`mark_failed(HAMMER2_FAIL_DEFER)` (in memory at once); the flush persists it (`persist_failed`) after the
+drain, before the volume header, so a member failed by the reaper is on the media before a header that
+depends on it.
+
+*Results (h2dev, x86, 4 x vbd; Pi not measured by this branch).* async_seal=0 / 1, same build:
+
+| | 0 | 1 |
+|---|---|---|
+| P1 (256 MB) | 50.6 MB/s, P/Q wait 550 ms, 10.9% of wall | 59.4 MB/s, wait 0 ms |
+| P1c | 39.4 MB/s, wait 397 ms (6.1%) | 74.0 MB/s, wait 0 ms |
+| P2 / P2c wait | 50 / 60 ms | 0 / 0 ms |
+| write-amp P1 / P1c / P2 / P2c | 2.023 / 1.018 / 3.77 / 2.22 | 2.023 / 1.015 / 5.05 / 3.62 |
+
+Write-amp for P2/P2c varies run to run with metadata flush timing (the data columns and P1/P1c are
+unchanged); the 1 run per mode is not enough to call P2 a regression. The async=0 P1c throughput target
+(>= 90% of P1) failed once on the VM (noise: 39 vs 51 MB/s); async=1 passed it.
+Group O (new, 37 checks) and A B C D F K L R W X Y Z pass with async_seal=1; see the commit message
+for counts.
+
 ### P4. All metadata reads go to disk 0 [V2]
 **Where:** `hammer2_dio_key` (`io.c:143–154`): metadata uses `vol->id`, which is always 0 because `md_extents[0]` lives in volume 0.
 

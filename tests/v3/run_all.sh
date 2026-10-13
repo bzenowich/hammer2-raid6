@@ -18,7 +18,9 @@
 #   Z metadata on 3 copies (placement, any 2 failures, heal, resilver, layout 2),
 #   T slot reuse, U sub-column offsets (test hook raid6_subcol_test),
 #   V sub-column allocation (raid6_subcol_max), Q small files on sub-columns.
+#   O async sealing (opt-in; forces vfs.hammer2.async_seal=1),
 #   Run R with: sh run_all.sh R
+#   Run any group with async sealing on: ASYNC_SEAL=1 sh run_all.sh A B
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
@@ -95,9 +97,10 @@ for GROUP in $GROUPS; do
     V) run_group "Group V" "$SCRIPTDIR/test_v_subcol_alloc.sh" ;;
     W) run_group "Group W" "$SCRIPTDIR/test_w_writefault.sh"   ;;
     X) run_group "Group X" "$SCRIPTDIR/test_x_lifecycle.sh"    ;;
+    O) run_group "Group O" "$SCRIPTDIR/test_o_async_seal.sh" ;;
     Y) run_group "Group Y" "$SCRIPTDIR/test_y_parity_scrub.sh" ;;
     Z) run_group "Group Z" "$SCRIPTDIR/test_z_meta3copy.sh" ;;
-    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N P Q R S T U V W X Y Z)" ;;
+    *) echo "Unknown group: $GROUP (valid: A B C D E F G H I J K L M N O P Q R S T U V W X Y Z)" ;;
     esac
 done
 

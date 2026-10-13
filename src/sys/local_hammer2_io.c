@@ -1741,6 +1741,8 @@ hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
 
 	for (;;) {
 		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		/* parity writes in flight to the member (async_seal) */
+		hammer2_pq_drain(hmp);
 		error = hammer2_raid6_close_member_locked(hmp, disk_idx,
 							  expect_devvp);
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
@@ -2128,6 +2130,12 @@ hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 	struct buf *bp;
 	int error;
 
+	/*
+	 * Parity (or a zero column) of a row sealed with async_seal may
+	 * still be on its way to the media; a busy buffer sends the read
+	 * below to the media, where the old bytes are.  Wait first.
+	 */
+	hammer2_pq_wait_slot(hmp, off);
 	error = hammer2_io_raid6_read_bufcache(hmp, disk_idx, devvp, off,
 					       dst, bytes, nocache);
 	if (error != EWOULDBLOCK)
@@ -3517,6 +3525,12 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		 * read a data column that is still a delayed write.
 		 */
 		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		/*
+		 * The pass reads P/Q and columns straight from the media:
+		 * rows sealed before the rebuild began may still have
+		 * parity in flight (async_seal).  No new seal can start.
+		 */
+		hammer2_pq_drain(hmp);
 		if (hmp->rebuild_done != NULL) {
 			int m = 0;
 
@@ -4932,4 +4946,82 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
 			atomic_add_int(&hmp->iofree_count, -1);
 		}
 	}
+}
+
+/*
+ * Test hook for async seal (vfs.hammer2.pq_test, group O).  Commands:
+ *   probe              the oldest row with parity in flight:
+ *                      "off=<phys> p=<disk> q=<disk> d=<a data disk>" or "none"
+ *   raw <disk> <off>   read a column straight from the media (bypasses
+ *                      the wait), result "crc=<hash>"
+ *   col <disk> <off>   read_sibling of a column (waits for parity in flight)
+ *   deg <disk> <off>   reconstruct that column from the others with P/Q
+ * col and deg also report how long they waited, in ms.
+ */
+int
+hammer2_pq_test_cmd(hammer2_dev_t *hmp, const char *cmd, char *res, size_t rlen)
+{
+	size_t su = hmp->raid_config.stripe_unit;
+	struct hammer2_pq_ent *pe;
+	struct timespec t0, t1;
+	char name[8];
+	unsigned long off;
+	uint8_t *buf;
+	int disk;
+	int error = 0;
+
+	if (strncmp(cmd, "probe", 5) == 0) {
+		int p, q, d;
+
+		hammer2_spin_sh(&hmp->pq_spin);
+		pe = TAILQ_FIRST(&hmp->pq_list);
+		if (pe == NULL) {
+			hammer2_spin_unsh(&hmp->pq_spin);
+			ksnprintf(res, rlen, "none");
+			return 0;
+		}
+		off = (unsigned long)pe->phys_off;
+		hammer2_spin_unsh(&hmp->pq_spin);
+		hammer2_raid6_pq(hammer2_raid6_slot(off, su),
+		    hmp->raid_config.ndisks, &p, &q);
+		for (d = 0; d == p || d == q; d++)
+			;
+		ksnprintf(res, rlen, "off=%lu p=%d q=%d d=%d", off, p, q, d);
+		return 0;
+	}
+	if (ksscanf(cmd, "%7s %d %lu", name, &disk, &off) != 3 ||
+	    disk < 0 || disk >= hmp->raid_config.ndisks ||
+	    hmp->volumes[disk].dev == NULL ||
+	    hmp->volumes[disk].dev->devvp == NULL)
+		return EINVAL;
+	buf = kmalloc(su, M_HAMMER2, M_WAITOK | M_ZERO);
+	nanouptime(&t0);
+	if (strcmp(name, "raw") == 0) {
+		struct buf *bp;
+
+		bp = hammer2_resilver_read_start(
+		    hmp->volumes[disk].dev->devvp, (off_t)off, (int)su);
+		error = hammer2_resilver_read_wait(bp);
+		if (error == 0)
+			bcopy(bp->b_data, buf, su);
+		relpbuf(bp, NULL);
+	} else if (strcmp(name, "col") == 0) {
+		error = hammer2_io_raid6_read_sibling(hmp, disk,
+		    hmp->volumes[disk].dev->devvp, (off_t)off, buf, (int)su, 0);
+	} else if (strcmp(name, "deg") == 0) {
+		error = hammer2_io_raid6_read_degraded(hmp, (hammer2_off_t)off,
+		    disk, buf, su, 1);
+	} else {
+		error = EINVAL;
+	}
+	nanouptime(&t1);
+	if (error == 0)
+		ksnprintf(res, rlen, "crc=%016jx waited_ms=%ld",
+		    (uintmax_t)XXH64(buf, su, 0),
+		    (long)((t1.tv_sec - t0.tv_sec) * 1000 +
+			   (t1.tv_nsec - t0.tv_nsec) / 1000000));
+	else
+		ksnprintf(res, rlen, "error=%d", error);
+	kfree(buf, M_HAMMER2);
+	return error == 0 ? 0 : EIO;
 }

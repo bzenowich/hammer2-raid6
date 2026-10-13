@@ -1390,6 +1390,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	struct vnode *devvp;
 	int flush_error = 0;
 	int fsync_error = 0;
+	uint64_t pq_seq0 = 0;
 	int total_error = 0;
 	int error;
 	int j;
@@ -1569,6 +1570,18 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	}
 
 	/*
+	 * async_seal: the rows sealed above, and by the writers of this
+	 * generation, have their P/Q writes in flight.  They must be on the
+	 * devices (and failures recorded) before the VOP_FSYNC passes below
+	 * flush the members' caches and before any volume header.
+	 */
+	if (hammer2_raid6_v3(hmp)) {
+		pq_seq0 = hmp->pq_seq;
+		hammer2_pq_drain(hmp);
+		hammer2_raid6_persist_failed(hmp);
+	}
+
+	/*
 	 * Metadata mirror copies deferred by putblk: write each block once,
 	 * before the drain and the volume header below.
 	 */
@@ -1704,6 +1717,9 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	 *
 	 * XXX synchronize the flag & data with only this flush XXX
 	 */
+	/* R1: no header before the parity it commits (must not fire) */
+	if (hammer2_raid6_v3(hmp) && hmp->pq_done_seq < pq_seq0)
+		hammer2_rz_pq_hdr_viol++;
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
 		struct buf *bp;

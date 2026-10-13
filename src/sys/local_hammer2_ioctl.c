@@ -1705,6 +1705,8 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	 */
 again:
 	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	/* parity writes of earlier seals may still be in flight (async_seal) */
+	hammer2_pq_drain(hmp);
 	if (!hmp->raid_failed[failed_disk_idx] || hmp->rebuild_active) {
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 		kprintf("hammer2: raid replace: disk %d %s\n", failed_disk_idx,
@@ -1757,6 +1759,7 @@ again:
 	error = hammer2_io_raid6_resilver(hmp, ip->pmp, failed_disk_idx, new_devvp);
 
 	lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+	hammer2_pq_drain(hmp);
 	hmp->rebuild_active = 0;
 	/* writers hold rebuild_lk shared, so rebuild_werror is final */
 	if (error == 0 && hmp->rebuild_werror)
