@@ -95,7 +95,7 @@ uint32_t hammer2_inject_delay_ms_disk_mask = 0; /* late-I/O injection bitmask */
 int hammer2_inject_delay_ms = 3000;	/* ... by this many ms */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
-int hammer2_raid6_subcol_max;	/* v3: chains up to this size share a column (0 = off) */
+int hammer2_raid6_subcol_max = 32768;	/* v3: chains up to this size share a column (0 = off) */
 int hammer2_raid6_subcol_test;	/* test hook: place chains inside their column */
 int hammer2_raid6_gen_wait_ms = 5000;	/* v3: flush wait for pending columns */
 long hammer2_rz_open_left;

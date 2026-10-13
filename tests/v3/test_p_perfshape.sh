@@ -6,21 +6,28 @@
 #   P1  256 MB of incompressible data, then sync
 #   P2  4000 files of 4 KB (compressed sub-64K blocks), then sync
 #       Each asserts: array reads <= 1 MB (new blocks are never read
-#       first), per-disk bytes written within 10% of the mean, total
-#       written <= 2.15x user bytes (4+2 parity overhead is 1.5x for
-#       the data columns, the rest is metadata).
+#       first), per-disk bytes written within 10% of the mean (P1/P1c),
+#       total written <= 2.15x user bytes (P1/P1c; 4+2 parity overhead
+#       is 1.5x for the data columns, the rest is metadata).  P2/P2c
+#       judge balance on data columns per disk instead (see below).
 #   P1c 256 MB of text-like data LZ4 halves (about 2x), then sync
 #   P2c 4000 files of 4 KB that LZ4 shrinks to about 1 KB, then sync
 #   P3  cold sequential read of the P1 file; informational only.
 #
 # P1/P1c/P2/P2c also print the columns reserved (vfs.hammer2.rz_cols_alloc),
-# the df space used and, for the big writes, the throughput, next to the
-# targets of oct-review.md 11.1 / 11.5 (sub-column allocation).  Those
-# targets fail today and are only printed; P5_ASSERT=1 turns them into
-# assertions (11.5 step 4):
+# the df space used and, for the big writes, the throughput.  The sub-column
+# targets of oct-review.md 11.1 / 11.5 are asserted (the default since
+# raid6_subcol_max = 32768, step 4):
 #   P2  write amp <= 8x, df space <= 2x user bytes
 #   P2c columns reserved <= 1/3 of P2
 #   P1c columns reserved <= 0.6x P1, throughput >= 90% of P1
+# P5_ASSERT=0 only prints them (for a kernel with raid6_subcol_max=0, or
+# when the throughput ratio is too noisy on a loaded host).
+#
+# Balance of the small-file runs is judged on DATA COLUMNS per disk (distinct
+# data columns in `hammer2 show`), not bytes: with packing, metadata (mirrors
+# on every member, primaries on disk 0) dominates the bytes written, while
+# data columns are spread exactly evenly.  The byte deviation is printed.
 #
 # Baseline before sub-column allocation (h2dev, 4 disks = 2+2, 2026-10-12;
 # the PFS shows comp lz4:default, setcomp lz4 is applied anyway):
@@ -29,8 +36,6 @@
 #   P1c    518 MB   2.03x   4096     256 MB    29.2 MB/s  (LZ4 saves nothing)
 #   P2     551 MB   35.3x   4000     256 MB (16.4x user bytes)
 #   P2c    534 MB   34.2x   4000     256 MB (same as P2)
-# Targets (not asserted): P2 amp <= 8x and df <= 2x; P2c columns <= 1333;
-# P1c columns <= 2457 and >= 90% of P1 throughput.
 # Source data is prepared outside the measured window.
 
 SCRIPTDIR=$(dirname "$0")
@@ -43,8 +48,10 @@ SMALLSRC=/var/tmp/p_small
 CMPSRC=/var/tmp/p_cmp256
 SMALLCSRC=/var/tmp/p_smallc
 BIG_MB=256
-P5_ASSERT=${P5_ASSERT:-0}
+P5_ASSERT=${P5_ASSERT:-1}
 NFILES=4000
+SMALL_AMP=8
+[ "$P5_ASSERT" = 0 ] && SMALL_AMP=45
 trap 'rm -rf $SMALLSRC $SMALLCSRC $CMPSRC' EXIT INT TERM
 
 echo "=== Group P: I/O shape (NDISKS=$NDISKS) ==="
@@ -105,9 +112,11 @@ ds_report() {
     else
         result FAIL "$label: array reads during write $rdt B (> 1 MB)"
     fi
-    if awk -v d="$dev" -v m="$maxdev" 'BEGIN { exit !(d <= m) }'; then
+    if [ "$maxdev" = info ]; then
+        echo "  INFO: $label: per-disk byte deviation $dev (metadata dominates; see data columns)"
+    elif awk -v d="$dev" -v m="$maxdev" 'BEGIN { exit !(d <= m) }'; then
         result PASS "$label: per-disk writes balanced (max deviation $dev)"
-    elif [ "$strict" = 1 ]; then
+    elif [ "$strict" = 1 ] && [ "$maxdev" != info ]; then
         result FAIL "$label: per-disk writes unbalanced (max deviation $dev > $maxdev)"
     else
         echo "  INFO: $label: per-disk writes unbalanced (max deviation $dev > $maxdev) [known, not asserted]"
@@ -123,14 +132,37 @@ ds_report() {
 
 
 # p5_target <label> <ok:0|1> <text>: a 11.1 target.  Printed always;
-# asserted only with P5_ASSERT=1 (they fail until step 4 of 11.5).
+# asserted unless P5_ASSERT=0.
 p5_target() {
     local label="$1" ok="$2" text="$3"
-    if [ "$P5_ASSERT" = 1 ]; then
+    if [ "$P5_ASSERT" != 0 ]; then
         if [ "$ok" = 1 ]; then result PASS "$label: $text"
         else result FAIL "$label: $text"; fi
     else
-        result PASS "$label: $text [target not asserted, P5_ASSERT=1]"
+        result PASS "$label: $text [target not asserted, P5_ASSERT=0]"
+    fi
+}
+
+# col_balance <label> <maxdev>: DATA columns per disk from `hammer2 show`
+# (distinct disk:column pairs; vol= is the disk).  Parity and metadata are
+# not counted.  Each disk must be within maxdev of the mean.
+col_balance() {
+    local label="$1" maxdev="$2" i out
+    hammer2 -q show $DEVSPEC 2>/dev/null |
+        awk '$1 ~ /^data\./ && $4 ~ /^vol=/ { sub(/^vol=/, "", $4); print $4, substr($2, 1, length($2) - 4) }' |
+        sort -u |
+        awk -v nd=$NDISKS '{ c[$1]++; t++ }
+            END { m = t / nd; mx = 0
+                  for (i = 0; i < nd; i++) {
+                      printf "  disk %d: %d data columns\n", i, c[i] > "/dev/stderr"
+                      d = (c[i] > m ? c[i] - m : m - c[i]) / (m ? m : 1)
+                      if (d > mx) mx = d }
+                  printf "%d %.4f\n", t, mx }' > /var/tmp/p_cb.txt
+    set -- $(cat /var/tmp/p_cb.txt)
+    if [ "${1:-0}" -gt 0 ] && awk -v d="$2" -v m="$maxdev" 'BEGIN { exit !(d <= m) }'; then
+        result PASS "$label: data columns balanced ($1 columns, max deviation $2)"
+    else
+        result FAIL "$label: data columns unbalanced or none ($1 columns, max deviation $2 > $maxdev)"
     fi
 }
 
@@ -280,15 +312,14 @@ teardown "P3"
 
 # P2: many small files
 small_write P2 $SMALLSRC
-# Every 4 KB file still costs a whole 64 KB column plus parity (oct-review
-# P5), about 32x the user bytes.  Measured 35.0-35.7x on h2dev and the Pi,
-# but once 41.3x on the Pi (kernel #20, full run: one extra syncer pass
-# during the copy rewrote metadata, +32 MB on each of disks 1-3), so the
-# limit is 45x.  Before P10 (metadata mirrors written on every dirty
-# release) it was 326x, which this still catches by a wide margin.
-# Metadata primaries all live on disk 0 (oct-review P4) and the syncer
-# rewrites them a varying number of times, so allow 25% imbalance.
-ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 45 0.25
+# With sub-column allocation (the default) 4000 x 4 KB files write about
+# 4x the user bytes; without it every file costs a whole column plus
+# parity, 35-41x (P5_ASSERT=0, raid6_subcol_max=0: limit 45x, which still
+# catches the 326x before P10).  Balance is judged on data columns (the
+# byte deviation is metadata: primaries on disk 0, mirrors everywhere,
+# syncer passes vary).
+ds_report "P2" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 $SMALL_AMP info
+col_balance P2 0.10
 P2_COLS=$SW_COLS; P2_RATIO=$LAST_RATIO
 echo "    P2: df used +$((SW_USED_KB / 1024)) MB for $((NFILES * 4 / 1024)) MB of files," \
      "space ratio $(awk -v u=$SW_USED_KB -v b=$((NFILES * 4)) 'BEGIN { printf "%.2f", u / b }')"
@@ -372,7 +403,8 @@ teardown "P2"
 # P2c: the same count of compressible files (LZ4: 4 KB -> about 1 KB).
 # Compression saves nothing on v3 today (a column per chain either way).
 small_write P2c $SMALLCSRC
-ds_report "P2c" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 45 0.25
+ds_report "P2c" $((NFILES * 4096)) /var/tmp/p_b2 /var/tmp/p_a2 1 $SMALL_AMP info
+col_balance P2c 0.10
 echo "    P2c vs P2: columns $SW_COLS vs $P2_COLS, write-amp $LAST_RATIO vs $P2_RATIO," \
      "df used +$((SW_USED_KB / 1024)) MB"
 p5_target "P2c" $(awk -v c=$SW_COLS -v p=$P2_COLS 'BEGIN { print (c <= p / 3) }') \
