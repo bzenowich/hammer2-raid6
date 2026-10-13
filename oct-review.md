@@ -1034,6 +1034,12 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
    columns of P1 and keep >= 90% of P1's throughput (the whole stream now goes through the pin). New group Q: 4000 files, remove half, bulkfree x2, remount, every file verified;
    two-disk failure with reads; corrupt one sub-block, scrub finds and repairs exactly it; overwrite
    in the same TXG (pending and closed). N and T (reuse) for capacity.
+   **Done 2026-10-12 (b6f2894, d1fa016, 993b683; merged b8cf3b8).** h2dev: P2 write amp 35x -> 4.2x,
+   columns 4000 -> 251, df 16x -> 1.44x user; P2c 63 columns, 2.96x; P1c 2048 columns (0.5x P1), 1.03x.
+   Balance is judged on data columns per disk (63/61/63/64), bytes only printed. P1c throughput on the VM
+   is above P1 (half the bytes, LZ4 cost hidden); the 90% target still has to be checked on the Pi.
+   Q5 churn (4 rounds x 1000 files): 374 columns allocated, 300 live at 25% mean occupancy, so step 5
+   matters. Pi: L K D V passed with packing on (kernel #30, sysctl) before the default changed.
 5. **Bulkfree per column** (`bf_mark`/`bf_end`), still with the v1 map (refcount byte becomes a
    bitmask of 8 data disks, or an in-memory-only mask). Test: Q after rm leaves ~50% of columns freed;
    Q churn variant (create, delete half, repeat) reports dead columns (11.6 Q5).
