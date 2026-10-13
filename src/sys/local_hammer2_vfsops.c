@@ -109,6 +109,11 @@ long hammer2_rz_gen_wait_fail;
 long hammer2_rz_seal_full;
 long hammer2_rz_seal_flush;
 long hammer2_rz_seal_flush_short;
+long hammer2_rz_bf_rows_freed;
+long hammer2_rz_bf_reclaimed;
+long hammer2_rz_bf_rows_live;
+long hammer2_rz_bf_cols_live;
+long hammer2_rz_bf_cols_dead;
 long hammer2_rz_subcol_open;
 long hammer2_rz_subcol_close;
 long hammer2_rz_subcol_chains;
@@ -251,6 +256,20 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_full, CTLFLAG_RD,
 	   "v3 RAID6: rows sealed by the put that filled them");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush, 0, "v3 RAID6: rows sealed by a flush");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_bf_rows_freed, CTLFLAG_RD,
+	   &hammer2_rz_bf_rows_freed, 0, "v3 RAID6: rows freed by bulkfree");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_bf_reclaimed, CTLFLAG_RD,
+	   &hammer2_rz_bf_reclaimed, 0,
+	   "v3 RAID6: referenced rows bulkfree found free (must be 0)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_bf_rows_live, CTLFLAG_RD,
+	   &hammer2_rz_bf_rows_live, 0,
+	   "v3 RAID6: rows the last bulkfree pass found referenced");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_bf_cols_live, CTLFLAG_RD,
+	   &hammer2_rz_bf_cols_live, 0,
+	   "v3 RAID6: columns with a live chain, last bulkfree pass");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_bf_cols_dead, CTLFLAG_RD,
+	   &hammer2_rz_bf_cols_dead, 0,
+	   "v3 RAID6: dead columns held in referenced rows, last pass");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_open, CTLFLAG_RD,
 	   &hammer2_rz_subcol_open, 0, "v3 RAID6: sub-columns opened");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_subcol_close, CTLFLAG_RD,

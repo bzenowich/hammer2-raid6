@@ -1630,7 +1630,7 @@ hammer2_raid6_sm_init(hammer2_dev_t *hmp)
 				 M_HAMMER2, M_WAITOK | M_ZERO);
 	hmp->sm_crc[1] = kmalloc((size_t)npages * sizeof(uint32_t),
 				 M_HAMMER2, M_WAITOK | M_ZERO);
-	hmp->stripe_bf_seen = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
+	hmp->stripe_bf_seen = kmalloc((size_t)nslots, M_HAMMER2,
 				      M_WAITOK | M_ZERO);
 	hmp->stripe_bf_new = kmalloc(hmp->stripe_bitmap_size, M_HAMMER2,
 				     M_WAITOK | M_ZERO);
@@ -3383,11 +3383,25 @@ hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain)
  *
  * The staged set is in memory only; after a remount the first pass
  * stages again.
+ *
+ * Liveness is kept per column.  The space map stays per row (one
+ * refcount byte per slot, v1 format, unchanged), because a sealed row's
+ * P/Q cover all its columns and a dead column cannot be reused without
+ * a read-modify-write; so a row is freed when no column of it is live,
+ * exactly as before.  Several chains share a column (sub-columns), and
+ * the column, hence the row, stays until the last of them is gone: the
+ * scan ORs a bit per column (the chain's disk, copyid) into
+ * stripe_bf_seen[slot], and a chain dying only drops out of the next
+ * scan.  The mask is rebuilt by every scan and never written to disk,
+ * so a crash cannot leave it stale and the on-disk map keeps its meaning
+ * for an older kernel.  It gives the count of live and dead columns
+ * (vfs.hammer2.rz_bf_*) and is what a later resilver or scrub can use to
+ * skip dead columns.
  */
 void
 hammer2_raid6_bf_begin(hammer2_dev_t *hmp)
 {
-	bzero(hmp->stripe_bf_seen, hmp->stripe_bitmap_size);
+	bzero(hmp->stripe_bf_seen, (size_t)hmp->stripe_num_slots);
 	hammer2_spin_ex(&hmp->stripe_bitmap_spin);
 	bzero(hmp->stripe_bf_new, hmp->stripe_bitmap_size);
 	hmp->stripe_bf_active = 1;
@@ -3407,7 +3421,7 @@ hammer2_raid6_bf_mark(hammer2_dev_t *hmp, const hammer2_blockref_t *bref)
 
 	if (!hammer2_raid6_bref_slot(hmp, bref, &slot))
 		return 0;
-	setbit(hmp->stripe_bf_seen, slot);
+	hmp->stripe_bf_seen[slot] |= HAMMER2_RAID6_BF_COLBIT(bref->copyid);
 	return 1;
 }
 
@@ -3426,6 +3440,8 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 	long nfreed = 0;
 	long nstaged = 0;
 	long nfixed = 0;
+	long nrows = 0;
+	long ncols = 0;
 
 	if (hmp->stripe_bf_complete == 0) {
 		hammer2_spin_ex(&hmp->stripe_bitmap_spin);
@@ -3451,9 +3467,14 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 			 */
 			if (isset(hmp->stripe_open, slot))
 				continue;
-			if (isset(hmp->stripe_bf_seen, slot) ||
+			if (hmp->stripe_bf_seen[slot] ||
 			    isset(hmp->stripe_bf_new, slot)) {
 				clrbit(hmp->stripe_bf_staged, slot);
+				if (hmp->stripe_bf_seen[slot]) {
+					++nrows;
+					ncols += bitcount32(
+					    hmp->stripe_bf_seen[slot]);
+				}
 				/*
 				 * Referenced by the committed tree but
 				 * free in the map: take it back.
@@ -3490,6 +3511,20 @@ hammer2_raid6_bf_end(hammer2_dev_t *hmp)
 	hmp->stripe_used_ticks = 0;
 	hammer2_spin_unex(&hmp->stripe_bitmap_spin);
 
+	/*
+	 * A row referenced by the committed tree holds ndata columns, of
+	 * which popcount(mask) are live.  The others are dead: no chain
+	 * is in them (or the row was sealed short), and they stay held
+	 * until the row's last live column dies (no hole reuse, 11.6).
+	 */
+	hammer2_rz_bf_rows_freed += nfreed;
+	hammer2_rz_bf_reclaimed += nfixed;
+	hammer2_rz_bf_rows_live = nrows;
+	hammer2_rz_bf_cols_live = ncols;
+	hammer2_rz_bf_cols_dead =
+	    nrows * (long)hmp->raid_config.ndata - ncols;
 	kprintf("hammer2: v3 bulkfree: %ld rows freed, %ld staged, "
-		"%ld reclaimed\n", nfreed, nstaged, nfixed);
+		"%ld reclaimed; %ld rows live, %ld columns live, "
+		"%ld dead\n", nfreed, nstaged, nfixed, nrows, ncols,
+		hammer2_rz_bf_cols_dead);
 }

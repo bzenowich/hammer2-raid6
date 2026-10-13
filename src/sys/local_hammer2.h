@@ -1269,9 +1269,10 @@ struct hammer2_dev {
 	 * v3 bulkfree (docs/capacity.md, Freeing).  Data slots are freed
 	 * only here: a slot with a live refcount that two consecutive
 	 * passes find unreferenced, and that was not allocated during
-	 * either, is freed by the second.  Each is 1 bit per slot.
+	 * either, is freed by the second.  Each is 1 bit per slot, except
+	 * stripe_bf_seen: 1 byte per slot, a bit per column.
 	 */
-	uint8_t		*stripe_bf_seen;	/* referenced in this pass's scan */
+	uint8_t		*stripe_bf_seen;	/* per slot: columns (disk & 7) the scan found live */
 	uint8_t		*stripe_bf_new;		/* allocated during this pass */
 	uint8_t		*stripe_bf_staged;	/* unreferenced in the last pass */
 	uint8_t		*stripe_open;		/* slot has an open row (bit per slot) */
@@ -2220,6 +2221,8 @@ int  hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp);
 void hammer2_raid6_sm_dirty_all(hammer2_dev_t *hmp);
 int  hammer2_raid6_rebuild_stripe_bitmap(hammer2_dev_t *hmp);
 int  hammer2_raid6_stripe_alloc(hammer2_dev_t *hmp, hammer2_chain_t *chain);
+/* bit of a column (its disk index; arrays over 8 disks alias, which only over-counts live) */
+#define HAMMER2_RAID6_BF_COLBIT(disk)	((uint8_t)(1U << ((disk) & 7)))
 void hammer2_raid6_bf_begin(hammer2_dev_t *hmp);
 int  hammer2_raid6_bf_mark(hammer2_dev_t *hmp, const hammer2_blockref_t *bref);
 void hammer2_raid6_bf_end(hammer2_dev_t *hmp);
@@ -2421,6 +2424,11 @@ extern long hammer2_rz_gen_wait_fail;	/* flushes failed by a gen wait */
 extern long hammer2_rz_seal_full;	/* rows sealed when filled */
 extern long hammer2_rz_seal_flush;	/* rows sealed by a flush */
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
+extern long hammer2_rz_bf_rows_freed;	/* rows freed by bulkfree, total */
+extern long hammer2_rz_bf_reclaimed;	/* referenced rows found free (must stay 0) */
+extern long hammer2_rz_bf_rows_live;	/* last pass: rows the tree references */
+extern long hammer2_rz_bf_cols_live;	/* last pass: columns with a live chain */
+extern long hammer2_rz_bf_cols_dead;	/* last pass: dead columns in those rows */
 extern long hammer2_rz_subcol_open;	/* sub-columns opened */
 extern long hammer2_rz_subcol_close;	/* sub-columns closed (pin dropped) */
 extern long hammer2_rz_subcol_chains;	/* chains placed in a sub-column */

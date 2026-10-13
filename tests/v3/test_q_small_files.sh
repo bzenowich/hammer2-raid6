@@ -12,8 +12,13 @@
 #   Q4  overwrite in the same TXG (the chain's column still pending) and
 #       in the next (closed): same size, smaller, bigger
 #   Q5  churn: create, remove half, bulkfree x2, repeat.  REPORTS the
-#       columns allocated, live and partially live; not asserted (bulkfree
-#       per column is step 5 of 11.5, 11.6 Q5)
+#       columns allocated, live and partially live, and the kernel's live
+#       and dead column counts (rz_bf_*); asserted only for sanity (11.6 Q5)
+#   Q6  two batches in separate TXGs, remove one whole batch: bulkfree
+#       leaves ~50% of the live columns (rz_bf_cols_live) and frees rows,
+#       survivors verified.  Q1 removes every other file instead, so every
+#       column keeps a live chain: only the columns of nothing but 32 KB
+#       (odd) files die, <= 10%; rz_bf_reclaimed == 0
 #
 # Environment: SUBCOL_MAX (default: the kernel's), NFILES (default 4000),
 # CHURN_ROUNDS (default 4).
@@ -32,7 +37,7 @@ if [ -z "$MAX_SAVED" ]; then
 fi
 restore_max() {
     sysctl -w vfs.hammer2.raid6_subcol_max="$MAX_SAVED" > /dev/null 2>&1
-    rm -rf $SRC
+    rm -rf $SRC $SRC.b
 }
 SRC=/var/tmp/q_src
 trap restore_max EXIT INT TERM
@@ -104,6 +109,9 @@ cp -R $SRC/. $MNTPT/
 sync; sync
 C1=$(ctr rz_cols_alloc)
 echo "  INFO: Q1: $NFILES files took $((C1 - C0)) columns"
+bulkfree2
+Q1_LIVE0=$(ctr rz_bf_cols_live)
+Q1_ROWS0=$(ctr rz_bf_rows_live)
 i=1
 while [ $i -lt $NFILES ]; do
     echo $MNTPT/f$i
@@ -111,6 +119,17 @@ while [ $i -lt $NFILES ]; do
 done | xargs rm -f
 sync
 bulkfree2
+Q1_LIVE1=$(ctr rz_bf_cols_live)
+# Nearly every column holds files of both parities, so almost none may
+# die.  The 32 KB files are all odd (i % 16 == 15), so a column of only
+# those (two chains) legitimately dies: ~3% of the columns, allow 10%.
+if [ "${Q1_LIVE1:-0}" -ge $((Q1_LIVE0 * 90 / 100)) ] &&
+   [ "$Q1_LIVE1" -le "$Q1_LIVE0" ] &&
+   [ "$(ctr rz_bf_reclaimed)" = 0 ]; then
+    result PASS "Q1: shared columns stay allocated ($Q1_LIVE1 live columns in $Q1_ROWS0 rows, none freed)"
+else
+    result FAIL "Q1: live columns $Q1_LIVE0 -> $Q1_LIVE1, reclaimed $(ctr rz_bf_reclaimed)"
+fi
 remount
 even_sums > /var/tmp/q_even.sum
 verify "Q1: survivors after rm of half, bulkfree x2, remount" /var/tmp/q_even.sum
@@ -265,8 +284,17 @@ while [ $round -lt $CHURN_ROUNDS ]; do
         END { for (k in used) { live++; b += used[k]; if (used[k] < 65536) part++ }
               printf "  INFO: Q5 round %d: columns allocated so far %d, live %d, dead-or-reused %d, partially live %d (mean occupancy %.0f%% of live columns)\n",
                      r + 1, alloc, live, alloc - live, part, live ? 100 * b / (live * 65536) : 0 }' /var/tmp/q5_layout.txt
+    echo "  INFO: Q5 round $((round + 1)): kernel bulkfree: $(ctr rz_bf_rows_live) rows live, $(ctr rz_bf_cols_live) columns live, $(ctr rz_bf_cols_dead) dead, $(ctr rz_bf_rows_freed) rows freed so far"
     round=$((round + 1))
 done
+QC_ALLOC=$(( $(ctr rz_cols_alloc) - CA0 ))
+QC_LIVE=$(ctr rz_bf_cols_live)
+if [ "${QC_LIVE:-0}" -gt 0 ] && [ "$QC_LIVE" -le "$QC_ALLOC" ] &&
+   [ "$(ctr rz_bf_reclaimed)" = 0 ]; then
+    result PASS "Q5: $QC_ALLOC columns allocated over $CHURN_ROUNDS rounds, $QC_LIVE live, $(ctr rz_bf_cols_dead) dead in held rows, $(ctr rz_bf_rows_freed) rows freed"
+else
+    result FAIL "Q5: allocated $QC_ALLOC live $QC_LIVE reclaimed $(ctr rz_bf_reclaimed)"
+fi
 remount
 (cd $MNTPT && ls | sort | xargs sha256 2>&1 | grep -c 'No such\|rror') > /var/tmp/q5_err.txt
 if [ "$(cat /var/tmp/q5_err.txt)" = 0 ]; then
@@ -276,5 +304,55 @@ else
 fi
 scrub_clean "Q5"
 teardown "Q5"
+
+# --- Q6: remove a whole batch: ~50% of the live columns die
+setup_fresh
+check_v3
+rm -rf $SRC $SRC.b
+HALF=$((NFILES / 2))
+gen $SRC 0 $HALF 31
+gen $SRC.b 0 $HALF 32
+(cd $SRC.b && ls | sort | xargs sha256) > /var/tmp/q6_b.sum
+mkdir $MNTPT/a $MNTPT/b
+cp -R $SRC/. $MNTPT/a/
+sync; sync
+cp -R $SRC.b/. $MNTPT/b/
+sync; sync
+bulkfree2
+Q6_LIVE0=$(ctr rz_bf_cols_live)
+Q6_ROWS0=$(ctr rz_bf_rows_live)
+FREED0=$(ctr rz_bf_rows_freed)
+rm -rf $MNTPT/a
+sync
+bulkfree2
+Q6_LIVE1=$(ctr rz_bf_cols_live)
+Q6_ROWS1=$(ctr rz_bf_rows_live)
+FREED=$(( $(ctr rz_bf_rows_freed) - FREED0 ))
+echo "  INFO: Q6: live columns $Q6_LIVE0 -> $Q6_LIVE1, rows $Q6_ROWS0 -> $Q6_ROWS1, $FREED rows freed, $(ctr rz_bf_cols_dead) dead columns"
+# The batches have the same size mix and seal in separate TXGs, so
+# they share no row; the tolerance covers a few rows of unequal fill and
+# the directories' own data chains.
+if [ "${Q6_LIVE0:-0}" -gt 0 ] &&
+   [ $((Q6_LIVE1 * 100)) -ge $((Q6_LIVE0 * 40)) ] &&
+   [ $((Q6_LIVE1 * 100)) -le $((Q6_LIVE0 * 60)) ]; then
+    result PASS "Q6: bulkfree left $Q6_LIVE1 of $Q6_LIVE0 live columns (40-60% expected)"
+else
+    result FAIL "Q6: live columns $Q6_LIVE0 -> $Q6_LIVE1, want 40-60% of the first"
+fi
+if [ "$FREED" -gt 0 ] && [ "$(ctr rz_bf_reclaimed)" = 0 ]; then
+    result PASS "Q6: $FREED rows freed, none reclaimed"
+else
+    result FAIL "Q6: freed $FREED reclaimed $(ctr rz_bf_reclaimed)"
+fi
+remount
+(cd $MNTPT/b && ls | sort | xargs sha256 2>&1) > /var/tmp/q6_check.sum
+if diff -q /var/tmp/q6_b.sum /var/tmp/q6_check.sum > /dev/null 2>&1 &&
+   [ ! -e $MNTPT/a ]; then
+    result PASS "Q6: surviving batch reads back, removed one is gone"
+else
+    result FAIL "Q6: survivors differ or a/ still present"
+fi
+scrub_clean "Q6"
+teardown "Q6"
 
 summary

@@ -1043,6 +1043,29 @@ zeroing and `GOOD` handling for a shared dio must be checked in `_hammer2_io_get
 5. **Bulkfree per column** (`bf_mark`/`bf_end`), still with the v1 map (refcount byte becomes a
    bitmask of 8 data disks, or an in-memory-only mask). Test: Q after rm leaves ~50% of columns freed;
    Q churn variant (create, delete half, repeat) reports dead columns (11.6 Q5).
+   **Step 5 design and result (2026-10-12).** Checked first: today's bulkfree is per row (slot):
+   `bf_mark` sets one bit per slot, `bf_end` frees a row only when no chain in any of its columns
+   was found in two consecutive passes. So a shared column was never freed early (no data-loss
+   bug; Q1 removes every other file and checks survivors, and now also that no live column is lost
+   and `rz_bf_reclaimed` stays 0). What was missing was the per-column picture. Choice: the
+   **in-memory-only mask**. `stripe_bf_seen` is now a byte per slot, `bf_mark` ORs
+   `1 << (copyid & 7)` (the chain's disk), `bf_end` counts live columns (popcount) and dead ones
+   (`rows referenced x ndata - live`; a row sealed short counts its unused columns as dead, they
+   are as unusable). The mask is rebuilt by every scan and never persisted, so a crash cannot
+   leave it stale (the worst a crash does is lose the staged set, as before), the v1 refcount byte
+   keeps its meaning and an older kernel mounts the array unchanged. Over 8 disks bits alias,
+   which only over-counts live columns and cannot make a live row look dead. Why not the on-disk
+   bitmask: a column cannot be reused whatever its bit says (sealed P/Q cover it, a dead column
+   would need RMW, 11.6), so the row stays the unit of freeing and the persisted mask buys
+   nothing until resilver/scrub skip dead columns (step 6). Consequence for the test: "~50% of
+   columns freed" holds when a whole batch dies (Q6: two batches in separate TXGs, one removed, live
+   columns 40-60% of before). Removing every other file frees nothing, since every column keeps a
+   live chain (Q1, status quo by 11.6). Counters: `vfs.hammer2.rz_bf_{rows_freed,reclaimed,
+   rows_live,cols_live,cols_dead}`; Q5 now prints them per round.
+   **Result (h2dev, 4 disks):** Q6 369 -> 185 live columns, 93 rows freed; Q1 (every other file)
+   374 -> 361, the 13 that died are columns of only 32 KB (odd) files; Q5 churn, 370 columns
+   allocated, 290 live, 54 dead in held rows, 14 rows freed (was: nothing reported). The dead
+   columns cannot be reused, only reported; reclaiming them needs repack, left out (11.6).
 6. **Later: sm v2 / S1 mask** and resilver/scrub skip of dead columns (P6); S3 fold-in.
 
 ### 11.6 Open questions (all decided 2026-10-12)
