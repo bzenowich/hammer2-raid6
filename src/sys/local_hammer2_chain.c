@@ -5679,6 +5679,9 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 			(long)chain->bref.key);
 	} else if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
 		kprintf("   Resides in inode index - CRITICAL!!!\n");
+	} else if (chain == NULL) {
+		/* the walk up lost its parent (a detached chain) */
+		kprintf("   Location unknown\n");
 	} else {
 		kprintf("   Resides in root index - CRITICAL!!!\n");
 	}
