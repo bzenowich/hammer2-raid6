@@ -2190,7 +2190,12 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 	for (k = 0; k < hmp->md_ncopies; k++) {
 		i = hammer2_md_copy_disk(hmp->raid_config.ndisks,
 		    hmp->md_ncopies, bad_disk_idx, dev_pbase, k);
-		if (i == bad_disk_idx)
+		/*
+		 * Skip the copy that supplied the bad bytes: the mirror a
+		 * cold read came from, else the primary.  When it was a
+		 * mirror the primary's media copy may still be good.
+		 */
+		if (i == ((alt_disk_idx >= 0) ? alt_disk_idx : bad_disk_idx))
 			continue;
 		if (hmp->raid_failed[i])
 			continue;
@@ -2219,7 +2224,7 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 				    (int)bytes, patch, off, (int)bytes,
 				    badhash);
 			}
-			if (hmp->raid_failed[bad_disk_idx])
+			if (i == bad_disk_idx || hmp->raid_failed[bad_disk_idx])
 				return 0;
 			patch = kmalloc(bytes, M_HAMMER2, M_WAITOK);
 			bcopy(bdata, patch, bytes);

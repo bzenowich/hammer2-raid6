@@ -1272,9 +1272,10 @@ The new kernel accepts layout 2 and 3 (`HAMMER2_RZ_LAYOUT_MIN` = 2):
 **Risks.** (1) Only 2 copies after one disk failure and 1 after two: a bitrot hit in that window on
 the last copy is unrecoverable, as for the data columns (RAID6 with two failed has no redundancy
 either). All-disk mirrors would have had N-2 left. (2) Heal when the cold read came from a mirror
-(`alt_disk`) skips the primary (its cached buffer holds the bad bytes), so a block whose read copy and
-its other mirror are both bad is not healed from a good primary; before, N-2 other disks were tried.
-Left alone, noted. (3) Distribution: disk 0 holds the primary of every block (`bdwrite`, coalesced),
+(`alt_disk`) skips that mirror and tries the primary's media copy (the dio holds the primary's buffer,
+so `read_sibling`'s non-blocking `getblk` fails and it reads through a pbuf; a free cached buffer
+holds the bad bytes and simply fails the check), then the other mirror. A good primary only repairs
+the mirror. (3) Distribution: disk 0 holds the primary of every block (`bdwrite`, coalesced),
 mirrors are spread: on 4 disks disk 0 now writes less than the others (P2 per-disk deviation rose
 from ~0.13-0.3 to ~0.3-0.45, informational only).
 

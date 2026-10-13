@@ -12,6 +12,9 @@
 #       mount degraded, every file reads cold, scrub clean
 #   Z3  the primary and one mirror of every metadata block corrupt:
 #       everything reads and scrubs, healed from the third copy
+#   Z3b both mirrors of every metadata block corrupt, the primary good,
+#       cold reads spread over the mirrors: a read from a bad mirror
+#       heals from the primary
 #   Z4  resilver each disk position, then fail two others: the copies
 #       the resilver wrote are the ones that carry the data
 #   Z5  a mirror disk fails, files are written (2 copies each), then a
@@ -234,6 +237,44 @@ fi
 # the log carries the CHECK FAILs of the corrupt copies, expected here
 kmsg_clear
 teardown "Z3"
+
+# --- Z3b: both mirrors corrupt, primary good -------------------------
+zero_heads
+setup_fresh
+check_v3
+ref_tree z3b
+umount $MNTPT
+holders
+NB=$(wc -l < /var/tmp/z_holders.txt | tr -d ' ')
+while read -r blk h0 m1 m2 rest; do
+    corrupt_disk "$m1" $((MD_BLK + blk)) 1
+    [ -n "$m2" ] && corrupt_disk "$m2" $((MD_BLK + blk)) 1
+done < /var/tmp/z_holders.txt
+OSPREAD=$(sysctl -n vfs.hammer2.md_read_spread)
+sysctl vfs.hammer2.md_read_spread=1 > /dev/null
+kmsg_clear
+if mount -t hammer2 $PFSPATH $MNTPT 2>/dev/null; then
+    check_tree "Z3b: both mirrors of $NB blocks corrupt"
+    # charged to the primary's counter whichever copy is repaired
+    H=0
+    d=0
+    while [ "$d" -lt "$NDISKS" ]; do
+        H=$((H + $(disk_counter $d healed)))
+        d=$((d + 1))
+    done
+    if [ "$H" -gt 0 ]; then
+        result PASS "Z3b: reads from bad mirrors healed from the primary ($H)"
+    else
+        result FAIL "Z3b: no mirror healed by the read path"
+    fi
+    scrub_clean "Z3b"
+    no_unrepairable "Z3b"
+else
+    result FAIL "Z3b: mount refused with both mirrors corrupt"
+fi
+sysctl vfs.hammer2.md_read_spread=$OSPREAD > /dev/null
+kmsg_clear
+teardown "Z3b"
 
 # --- Z4: resilver each position, then fail two others -----------------
 D=0
