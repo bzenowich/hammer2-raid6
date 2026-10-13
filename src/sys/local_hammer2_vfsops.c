@@ -124,6 +124,16 @@ long hammer2_rz_seal_full;
 long hammer2_rz_seal_flush;
 long hammer2_rz_seal_flush_short;
 long hammer2_rz_pq_wait_ns;
+int hammer2_async_seal = 0;		/* P3 phase 2: seal without waiting for P/Q */
+int hammer2_async_seal_max = 16;	/* ... rows with parity in flight */
+int hammer2_inject_pq_defer_ms = 0;	/* test: start parity writes this late */
+long hammer2_rz_pq_err;
+long hammer2_rz_pq_async;
+long hammer2_rz_pq_bp_wait;
+long hammer2_rz_pq_rd_wait;
+long hammer2_rz_pq_drain_wait;
+long hammer2_rz_pq_high;
+long hammer2_rz_pq_hdr_viol;
 long hammer2_rz_pq_wait_cnt;
 long hammer2_rz_seal_ns;
 long hammer2_rz_seal_cnt;
@@ -376,6 +386,32 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_unlocatable, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_skipped, CTLFLAG_RD,
 	   &hammer2_scrub_pq_skipped, 0,
 	   "scrub parity pass: rows skipped (open, busy, unreadable)");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal, CTLFLAG_RW,
+	   &hammer2_async_seal, 0,
+	   "v3 RAID6: seal rows without the writer waiting for P/Q (oct-review "
+	   "P3 phase 2); 0 = wait, as before");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal_max, CTLFLAG_RW,
+	   &hammer2_async_seal_max, 0,
+	   "v3 RAID6: rows with parity in flight before a writer waits");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_pq_defer_ms, CTLFLAG_RW,
+	   &hammer2_inject_pq_defer_ms, 0,
+	   "Test: with async_seal the reaper starts the P/Q/zero writes this "
+	   "many ms after the row was sealed (media holds old parity)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_err, CTLFLAG_RW,
+	   &hammer2_rz_pq_err, 0, "v3 RAID6: parity writes that failed (reaper)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_async, CTLFLAG_RW,
+	   &hammer2_rz_pq_async, 0, "v3 RAID6: rows handed to the parity reaper");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_bp_wait, CTLFLAG_RW,
+	   &hammer2_rz_pq_bp_wait, 0, "v3 RAID6: writers held by async back-pressure");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_rd_wait, CTLFLAG_RW,
+	   &hammer2_rz_pq_rd_wait, 0, "v3 RAID6: parity reads that waited for a row in flight");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_drain_wait, CTLFLAG_RW,
+	   &hammer2_rz_pq_drain_wait, 0, "v3 RAID6: drains that had to wait");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_high, CTLFLAG_RW,
+	   &hammer2_rz_pq_high, 0, "v3 RAID6: peak rows with parity in flight");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_hdr_viol, CTLFLAG_RW,
+	   &hammer2_rz_pq_hdr_viol, 0,
+	   "v3 RAID6: volume headers written with parity in flight (must stay 0)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_wait_ns, CTLFLAG_RW,
 	   &hammer2_rz_pq_wait_ns, 0, "v3 RAID6: ns waiting for P/Q writes at seal");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_wait_cnt, CTLFLAG_RW,
@@ -764,6 +800,12 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 			continue;
 		}
+		if (hammer2_pq_busy(hmp)) {
+			/* parity in flight (async_seal): not with mntlk held */
+			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			again = 1;
+			continue;
+		}
 		error = hammer2_raid6_close_member_locked(hmp, i, devvp);
 		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 		if (error == EAGAIN) {
@@ -853,6 +895,68 @@ SYSCTL_PROC(_vfs_hammer2, OID_AUTO, inject_gone,
 	    sysctl_hammer2_inject_gone, "I",
 	    "Test only: treat the device of this RAID6 member as gone "
 	    "(disk_gone), failing and closing it.");
+
+/*
+ * Test-only (group O): rows with parity in flight on the first RAID6
+ * mount, and the command hook of hammer2_pq_test_cmd().
+ */
+static hammer2_dev_t *
+hammer2_test_first_raid6(void)
+{
+	hammer2_dev_t *hmp;
+
+	TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry) {
+		if (hmp->raid_type == HAMMER2_RAID_TYPE_RAID6)
+			return hmp;
+	}
+	return NULL;
+}
+
+static int
+sysctl_hammer2_pq_inflight(SYSCTL_HANDLER_ARGS)
+{
+	hammer2_dev_t *hmp;
+	int n = 0;
+
+	lockmgr(&hammer2_mntlk, LK_SHARED);
+	if ((hmp = hammer2_test_first_raid6()) != NULL)
+		n = hmp->pq_count;
+	lockmgr(&hammer2_mntlk, LK_RELEASE);
+	return sysctl_handle_int(oidp, &n, 0, req);
+}
+SYSCTL_PROC(_vfs_hammer2, OID_AUTO, pq_inflight,
+	    CTLTYPE_INT | CTLFLAG_RD, NULL, 0, sysctl_hammer2_pq_inflight, "I",
+	    "v3 RAID6: rows with parity writes in flight (async_seal)");
+
+static char hammer2_pq_test_res[96] = "none";
+
+static int
+sysctl_hammer2_pq_test(SYSCTL_HANDLER_ARGS)
+{
+	hammer2_dev_t *hmp;
+	char cmd[64];
+	int error;
+
+	if (req->newptr == NULL)
+		return sysctl_handle_string(oidp, hammer2_pq_test_res,
+		    sizeof(hammer2_pq_test_res), req);
+	bzero(cmd, sizeof(cmd));
+	error = sysctl_handle_string(oidp, cmd, sizeof(cmd), req);
+	if (error)
+		return error;
+	/* mntlk is not held across the I/O: the test keeps the mount */
+	lockmgr(&hammer2_mntlk, LK_SHARED);
+	hmp = hammer2_test_first_raid6();
+	lockmgr(&hammer2_mntlk, LK_RELEASE);
+	if (hmp == NULL)
+		return ENOENT;
+	return hammer2_pq_test_cmd(hmp, cmd, hammer2_pq_test_res,
+	    sizeof(hammer2_pq_test_res));
+}
+SYSCTL_PROC(_vfs_hammer2, OID_AUTO, pq_test,
+	    CTLTYPE_STRING | CTLFLAG_RW, NULL, 0, sysctl_hammer2_pq_test, "A",
+	    "Test only: async_seal parity probe/read commands; reading gives "
+	    "the last result");
 
 /*
  * Core PFS allocator.  Used to allocate or reference the pmp structure
@@ -1974,6 +2078,9 @@ next_hmp:
 			 */
 			hammer2_io_repair_start(hmp);
 
+			/* async seal: parity reaper (idle unless async_seal) */
+			hammer2_pq_start(hmp);
+
 		} else if (hmp->voldata.version >=
 			   HAMMER2_VOL_VERSION_MULTI_VOLUMES) {
 			hmp->nvolumes = hmp->voldata.nvolumes;
@@ -2628,6 +2735,7 @@ again:
 	 * are still open (queued repair writes must land before the
 	 * final flush below).
 	 */
+	hammer2_pq_stop(hmp);
 	hammer2_io_repair_stop(hmp);
 
 	/* a failure queued by a read completion must reach the final flush */

@@ -1199,6 +1199,7 @@ struct hammer2_open_row {
 
 RB_HEAD(hammer2_orow_tree, hammer2_open_row);
 
+struct hammer2_pq_ent;
 struct hammer2_dev {
 	struct vnode	*devvp;		/* device vnode for root volume */
 	int		ronly;		/* read-only mount */
@@ -1311,6 +1312,21 @@ struct hammer2_dev {
 	volatile int	rz_sealing;		/* rows unlinked, not yet written */
 	volatile uint64_t rz_free_epoch;	/* bumped when bulkfree frees a row */
 	struct hammer2_subcol *sc_open;		/* the open sub-column, if any */
+
+	/*
+	 * Async seal (oct-review P3 phase 2): rows whose P/Q/zero-column
+	 * writes are started but not yet waited for.  pq_list is in
+	 * registration order (pq_seq); the reaper kthread completes them
+	 * in that order, so an entry is done when pq_done_seq >= its seq.
+	 * rz_sealing stays counted for each entry until it is done.
+	 */
+	hammer2_spin_t	pq_spin;		/* pq_list, pq_count, pq_seq */
+	TAILQ_HEAD(, hammer2_pq_ent) pq_list;
+	int		pq_count;		/* entries on pq_list */
+	uint64_t	pq_seq;			/* last sequence handed out */
+	volatile uint64_t pq_done_seq;		/* all entries up to here done */
+	volatile int	pq_running;		/* reaper kthread alive */
+	volatile int	pq_exit;		/* ask it to exit */
 
 	/*
 	 * Deferred metadata mirror copies (v3), one entry per block.
@@ -2328,9 +2344,39 @@ typedef struct hammer2_row_col {
 	size_t	bytes;		/* always == stripe_unit */
 } hammer2_row_col_t;
 
+/*
+ * Parity writes of one sealed row that have been started, to be waited
+ * for and released by the caller (or by the reaper, see async seal).
+ */
+#define HAMMER2_PQ_MAXBUFS	(2 + HAMMER2_MAX_VOLUMES)
+
+struct hammer2_pq_ent {
+	TAILQ_ENTRY(hammer2_pq_ent) entry;
+	hammer2_off_t	phys_off;
+	uint64_t	seq;
+	int		nbuf;
+	int		defer;		/* test: reaper starts the writes */
+	volatile int	ready;		/* handed to the reaper */
+	int		tick;		/* ticks at registration */
+	struct buf	*bp[HAMMER2_PQ_MAXBUFS];
+	int		disk[HAMMER2_PQ_MAXBUFS];
+};
+
 int hammer2_io_raid6_write_row(hammer2_dev_t *hmp,
 		hammer2_off_t phys_off, const hammer2_row_col_t *cols,
-		int ncols, size_t bytes);
+		int ncols, size_t bytes, struct hammer2_pq_ent *pe);
+void hammer2_pq_add(struct hammer2_pq_ent *pe, struct buf *bp, int disk);
+void hammer2_pq_throttle(hammer2_dev_t *hmp);
+struct hammer2_pq_ent *hammer2_pq_register(hammer2_dev_t *hmp,
+		hammer2_off_t phys_off);
+void hammer2_pq_handoff(hammer2_dev_t *hmp, struct hammer2_pq_ent *pe);
+void hammer2_pq_wait_slot(hammer2_dev_t *hmp, hammer2_off_t phys_off);
+void hammer2_pq_drain(hammer2_dev_t *hmp);
+int  hammer2_pq_busy(hammer2_dev_t *hmp);
+int  hammer2_pq_test_cmd(hammer2_dev_t *hmp, const char *cmd, char *res,
+		size_t rlen);
+void hammer2_pq_start(hammer2_dev_t *hmp);
+void hammer2_pq_stop(hammer2_dev_t *hmp);
 
 /*
  * Open-row packing (6C).  See struct hammer2_open_row in
@@ -2486,6 +2532,16 @@ extern long hammer2_rz_pq_wait_cnt;
 extern long hammer2_rz_seal_ns;		/* ns inside row_io, total */
 extern long hammer2_rz_seal_cnt;
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
+extern int hammer2_async_seal;		/* seal without waiting for P/Q */
+extern int hammer2_async_seal_max;	/* rows with parity in flight */
+extern int hammer2_inject_pq_defer_ms;	/* test: start parity this late */
+extern long hammer2_rz_pq_err;		/* parity writes that failed */
+extern long hammer2_rz_pq_async;	/* rows handed to the reaper */
+extern long hammer2_rz_pq_bp_wait;	/* writers held by back-pressure */
+extern long hammer2_rz_pq_rd_wait;	/* readers that waited for parity */
+extern long hammer2_rz_pq_drain_wait;	/* drains that had to wait */
+extern long hammer2_rz_pq_high;		/* peak rows in flight */
+extern long hammer2_rz_pq_hdr_viol;	/* header with parity in flight */
 extern long hammer2_rz_bf_rows_freed;	/* rows freed by bulkfree, total */
 extern long hammer2_rz_bf_reclaimed;	/* referenced rows found free (must stay 0) */
 extern long hammer2_rz_bf_rows_live;	/* last pass: rows the tree references */

@@ -652,11 +652,16 @@ hammer2_bwrite_wait(struct buf *bp)
  * A failed P or Q write goes to hammer2_raid6_write_failed(), which
  * auto-fails that member.  Returns 0 if the row is written or degraded
  * within redundancy, ENXIO if a failure exceeded it.
+ *
+ * pe != NULL (async seal): the P and Q writes are started (or, for
+ * the test hook, left for the reaper to start) and added to pe, which
+ * the caller hands to the reaper; nothing is waited for and 0 is
+ * returned.
  */
 int
 hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			   const hammer2_row_col_t *cols, int ncols,
-			   size_t bytes)
+			   size_t bytes, struct hammer2_pq_ent *pe)
 {
 	hammer2_raid_config_t *rc = &hmp->raid_config;
 	int ndisks = rc->ndisks;
@@ -749,12 +754,16 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	if (pbp) {
 		/* parity is never read back on the normal path: drop it */
 		pbp->b_flags |= B_RELBUF | B_NOCACHE;
-		if (!hammer2_bwrite_start(pbp, p_disk))
+		if (pe && pe->defer)
+			BUF_KERNPROC(pbp);
+		else if (!hammer2_bwrite_start(pbp, p_disk))
 			pbp = NULL;
 	}
 	if (qbp) {
 		qbp->b_flags |= B_RELBUF | B_NOCACHE;
-		if (!hammer2_bwrite_start(qbp, q_disk))
+		if (pe && pe->defer)
+			BUF_KERNPROC(qbp);
+		else if (!hammer2_bwrite_start(qbp, q_disk))
 			qbp = NULL;
 	}
 	if (p_mem) {
@@ -772,6 +781,13 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		if (e)
 			hammer2_raid6_write_failed(hmp, q_disk, e);
 		kfree(q_mem, M_HAMMER2);
+	}
+	if (pe) {
+		if (pbp)
+			hammer2_pq_add(pe, pbp, p_disk);
+		if (qbp)
+			hammer2_pq_add(pe, qbp, q_disk);
+		return 0;
 	}
 	nanouptime(&ts0);
 	if (pbp) {
@@ -793,6 +809,246 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	atomic_add_long(&hammer2_rz_pq_wait_cnt, 1);
 
 	return error;
+}
+
+/*
+ * Async seal (oct-review P3 phase 2).  See the design there; in short:
+ * the writer registers a hammer2_pq_ent for the row under rebuild_lk
+ * shared, starts the P/Q/zero-column writes, and hands the entry to the
+ * reaper kthread, which waits for them (timed, R11), releases the
+ * buffers, fails a member whose write failed, and finally drops the
+ * row's rz_sealing reference.  Entries complete in registration order.
+ */
+void
+hammer2_pq_add(struct hammer2_pq_ent *pe, struct buf *bp, int disk)
+{
+	KKASSERT(pe->nbuf < HAMMER2_PQ_MAXBUFS);
+	pe->bp[pe->nbuf] = bp;
+	pe->disk[pe->nbuf] = disk;
+	pe->nbuf++;
+}
+
+/*
+ * Hold the writer back while async_seal_max rows are in flight.  Before
+ * rebuild_lk is taken, so a sleeping writer does not hold it.
+ */
+void
+hammer2_pq_throttle(hammer2_dev_t *hmp)
+{
+	while (hmp->pq_count >= hammer2_async_seal_max && hmp->pq_running) {
+		tsleep_interlock(__DEVOLATILE(void *, &hmp->pq_done_seq), 0);
+		if (hmp->pq_count < hammer2_async_seal_max)
+			break;
+		hammer2_rz_pq_bp_wait++;
+		tsleep(__DEVOLATILE(void *, &hmp->pq_done_seq), PINTERLOCKED,
+		       "h2pqbp", hz);
+	}
+}
+
+/*
+ * Called before the row's parity work, with rebuild_lk held shared.  The
+ * rz_sealing reference of the row passes to the entry.
+ */
+struct hammer2_pq_ent *
+hammer2_pq_register(hammer2_dev_t *hmp, hammer2_off_t phys_off)
+{
+	struct hammer2_pq_ent *pe;
+
+	pe = kmalloc(sizeof(*pe), M_HAMMER2, M_WAITOK | M_ZERO);
+	pe->phys_off = phys_off;
+	pe->defer = hammer2_inject_pq_defer_ms > 0;
+	pe->tick = ticks;
+	hammer2_spin_ex(&hmp->pq_spin);
+	pe->seq = ++hmp->pq_seq;
+	TAILQ_INSERT_TAIL(&hmp->pq_list, pe, entry);
+	if (++hmp->pq_count > hammer2_rz_pq_high)
+		hammer2_rz_pq_high = hmp->pq_count;
+	hammer2_spin_unex(&hmp->pq_spin);
+	return pe;
+}
+
+/* The row's writes are started (or prepared): the reaper may take it. */
+void
+hammer2_pq_handoff(hammer2_dev_t *hmp, struct hammer2_pq_ent *pe)
+{
+	atomic_add_long(&hammer2_rz_pq_async, 1);
+	/* nbuf and the buffers are set before this; the reaper reads them after */
+	cpu_sfence();
+	pe->ready = 1;
+	wakeup(&hmp->pq_list);
+}
+
+/* An entry is on the list but not yet done: wait for it, by seq. */
+static void
+hammer2_pq_wait_seq(hammer2_dev_t *hmp, uint64_t seq)
+{
+	while (hmp->pq_done_seq < seq) {
+		tsleep_interlock(__DEVOLATILE(void *, &hmp->pq_done_seq), 0);
+		if (hmp->pq_done_seq >= seq)
+			break;
+		tsleep(__DEVOLATILE(void *, &hmp->pq_done_seq), PINTERLOCKED,
+		       "h2pqw", hz);
+	}
+}
+
+/*
+ * Wait until the parity-side writes to this per-disk offset (any
+ * member) that are in flight are done.  Callers read P/Q or a zero
+ * column of the row from the media.
+ */
+void
+hammer2_pq_wait_slot(hammer2_dev_t *hmp, hammer2_off_t phys_off)
+{
+	struct hammer2_pq_ent *pe;
+	uint64_t seq = 0;
+
+	if (hmp->pq_count == 0)
+		return;
+	hammer2_spin_sh(&hmp->pq_spin);
+	TAILQ_FOREACH(pe, &hmp->pq_list, entry) {
+		if (pe->phys_off == phys_off && pe->seq > seq)
+			seq = pe->seq;
+	}
+	hammer2_spin_unsh(&hmp->pq_spin);
+	if (seq && hmp->pq_done_seq < seq) {
+		hammer2_rz_pq_rd_wait++;
+		hammer2_pq_wait_seq(hmp, seq);
+	}
+}
+
+/* Wait for every entry registered so far. */
+void
+hammer2_pq_drain(hammer2_dev_t *hmp)
+{
+	uint64_t seq;
+
+	if (hmp->pq_count == 0)
+		return;
+	hammer2_spin_sh(&hmp->pq_spin);
+	seq = hmp->pq_seq;
+	hammer2_spin_unsh(&hmp->pq_spin);
+	if (hmp->pq_done_seq < seq) {
+		hammer2_rz_pq_drain_wait++;
+		hammer2_pq_wait_seq(hmp, seq);
+	}
+}
+
+int
+hammer2_pq_busy(hammer2_dev_t *hmp)
+{
+	return hmp->pq_count != 0;
+}
+
+/*
+ * A failed parity write.  The reaper must not sleep for the voldata lock
+ * (a reader that holds it may be waiting for this very entry), so the
+ * failure is recorded in memory at once and persisted by the task; the
+ * flush persists it before the volume header (hammer2_raid6_persist_failed).
+ */
+static void
+hammer2_pq_write_failed(hammer2_dev_t *hmp, int disk, int error)
+{
+	if (hmp->raid_failed[disk])
+		hammer2_raid6_write_failed(hmp, disk, error);
+	else
+		(void)hammer2_raid6_mark_failed(hmp, disk, HAMMER2_FAIL_DEFER);
+}
+
+static void
+hammer2_pq_reap(hammer2_dev_t *hmp, struct hammer2_pq_ent *pe)
+{
+	int i;
+
+	if (pe->defer) {
+		/*
+		 * Test: start the writes inject_pq_defer_ms after the row
+		 * was registered; setting the sysctl to 0 releases them.
+		 */
+		while (hammer2_inject_pq_defer_ms > 0 &&
+		       (int)(ticks - pe->tick) <
+		       hammer2_inject_pq_defer_ms * hz / 1000)
+			tsleep(pe, 0, "h2pqdf", hz / 20 + 1);
+		for (i = 0; i < pe->nbuf; i++)
+			(void)hammer2_bwrite_start(pe->bp[i], pe->disk[i]);
+	}
+	for (i = 0; i < pe->nbuf; i++) {
+		int e = hammer2_bwrite_wait(pe->bp[i]);
+
+		if (e) {
+			hammer2_rz_pq_err++;
+			hammer2_pq_write_failed(hmp, pe->disk[i], e);
+		}
+	}
+}
+
+static void
+hammer2_pq_thread(void *arg)
+{
+	hammer2_dev_t *hmp = arg;
+	struct hammer2_pq_ent *pe;
+
+	for (;;) {
+		tsleep_interlock(&hmp->pq_list, 0);
+		hammer2_spin_sh(&hmp->pq_spin);
+		pe = TAILQ_FIRST(&hmp->pq_list);
+		hammer2_spin_unsh(&hmp->pq_spin);
+		if (pe == NULL) {
+			if (hmp->pq_exit)
+				break;
+			tsleep(&hmp->pq_list, PINTERLOCKED, "h2pqrp", hz);
+			continue;
+		}
+		if (pe->ready == 0) {
+			/* the writer is still preparing it */
+			tsleep(&hmp->pq_list, PINTERLOCKED, "h2pqrp", hz);
+			continue;
+		}
+		hammer2_pq_reap(hmp, pe);
+		hammer2_spin_ex(&hmp->pq_spin);
+		TAILQ_REMOVE(&hmp->pq_list, pe, entry);
+		hmp->pq_count--;
+		hmp->pq_done_seq = pe->seq;
+		hammer2_spin_unex(&hmp->pq_spin);
+		atomic_add_int(&hmp->rz_sealing, -1);
+		wakeup(__DEVOLATILE(void *, &hmp->pq_done_seq));
+		kfree(pe, M_HAMMER2);
+	}
+	hmp->pq_running = 0;
+	wakeup(__DEVOLATILE(void *, &hmp->pq_running));
+	kthread_exit();
+}
+
+void
+hammer2_pq_start(hammer2_dev_t *hmp)
+{
+	hammer2_spin_init(&hmp->pq_spin, "h2pq");
+	TAILQ_INIT(&hmp->pq_list);
+	hmp->pq_exit = 0;
+	hmp->pq_running = 1;
+	if (kthread_create(hammer2_pq_thread, hmp, NULL, "h2parity")) {
+		hmp->pq_running = 0;
+		kprintf("hammer2: parity reaper kthread create failed; "
+			"async_seal is off for this mount\n");
+	}
+}
+
+/*
+ * Drain and stop the reaper.  Nothing can seal any more (the final flush
+ * is done); the devices are still open.
+ */
+void
+hammer2_pq_stop(hammer2_dev_t *hmp)
+{
+	hammer2_pq_drain(hmp);
+	if (hmp->pq_running) {
+		hmp->pq_exit = 1;
+		wakeup(&hmp->pq_list);
+		while (hmp->pq_running) {
+			tsleep(__DEVOLATILE(void *, &hmp->pq_running), 0,
+			       "h2pqx", hz / 10);
+			wakeup(&hmp->pq_list);
+		}
+	}
 }
 
 /*

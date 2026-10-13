@@ -2108,8 +2108,12 @@ hammer2_raid6_open_rows_free(hammer2_dev_t *hmp)
  * Write a row: zero the data columns no chain reserved, write the
  * columns putblk dropped, then P/Q over cols[].  Called without
  * stripe_bitmap_spin; sleeps.
+ *
+ * Returns 1 if the row's parity writes were handed to the parity reaper
+ * (async_seal), which then owns the row's rz_sealing reference; else 0,
+ * and everything is on the media.
  */
-static void
+static int
 hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		     uint64_t row_id, uint32_t alloc_mask, uint32_t dropped,
 		     int p_disk, int q_disk, hammer2_row_col_t *cols,
@@ -2120,10 +2124,13 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	int ndisks = hmp->raid_config.ndisks;
 	int nz = 0;
 	int zdisk[HAMMER2_MAX_VOLUMES];
+	struct hammer2_pq_ent *pe = NULL;
 	struct timespec ts0, ts1;
 	int d, i;
 
 	nanouptime(&ts0);
+	if (hammer2_async_seal && hmp->pq_running && ncols > 0)
+		hammer2_pq_throttle(hmp);
 	/*
 	 * Hold off the resilver's copy of this slot while we write it,
 	 * and tell it the slot is done if a rebuild is running: this seal
@@ -2148,6 +2155,14 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	}
 
 	if (ncols > 0) {
+		/*
+		 * Async seal: the row is on the reaper's list before any of
+		 * its parity-side writes exist, so a reader of its P/Q or
+		 * zero columns waits for it from here on.
+		 */
+		if (hammer2_async_seal && hmp->pq_running)
+			pe = hammer2_pq_register(hmp, phys_off);
+
 		/*
 		 * Zero data-disk columns that no chain ever reserved.  P/Q
 		 * are computed assuming those cols are zero, but the disk
@@ -2196,9 +2211,16 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			bzero(zbp->b_data, bytes);
 			zbp->b_flags |= B_RELBUF | B_NOCACHE;
 			/* a column left non-zero makes P/Q wrong for it */
-			if (hammer2_bwrite_start(zbp, d)) {
-				zdisk[nz] = d;
-				zbps[nz++] = zbp;
+			if (pe && pe->defer) {
+				BUF_KERNPROC(zbp);
+				hammer2_pq_add(pe, zbp, d);
+			} else if (hammer2_bwrite_start(zbp, d)) {
+				if (pe) {
+					hammer2_pq_add(pe, zbp, d);
+				} else {
+					zdisk[nz] = d;
+					zbps[nz++] = zbp;
+				}
 			}
 		}
 
@@ -2231,7 +2253,7 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 		 * auto_fail_disk has already reported.
 		 */
 		(void)hammer2_io_raid6_write_row(hmp, phys_off, cols,
-						 ncols, bytes);
+						 ncols, bytes, pe);
 
 		for (i = 0; i < nz; i++) {
 			int werr = hammer2_bwrite_wait(zbps[i]);
@@ -2244,11 +2266,14 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 	if (zbuf)
 		kfree(zbuf, M_HAMMER2);
+	if (pe)
+		hammer2_pq_handoff(hmp, pe);
 	nanouptime(&ts1);
 	atomic_add_long(&hammer2_rz_seal_ns,
 	    (long)((ts1.tv_sec - ts0.tv_sec) * 1000000000L +
 		   (ts1.tv_nsec - ts0.tv_nsec)));
 	atomic_add_long(&hammer2_rz_seal_cnt, 1);
+	return pe != NULL;
 }
 
 /*
@@ -2282,6 +2307,7 @@ hammer2_raid6_row_write_free(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 	hammer2_row_col_t cols[HAMMER2_MAX_VOLUMES];
 	void *to_free[HAMMER2_MAX_VOLUMES];
 	int ncols = 0;
+	int handed;
 	int d, i;
 
 	for (d = 0; d < hmp->raid_config.ndisks; d++) {
@@ -2296,13 +2322,15 @@ hammer2_raid6_row_write_free(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 		r->col_data[d] = NULL;
 		ncols++;
 	}
-	hammer2_raid6_row_io(hmp, r->phys_off, r->row_id, r->alloc_mask,
-			     r->dropped_mask, r->p_disk, r->q_disk,
-			     cols, ncols, r->bytes);
+	handed = hammer2_raid6_row_io(hmp, r->phys_off, r->row_id,
+				      r->alloc_mask, r->dropped_mask,
+				      r->p_disk, r->q_disk, cols, ncols,
+				      r->bytes);
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
 	kfree(r, M_HAMMER2);
-	atomic_add_int(&hmp->rz_sealing, -1);
+	if (!handed)
+		atomic_add_int(&hmp->rz_sealing, -1);
 }
 
 /*
