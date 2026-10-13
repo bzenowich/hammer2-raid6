@@ -506,6 +506,12 @@ hammer2_biodone_timed(struct bio *bio)
 void
 hammer2_bio_timed_init(struct buf *bp, int pbuf)
 {
+	/*
+	 * The completion may release the buffer from the driver's thread,
+	 * and lockmgr refuses a release by anyone but the holder: hand the
+	 * buffer lock to the kernel, as an async write does.
+	 */
+	BUF_KERNPROC(bp);
 	bp->b_bio1.bio_done = hammer2_biodone_timed;
 	bp->b_bio1.bio_flags |= BIO_SYNC;
 	bp->b_bio1.bio_caller_info2.index = pbuf;
