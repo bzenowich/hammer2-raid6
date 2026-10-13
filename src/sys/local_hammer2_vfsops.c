@@ -93,6 +93,7 @@ int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
 uint32_t hammer2_inject_wio_disk_mask = 0; /* write EIO injection bitmask */
 uint32_t hammer2_inject_delay_ms_disk_mask = 0; /* late-I/O injection bitmask */
 int hammer2_inject_delay_ms = 3000;	/* ... by this many ms */
+int hammer2_io_timeout_ms = 30000;	/* fail a member silent this long */
 int hammer2_raid6_resilver_skip_unalloc = 1;	/* v3: skip unalloc slots */
 int hammer2_raid6_put_stall_ms;	/* test hook: stall one write before its put */
 int hammer2_raid6_subcol_max;	/* v3: chains up to this size share a column (0 = off) */
@@ -202,6 +203,11 @@ SYSCTL_UINT(_vfs_hammer2, OID_AUTO, inject_delay_ms_disk_mask, CTLFLAG_RW,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, inject_delay_ms, CTLFLAG_RW,
 	   &hammer2_inject_delay_ms, 0,
 	   "v3 RAID6 fault injection: delay in ms (default 3000).");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, io_timeout_ms, CTLFLAG_RW,
+	   &hammer2_io_timeout_ms, 0,
+	   "RAID6: a member with I/O outstanding that completes none for "
+	   "this many ms is failed, and a synchronous write that does not "
+	   "complete in this time is abandoned (0 = never)");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, resilver_skip_unalloc, CTLFLAG_RW,
 	   &hammer2_raid6_resilver_skip_unalloc, 0,
 	   "v3 RAID6: skip unallocated stripe slots during resilver "
@@ -342,6 +348,7 @@ static TAILQ_HEAD(, hammer2_gone) hammer2_gone_list =
 	TAILQ_HEAD_INITIALIZER(hammer2_gone_list);
 static struct spinlock hammer2_gone_spin;
 static struct task hammer2_gone_task;
+static struct taskqueue *hammer2_gone_tq;
 static eventhandler_tag hammer2_gone_tag;
 #endif
 static int hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
@@ -511,6 +518,11 @@ hammer2_vfs_init(struct vfsconf *conf)
 #ifdef DISK_GONE
 	spin_init(&hammer2_gone_spin, "h2gone");
 	TASK_INIT(&hammer2_gone_task, 0, hammer2_disk_gone_task, NULL);
+	hammer2_gone_tq = taskqueue_create("h2gone", M_WAITOK,
+					   taskqueue_thread_enqueue,
+					   &hammer2_gone_tq);
+	taskqueue_start_threads(&hammer2_gone_tq, 1, TDPRI_KERN_DAEMON, -1,
+				"h2gone");
 	hammer2_gone_tag = EVENTHANDLER_REGISTER(disk_gone, hammer2_disk_gone,
 						 NULL, EVENTHANDLER_PRI_ANY);
 #endif
@@ -524,7 +536,8 @@ hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
 {
 #ifdef DISK_GONE
 	EVENTHANDLER_DEREGISTER(disk_gone, hammer2_gone_tag);
-	taskqueue_drain(taskqueue_thread[0], &hammer2_gone_task);
+	taskqueue_drain(hammer2_gone_tq, &hammer2_gone_task);
+	taskqueue_free(hammer2_gone_tq);
 #endif
 	taskqueue_drain(taskqueue_thread[0], &hammer2_persist_task);
 	objcache_destroy(cache_buffer_read);
@@ -563,7 +576,11 @@ hammer2_raid6_persist_kick(void)
  * that path.
  *
  * The disk_gone handler runs on the disk thread, where the close must not
- * happen (see disk_gone_fn); a task does the work.
+ * happen (see disk_gone_fn); a task does the work.  The task has a queue
+ * of its own and never sleeps for a lock while holding hammer2_mntlk: a
+ * hung member keeps its writers inside rebuild_lk (R11), and waiting for
+ * it exclusive with mntlk held, on the shared thread, wedged mount,
+ * unmount and every seal behind it.
  */
 static void
 hammer2_disk_gone(void *arg __unused, struct disk *dp)
@@ -575,24 +592,30 @@ hammer2_disk_gone(void *arg __unused, struct disk *dp)
 	spin_lock(&hammer2_gone_spin);
 	TAILQ_INSERT_TAIL(&hammer2_gone_list, g, entry);
 	spin_unlock(&hammer2_gone_spin);
-	taskqueue_enqueue(taskqueue_thread[0], &hammer2_gone_task);
+	taskqueue_enqueue(hammer2_gone_tq, &hammer2_gone_task);
 }
 
 /*
  * dp is only compared, never dereferenced: it may be destroyed by now,
  * but not while a member still has it open, so a match is the real disk.
+ *
+ * Fail first, at once (a shared rebuild_lk keeps a replace from changing
+ * the member), so that I/O goes around the disk.  Then close it, which
+ * needs rebuild_lk exclusive to wait out the writers; that is only tried,
+ * and the caller tries again later.  Returns 1 if it has to.
  */
-static void
+static int
 hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 {
 	hammer2_devvp_t *dev;
 	struct vnode *devvp;
+	int again = 0;
 	int error;
 	int i;
 
 	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
-		return;
-	for (i = 0; i < hmp->nvolumes; ++i) {
+		return 0;
+	for (i = 0; i < hmp->nvolumes; i++) {
 		dev = hmp->volumes[i].dev;
 		if (dev == NULL || dev->open == 0)
 			continue;
@@ -602,18 +625,33 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 			continue;
 
 		/*
-		 * As in raid replace: wait out writers to the disk.  A
-		 * replace may have finished while we waited, so check
+		 * A replace may finish while we wait for the lock, so check
 		 * again that the member is still the disk that went away
 		 * before failing it, or the new disk would be failed.
 		 */
-		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
-		if (dev->devvp != devvp || !dev->open) {
+		if (!hmp->raid_failed[i]) {
+			if (lockmgr(&hmp->rebuild_lk,
+				    LK_SHARED | LK_NOWAIT) != 0) {
+				again = 1;
+				continue;
+			}
+			if (dev->devvp != devvp || !dev->open) {
+				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+				continue;
+			}
+			/* A third failure is left alone: the array is lost */
+			error = hammer2_raid6_mark_failed(hmp, i,
+							  HAMMER2_FAIL_DEFER);
 			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+			if (error)
+				continue;
+		}
+
+		if (lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE | LK_NOWAIT) != 0) {
+			again = 1;
 			continue;
 		}
-		/* A third failure is left alone: the array is lost anyway */
-		if (hammer2_raid6_mark_failed(hmp, i, 0) != 0) {
+		if (dev->devvp != devvp || !dev->open) {
 			lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 			continue;
 		}
@@ -628,6 +666,7 @@ hammer2_disk_gone_hmp(hammer2_dev_t *hmp, struct disk *dp)
 				"and closed\n", i, dev->path);
 		}
 	}
+	return again;
 }
 
 static void
@@ -635,6 +674,8 @@ hammer2_disk_gone_task(void *arg __unused, int pending __unused)
 {
 	struct hammer2_gone *g;
 	hammer2_dev_t *hmp;
+	int again;
+	int tries;
 
 	for (;;) {
 		spin_lock(&hammer2_gone_spin);
@@ -644,10 +685,17 @@ hammer2_disk_gone_task(void *arg __unused, int pending __unused)
 		spin_unlock(&hammer2_gone_spin);
 		if (g == NULL)
 			break;
-		lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
-		TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry)
-			hammer2_disk_gone_hmp(hmp, g->dp);
-		lockmgr(&hammer2_mntlk, LK_RELEASE);
+		/* writers of a hung member may hold rebuild_lk for a while */
+		for (tries = 0; tries < 3000; tries++) {
+			again = 0;
+			lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
+			TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry)
+				again |= hammer2_disk_gone_hmp(hmp, g->dp);
+			lockmgr(&hammer2_mntlk, LK_RELEASE);
+			if (!again)
+				break;
+			tsleep(g, 0, "h2gone", hz / 10 + 1);
+		}
 		kfree(g, M_HAMMER2);
 	}
 }
@@ -1535,7 +1583,7 @@ next_hmp:
 		KKASSERT(!TAILQ_EMPTY(&devvpl));
 		error = hammer2_open_devvp(&devvpl, ronly);
 		if (error) {
-			hammer2_close_devvp(&devvpl, ronly);
+			hammer2_close_devvp(NULL, &devvpl, ronly);
 			hammer2_cleanup_devvp(&devvpl);
 			lockmgr(&hammer2_mntlk, LK_RELEASE);
 			return error;
@@ -1550,7 +1598,7 @@ next_hmp:
 					     &hmp->voldata, &hmp->volhdrno,
 					     &hmp->devvp);
 		if (error) {
-			hammer2_close_devvp(&devvpl, ronly);
+			hammer2_close_devvp(NULL, &devvpl, ronly);
 			hammer2_cleanup_devvp(&devvpl);
 			lockmgr(&hammer2_mntlk, LK_RELEASE);
 			kfree(hmp, M_HAMMER2);
@@ -1558,7 +1606,7 @@ next_hmp:
 		}
 		if (!hmp->devvp) {
 			kprintf("hammer2: failed to initialize root volume\n");
-			hammer2_close_devvp(&devvpl, ronly);
+			hammer2_close_devvp(NULL, &devvpl, ronly);
 			hammer2_cleanup_devvp(&devvpl);
 			lockmgr(&hammer2_mntlk, LK_RELEASE);
 			kfree(hmp, M_HAMMER2);
@@ -1597,6 +1645,7 @@ next_hmp:
 		lockinit(&hmp->bulklk, "h2bulk", 0, 0);
 		lockinit(&hmp->bflock, "h2bflk", 0, 0);
 		lockinit(&hmp->rebuild_lk, "h2rbld", 0, 0);
+		hammer2_iowd_start(hmp);
 		hammer2_spin_init(&hmp->mirror_spin, "h2mirror");
 		lockinit(&hmp->mirror_flush_lk, "h2mflk", 0, 0);
 		for (i = 0; i < HAMMER2_MIRROR_HASH; ++i)
@@ -2397,6 +2446,7 @@ again:
 	hammer2_iocom_uninit(hmp);
 
 	hammer2_bulkfree_uninit(hmp);
+	hammer2_iowd_stop(hmp);
 
 	/*
 	 * Drain and stop the self-heal repair kthread while all devvps
@@ -2467,7 +2517,7 @@ again:
 	 * Finish up with the device vnode
 	 */
 	if (!TAILQ_EMPTY(&hmp->devvpl)) {
-		hammer2_close_devvp(&hmp->devvpl, hmp->ronly);
+		hammer2_close_devvp(hmp, &hmp->devvpl, hmp->ronly);
 		hammer2_cleanup_devvp(&hmp->devvpl);
 	}
 	KKASSERT(TAILQ_EMPTY(&hmp->devvpl));

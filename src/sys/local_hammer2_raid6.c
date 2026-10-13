@@ -472,6 +472,77 @@ hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 }
 
 /*
+ * Timed waits for the explicit bios sent to a member (R11).
+ *
+ * A hung drive never completes a command, and nothing can take a bio
+ * back from a driver: the buffer must stay owned until the driver
+ * returns it.  A waiter that gives up (ETIMEDOUT) therefore hands the
+ * buffer over to the completion, which releases it whenever the driver
+ * finally returns it; the waiter must not touch it again.  bio_caller_info3
+ * is the hand-over: 0 running, 1 completed (the waiter releases), 2
+ * abandoned (the completion releases).  bio_caller_info2 says whether the
+ * buffer is a pbuf (else a buffer cache buffer).
+ */
+static void
+hammer2_biodone_timed(struct bio *bio)
+{
+	struct buf *bp = bio->bio_buf;
+	int pbuf = bio->bio_caller_info2.index;
+
+	if (atomic_cmpset_int(&bio->bio_caller_info3.value, 0, 1)) {
+		biodone_sync(bio);
+		return;
+	}
+	/* abandoned by its waiter */
+	biodone_sync(bio);
+	if (pbuf) {
+		relpbuf(bp, NULL);
+	} else {
+		bp->b_flags |= B_INVAL | B_NOCACHE;
+		brelse(bp);
+	}
+}
+
+void
+hammer2_bio_timed_init(struct buf *bp, int pbuf)
+{
+	bp->b_bio1.bio_done = hammer2_biodone_timed;
+	bp->b_bio1.bio_flags |= BIO_SYNC;
+	bp->b_bio1.bio_caller_info2.index = pbuf;
+	bp->b_bio1.bio_caller_info3.value = 0;
+}
+
+/*
+ * Wait for a bio set up by hammer2_bio_timed_init(), at most
+ * vfs.hammer2.io_timeout_ms.  Returns ETIMEDOUT if the waiter gave up, in
+ * which case the buffer belongs to the completion and must not be
+ * released.  Otherwise returns the I/O error, and the caller releases the
+ * buffer.
+ */
+int
+hammer2_biowait_timed(struct buf *bp, const char *wmesg)
+{
+	struct bio *bio = &bp->b_bio1;
+	int to = hammer2_io_timeout_ms;
+	int error;
+
+	if (to <= 0)
+		return biowait(bio, wmesg);
+	error = biowait_timeout(bio, wmesg, (int)((int64_t)to * hz / 1000) + 1);
+	if (error == EWOULDBLOCK &&
+	    atomic_cmpset_int(&bio->bio_caller_info3.value, 0, 2)) {
+		kprintf("hammer2: I/O to a member did not complete in %d ms; "
+			"abandoned\n", to);
+		return ETIMEDOUT;
+	}
+	if (error == EWOULDBLOCK) {
+		/* the completion won the race, and is about to finish */
+		error = biowait(bio, wmesg);
+	}
+	return error;
+}
+
+/*
  * bwrite() in two halves, so that the writes of a row's P and Q columns,
  * or of a metadata block's mirror copies, are all in flight at once
  * instead of one disk after another.  The buffers stay in the buffer
@@ -489,8 +560,7 @@ hammer2_bwrite_start(struct buf *bp, int disk_idx)
 	bp->b_flags |= B_CACHE;
 	bp->b_cmd = BUF_CMD_WRITE;
 	bp->b_error = 0;
-	bp->b_bio1.bio_done = biodone_sync;
-	bp->b_bio1.bio_flags |= BIO_SYNC;
+	hammer2_bio_timed_init(bp, 0);
 	vfs_busy_pages(bp->b_vp, bp);
 	bsetrunningbufspace(bp, bp->b_bufsize);
 	hammer2_inject_delay(disk_idx);
@@ -506,13 +576,18 @@ hammer2_bwrite_start(struct buf *bp, int disk_idx)
 	return 1;
 }
 
+/*
+ * Returns ETIMEDOUT if the write did not complete in time; the buffer
+ * is then not ours any more (see hammer2_biowait_timed).
+ */
 int
 hammer2_bwrite_wait(struct buf *bp)
 {
 	int error;
 
-	error = biowait(&bp->b_bio1, "h2bww");
-	brelse(bp);
+	error = hammer2_biowait_timed(bp, "h2bww");
+	if (error != ETIMEDOUT)
+		brelse(bp);
 	return error;
 }
 
@@ -948,8 +1023,8 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 	 * buffer is EWOULDBLOCK; the caller chooses another copy or waits.
 	 */
 	if (!block)
-		return hammer2_io_raid6_read_bufcache(vol->dev->devvp,
-		    per_disk_off, buf, (int)bytes, 1);
+		return hammer2_io_raid6_read_bufcache(hmp, disk_idx,
+		    vol->dev->devvp, per_disk_off, buf, (int)bytes, 1);
 	{
 		struct buf *bp = NULL;
 

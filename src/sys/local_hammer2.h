@@ -92,6 +92,7 @@
 #include <sys/file.h>
 #include <sys/filio.h>
 #include <sys/objcache.h>
+#include <sys/callout.h>
 
 #ifdef _KERNEL
 #include <sys/signal2.h>
@@ -1255,7 +1256,7 @@ struct hammer2_dev {
 	uint64_t	stripe_generation;	/* space map generation last written */
 	int		stripe_bitmap_invalid;	/* 1 if no valid space map copy */
 	hammer2_spin_t	stripe_bitmap_spin;	/* protects bitmap + cursor + refcount + next_disk + sm_dirty */
-	int		stripe_next_disk;	/* round-robin data disk counter */
+	u_int		stripe_next_disk;	/* round-robin data disk counter */
 	uint64_t	stripe_data_slots;	/* slots that can hold a row, 0 = not counted */
 	uint64_t	stripe_used_slots;	/* set bits, cached for statfs */
 	int		stripe_used_ticks;	/* when stripe_used_slots was counted */
@@ -1347,6 +1348,21 @@ struct hammer2_dev {
 	int		rebuild_disk;
 	int		rebuild_werror;	/* write to rebuild_disk failed */
 	uint8_t		*rebuild_done;		/* 1 bit per stripe slot */
+
+	/*
+	 * Hung-disk watchdog (R11, hammer2_io_timeout_ms).  Per member,
+	 * the reads that wait inside the buffer cache are counted in
+	 * iowd[].nwait and every completion refreshes iowd[].stamp; the
+	 * callout fails a member that has waiters, I/O at the device and
+	 * no completion for io_timeout_ms.  gen is bumped when the disk is
+	 * replaced so that waiters of the old one do not count.
+	 */
+	struct hammer2_iowd {
+		volatile int	nwait;
+		volatile int	stamp;		/* ticks of last progress */
+		volatile int	gen;
+	} iowd[HAMMER2_MAX_VOLUMES];
+	struct callout	io_wd_co;
 
 	/* RAID6 scrub progress (M3 — written by scrub, read by status ioctl) */
 	volatile uint64_t scrub_brefs_done;	/* DATA/DIRENT brefs visited */
@@ -2203,7 +2219,8 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
  * hammer2_ondisk.c
  */
 int hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
-int hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
+int hammer2_close_devvp(hammer2_dev_t *hmp,
+		const hammer2_devvp_list_t *devvpl, int ronly);
 int hammer2_init_devvp(const char *blkdevs, int rootmount,
 			hammer2_devvp_list_t *devvpl);
 void hammer2_cleanup_devvp(hammer2_devvp_list_t *devvpl);
@@ -2244,9 +2261,11 @@ void hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 void hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp);
 int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
-int hammer2_io_raid6_read_bufcache(struct vnode *devvp, off_t off,
+int hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
+				   struct vnode *devvp, off_t off,
 		void *dst, int bytes, int nocache);
-int hammer2_io_raid6_read_sibling(struct vnode *devvp, off_t off,
+int hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
+				  struct vnode *devvp, off_t off,
 		void *dst, int bytes, int nocache);
 int hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes, int block);
@@ -2401,6 +2420,14 @@ extern int hammer2_inject_eio_autofail;
 extern uint32_t hammer2_inject_wio_disk_mask;
 extern uint32_t hammer2_inject_delay_ms_disk_mask;
 extern int hammer2_inject_delay_ms;
+extern int hammer2_io_timeout_ms;
+int hammer2_iowd_begin(hammer2_dev_t *hmp, int disk_idx);
+void hammer2_iowd_end(hammer2_dev_t *hmp, int disk_idx, int gen);
+void hammer2_iowd_reset(hammer2_dev_t *hmp, int disk_idx);
+void hammer2_iowd_start(hammer2_dev_t *hmp);
+void hammer2_iowd_stop(hammer2_dev_t *hmp);
+void hammer2_bio_timed_init(struct buf *bp, int pbuf);
+int hammer2_biowait_timed(struct buf *bp, const char *wmesg);
 void hammer2_inject_delay_slow(int disk_idx);
 void hammer2_inject_wio_dirty(struct buf *bp);
 extern int hammer2_raid6_resilver_skip_unalloc;

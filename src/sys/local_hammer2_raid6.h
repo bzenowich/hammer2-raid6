@@ -154,7 +154,7 @@ hammer2_raid6_pick_data_disk(hammer2_dev_t *hmp, int p_disk, int q_disk,
 	int candidate, tries;
 
 	for (tries = 0; tries < ndisks; tries++) {
-		candidate = hmp->stripe_next_disk % ndisks;
+		candidate = (int)(hmp->stripe_next_disk % (u_int)ndisks);
 		hmp->stripe_next_disk++;
 		if (candidate == p_disk || candidate == q_disk)
 			continue;

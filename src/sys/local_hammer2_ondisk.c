@@ -170,16 +170,35 @@ hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 	return 0;
 }
 
+/*
+ * A failed member is not flushed and its dirty buffers are not saved
+ * (V_SAVE): its columns are rewritten by the resilver, and a hung drive
+ * would take minutes per command with the mount lock held (R11).  hmp
+ * may be NULL (a mount that did not get far enough to have members
+ * failed).
+ */
 int
-hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
+hammer2_close_devvp(hammer2_dev_t *hmp, const hammer2_devvp_list_t *devvpl,
+		    int ronly)
 {
 	hammer2_devvp_t *e;
 	struct vnode *devvp;
+	int failed;
+	int i;
 
 	TAILQ_FOREACH(e, devvpl, entry) {
 		devvp = e->devvp;
 		if (devvp == NULL)
 			continue;
+		failed = 0;
+		if (hmp != NULL && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+			for (i = 0; i < hmp->nvolumes; i++) {
+				if (hmp->volumes[i].dev == e) {
+					failed = hmp->raid_failed[i];
+					break;
+				}
+			}
+		}
 		if (e->open) {
 			struct buf *bp;
 
@@ -194,18 +213,24 @@ hammer2_close_devvp(const hammer2_devvp_list_t *devvpl, int ronly)
 			 * leaking runningbufspace.
 			 */
 			vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-			bp = getpbuf(NULL);
-			bp->b_bio1.bio_offset = 0;
-			bp->b_bufsize = 0;
-			bp->b_bcount = 0;
-			bp->b_cmd = BUF_CMD_FLUSH;
-			bp->b_bio1.bio_done = biodone_sync;
-			bp->b_bio1.bio_flags |= BIO_SYNC;
-			vn_strategy(devvp, &bp->b_bio1);
-			biowait(&bp->b_bio1, "h2cls");
-			relpbuf(bp, NULL);
+			if (!failed) {
+				bp = getpbuf(NULL);
+				bp->b_bio1.bio_offset = 0;
+				bp->b_bufsize = 0;
+				bp->b_bcount = 0;
+				bp->b_cmd = BUF_CMD_FLUSH;
+				hammer2_bio_timed_init(bp, 1);
+				vn_strategy(devvp, &bp->b_bio1);
+				if (hammer2_biowait_timed(bp, "h2cls") ==
+				    ETIMEDOUT) {
+					/* a hung drive: do not save to it */
+					failed = 1;
+				} else {
+					relpbuf(bp, NULL);
+				}
+			}
 
-			vinvalbuf(devvp, (ronly ? 0 : V_SAVE), 0, 0);
+			vinvalbuf(devvp, (ronly || failed) ? 0 : V_SAVE, 0, 0);
 			VOP_CLOSE(devvp, (ronly ? FREAD : FREAD|FWRITE), NULL);
 			vn_unlock(devvp);
 			e->open = 0;
@@ -1832,6 +1857,26 @@ invalid:
 }
 
 /*
+ * bwrite() of a space map page to member disk_idx, given up on after
+ * io_timeout_ms (R11); a member that hangs is failed, without the voldata
+ * lock (the caller may hold it).
+ */
+static int
+hammer2_sm_bwrite(hammer2_dev_t *hmp, int disk_idx, struct buf *bp)
+{
+	int error;
+
+	/* -1: not a fault injection point, as bwrite() was not */
+	if (hammer2_bwrite_start(bp, -1) == 0)
+		return 0;
+	error = hammer2_bwrite_wait(bp);
+	if (error == ETIMEDOUT) {
+		hammer2_raid6_mark_failed(hmp, disk_idx, HAMMER2_FAIL_DEFER);
+	}
+	return error;
+}
+
+/*
  * Write space map generation stripe_generation + 1 to its copy on every
  * live disk, synchronously.  Called by the flush before the volume
  * headers; the cache flush that precedes each volume header write makes
@@ -1889,12 +1934,17 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 			devvp = hammer2_raid6_sm_devvp(hmp, i);
 			if (devvp == NULL)
 				continue;
+			if (derr[i]) {
+				/* this copy is lost already; do not wait again */
+				perr = 1;
+				continue;
+			}
 			bp = getblk(devvp,
 				    base + (1 + (off_t)p) * HAMMER2_SM_PAGE,
 				    HAMMER2_SM_PAGE, GETBLK_KVABIO, 0);
 			bkvasync(bp);
 			bcopy(pbuf, bp->b_data, HAMMER2_SM_PAGE);
-			if (bwrite(bp)) {
+			if (hammer2_sm_bwrite(hmp, i, bp)) {
 				derr[i] = 1;
 				perr = 1;
 			}
@@ -1929,7 +1979,7 @@ hammer2_raid6_sm_write(hammer2_dev_t *hmp, uint64_t *genp)
 		bp = getblk(devvp, base, HAMMER2_SM_PAGE, GETBLK_KVABIO, 0);
 		bkvasync(bp);
 		bcopy(pbuf, bp->b_data, HAMMER2_SM_PAGE);
-		if (bwrite(bp) == 0)
+		if (hammer2_sm_bwrite(hmp, i, bp) == 0)
 			perr = 0;
 	}
 	lockmgr(&hmp->rebuild_lk, LK_RELEASE);

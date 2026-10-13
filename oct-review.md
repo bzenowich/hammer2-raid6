@@ -376,6 +376,26 @@ In addition:
 - Hold `rebuild_lk` only around buffer acquisition, not across completion waits.
 - At unmount, skip FLUSH and V_SAVE for failed members.
 
+**Status: done (fix/r11-hung-disk).** All bullets confirmed in the code; the second was done differently.
+
+- **Gone task (confirmed, done).** `hammer2_disk_gone_task` runs on its own queue `h2gone`. It fails the member first (shared `rebuild_lk`, `LK_NOWAIT`, so I/O goes around the disk at once), then tries `rebuild_lk` exclusive with `LK_NOWAIT` to close it. If a lock is busy it releases `mntlk`, sleeps 100 ms and rescans from the top (at most 5 min), so it never waits for a lock with `mntlk` held and never queues as an exclusive waiter that blocks the seals.
+- **`rebuild_lk` across waits (confirmed, modified).** The header loop must keep the lock until its I/O is done: it exists to keep `close_member` / `vinvalbuf` from running under a buffer being written. Instead every wait inside it is now bounded (below), so the hold is bounded by `io_timeout_ms` per phase, and the gone task no longer queues for it.
+- **Unmount (confirmed, done).** `hammer2_close_devvp` skips the cache FLUSH and V_SAVE for failed members. The FLUSH for a healthy member is timed, and a timeout also drops V_SAVE.
+- **`stripe_next_disk` (confirmed, done):** now `u_int`, taken modulo `ndisks` unsigned.
+
+**I/O timeout (`vfs.hammer2.io_timeout_ms`, default 30000, 0 = off).**
+
+Nothing can take a bio back from a driver, so the design never cancels or frees anything the driver holds. Two mechanisms:
+
+1. *Timed waits for explicit bios* (P/Q and mirror writes, header writes, cache flushes, space-map pages, resilver writes, sibling pbuf reads). `hammer2_bio_timed_init` installs `hammer2_biodone_timed`; `hammer2_biowait_timed` is `biowait_timeout` plus a hand-over word in `bio_caller_info3` (0 running, 1 completed, 2 abandoned). On a timeout the waiter moves 0 to 2, returns `ETIMEDOUT` and **never touches the buffer again**; when the driver finally returns the bio, the completion sees 2 and releases the buffer (`brelse` with `B_INVAL|B_NOCACHE`, or `relpbuf`). A completion that wins the race makes the waiter finish normally. Callers already turn a write error into `hammer2_raid6_write_failed`, so `ETIMEDOUT` fails and persists the member through the R3 helper, the P/Q write of a seal returns and the chain locks are released. Cost: a buffer (and its 64 KB) stays locked until the driver returns it, at most the number of commands in the drive's queue, and no more are issued once the member is failed.
+2. *Watchdog for reads and delayed writes.* `bread`/`cluster_readx` and `VOP_FSYNC` cannot be timed. Per member `iowd.nwait` counts reads waiting on the device (the buffer is `getblk`ed first, so a wait for a buffer lock does not count) and the sync's wait for the member's write track; each completion refreshes `iowd.stamp`. A per-mount callout (1 s) fails (`HAMMER2_FAIL_DEFER`) a member with `nwait > 0`, bios outstanding on its device vnode, and no completion for `io_timeout_ms`. The sync waits for a member's write track itself (1 s slices) and stops waiting once the member is failed, so one hung drive no longer holds the flush. A failed member is not `vinvalbuf`ed while bios are still outstanding on it.
+
+*Which readers stay stuck.* A reader already inside `cluster_readx` on the hung disk stays there until the driver returns the command: its buffer holds the same (vnode, offset) any reconstruct would `getblk`. Everything else goes degraded as soon as the member is failed. That reader is bounded by the driver (da: 60 s per attempt and retries), not by us; uas resets (about 3 s) fail all outstanding commands, which also releases it.
+
+*Default.* 30 s is above any legitimate stall on these drives (a SYNCHRONIZE CACHE of a full write cache takes a few seconds, a uas reset about 3 s) and below the first da timeout (60 s), so a drive that is truly silent is failed before CAM starts its retry cascade (minutes). On a hard disk with spin-up, raise it.
+
+*Gaps.* Not timed: resilver reads (`rebuild_lk` exclusive: a hung survivor stalls the resilver and the writers), mount-time reads, the blocking metadata mirror `bread`, and `ioctl` header rewrites. The injected delay is a sleep in hammer2 before submit (`inject_delay_ms`); the watchdog counts it like a stalled bio, which is how W4/W5 exercise the same fail path as a real hang. Real-driver behaviour (a bio that stays in the driver) is covered by reasoning only: the abandon hand-over above is the part tests cannot reach.
+
 ### Minor reliability items
 - **`stripe_next_disk` is a signed int** that is incremented on every probe (`hammer2.h:1216`). After 2^31 probes (tens of TB without a remount) it goes negative, producing a negative disk index and undefined shifts. Fix: make it unsigned, or store it modulo ndisks. [V]
 - **New rows can be placed on a failed disk** (`ondisk.c:2452–2459` skips only P/Q). Each such NEW then rebuilds a never-used slot from parity and zeroes the result. A sibling read error during that pointless rebuild can auto-fail a second disk. The packing path already skips failed disks. [V2]
