@@ -3354,6 +3354,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
  * before the scrub started), so they never collide with the new chains
  * that concurrent writers land in fresh slots from COW.
  */
+struct scrub_chain;
 struct hammer2_scrub_ctx {
 	hammer2_dev_t	*hmp;
 	uint64_t	done;
@@ -3361,6 +3362,34 @@ struct hammer2_scrub_ctx {
 	uint64_t	repaired;
 	uint64_t	unrepairable;
 	char		*rbuf;		/* HAMMER2_PBUFSIZE, uncached reads */
+
+	/* parity pass (S6) */
+	hammer2_pfs_t	*pmp;		/* to sync before a chain lookup */
+	uint64_t	pq_rows;
+	uint64_t	pq_bad;
+	uint64_t	pq_repaired;
+	uint64_t	pq_unloc;
+	uint64_t	pq_skipped;
+	char		*pq_col[HAMMER2_MAX_VOLUMES]; /* a row, by member */
+	uint8_t		*pq_xp, *pq_xq;	/* P and Q recomputed */
+	uint8_t		*pq_ps, *pq_qs;	/* syndromes */
+
+	/* chain lookup for the rows in question (find mode of the walk) */
+	int		find;
+	int		nfslots;
+	int		nfchains;
+	int		foverflow;
+	uint64_t	*fslots;
+	struct scrub_chain *fchains;
+	uint8_t		fmap[32];	/* bit per (slot & 255) in fslots */
+};
+
+struct scrub_chain {
+	uint64_t	slot;
+	int		disk;
+	int		off;		/* byte offset in the column */
+	int		bytes;
+	hammer2_blockref_t bref;
 };
 
 /*
@@ -3501,6 +3530,9 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	return 0;
 }
 
+static void hammer2_scrub_find_bref(struct hammer2_scrub_ctx *ctx,
+				    const hammer2_blockref_t *bref);
+
 /*
  * Recursive walker.  Caller passes parent *unlocked*; walker locks
  * parent SHARED at entry, unlocks at out:.  Before descending into a
@@ -3556,11 +3588,15 @@ hammer2_scrub_walk(struct hammer2_scrub_ctx *ctx, hammer2_chain_t *parent)
 			break;
 		}
 
-		hammer2_scrub_verify_bref(ctx, &bref);
-		ctx->hmp->scrub_brefs_done = ctx->done;
-		ctx->hmp->scrub_brefs_bad = ctx->bad;
-		ctx->hmp->scrub_brefs_repaired = ctx->repaired;
-		ctx->hmp->scrub_brefs_unrepairable = ctx->unrepairable;
+		if (ctx->find) {
+			hammer2_scrub_find_bref(ctx, &bref);
+		} else {
+			hammer2_scrub_verify_bref(ctx, &bref);
+			ctx->hmp->scrub_brefs_done = ctx->done;
+			ctx->hmp->scrub_brefs_bad = ctx->bad;
+			ctx->hmp->scrub_brefs_repaired = ctx->repaired;
+			ctx->hmp->scrub_brefs_unrepairable = ctx->unrepairable;
+		}
 
 		if (chain == NULL)
 			continue;
@@ -3617,8 +3653,742 @@ out:
 	return error;
 }
 
+/*
+ * Row-ordered parity pass (oct-review.md S6).
+ *
+ * The walk above checks every live chain against its CHECK code but never
+ * looks at P and Q.  This pass walks the rows of the space map in disk
+ * order, reads a batch of rows from all members at once (one 64 KB read
+ * per column, all in flight together), recomputes P and Q from the data
+ * columns and compares them with the media.
+ *
+ * What a row holds.  P and Q cover every data column of a sealed row as
+ * the media has it: a column no chain reserved is zeroed by the seal, and
+ * a column whose chains are all dead keeps its bytes (a dead column
+ * cannot be reused without a read-modify-write), so liveness does not
+ * matter to the arithmetic and every column is read.  Rows scanned are
+ * those with their bit in the stripe bitmap, in a data slot, and not open.
+ * A degraded array is not scanned: the survivors cannot tell which column
+ * is wrong.
+ *
+ * Races.  The batch read takes no lock, so a row that is being sealed
+ * (its P/Q not written yet) or whose data column is still a delayed write
+ * can look inconsistent.  A data column that is dirty in the buffer cache
+ * is read through the cache; everything else is read from the media.  A
+ * row that disagrees is then verified again under rebuild_lk exclusive,
+ * which a seal takes shared while it writes the row, with rz_sealing zero
+ * (no row between unlink and write), reading every column through the
+ * buffer cache.  Only a row that still disagrees is examined.
+ *
+ * Localising.  With e the error in one column, ps = P ^ P' = e and
+ * qs = Q ^ Q' = g^z * e for data column z, so z = log(qs) - log(ps)
+ * (md raid6check).  The test is per byte: only ps (or only qs) nonzero
+ * means P (or Q) is wrong there.  A row is repaired only if all its bad
+ * bytes implicate the same single column; anything else is left alone and
+ * counted as unlocatable.  P and Q are rewritten from the data.  A data
+ * column is rewritten only if every chain that the fix changes verifies
+ * against its CHECK code with the fixed bytes: that needs the chains of
+ * the column, found by one more tree walk (after a sync) for the rows in
+ * question, so clean arrays never pay for it.
+ *
+ * Repair goes through the repair queue like the read-path self-heal: the
+ * kthread rewrites the column only while the slot still holds the bytes
+ * found bad, so a row freed and reused meanwhile is left alone.
+ */
+#define SCRUB_PQ_BATCH		16
+#define SCRUB_PQ_MAXPBUFS	64
+#define SCRUB_PQ_MAXBAD		32	/* candidate rows per round */
+#define SCRUB_PQ_MAXPQ		4	/* ... of which need the whole row */
+#define SCRUB_PQ_MAXCHAINS	8192
+
+struct scrub_pq_cand {
+	uint64_t	slot;
+	int		kind;		/* 0: one data column, 1: P and Q */
+	int		disk;		/* kind 0: the member holding it */
+	char		*cur;		/* kind 0: column as read */
+	char		*fix;		/* kind 0: column with the error removed */
+	char		*row;		/* kind 1: every column, by member, */
+					/* then P and Q recomputed */
+};
+
+static void
+hammer2_scrub_find_bref(struct hammer2_scrub_ctx *ctx,
+			const hammer2_blockref_t *bref)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	uint64_t su = hmp->raid_config.stripe_unit;
+	struct scrub_chain *sc;
+	hammer2_off_t phys;
+	uint64_t slot;
+	int bytes, off;
+	int i;
+
+	ctx->done++;
+	if (bref->type != HAMMER2_BREF_TYPE_DATA &&
+	    bref->type != HAMMER2_BREF_TYPE_DIRENT)
+		return;
+	if ((bref->data_off & HAMMER2_OFF_MASK_RADIX) == 0)
+		return;
+	phys = (bref->data_off & ~HAMMER2_OFF_MASK_RADIX) &
+	    HAMMER2_RAID6_PHYS_MASK;
+	if (phys < HAMMER2_ZONE_SEG64)
+		return;
+	slot = hammer2_raid6_slot(phys, su);
+	if (isclr(ctx->fmap, (int)(slot & 255)))
+		return;
+	for (i = 0; i < ctx->nfslots; i++) {
+		if (ctx->fslots[i] == slot)
+			break;
+	}
+	if (i == ctx->nfslots)
+		return;
+	bytes = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
+	off = (int)((phys - HAMMER2_ZONE_SEG64) - slot * su);
+	if (off + bytes > (int)su)
+		return;
+	if (ctx->nfchains >= SCRUB_PQ_MAXCHAINS) {
+		ctx->foverflow = 1;
+		return;
+	}
+	sc = &ctx->fchains[ctx->nfchains++];
+	sc->slot = slot;
+	sc->disk = (int)bref->copyid;
+	sc->off = off;
+	sc->bytes = bytes;
+	sc->bref = *bref;
+}
+
+/*
+ * Start a timed read of one column straight from the media.  Returns
+ * the pbuf, to be waited for by scrub_pq_read_wait().
+ */
+static struct buf *
+scrub_pq_read_start(struct vnode *devvp, off_t off, int bytes, int disk_idx)
+{
+	struct buf *bp;
+
+	bp = getpbuf_mem(NULL);
+	KKASSERT(bytes <= bp->b_bufsize);
+	bp->b_cmd = BUF_CMD_READ;
+	bp->b_bcount = bytes;
+	bp->b_resid = bytes;
+	bp->b_bio1.bio_offset = off;
+	hammer2_bio_timed_init(bp, 1, disk_idx);
+	vn_strategy(devvp, &bp->b_bio1);
+	return bp;
+}
+
+/* Returns the I/O error; the pbuf is gone after ETIMEDOUT. */
+static int
+scrub_pq_read_wait(struct buf *bp)
+{
+	return hammer2_biowait_timed(bp, "h2pqsc");
+}
+
+/*
+ * Can the media copy of this column be trusted as current?  Not if the
+ * buffer cache holds it dirty, or busy (a write may be in flight).
+ */
+static int
+scrub_pq_col_stable(struct vnode *devvp, off_t off)
+{
+	struct buf *bp;
+	int stable;
+
+	if (findblk(devvp, off, FINDBLK_TEST) == NULL)
+		return 1;
+	bp = findblk(devvp, off, FINDBLK_NBLOCK | FINDBLK_KVABIO);
+	if (bp == NULL)
+		return 0;
+	stable = (bp->b_flags & B_DELWRI) == 0;
+	bremfree(bp);		/* findblk() leaves it on its queue */
+	brelse(bp);
+	return stable;
+}
+
+static int
+scrub_pq_usable(hammer2_dev_t *hmp, int d)
+{
+	return (!hmp->raid_failed[d] && hmp->volumes[d].dev != NULL &&
+	    hmp->volumes[d].dev->devvp != NULL && hmp->volumes[d].dev->open);
+}
+
+/*
+ * Queue the rewrite of one column.  data is consumed; bad is what the
+ * media holds now, which the repair thread requires to still be there.
+ */
+static void
+scrub_pq_queue(hammer2_dev_t *hmp, int disk, uint64_t slot, char *data,
+	       const void *bad)
+{
+	hammer2_off_t base = HAMMER2_ZONE_SEG64 +
+	    slot * hmp->raid_config.stripe_unit;
+	int su = (int)hmp->raid_config.stripe_unit;
+
+	hammer2_io_repair_enqueue_chk(hmp, disk, base, su, 0, su, data, 0, su,
+	    hammer2_io_repair_hash(bad, su));
+}
+
+/*
+ * Wait for n queued repairs and count them: repaired if the thread did
+ * the writes, else left alone.
+ */
+static void
+scrub_pq_settle(struct hammer2_scrub_ctx *ctx, int n, uint64_t dropped0)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+
+	if (n == 0)
+		return;
+	hammer2_io_repair_drain(hmp);
+	if (hmp->repair_thread_running &&
+	    hmp->repair_writes_dropped == dropped0) {
+		ctx->pq_repaired += n;
+	} else {
+		ctx->pq_unloc += n;
+	}
+}
+
+/*
+ * Verify one row that disagreed in the batch read, and queue its repair
+ * if P or Q is the wrong column.  A data column is added to cands[]
+ * instead (its chains are checked in one go by scrub_pq_fix_data()).
+ * Returns the number of columns queued.
+ */
+static int
+scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
+		    struct scrub_pq_cand *cands, int *ncandp)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	int ndisks = rc->ndisks;
+	int ndata = rc->ndata;
+	size_t su = rc->stripe_unit;
+	hammer2_off_t phys_off = HAMMER2_ZONE_SEG64 + slot * su;
+	void *ptrs[HAMMER2_MAX_VOLUMES];
+	int disk_of[HAMMER2_MAX_VOLUMES];	/* logical column -> member */
+	uint8_t *ps = ctx->pq_ps;
+	uint8_t *qs = ctx->pq_qs;
+	uint8_t *xp = ctx->pq_xp;
+	uint8_t *xq = ctx->pq_xq;
+	uint64_t mask = 0;
+	int p_disk, q_disk;
+	int tries, d, col, z, nbad, i;
+	int err = 0;
+	int bad = 0;
+
+	hammer2_raid6_pq(slot, ndisks, &p_disk, &q_disk);
+
+	/*
+	 * Read the whole row under rebuild_lk exclusive: no seal can be
+	 * writing it, and none that has started is unwritten.
+	 */
+	for (tries = 0; ; tries++) {
+		lockmgr(&hmp->rebuild_lk, LK_EXCLUSIVE);
+		if (hmp->rz_sealing == 0)
+			break;
+		lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+		if (tries >= 200 || hmp->raid_abort) {
+			ctx->pq_skipped++;
+			return 0;
+		}
+		tsleep(&ctx->pq_xp, 0, "h2pqsl", hz / 100 ? hz / 100 : 1);
+	}
+	hammer2_spin_sh(&hmp->stripe_bitmap_spin);
+	if (isclr(hmp->stripe_bitmap, slot) || isset(hmp->stripe_open, slot))
+		err = ESRCH;
+	hammer2_spin_unsh(&hmp->stripe_bitmap_spin);
+	if (hmp->raid_nfailed || hmp->rebuild_active)
+		err = EBUSY;
+	for (d = 0; d < ndisks && err == 0; d++) {
+		if (!scrub_pq_usable(hmp, d) || hammer2_inject_eio(d)) {
+			err = EIO;
+			break;
+		}
+		for (tries = 0; tries < 50; tries++) {
+			err = hammer2_io_raid6_read_bufcache(hmp, d,
+			    hmp->volumes[d].dev->devvp, (off_t)phys_off,
+			    ctx->pq_col[d], (int)su, 1);
+			if (err != EWOULDBLOCK)
+				break;
+			tsleep(&ctx->pq_xp, 0, "h2pqbs", 1);
+		}
+	}
+	if (err == 0) {
+		/* a seal that began while we read would have had to wait */
+		hammer2_spin_sh(&hmp->stripe_bitmap_spin);
+		if (isclr(hmp->stripe_bitmap, slot) ||
+		    isset(hmp->stripe_open, slot) || hmp->rz_sealing)
+			err = ESRCH;
+		hammer2_spin_unsh(&hmp->stripe_bitmap_spin);
+	}
+	lockmgr(&hmp->rebuild_lk, LK_RELEASE);
+	if (err) {
+		ctx->pq_skipped++;
+		return 0;
+	}
+
+	for (d = 0; d < ndisks; d++) {
+		col = hammer2_raid6_lcol(d, p_disk, q_disk, ndata);
+		disk_of[col] = d;
+		if (col < ndata)
+			ptrs[col] = ctx->pq_col[d];
+	}
+	ptrs[ndata] = xp;
+	ptrs[ndata + 1] = xq;
+	hammer2_raid6_gen_syndrome(ndisks, su, ptrs);
+	bcopy(xp, ps, su);
+	hammer2_raid6_xor(ps, ctx->pq_col[p_disk], su);
+	bcopy(xq, qs, su);
+	hammer2_raid6_xor(qs, ctx->pq_col[q_disk], su);
+
+	for (i = 0; i < (int)su; i++) {
+		uint8_t a = ps[i];
+		uint8_t b = qs[i];
+
+		if (a == 0 && b == 0)
+			continue;
+		if (b == 0) {
+			mask |= 1ULL << ndata;
+		} else if (a == 0) {
+			mask |= 1ULL << (ndata + 1);
+		} else {
+			z = hammer2_gf_log[b] - hammer2_gf_log[a];
+			if (z < 0)
+				z += 255;
+			if (z >= ndata)
+				bad = 1;
+			else
+				mask |= 1ULL << z;
+		}
+	}
+	if (mask == 0 && !bad) {
+		/* it was a race (the row is consistent now) */
+		return 0;
+	}
+	ctx->pq_bad++;
+	nbad = 0;
+	for (col = 0; col < ndisks; col++) {
+		if (mask & (1ULL << col))
+			nbad++;
+	}
+	if (bad || nbad != 1) {
+		/*
+		 * No single column explains it.  Both parity columns may be
+		 * wrong, say, which looks like a data column or like noise.
+		 * If every chain of the row verifies as it is, the data is
+		 * as good as it can be shown to be and P and Q are rewritten
+		 * from it (scrub_pq_fix_data()); otherwise leave the row.
+		 */
+		int n1 = 0;
+
+		for (i = 0; i < *ncandp; i++)
+			n1 += cands[i].kind;
+		if (n1 < SCRUB_PQ_MAXPQ && *ncandp < SCRUB_PQ_MAXBAD) {
+			struct scrub_pq_cand *c = &cands[(*ncandp)++];
+
+			c->slot = slot;
+			c->kind = 1;
+			c->cur = c->fix = NULL;
+			c->row = kmalloc((ndisks + 2) * su, M_HAMMER2,
+					 M_WAITOK);
+			for (d = 0; d < ndisks; d++)
+				bcopy(ctx->pq_col[d], c->row + d * su, su);
+			bcopy(xp, c->row + ndisks * su, su);
+			bcopy(xq, c->row + (ndisks + 1) * su, su);
+			return 0;
+		}
+		ctx->pq_unloc++;
+		kprintf("hammer2: scrub: row %ju inconsistent, no single bad "
+		    "column (mask %016jx%s)\n", (uintmax_t)slot,
+		    (uintmax_t)mask, bad ? ", syndrome out of range" : "");
+		return 0;
+	}
+	for (col = 0; col < ndisks; col++) {
+		if (mask & (1ULL << col))
+			break;
+	}
+	if (col == ndata || col == ndata + 1) {
+		char *np;
+
+		d = disk_of[col];
+		np = kmalloc(su, M_HAMMER2, M_WAITOK);
+		bcopy(col == ndata ? xp : xq, np, su);
+		scrub_pq_queue(hmp, d, slot, np, ctx->pq_col[d]);
+		kprintf("hammer2: scrub: row %ju %c on disk %d inconsistent, "
+		    "rewriting\n", (uintmax_t)slot, col == ndata ? 'P' : 'Q',
+		    d);
+		return 1;
+	}
+	/* a data column: the chains in it must agree */
+	if (*ncandp >= SCRUB_PQ_MAXBAD) {
+		ctx->pq_unloc++;
+		return 0;
+	}
+	{
+		struct scrub_pq_cand *c = &cands[(*ncandp)++];
+
+		c->slot = slot;
+		c->kind = 0;
+		c->row = NULL;
+		c->disk = disk_of[col];
+		c->cur = kmalloc(su, M_HAMMER2, M_WAITOK);
+		c->fix = kmalloc(su, M_HAMMER2, M_WAITOK);
+		bcopy(ctx->pq_col[c->disk], c->cur, su);
+		bcopy(c->cur, c->fix, su);
+		hammer2_raid6_xor(c->fix, ps, su);
+	}
+	return 0;
+}
+
+/*
+ * A row with no single bad column: if every chain in it verifies as read,
+ * rewrite P and Q from its data columns.  Counts one row in *nqp if it
+ * queued anything.
+ */
+static void
+scrub_pq_fix_pq(struct hammer2_scrub_ctx *ctx, struct hammer2_scrub_ctx *fctx,
+		struct scrub_pq_cand *c, int *okp, int *nqp)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	int ndisks = rc->ndisks;
+	size_t su = rc->stripe_unit;
+	int p_disk, q_disk;
+	char *np;
+	int j;
+
+	for (j = 0; j < fctx->nfchains; j++) {
+		struct scrub_chain *sc = &fctx->fchains[j];
+
+		if (sc->slot != c->slot || sc->disk >= ndisks)
+			continue;
+		if (!hammer2_bref_check_match(&sc->bref,
+		    c->row + sc->disk * su + sc->off, sc->bytes)) {
+			ctx->pq_unloc++;
+			kprintf("hammer2: scrub: row %ju: chain data_off "
+			    "%016jx does not verify, parity left alone\n",
+			    (uintmax_t)c->slot, (uintmax_t)sc->bref.data_off);
+			*okp = 0;
+			return;
+		}
+	}
+	hammer2_raid6_pq(c->slot, ndisks, &p_disk, &q_disk);
+	kprintf("hammer2: scrub: row %ju P and Q rewritten from data "
+	    "(every chain verifies)\n", (uintmax_t)c->slot);
+	np = kmalloc(su, M_HAMMER2, M_WAITOK);
+	bcopy(c->row + ndisks * su, np, su);
+	scrub_pq_queue(hmp, p_disk, c->slot, np, c->row + p_disk * su);
+	np = kmalloc(su, M_HAMMER2, M_WAITOK);
+	bcopy(c->row + (ndisks + 1) * su, np, su);
+	scrub_pq_queue(hmp, q_disk, c->slot, np, c->row + q_disk * su);
+	(*nqp)++;
+}
+
+/*
+ * Decide the data-column candidates.  Sync, snapshot the tree, find the
+ * chains that live in those rows and require every chain whose bytes the
+ * fix changes to verify afterwards.
+ */
+static void
+scrub_pq_fix_data(struct hammer2_scrub_ctx *ctx, struct scrub_pq_cand *cands,
+		  int ncand)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	struct hammer2_scrub_ctx fctx;
+	hammer2_chain_t *vsnap;
+	uint64_t dropped0;
+	int nq = 0;
+	int i, j, ok;
+
+	if (ctx->pmp)
+		hammer2_vfs_sync_pmp(ctx->pmp, MNT_WAIT);
+	fctx = *ctx;
+	fctx.find = 1;
+	fctx.nfslots = ncand;
+	fctx.nfchains = 0;
+	fctx.foverflow = 0;
+	bzero(fctx.fmap, sizeof(fctx.fmap));
+	for (i = 0; i < ncand; i++) {
+		fctx.fslots[i] = cands[i].slot;
+		setbit(fctx.fmap, (int)(cands[i].slot & 255));
+	}
+	vsnap = hammer2_chain_bulksnap(hmp);
+	j = hammer2_scrub_walk(&fctx, vsnap);
+	hammer2_chain_bulkdrop(vsnap);
+	/* the find walk must not leave its counts in the shared ones */
+	hmp->scrub_brefs_bad = ctx->bad;
+	hmp->scrub_brefs_unrepairable = ctx->unrepairable;
+	hmp->scrub_brefs_done = ctx->done;
+	hmp->scrub_brefs_repaired = ctx->repaired;
+	if (j || fctx.foverflow) {
+		/* without the whole list of chains we cannot confirm */
+		ctx->pq_unloc += ncand;
+		kprintf("hammer2: scrub: %d data-column rows left alone "
+		    "(chain lookup %s)\n", ncand,
+		    j ? "failed" : "overflowed");
+		goto out;
+	}
+
+	dropped0 = hmp->repair_writes_dropped;
+	for (i = 0; i < ncand; i++) {
+		struct scrub_pq_cand *c = &cands[i];
+
+		ok = 1;
+		if (c->kind == 1) {
+			scrub_pq_fix_pq(ctx, &fctx, c, &ok, &nq);
+			continue;
+		}
+		for (j = 0; j < fctx.nfchains && ok; j++) {
+			struct scrub_chain *sc = &fctx.fchains[j];
+
+			if (sc->slot != c->slot || sc->disk != c->disk)
+				continue;
+			if (bcmp(c->cur + sc->off, c->fix + sc->off,
+				 sc->bytes) == 0)
+				continue;	/* the fix does not touch it */
+			if (!hammer2_bref_check_match(&sc->bref,
+			    c->fix + sc->off, sc->bytes)) {
+				ok = 0;
+				kprintf("hammer2: scrub: row %ju disk %d: "
+				    "chain data_off %016jx does not verify "
+				    "after the syndrome fix, left alone\n",
+				    (uintmax_t)c->slot, c->disk,
+				    (uintmax_t)sc->bref.data_off);
+			}
+		}
+		if (!ok) {
+			ctx->pq_unloc++;
+			continue;
+		}
+		kprintf("hammer2: scrub: row %ju data column on disk %d "
+		    "inconsistent, rewriting\n", (uintmax_t)c->slot, c->disk);
+		scrub_pq_queue(hmp, c->disk, c->slot, c->fix, c->cur);
+		c->fix = NULL;		/* the queue owns it */
+		nq++;
+	}
+	scrub_pq_settle(ctx, nq, dropped0);
+out:
+	for (i = 0; i < ncand; i++) {
+		if (cands[i].cur)
+			kfree(cands[i].cur, M_HAMMER2);
+		if (cands[i].fix)
+			kfree(cands[i].fix, M_HAMMER2);
+		if (cands[i].row)
+			kfree(cands[i].row, M_HAMMER2);
+	}
+}
+
+/* Verify and repair the candidate rows collected so far. */
+static void
+scrub_pq_round(struct hammer2_scrub_ctx *ctx, const uint64_t *bad, int nbad)
+{
+	struct scrub_pq_cand cands[SCRUB_PQ_MAXBAD];
+	uint64_t dropped0 = ctx->hmp->repair_writes_dropped;
+	int ncand = 0;
+	int nq = 0;
+	int i;
+
+	for (i = 0; i < nbad; i++)
+		nq += scrub_pq_verify_row(ctx, bad[i], cands, &ncand);
+	scrub_pq_settle(ctx, nq, dropped0);
+	if (ncand)
+		scrub_pq_fix_data(ctx, cands, ncand);
+}
+
+static int
+hammer2_scrub_parity(struct hammer2_scrub_ctx *ctx)
+{
+	hammer2_dev_t *hmp = ctx->hmp;
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	int ndisks = rc->ndisks;
+	int ndata = rc->ndata;
+	size_t su = rc->stripe_unit;
+	uint64_t nslots = hmp->stripe_num_slots;
+	uint64_t slots[SCRUB_PQ_BATCH];
+	uint64_t bad[SCRUB_PQ_MAXBAD];
+	struct buf **rb;
+	int *rerr;
+	uint8_t *rslow;		/* column to be read through the cache */
+	int batch;
+	uint64_t slot;
+	int nbad = 0;
+	int error = 0;
+	int n, s, d, i;
+
+	if (hmp->raid_nfailed || hmp->rebuild_active) {
+		kprintf("hammer2: scrub: array degraded, parity pass "
+		    "skipped\n");
+		return 0;
+	}
+	batch = SCRUB_PQ_MAXPBUFS / ndisks;
+	if (batch > SCRUB_PQ_BATCH)
+		batch = SCRUB_PQ_BATCH;
+	if (batch < 1)
+		batch = 1;
+
+	rb = kmalloc(sizeof(*rb) * batch * HAMMER2_MAX_VOLUMES, M_HAMMER2,
+		     M_WAITOK | M_ZERO);
+	rerr = kmalloc(sizeof(*rerr) * batch * HAMMER2_MAX_VOLUMES,
+		       M_HAMMER2, M_WAITOK | M_ZERO);
+	rslow = kmalloc(batch * HAMMER2_MAX_VOLUMES, M_HAMMER2,
+			M_WAITOK | M_ZERO);
+	for (d = 0; d < ndisks; d++)
+		ctx->pq_col[d] = kmalloc(su, M_HAMMER2, M_WAITOK);
+	ctx->pq_xp = kmalloc(su, M_HAMMER2, M_WAITOK);
+	ctx->pq_xq = kmalloc(su, M_HAMMER2, M_WAITOK);
+	ctx->pq_ps = kmalloc(su, M_HAMMER2, M_WAITOK);
+	ctx->pq_qs = kmalloc(su, M_HAMMER2, M_WAITOK);
+	ctx->fchains = kmalloc(sizeof(*ctx->fchains) * SCRUB_PQ_MAXCHAINS,
+			       M_HAMMER2, M_WAITOK);
+	ctx->fslots = kmalloc(sizeof(uint64_t) * SCRUB_PQ_MAXBAD, M_HAMMER2,
+			      M_WAITOK);
+
+	slot = 0;
+	while (slot < nslots) {
+		void *ptrs[HAMMER2_MAX_VOLUMES];
+
+		if (hmp->raid_abort) {
+			error = EINTR;
+			break;
+		}
+
+		/*
+		 * Next rows: allocated, able to hold a row, not open.  The
+		 * bitmap is read without the spin; a wrong guess only makes
+		 * a row skipped or verified.
+		 */
+		n = 0;
+		for (; slot < nslots && n < batch; slot++) {
+			if ((slot % 8) == 0 && hmp->stripe_bitmap[slot / 8] == 0) {
+				slot += 7;
+				continue;
+			}
+			if (isclr(hmp->stripe_bitmap, slot) ||
+			    isset(hmp->stripe_open, slot))
+				continue;
+			if (!hammer2_raid6_slot_is_data(hmp, slot))
+				continue;
+			slots[n++] = slot;
+		}
+		if (n == 0)
+			break;
+
+		for (s = 0; s < n; s++) {
+			hammer2_off_t off = HAMMER2_ZONE_SEG64 + slots[s] * su;
+
+			for (d = 0; d < ndisks; d++) {
+				i = s * HAMMER2_MAX_VOLUMES + d;
+				rb[i] = NULL;
+				rerr[i] = 0;
+				rslow[i] = 0;
+				if (!scrub_pq_usable(hmp, d) ||
+				    hammer2_inject_eio(d)) {
+					rerr[i] = EIO;
+					continue;
+				}
+				if (!scrub_pq_col_stable(
+				    hmp->volumes[d].dev->devvp, (off_t)off)) {
+					rslow[i] = 1;
+					continue;
+				}
+				rb[i] = scrub_pq_read_start(
+				    hmp->volumes[d].dev->devvp, (off_t)off,
+				    (int)su, d);
+			}
+		}
+		for (s = 0; s < n; s++) {
+			for (d = 0; d < ndisks; d++) {
+				i = s * HAMMER2_MAX_VOLUMES + d;
+				if (rb[i] == NULL)
+					continue;
+				rerr[i] = scrub_pq_read_wait(rb[i]);
+				if (rerr[i] == ETIMEDOUT)
+					rb[i] = NULL;
+			}
+		}
+
+		for (s = 0; s < n; s++) {
+			uint8_t *a, *b;
+			int p_disk, q_disk;
+			int suspect = 0;
+			int ioerr = 0;
+
+			hammer2_raid6_pq(slots[s], ndisks, &p_disk, &q_disk);
+			for (d = 0; d < ndisks; d++) {
+				i = s * HAMMER2_MAX_VOLUMES + d;
+				if (rerr[i])
+					ioerr = 1;
+				else if (rslow[i])
+					suspect = 1;
+			}
+			if (ioerr) {
+				ctx->pq_skipped++;
+				continue;
+			}
+			ctx->pq_rows++;
+			if (suspect) {
+				/* verify it the careful way */
+				bad[nbad++] = slots[s];
+				continue;
+			}
+			for (d = 0; d < ndisks; d++) {
+				int col = hammer2_raid6_lcol(d, p_disk, q_disk,
+							     ndata);
+
+				if (col < ndata)
+					ptrs[col] = rb[s * HAMMER2_MAX_VOLUMES +
+					    d]->b_data;
+			}
+			ptrs[ndata] = ctx->pq_xp;
+			ptrs[ndata + 1] = ctx->pq_xq;
+			hammer2_raid6_gen_syndrome(ndisks, su, ptrs);
+			a = rb[s * HAMMER2_MAX_VOLUMES + p_disk]->b_data;
+			b = rb[s * HAMMER2_MAX_VOLUMES + q_disk]->b_data;
+			if (bcmp(ctx->pq_xp, a, su) != 0 ||
+			    bcmp(ctx->pq_xq, b, su) != 0)
+				bad[nbad++] = slots[s];
+		}
+		for (s = 0; s < n; s++) {
+			for (d = 0; d < ndisks; d++) {
+				i = s * HAMMER2_MAX_VOLUMES + d;
+				if (rb[i]) {
+					relpbuf(rb[i], NULL);
+					rb[i] = NULL;
+				}
+			}
+		}
+
+		if (nbad + batch > SCRUB_PQ_MAXBAD) {
+			scrub_pq_round(ctx, bad, nbad);
+			nbad = 0;
+		}
+		hmp->scrub_rows_checked = ctx->pq_rows;
+		hmp->scrub_parity_bad = ctx->pq_bad;
+		hmp->scrub_parity_repaired = ctx->pq_repaired;
+		hmp->scrub_parity_unlocatable = ctx->pq_unloc;
+		hmp->scrub_rows_skipped = ctx->pq_skipped;
+		lwkt_yield();
+	}
+	if (nbad > 0)
+		scrub_pq_round(ctx, bad, nbad);
+
+	kfree(ctx->fslots, M_HAMMER2);
+	kfree(ctx->fchains, M_HAMMER2);
+	kfree(ctx->pq_qs, M_HAMMER2);
+	kfree(ctx->pq_ps, M_HAMMER2);
+	kfree(ctx->pq_xq, M_HAMMER2);
+	kfree(ctx->pq_xp, M_HAMMER2);
+	for (d = 0; d < ndisks; d++)
+		kfree(ctx->pq_col[d], M_HAMMER2);
+	kfree(rslow, M_HAMMER2);
+	kfree(rerr, M_HAMMER2);
+	kfree(rb, M_HAMMER2);
+	return error;
+}
+
 int
-hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
+hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint32_t flags)
 {
 	struct hammer2_scrub_ctx ctx;
 	hammer2_chain_t *vsnap;
@@ -3632,13 +4402,26 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 
 	bzero(&ctx, sizeof(ctx));
 	ctx.hmp = hmp;
+	ctx.pmp = pmp;
 	ctx.rbuf = kmalloc(HAMMER2_PBUFSIZE, M_HAMMER2, M_WAITOK);
 
 	hmp->scrub_brefs_done = 0;
 	hmp->scrub_brefs_bad = 0;
 	hmp->scrub_brefs_repaired = 0;
 	hmp->scrub_brefs_unrepairable = 0;
+	hmp->scrub_rows_checked = 0;
+	hmp->scrub_parity_bad = 0;
+	hmp->scrub_parity_repaired = 0;
+	hmp->scrub_parity_unlocatable = 0;
+	hmp->scrub_rows_skipped = 0;
 	hmp->scrub_error = 0;
+
+	/*
+	 * The parity pass looks at rows on the media: have everything
+	 * written so far sealed and committed first.
+	 */
+	if ((flags & HAMMER2_SCRUB_NOPARITY) == 0 && pmp != NULL)
+		hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
 	/*
 	 * Bulksnap the volume chain so the walker operates on the
@@ -3648,10 +4431,26 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	 * picks them up.  Caller passes vsnap *unlocked* — the walker
 	 * locks and unlocks parent at every level itself.
 	 */
-	vsnap = hammer2_chain_bulksnap(hmp);
-	error = hammer2_scrub_walk(&ctx, vsnap);
-	hammer2_chain_bulkdrop(vsnap);
+	error = 0;
+	if ((flags & HAMMER2_SCRUB_NOTREE) == 0) {
+		vsnap = hammer2_chain_bulksnap(hmp);
+		error = hammer2_scrub_walk(&ctx, vsnap);
+		hammer2_chain_bulkdrop(vsnap);
+	}
 	kfree(ctx.rbuf, M_HAMMER2);
+
+	if (error == 0 && (flags & HAMMER2_SCRUB_NOPARITY) == 0)
+		error = hammer2_scrub_parity(&ctx);
+	hmp->scrub_rows_checked = ctx.pq_rows;
+	hmp->scrub_parity_bad = ctx.pq_bad;
+	hmp->scrub_parity_repaired = ctx.pq_repaired;
+	hmp->scrub_parity_unlocatable = ctx.pq_unloc;
+	hmp->scrub_rows_skipped = ctx.pq_skipped;
+	hammer2_scrub_pq_rows += ctx.pq_rows;
+	hammer2_scrub_pq_bad += ctx.pq_bad;
+	hammer2_scrub_pq_repaired += ctx.pq_repaired;
+	hammer2_scrub_pq_unloc += ctx.pq_unloc;
+	hammer2_scrub_pq_skipped += ctx.pq_skipped;
 
 	hmp->scrub_brefs_done = ctx.done;
 	hmp->scrub_brefs_bad = ctx.bad;
@@ -3667,6 +4466,15 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp)
 	    (unsigned long long)ctx.repaired,
 	    (unsigned long long)ctx.unrepairable,
 	    error);
+	if ((flags & HAMMER2_SCRUB_NOPARITY) == 0) {
+		kprintf("hammer2: scrub parity: %llu rows, %llu bad, "
+		    "%llu repaired, %llu unlocatable, %llu skipped\n",
+		    (unsigned long long)ctx.pq_rows,
+		    (unsigned long long)ctx.pq_bad,
+		    (unsigned long long)ctx.pq_repaired,
+		    (unsigned long long)ctx.pq_unloc,
+		    (unsigned long long)ctx.pq_skipped);
+	}
 
 	return error;
 }

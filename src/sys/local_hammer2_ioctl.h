@@ -303,7 +303,22 @@ struct hammer2_ioc_raid_scrub {
 	uint64_t	brefs_bad;	/* CHECK FAIL count */
 	uint64_t	brefs_repaired;	/* successfully parity-repaired */
 	uint64_t	brefs_unrepairable; /* CHECK FAIL, parity also bad */
+	/*
+	 * Row-ordered parity pass (oct-review.md S6).  flags is input,
+	 * the rest output.  The pass runs unless NOPARITY is set.
+	 */
+	uint32_t	flags;
+	uint32_t	reserved;
+	uint64_t	rows_checked;	/* rows whose P and Q were recomputed */
+	uint64_t	parity_bad;	/* rows where P or Q disagreed */
+	uint64_t	parity_repaired; /* ... and were rewritten */
+	uint64_t	parity_unlocatable; /* ... and could not be, or the
+					   repair did not reach the media */
+	uint64_t	rows_skipped;	/* busy, open, or unreadable rows */
 };
+
+#define HAMMER2_SCRUB_NOPARITY	0x00000001	/* checksum walk only */
+#define HAMMER2_SCRUB_NOTREE	0x00000002	/* parity pass only */
 
 typedef struct hammer2_ioc_raid_scrub hammer2_ioc_raid_scrub_t;
 

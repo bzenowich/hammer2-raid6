@@ -1309,6 +1309,7 @@ struct hammer2_dev {
 	long		open_rows_high;		/* peak entry count (diag) */
 	uint32_t	rz_gen;			/* current row generation */
 	int		rz_gen_waiting;		/* flusher sleeping on open_rows */
+	volatile int	rz_sealing;		/* rows unlinked, not yet written */
 	struct hammer2_subcol *sc_open;		/* the open sub-column, if any */
 
 	/*
@@ -1370,6 +1371,11 @@ struct hammer2_dev {
 	volatile uint64_t scrub_brefs_bad;	/* CHECK FAIL count */
 	volatile uint64_t scrub_brefs_repaired;	/* successfully parity-repaired */
 	volatile uint64_t scrub_brefs_unrepairable; /* CHECK FAIL, parity also bad */
+	volatile uint64_t scrub_rows_checked;	/* parity pass (S6) */
+	volatile uint64_t scrub_parity_bad;
+	volatile uint64_t scrub_parity_repaired;
+	volatile uint64_t scrub_parity_unlocatable;
+	volatile uint64_t scrub_rows_skipped;
 	volatile int	scrub_running;		/* 1 while scrub active */
 	int		scrub_error;		/* last scrub error (0 = none) */
 
@@ -2356,7 +2362,8 @@ int hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 		int extra_disk, void *extra_buf);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
-int hammer2_io_raid6_scrub(hammer2_dev_t *hmp);
+int hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
+		uint32_t flags);
 int hammer2_raid6_auto_fail_disk(hammer2_dev_t *hmp, int disk_idx);
 int hammer2_raid6_mark_failed(hammer2_dev_t *hmp, int disk_idx, int flags);
 int hammer2_raid6_close_member(hammer2_dev_t *hmp, int disk_idx,
@@ -2474,6 +2481,12 @@ extern long hammer2_rz_subcol_chains;	/* chains placed in a sub-column */
 extern long hammer2_rz_subcol_nofit;	/* sub-columns closed: no aligned range */
 extern long hammer2_rz_subcol_inplace;	/* rewrites that kept their range */
 extern long hammer2_rz_subcol_stale;	/* tickets released by a safety net */
+/* scrub parity pass (vfs.hammer2.scrub_pq_*), all hmps, cumulative */
+extern long hammer2_scrub_pq_rows;
+extern long hammer2_scrub_pq_bad;
+extern long hammer2_scrub_pq_repaired;
+extern long hammer2_scrub_pq_unloc;
+extern long hammer2_scrub_pq_skipped;
 
 static __inline int
 hammer2_inject_eio(int disk_idx)

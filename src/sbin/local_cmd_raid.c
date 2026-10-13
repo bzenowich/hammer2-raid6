@@ -11,9 +11,13 @@
  *	HAMMER2IOC_RAID_REPLACE — synchronous online resilver of <old>'s
  *	stripe positions onto <new>.  Same path for both args is the
  *	"reattach the same slot" case used by the test suite.
- *   raid scrub [-n]
+ *   raid scrub [-n] [-t | -p]
  *	HAMMER2IOC_RAID_SCRUB — walk every live DATA/DIRENT bref, verify
- *	the CHECK code, parity-repair on mismatch.  Default is blocking;
+ *	the CHECK code, parity-repair on mismatch; then read every
+ *	allocated row in disk order and check P and Q (rows_checked,
+ *	parity_bad, parity_repaired, parity_unlocatable).  -t skips the
+ *	parity pass (checksum walk only); -p skips the checksum walk
+ *	(parity pass only).  Default is blocking;
  *	with -n, forks a child to run the blocking ioctl and polls
  *	HAMMER2IOC_RAID_SCRUB_STATUS from the parent for live progress.
  */
@@ -25,7 +29,7 @@
 
 int cmd_raid(const char *sel_path, int ac, const char **av);
 
-static int raid_scrub_blocking(const char *sel_path);
+static int raid_scrub_blocking(const char *sel_path, uint32_t flags);
 
 static int
 raid_status(const char *sel_path)
@@ -160,7 +164,7 @@ raid_replace(const char *sel_path, const char *old_dev, const char *new_dev)
 	 */
 	printf("raid replace: running post-resilver scrub "
 	       "(resilver does not verify checksums)...\n");
-	return raid_scrub_blocking(sel_path);
+	return raid_scrub_blocking(sel_path, 0);
 }
 
 static void
@@ -175,6 +179,16 @@ raid_scrub_print_final(const struct hammer2_ioc_raid_scrub *rs)
 	       (unsigned long long)rs->brefs_repaired);
 	printf("  brefs_unrepairable: %llu\n",
 	       (unsigned long long)rs->brefs_unrepairable);
+	printf("  rows_checked:       %llu\n",
+	       (unsigned long long)rs->rows_checked);
+	printf("  parity_bad:         %llu\n",
+	       (unsigned long long)rs->parity_bad);
+	printf("  parity_repaired:    %llu\n",
+	       (unsigned long long)rs->parity_repaired);
+	printf("  parity_unlocatable: %llu\n",
+	       (unsigned long long)rs->parity_unlocatable);
+	printf("  rows_skipped:       %llu\n",
+	       (unsigned long long)rs->rows_skipped);
 	printf("  error:              %d\n", rs->error);
 }
 
@@ -183,7 +197,7 @@ raid_scrub_print_final(const struct hammer2_ioc_raid_scrub *rs)
  * per call.
  */
 static int
-raid_scrub_blocking(const char *sel_path)
+raid_scrub_blocking(const char *sel_path, uint32_t flags)
 {
 	struct hammer2_ioc_raid_scrub rs;
 	int fd;
@@ -193,6 +207,7 @@ raid_scrub_blocking(const char *sel_path)
 	if (fd < 0)
 		return 1;
 	bzero(&rs, sizeof(rs));
+	rs.flags = flags;
 	rc = ioctl(fd, HAMMER2IOC_RAID_SCRUB, &rs);
 	close(fd);
 	if (rc < 0) {
@@ -200,7 +215,8 @@ raid_scrub_blocking(const char *sel_path)
 		return 1;
 	}
 	raid_scrub_print_final(&rs);
-	return (rs.error || rs.brefs_unrepairable) ? 1 : 0;
+	return (rs.error || rs.brefs_unrepairable || rs.parity_unlocatable) ?
+	    1 : 0;
 }
 
 /*
@@ -211,7 +227,7 @@ raid_scrub_blocking(const char *sel_path)
  * dmesg.
  */
 static int
-raid_scrub_polling(const char *sel_path)
+raid_scrub_polling(const char *sel_path, uint32_t flags)
 {
 	struct hammer2_ioc_raid_scrub rs;
 	uint64_t last_done = ~(uint64_t)0;
@@ -232,6 +248,7 @@ raid_scrub_polling(const char *sel_path)
 	if (pid == 0) {
 		/* Child: blocking scrub. */
 		bzero(&rs, sizeof(rs));
+		rs.flags = flags;
 		(void)ioctl(fd, HAMMER2IOC_RAID_SCRUB, &rs);
 		_exit(rs.error ? 1 : 0);
 	}
@@ -270,7 +287,8 @@ raid_scrub_polling(const char *sel_path)
 	(void)ioctl(fd, HAMMER2IOC_RAID_SCRUB_STATUS, &rs);
 	close(fd);
 	raid_scrub_print_final(&rs);
-	return (rs.error || rs.brefs_unrepairable) ? 1 : 0;
+	return (rs.error || rs.brefs_unrepairable || rs.parity_unlocatable) ?
+	    1 : 0;
 }
 
 int
@@ -299,9 +317,26 @@ cmd_raid(const char *sel_path, int ac, const char **av)
 		}
 		return raid_replace(sel_path, av[1], av[2]);
 	} else if (strcmp(av[0], "scrub") == 0) {
-		if (ac >= 2 && strcmp(av[1], "-n") == 0)
-			return raid_scrub_polling(sel_path);
-		return raid_scrub_blocking(sel_path);
+		int poll = 0;
+		uint32_t flags = 0;
+		int i;
+
+		for (i = 1; i < ac; i++) {
+			if (strcmp(av[i], "-n") == 0) {
+				poll = 1;
+			} else if (strcmp(av[i], "-t") == 0) {
+				flags |= HAMMER2_SCRUB_NOPARITY;
+			} else if (strcmp(av[i], "-p") == 0) {
+				flags |= HAMMER2_SCRUB_NOTREE;
+			} else {
+				fprintf(stderr,
+				    "raid scrub: usage: scrub [-n] [-t | -p]\n");
+				return 1;
+			}
+		}
+		if (poll)
+			return raid_scrub_polling(sel_path, flags);
+		return raid_scrub_blocking(sel_path, flags);
 	}
 	fprintf(stderr, "raid: unknown subcommand '%s'\n", av[0]);
 	return 1;

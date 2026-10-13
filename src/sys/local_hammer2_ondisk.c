@@ -2253,6 +2253,8 @@ hammer2_raid6_open_row_unlink_locked(hammer2_dev_t *hmp,
 	}
 	hmp->open_rows_count--;
 	clrbit(hmp->stripe_open, r->row_id);
+	/* until its write is done the media holds no P/Q of this row yet */
+	atomic_add_int(&hmp->rz_sealing, 1);
 }
 
 /*
@@ -2285,6 +2287,7 @@ hammer2_raid6_row_write_free(hammer2_dev_t *hmp, struct hammer2_open_row *r)
 	for (i = 0; i < ncols; i++)
 		kfree(to_free[i], M_HAMMER2);
 	kfree(r, M_HAMMER2);
+	atomic_add_int(&hmp->rz_sealing, -1);
 }
 
 /*
