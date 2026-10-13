@@ -65,7 +65,9 @@ while [ "$i" -lt "$NFILL" ]; do
     cp $CHUNK $MNTPT/f$i || break
     i=$((i + 1))
 done
-sync
+# sync(2) does not wait for the flush (MNT_NOWAIT); df right after a
+# single sync was 21 MB short once on the Pi.
+sync; sync; sleep 2
 if [ "$i" = "$NFILL" ]; then
     result PASS "N1: wrote $NFILL x 64 MB (old limit ${OLD_LIMIT_MB} MB)"
 else
