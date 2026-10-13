@@ -264,4 +264,60 @@ fi
 kmsg_clear
 teardown "L5"
 
+# L6: a mount refused because the super-root fails its check on every
+# copy must unwind cleanly (it once panicked in hammer2_pfsfree_scan ->
+# hammer2_inode_drop).  The mount fails, a second attempt fails the same
+# way, and a newfs + mount afterwards still works (no leaked state).
+setup_fresh
+check_v3
+mkdir -p $MNTPT/l6
+echo "content-6" > $MNTPT/l6/file
+sync; sync
+umount $MNTPT
+d=0
+while [ $d -lt $NDISKS ]; do
+    corrupt_disk $d $((MD_BLK + 16)) $((DATA_BLK - MD_BLK - 16))
+    d=$((d + 1))
+done
+kmsg_clear
+if mount -t hammer2 $PFSPATH $MNTPT 2>/var/tmp/l6_mount1.txt; then
+    result FAIL "L6: mount with every metadata copy corrupt succeeded"
+    umount $MNTPT 2>/dev/null || umount -f $MNTPT 2>/dev/null || true
+else
+    result PASS "L6: mount refused with every metadata copy corrupt"
+fi
+if kmsg | grep -q 'hammer2_mount: .*reading super-root'; then
+    result PASS "L6: refused at the super-root check"
+else
+    result FAIL "L6: mount not refused at the super-root check"
+    kmsg | grep hammer2 | tail -8
+fi
+if mount -t hammer2 $PFSPATH $MNTPT 2>/dev/null; then
+    result FAIL "L6: second mount of corrupt array succeeded"
+    umount $MNTPT 2>/dev/null || umount -f $MNTPT 2>/dev/null || true
+else
+    result PASS "L6: second mount refused too"
+fi
+
+# Refusal after the super-root is fully set up: no such PFS label.
+setup_fresh
+umount $MNTPT
+kmsg_clear
+if mount -t hammer2 ${DEVSPEC}@NOSUCHPFS $MNTPT 2>/dev/null; then
+    result FAIL "L6: mount of a missing PFS label succeeded"
+    umount $MNTPT 2>/dev/null || true
+else
+    result PASS "L6: mount of a missing PFS label refused"
+fi
+mount -t hammer2 $PFSPATH $MNTPT
+echo "content-6b" > $MNTPT/l6b
+sync
+if [ "$(cat $MNTPT/l6b 2>/dev/null)" = "content-6b" ]; then
+    result PASS "L6: newfs + mount works after refused mounts"
+else
+    result FAIL "L6: fresh mount unusable after refused mounts"
+fi
+kmsg_clear
+teardown "L6"
+
 summary
