@@ -123,6 +123,10 @@ long hammer2_rz_gen_wait_fail;
 long hammer2_rz_seal_full;
 long hammer2_rz_seal_flush;
 long hammer2_rz_seal_flush_short;
+long hammer2_rz_pq_wait_ns;
+long hammer2_rz_pq_wait_cnt;
+long hammer2_rz_seal_ns;
+long hammer2_rz_seal_cnt;
 long hammer2_rz_bf_rows_freed;
 long hammer2_rz_bf_reclaimed;
 long hammer2_rz_bf_rows_live;
@@ -372,6 +376,14 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_unlocatable, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_skipped, CTLFLAG_RD,
 	   &hammer2_scrub_pq_skipped, 0,
 	   "scrub parity pass: rows skipped (open, busy, unreadable)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_wait_ns, CTLFLAG_RW,
+	   &hammer2_rz_pq_wait_ns, 0, "v3 RAID6: ns waiting for P/Q writes at seal");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_wait_cnt, CTLFLAG_RW,
+	   &hammer2_rz_pq_wait_cnt, 0, "v3 RAID6: seals that waited for P/Q");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_ns, CTLFLAG_RW,
+	   &hammer2_rz_seal_ns, 0, "v3 RAID6: ns inside row seal I/O, total");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_cnt, CTLFLAG_RW,
+	   &hammer2_rz_seal_cnt, 0, "v3 RAID6: rows sealed (timed)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
 	   &hammer2_rz_seal_flush_short, 0,
 	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");
