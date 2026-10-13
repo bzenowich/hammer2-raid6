@@ -207,6 +207,25 @@ big_write() {
     teardown "$label"
 }
 
+# P10 flush/mirror counters: passes by the sync, early flushes by MAXPEND,
+# mirror blocks written, copies queued, dirty-chain limit triggers/stalls.
+P10_CTRS="mf_sync mf_maxpend mf_blocks mf_defers dc_trigger dc_stall"
+p10_snap() {
+    P10_B=""
+    for k in $P10_CTRS; do
+        P10_B="$P10_B $(sysctl -n vfs.hammer2.p10_$k 2>/dev/null || echo 0)"
+    done
+}
+p10_report() {
+    local out="" n=0 b
+    for k in $P10_CTRS; do
+        n=$((n + 1))
+        b=$(echo $P10_B | cut -d' ' -f$n)
+        out="$out $k=+$(( $(sysctl -n vfs.hammer2.p10_$k 2>/dev/null || echo 0) - ${b:-0} ))"
+    done
+    echo "    INFO $1 flush counters:$out limit_dirty_chains=$(sysctl -n vfs.hammer2.limit_dirty_chains)"
+}
+
 # small_write <label> <srcdir>: P2-style copy of 4000 files into a fresh
 # array; sets SW_COLS SW_USED_KB SW_RATIO SW_WRT.  Leaves the array mounted
 # (P4/P5 use the tree) and does not tear down.
@@ -220,10 +239,20 @@ small_write() {
     ds_snap /var/tmp/p_b2
     c0=$(sysctl -n vfs.hammer2.rz_cols_alloc 2>/dev/null)
     r0=$(sysctl -n vfs.hammer2.rz_rewrite_slots 2>/dev/null)
+    p10_snap
+    # P2_SYNC_EVERY=N: a sync every N seconds during the copy, to model a
+    # slow machine whose syncer runs several passes (oct-review 11.5, P2 on the Pi).
+    if [ -n "$P2_SYNC_EVERY" ]; then
+        touch /var/tmp/p2_syncing
+        ( while [ -f /var/tmp/p2_syncing ]; do sleep $P2_SYNC_EVERY; sync; done ) &
+    fi
     cp -R $src $MNTPT/small
+    rm -f /var/tmp/p2_syncing
+    wait
     sync; sync; sleep 2
     ds_snap /var/tmp/p_a2
     SW_COLS=$(( $(sysctl -n vfs.hammer2.rz_cols_alloc) - c0 ))
+    p10_report "$label"
     echo "    $label: columns reserved +$SW_COLS, rewrite slots +$(( $(sysctl -n vfs.hammer2.rz_rewrite_slots) - r0 ))"
     u1=$(used_kb)
     SW_USED_KB=$((u1 - u0))

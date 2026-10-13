@@ -106,6 +106,12 @@ long hammer2_rz_open_high;
 long hammer2_rz_rewrite_slots;
 long hammer2_rz_resize_inplace;
 long hammer2_rz_cols_alloc;
+long hammer2_p10_mf_sync;
+long hammer2_p10_mf_maxpend;
+long hammer2_p10_mf_blocks;
+long hammer2_p10_mf_defers;
+long hammer2_p10_dc_trigger;
+long hammer2_p10_dc_stall;
 long hammer2_rz_put_anomaly;
 long hammer2_rz_col_released;
 long hammer2_rz_gen_wait_fail;
@@ -256,6 +262,24 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_rewrite_slots, CTLFLAG_RD,
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_resize_inplace, CTLFLAG_RD,
 	   &hammer2_rz_resize_inplace, 0,
 	   "v3 RAID6: resizes that only changed the radix of the column");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_mf_sync, CTLFLAG_RD,
+	   &hammer2_p10_mf_sync, 0,
+	   "mirror flushes by the sync (TXG flush passes)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_mf_maxpend, CTLFLAG_RD,
+	   &hammer2_p10_mf_maxpend, 0,
+	   "mirror flushes forced early by MIRROR_MAXPEND");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_mf_blocks, CTLFLAG_RD,
+	   &hammer2_p10_mf_blocks, 0,
+	   "mirror blocks written by flushes (each to N-1 disks)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_mf_defers, CTLFLAG_RD,
+	   &hammer2_p10_mf_defers, 0,
+	   "metadata mirror copies queued by putblk");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_dc_trigger, CTLFLAG_RD,
+	   &hammer2_p10_dc_trigger, 0,
+	   "syncer triggers by the dirty-chain/inode limit (half)");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, p10_dc_stall, CTLFLAG_RD,
+	   &hammer2_p10_dc_stall, 0,
+	   "frontend stalls at the dirty-chain/inode limit");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_cols_alloc, CTLFLAG_RD,
 	   &hammer2_rz_cols_alloc, 0,
 	   "v3 RAID6: columns reserved by stripe_alloc");
@@ -3704,6 +3728,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		if (waiting > hammer2_limit_dirty_chains / 2 ||
 		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2)
 		{
+			atomic_add_long(&hammer2_p10_dc_trigger, 1);
 			trigger_syncer(pmp->mp);
 		}
 
@@ -3719,6 +3744,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		}
 
 		if (started == 0) {
+			atomic_add_long(&hammer2_p10_dc_stall, 1);
 			trigger_syncer_start(pmp->mp);
 			started = 1;
 		}

@@ -1572,8 +1572,10 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 	 * Metadata mirror copies deferred by putblk: write each block once,
 	 * before the drain and the volume header below.
 	 */
-	if (hammer2_raid6_v3(hmp))
+	if (hammer2_raid6_v3(hmp)) {
+		atomic_add_long(&hammer2_p10_mf_sync, 1);
 		hammer2_io_metadata_mirror_flush(hmp);
+	}
 
 	/*
 	 * We can't safely flush the volume header until we have

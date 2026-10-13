@@ -2448,6 +2448,13 @@ extern int hammer2_raid6_subcol_max;
 extern long hammer2_rz_open_left;	/* rows still open after the last flush */
 extern long hammer2_rz_open_high;	/* peak open rows */
 extern long hammer2_rz_resize_inplace;	/* v3 resizes that kept the column */
+/* P10 flush/mirror statistics (vfs.hammer2.p10_*) */
+extern long hammer2_p10_mf_sync;
+extern long hammer2_p10_mf_maxpend;
+extern long hammer2_p10_mf_blocks;
+extern long hammer2_p10_mf_defers;
+extern long hammer2_p10_dc_trigger;
+extern long hammer2_p10_dc_stall;
 extern long hammer2_rz_cols_alloc;	/* v3 columns reserved by stripe_alloc */
 extern long hammer2_rz_rewrite_slots;	/* rewrites that took a fresh slot */
 extern long hammer2_rz_col_released;

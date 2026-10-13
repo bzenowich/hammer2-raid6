@@ -951,8 +951,11 @@ hammer2_io_metadata_mirror_defer(hammer2_dev_t *hmp, int primary,
 	if (odata)
 		kfree(odata, M_HAMMER2);
 
-	if (count > HAMMER2_MIRROR_MAXPEND)
+	atomic_add_long(&hammer2_p10_mf_defers, 1);
+	if (count > HAMMER2_MIRROR_MAXPEND) {
+		atomic_add_long(&hammer2_p10_mf_maxpend, 1);
 		hammer2_io_metadata_mirror_flush(hmp);
+	}
 }
 
 /*
@@ -987,6 +990,7 @@ hammer2_io_metadata_mirror_flush(hammer2_dev_t *hmp)
 		hammer2_spin_unex(&hmp->mirror_spin);
 		if (mp == NULL)
 			break;
+		atomic_add_long(&hammer2_p10_mf_blocks, 1);
 
 		/*
 		 * A primary that is down (failed before the release, or
