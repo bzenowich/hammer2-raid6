@@ -1349,6 +1349,7 @@ struct hammer2_dev {
 	int		rebuild_disk;
 	int		rebuild_werror;	/* write to rebuild_disk failed */
 	uint8_t		*rebuild_done;		/* 1 bit per stripe slot */
+	uint64_t	rb_wgen;		/* rows sealed past a failed member */
 
 	/*
 	 * Hung-disk watchdog (R11, hammer2_io_timeout_ms).  Per member,
@@ -2176,6 +2177,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
 int hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes);
 void hammer2_freemap_adjust(hammer2_dev_t *hmp,
 				hammer2_blockref_t *bref, int how);
+void hammer2_freemap_md_alloc_map(hammer2_dev_t *hmp, hammer2_off_t off,
+				hammer2_off_t size, uint8_t *map);
 
 /*
  * hammer2_cluster.c
@@ -2439,6 +2442,10 @@ int hammer2_biowait_timed(struct buf *bp, const char *wmesg);
 void hammer2_inject_delay_slow(int disk_idx);
 void hammer2_inject_wio_dirty(struct buf *bp);
 extern int hammer2_raid6_resilver_skip_unalloc;
+extern int hammer2_raid6_resilver_ckpt_slots;
+extern uint64_t hammer2_raid6_resilver_md_bytes;
+extern uint64_t hammer2_raid6_resilver_resume_slot;
+extern int hammer2_raid6_resilver_stop_slots;
 extern int hammer2_raid6_gen_wait_ms;
 extern int hammer2_raid6_put_stall_ms;
 extern int hammer2_raid6_subcol_test;

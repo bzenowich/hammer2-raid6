@@ -2803,6 +2803,79 @@ hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx, int surv,
 }
 
 /*
+ * Where does a resilver of failed_disk_idx onto new_devvp start?
+ *
+ * The volume header (hmp->voldata, from the survivors) holds a resume
+ * record: the id of the target the resilver was filling, the first slot
+ * it had not rebuilt, and the count of degraded seals when it wrote
+ * that.  The record is good only if no row has been sealed past the
+ * failed member since (rz_rb_wgen: such a row is on the survivors and
+ * missing on the target, and may lie below the cursor), and only for
+ * the same target: its volume header, which the resilver stamps with
+ * the id, must carry the id.  Any other disk, a wiped one included,
+ * starts at slot 0 under a new id.  The cursor was committed only
+ * after the target's writes below it were flushed (the sync flushes
+ * every member before it writes a header), so the slots below it are
+ * on the target.
+ *
+ * Called with rebuild_active set: rows sealed from now on write the
+ * target themselves.
+ */
+static uint64_t
+hammer2_resilver_resume_point(hammer2_dev_t *hmp, int failed_disk_idx,
+			      struct vnode *new_devvp, uint64_t num_stripes)
+{
+	hammer2_raid_config_t *vrc = &hmp->voldata.raid_config;
+	hammer2_volume_data_t *vd;
+	struct buf *bp = NULL;
+	uint64_t cursor = 0;
+	int ok = 0;
+
+	hammer2_voldata_lock(hmp);
+	if (vrc->rz_rb_id != 0 && vrc->rz_rb_disk == failed_disk_idx &&
+	    vrc->rz_rb_cwgen == hmp->rb_wgen &&
+	    vrc->rz_rb_cursor > 0 && vrc->rz_rb_cursor <= num_stripes &&
+	    bread(new_devvp, 0, HAMMER2_VOLUME_BYTES, &bp) == 0) {
+		vd = (hammer2_volume_data_t *)bp->b_data;
+		bkvasync(bp);
+		if (vd->magic == HAMMER2_VOLUME_ID_HBO &&
+		    vd->volu_id == failed_disk_idx &&
+		    vd->raid_config.rz_rb_id == vrc->rz_rb_id)
+			ok = 1;
+	}
+	if (bp)
+		brelse(bp);
+	if (ok) {
+		cursor = vrc->rz_rb_cursor;
+	} else {
+		do {
+			vrc->rz_rb_id = ((uint64_t)karc4random() << 32) |
+					karc4random();
+		} while (vrc->rz_rb_id == 0);
+		vrc->rz_rb_disk = failed_disk_idx;
+		vrc->rz_rb_cursor = 0;
+	}
+	vrc->rz_rb_cwgen = hmp->rb_wgen;
+	hammer2_voldata_modify(hmp);
+	hammer2_voldata_unlock(hmp);
+	return cursor;
+}
+
+/*
+ * Commit the resume cursor: every slot below it is on the target.
+ */
+static void
+hammer2_resilver_ckpt(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint64_t cursor)
+{
+	hammer2_voldata_lock(hmp);
+	hmp->voldata.raid_config.rz_rb_cursor = cursor;
+	hmp->voldata.raid_config.rz_rb_cwgen = hmp->rb_wgen;
+	hammer2_voldata_modify(hmp);
+	hammer2_voldata_unlock(hmp);
+	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+}
+
+/*
  * RAID 6 online resilver.
  *
  * Reconstruct all data for the disk at failed_disk_idx onto new_devvp.
@@ -2826,6 +2899,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	uint64_t stripe_num;
 	struct timespec ts0, ts1, ts2;
 	uint64_t nrebuilt = 0;
+	uint64_t resume;
+	uint64_t last_ckpt;
 	void *outs[RESILVER_BATCH];
 	void *xbufs[4];
 	uint64_t slots[RESILVER_BATCH];
@@ -2854,9 +2929,17 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	/* Publish progress so status ioctl can be polled from userspace */
 	hmp->resilver_disk_idx = failed_disk_idx;
 	hmp->resilver_stripes_total = num_stripes;
-	hmp->resilver_stripes_done = 0;
 	hmp->resilver_running = 1;
+	resume = hammer2_resilver_resume_point(hmp, failed_disk_idx,
+					       new_devvp, num_stripes);
+	hmp->resilver_stripes_done = resume;
+	hammer2_raid6_resilver_resume_slot = resume;
+	hammer2_raid6_resilver_md_bytes = 0;
 	nanouptime(&ts0);
+	if (resume)
+		kprintf("hammer2: resilver disk %d resumes at slot %ju "
+			"of %ju\n", failed_disk_idx, (uintmax_t)resume,
+			(uintmax_t)num_stripes);
 
 	/*
 	 * Phase 1: Copy the volume header from a surviving disk to new_devvp.
@@ -2903,6 +2986,16 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					voldata = (hammer2_volume_data_t *)
 					    wbp->b_data;
 					voldata->volu_id = failed_disk_idx;
+					voldata->raid_config.rz_rb_id =
+					    hmp->voldata.raid_config.rz_rb_id;
+					voldata->raid_config.rz_rb_disk =
+					    failed_disk_idx;
+					voldata->raid_config.rz_rb_cursor =
+					    resume;
+					voldata->raid_config.rz_rb_cwgen =
+					    hmp->rb_wgen;
+					voldata->raid_config.rz_rb_wgen =
+					    hmp->rb_wgen;
 					/* Recompute CRCs: ICRC0 first (covers
 					 * volu_id), then ICRCVH (covers all,
 					 * including updated ICRC0). */
@@ -2992,17 +3085,32 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 			hammer2_off_t mo;
 			hammer2_off_t ms;
 			hammer2_off_t off;
+			uint8_t *amap = NULL;
 
 			if (ex < hmp->md_nextents) {
 				mo = hmp->md_extents[ex].md_off;
 				ms = hmp->md_extents[ex].md_size;
+				/*
+				 * Only the chunks the freemap has allocated;
+				 * the rest holds no block that anything can
+				 * reach, and a block allocated from now on
+				 * is written to the new disk by its flush.
+				 */
+				if (hammer2_raid6_resilver_skip_unalloc) {
+					amap = kmalloc((ms / MD_CHUNK + 8) / 8,
+						       M_HAMMER2,
+						       M_WAITOK | M_ZERO);
+					hammer2_freemap_md_alloc_map(hmp, mo,
+					    ms, amap);
+				}
 			} else {
 				mo = (hammer2_off_t)(ex - hmp->md_nextents) *
 				     HAMMER2_ZONE_BYTES64 + HAMMER2_VOLUME_BYTES;
 				ms = HAMMER2_ZONE_SEG64 - HAMMER2_VOLUME_BYTES;
 			}
 
-			for (off = 0; off < ms; off += MD_WINDOW * MD_CHUNK) {
+			for (off = 0; off < ms; ) {
+				hammer2_off_t cidx[MD_WINDOW];
 				struct buf *rbp[MD_WINDOW];
 				struct buf *wbp[MD_WINDOW];
 				int wpb[MD_WINDOW];
@@ -3011,17 +3119,22 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 
 				/* forced unmount (hammer2_vfs_unmount) */
 				if (hmp->raid_abort) {
+					if (amap)
+						kfree(amap, M_HAMMER2);
 					kfree(md_buf, M_HAMMER2);
 					hmp->resilver_running = 0;
 					return EINTR;
 				}
-				for (nch = 0; nch < MD_WINDOW; nch++) {
-					hammer2_off_t coff =
-					    off + (hammer2_off_t)nch * MD_CHUNK;
+				nch = 0;
+				while (nch < MD_WINDOW && off < ms) {
+					hammer2_off_t coff = off;
 					size_t this_chunk;
+					size_t ci = (size_t)(off / MD_CHUNK);
 
-					if (coff >= ms)
-						break;
+					off += MD_CHUNK;
+					if (amap &&
+					    (amap[ci / 8] & (1 << (ci % 8))) == 0)
+						continue;
 					this_chunk = (size_t)((ms - coff >
 					    MD_CHUNK) ? MD_CHUNK : (ms - coff));
 					/*
@@ -3036,7 +3149,10 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					if (this_chunk > MD_CHUNK)
 						this_chunk = MD_CHUNK;
 					clen[nch] = this_chunk;
+					cidx[nch++] = coff;
 				}
+				if (nch == 0)
+					break;
 
 				/*
 				 * Every survivor holds a mirror copy.  Mirror
@@ -3083,8 +3199,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					    devvp->v_track_write, 0, 0);
 				}
 				for (c = 0; c < nch; c++) {
-					hammer2_off_t coff = mo + off +
-					    (hammer2_off_t)c * MD_CHUNK;
+					hammer2_off_t coff = mo + cidx[c];
 					int src = -1;
 
 					rbp[c] = NULL;
@@ -3124,8 +3239,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 						    (off_t)coff, (int)clen[c]);
 				}
 				for (c = 0; c < nch; c++) {
-					hammer2_off_t coff = mo + off +
-					    (hammer2_off_t)c * MD_CHUNK;
+					hammer2_off_t coff = mo + cidx[c];
 
 					lerror = EIO;
 					if (rbp[c]) {
@@ -3161,6 +3275,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 							    wbp[i], wpb[i]);
 						lockmgr(&hmp->rebuild_lk,
 							LK_RELEASE);
+						if (amap)
+							kfree(amap, M_HAMMER2);
 						kfree(md_buf, M_HAMMER2);
 						hmp->resilver_running = 0;
 						return EIO;
@@ -3179,12 +3295,19 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 				}
 				lockmgr(&hmp->rebuild_lk, LK_RELEASE);
 				if (lerror) {
+					if (amap)
+						kfree(amap, M_HAMMER2);
 					kfree(md_buf, M_HAMMER2);
 					hmp->resilver_running = 0;
 					return lerror;
 				}
+				for (c = 0; c < nch; c++)
+					hammer2_raid6_resilver_md_bytes +=
+					    clen[c];
 				lwkt_yield();
 			}
+			if (amap)
+				kfree(amap, M_HAMMER2);
 		}
 		kfree(md_buf, M_HAMMER2);
 	}
@@ -3216,7 +3339,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 	 */
 	hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 
-	stripe_num = 0;
+	stripe_num = resume;
+	last_ckpt = resume;
 	while (stripe_num < num_stripes) {
 		int n = 0;
 
@@ -3305,6 +3429,18 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		/* Update progress and yield */
 		nrebuilt += n;
 		hmp->resilver_stripes_done = stripe_num;
+		if (hammer2_raid6_resilver_ckpt_slots > 0 &&
+		    stripe_num - last_ckpt >=
+		    (uint64_t)hammer2_raid6_resilver_ckpt_slots &&
+		    !hmp->raid_abort) {
+			hammer2_resilver_ckpt(hmp, pmp, stripe_num);
+			last_ckpt = stripe_num;
+		}
+		if (hammer2_raid6_resilver_stop_slots > 0 &&
+		    nrebuilt >= (uint64_t)hammer2_raid6_resilver_stop_slots) {
+			error = EINTR;
+			break;
+		}
 		lwkt_yield();
 	}
 

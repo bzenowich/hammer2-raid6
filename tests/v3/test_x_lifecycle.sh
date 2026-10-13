@@ -22,6 +22,11 @@
 #       out differently.)  Only the arm64 build has a SIMD path
 #       (NEON); on other builds the two settings run the same code
 #       and the test says so.
+#   X7  an interrupted resilver resumes from its committed cursor
+#       (same mount, after a remount), and a stale cursor (a write while
+#       the disk was out) is ignored
+#   X8  Phase A copies only the freemap-allocated metadata; what it
+#       skipped is never read as metadata
 #   X6  disk count: the number of vbd test disks the guest has against
 #       NDISKS (information; a 6-disk matrix needs a harness change)
 #
@@ -46,6 +51,8 @@ x_cleanup() {
     sysctl -w vfs.hammer2.inject_delay_ms_disk_mask=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null 2>&1
     sysctl -w vfs.hammer2.raid6_simd=1 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.resilver_stop_slots=0 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.resilver_ckpt_slots=2048 > /dev/null 2>&1
     rm -f $CHUNK /var/tmp/x_small
 }
 trap x_cleanup EXIT INT TERM
@@ -662,7 +669,259 @@ done
 echo "  info: X6: ${DISK_PREFIX}${DISK_BASE}.. present: $n disks (NDISKS=$NDISKS); NDISKS=6 needs 6"
 }
 
-for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6}; do
+# ----------------------------------------------------------------
+# X7: an interrupted resilver resumes (oct-review P6 resume cursor)
+#
+# vfs.hammer2.resilver_stop_slots stops the resilver after N slots
+# (EINTR, the disk stays FAILED, as after umount -f or a crash) and
+# resilver_ckpt_slots makes it commit its cursor every few slots.  The
+# next raid replace onto the same, un-wiped disk must continue from the
+# cursor (resilver_resume_slot > 0) and give a clean disk.
+#   X7a  stop, replace again in the same mount: resumed, clean
+#   X7b  stop, unmount, mount again (the cursor comes from the media),
+#        replace: resumed, clean
+#   X7c  stop, then a write while the disk is out: the cursor is stale
+#        (the new rows are not on the disk), the replace restarts at 0
+#   X7d  stop, then the disk is wiped (a different disk): restarts at 0
+# ----------------------------------------------------------------
+x7_cleanup() {
+    sysctl -w vfs.hammer2.resilver_stop_slots=0 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.resilver_ckpt_slots=2048 > /dev/null 2>&1
+}
+
+# x7_stopped <label> <nbig>: array, disk $X_DISK failed and wiped, a
+# resilver stopped part-way; returns 0 if it was stopped
+x7_stopped() {
+    local label="$1" nbig="$2"
+    setup_fresh $X_SIZE
+    check_v3
+    write_ref_data "ref"
+    if ! fill_big $nbig; then
+        result FAIL "$label: could not write the big files"
+        return 1
+    fi
+    fail_disk $X_DISK "$label" || return 1
+    x_fresh_disk $X_DISK
+    sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+    sysctl -w vfs.hammer2.resilver_ckpt_slots=${X7_CKPT:-64} > /dev/null
+    sysctl -w vfs.hammer2.resilver_stop_slots=${X7_STOP:-1500} > /dev/null
+    kmsg_clear
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
+            "$(disk_dev $X_DISK)" > /var/tmp/x_replace.txt 2>&1; then
+        result FAIL "$label: the resilver was not stopped (too few slots?)"
+        x7_cleanup
+        return 1
+    fi
+    sysctl -w vfs.hammer2.resilver_stop_slots=0 > /dev/null
+    if disk_state_is $X_DISK FAILED; then
+        result PASS "$label: resilver stopped part-way, disk$X_DISK still FAILED"
+    else
+        result FAIL "$label: disk$X_DISK is not FAILED after the stopped resilver"
+        return 1
+    fi
+    return 0
+}
+
+# x7_slots <disk>: the slot count of the last "resilver disk N: ..." line
+x7_slots() {
+    kmsg | grep "resilver disk $1: metadata" | tail -1 |
+        sed -n 's/.*ms, \([0-9]*\) slots in.*/\1/p'
+}
+
+# x7_finish <label> <expect resume: yes|no>: replace, check resume, data
+x7_finish() {
+    local label="$1" want="$2" first resumed n2
+    first=$(x7_slots $X_DISK)
+    kmsg_clear
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
+            "$(disk_dev ${3:-$X_DISK})" > /var/tmp/x_replace.txt 2>&1; then
+        result PASS "$label: the second raid replace completes"
+    else
+        result FAIL "$label: the second raid replace failed"
+        sed 's/^/      /' /var/tmp/x_replace.txt
+    fi
+    resumed=$(sysctl -n vfs.hammer2.resilver_resume_slot)
+    n2=$(x7_slots $X_DISK)
+    echo "  info: $label: first run rebuilt ${first:-?} slots, second run resumed at slot $resumed and rebuilt ${n2:-?}"
+    if [ "$want" = yes ]; then
+        if [ "${resumed:-0}" -gt 0 ] && kmsg_has "resumes at slot"; then
+            result PASS "$label: the resilver resumed at slot $resumed, not 0"
+        else
+            result FAIL "$label: the resilver restarted from slot 0"
+        fi
+    else
+        if [ "${resumed:-1}" = "0" ]; then
+            result PASS "$label: stale cursor ignored, resilver restarted at 0"
+        else
+            result FAIL "$label: resumed at slot $resumed from a stale cursor"
+        fi
+    fi
+    if disk_state_is $X_DISK ONLINE; then
+        result PASS "$label: disk$X_DISK ONLINE"
+    else
+        result FAIL "$label: disk$X_DISK not ONLINE"
+    fi
+}
+
+x7_verify() {
+    local label="$1" err
+    remount
+    verify_ref "$label: reference data (cold)" "ref"
+    verify_big $NBIG "$label"
+    err=$(disk_counter $X_DISK cksum_err)
+    if [ "${err:-x}" = "0" ]; then
+        result PASS "$label: disk$X_DISK read clean (no parity heals)"
+    else
+        result FAIL "$label: disk$X_DISK had $err bad columns on cold reads"
+    fi
+    scrub_clean "$label"
+}
+
+x7() {
+if x7_stopped X7a $NBIG; then
+    x7_finish X7a yes
+    x7_verify X7a
+fi
+x7_cleanup
+teardown "X7a"
+
+if x7_stopped X7b $NBIG; then
+    sync
+    if umount $MNTPT && mount -t hammer2 $PFSPATH $MNTPT 2>/dev/null; then
+        result PASS "X7b: remounted the full array after the stopped resilver"
+        if disk_state_is $X_DISK FAILED; then
+            x7_finish X7b yes
+            x7_verify X7b
+        else
+            result FAIL "X7b: disk$X_DISK is not FAILED after the remount"
+        fi
+    else
+        result FAIL "X7b: remount failed"
+    fi
+fi
+x7_cleanup
+teardown "X7b"
+
+if x7_stopped X7c $NBIG; then
+    # a write while the disk is out: rows that are not on the disk
+    dd if=/dev/urandom of=$MNTPT/late bs=65536 count=64 2>/dev/null
+    LATE=$(sha256 -q $MNTPT/late)
+    sync; sync
+    x7_finish X7c no
+    remount
+    [ "$(sha256 -q $MNTPT/late 2>/dev/null)" = "$LATE" ] &&
+        result PASS "X7c: the file written while the disk was out reads back" ||
+        result FAIL "X7c: the file written while the disk was out is wrong"
+    x7_verify X7c
+fi
+x7_cleanup
+teardown "X7c"
+
+# a different disk (the same one, wiped) must not inherit the cursor
+if x7_stopped X7d $NBIG; then
+    # the disk is held open by the mount: unmount to wipe it
+    sync
+    umount $MNTPT
+    x_fresh_disk $X_DISK
+    if mount -t hammer2 $PFSPATH $MNTPT 2>/var/tmp/x_mount.txt &&
+       disk_state_is $X_DISK FAILED; then
+        x7_finish X7d no
+        x7_verify X7d
+    else
+        result FAIL "X7d: full mount with the wiped disk failed: $(head -1 /var/tmp/x_mount.txt)"
+    fi
+fi
+x7_cleanup
+teardown "X7d"
+}
+
+# ----------------------------------------------------------------
+# X8: Phase A copies only the freemap-allocated metadata
+#
+# A nearly empty array: the metadata that exists is a few MB of a zone
+# of 100+ MB.  With resilver_skip_unalloc=1 the resilver must copy far
+# less than the zone (vfs.hammer2.resilver_md_bytes), with =0 the lot.
+# The disk is wiped first, so what the skipped part of the zone holds
+# is zeros: nothing may ever read it as metadata.  Prove that with a
+# directory tree grown after the resilver, and by reading all the
+# metadata back from the rebuilt disk alone (the other members of one
+# pair failed), then scrub.
+# ----------------------------------------------------------------
+x8() {
+local mdbytes skipped full
+setup_fresh $X_SIZE
+check_v3
+mdbytes=$(((DATA_BLK - MD_BLK) * 65536))
+write_ref_data "ref"
+mkdir $MNTPT/d0
+i=0
+while [ "$i" -lt 200 ]; do
+    echo "file $i" > $MNTPT/d0/f$i
+    i=$((i + 1))
+done
+sync; sync
+fail_disk $X_DISK "X8" || { teardown "X8"; return; }
+x_fresh_disk $X_DISK
+sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
+        "$(disk_dev $X_DISK)" > /var/tmp/x_replace.txt 2>&1; then
+    result PASS "X8: allocated-only resilver completes"
+else
+    result FAIL "X8: allocated-only resilver failed"
+    sed 's/^/      /' /var/tmp/x_replace.txt
+fi
+skipped=$(sysctl -n vfs.hammer2.resilver_md_bytes)
+echo "  info: X8: metadata zone $mdbytes bytes; Phase A copied $skipped"
+if [ "${skipped:-0}" -gt 0 ] && [ "$skipped" -lt "$((mdbytes / 4))" ]; then
+    result PASS "X8: Phase A copied $skipped bytes of a $mdbytes byte metadata zone"
+else
+    result FAIL "X8: Phase A copied $skipped of $mdbytes metadata bytes (expected well under a quarter)"
+fi
+# grow the tree on the rebuilt disk's zone, then read it back from it alone
+mkdir $MNTPT/d1
+i=0
+while [ "$i" -lt 400 ]; do
+    echo "late $i" > $MNTPT/d1/g$i
+    i=$((i + 1))
+done
+sync; sync
+fail_disk 0 "X8" && remount "$(degraded_spec 0)@V3TEST" &&
+    result PASS "X8: mounted without disk0 (metadata now served from the others)"
+verify_ref "X8: reference data, disk0 out" "ref"
+n0=$(ls $MNTPT/d0 | wc -l); n1=$(ls $MNTPT/d1 | wc -l)
+if [ "$n0" -eq 200 ] && [ "$n1" -eq 400 ] &&
+   [ "$(cat $MNTPT/d1/g399)" = "late 399" ]; then
+    result PASS "X8: all 600 small files read back with disk0 out"
+else
+    result FAIL "X8: directory counts d0=$n0 d1=$n1"
+fi
+scrub_clean "X8 (disk0 out)"
+teardown "X8"
+
+# the whole-zone baseline
+setup_fresh $X_SIZE
+check_v3
+write_ref_data "ref"
+fail_disk $X_DISK "X8b" || { teardown "X8b"; return; }
+x_fresh_disk $X_DISK
+sysctl -w vfs.hammer2.resilver_skip_unalloc=0 > /dev/null
+if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
+        "$(disk_dev $X_DISK)" > /var/tmp/x_replace.txt 2>&1; then
+    full=$(sysctl -n vfs.hammer2.resilver_md_bytes)
+    if [ "${full:-0}" -ge "$mdbytes" ]; then
+        result PASS "X8b: skip_unalloc=0 copies the whole zone ($full bytes)"
+    else
+        result FAIL "X8b: skip_unalloc=0 copied $full of $mdbytes bytes"
+    fi
+else
+    result FAIL "X8b: whole-zone resilver failed"
+fi
+sysctl -w vfs.hammer2.resilver_skip_unalloc=1 > /dev/null
+scrub_clean "X8b"
+teardown "X8b"
+}
+
+for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8}; do
     $t
 done
 

@@ -1795,6 +1795,10 @@ hammer2_ioctl_raid_replace(hammer2_inode_t *ip, void *data)
 	 */
 	hammer2_raid6_sm_dirty_all(hmp);
 
+	/* the resume record is done with */
+	hmp->voldata.raid_config.rz_rb_id = 0;
+	hmp->voldata.raid_config.rz_rb_cursor = 0;
+
 	/* Update on-disk RAID config disk state (both runtime and persisted) */
 	hmp->raid_config.disk_state[failed_disk_idx] =
 		HAMMER2_RAID6_DISK_ONLINE;

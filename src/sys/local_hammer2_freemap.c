@@ -316,6 +316,96 @@ hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes)
 }
 
 /*
+ * Which HAMMER2_PBUFSIZE chunks of [off, off + size) hold allocated
+ * freemap blocks?  Sets one bit per chunk in map (size / PBUFSIZE bits,
+ * cleared first).  The resilver's metadata copy (Phase A) copies only
+ * these.
+ *
+ * Statically allocated space (below allocator_beg) has no leaf of its
+ * own to look at and counts as allocated; so does a chunk of a leaf
+ * that cannot be read.  A missing leaf has had no allocation.  The
+ * reserved segment at the start of each 2GB zone is left out: the
+ * caller copies those separately.  Any state but "free" counts as
+ * allocated, so POSSIBLY FREE blocks are copied.
+ *
+ * Blocks allocated after this returns are not in the map; they are
+ * written to the rebuilding disk by their own flush, which is why the
+ * caller sets rebuild_active before it asks.
+ */
+void
+hammer2_freemap_md_alloc_map(hammer2_dev_t *hmp, hammer2_off_t off,
+			     hammer2_off_t size, uint8_t *map)
+{
+	hammer2_off_t lokey;
+	hammer2_off_t key;
+	hammer2_off_t pos;
+	hammer2_off_t end = off + size;
+	hammer2_chain_t *parent;
+	hammer2_chain_t *chain;
+	hammer2_key_t key_dummy;
+	int error;
+
+	bzero(map, (size_t)((size / HAMMER2_PBUFSIZE + 7) / 8));
+	lokey = (hmp->voldata.allocator_beg + HAMMER2_SEGMASK64) &
+		~HAMMER2_SEGMASK64;
+
+	parent = &hmp->fchain;
+	hammer2_chain_ref(parent);
+	hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
+
+	for (key = H2FMBASE(off, HAMMER2_FREEMAP_LEVEL1_RADIX); key < end;
+	     key += HAMMER2_FREEMAP_LEVEL1_SIZE) {
+		chain = hammer2_chain_lookup(&parent, &key_dummy, key,
+				key + HAMMER2_FREEMAP_LEVEL1_MASK, &error,
+				HAMMER2_LOOKUP_ALWAYS |
+				HAMMER2_LOOKUP_MATCHIND);
+		if (chain && chain->error)
+			error = chain->error;
+		for (pos = (key > off ? key : off);
+		     pos < key + HAMMER2_FREEMAP_LEVEL1_SIZE && pos < end;
+		     pos += HAMMER2_PBUFSIZE) {
+			hammer2_bmap_data_t *bmap;
+			hammer2_bitmap_t bits;
+			int alloc;
+			int el;
+			int sh;
+
+			if ((pos & HAMMER2_ZONE_MASK64) < HAMMER2_ZONE_SEG64) {
+				alloc = 0;
+			} else if (pos < lokey) {
+				alloc = 1;
+			} else if (error) {
+				alloc = 1;
+			} else if (chain == NULL) {
+				alloc = 0;
+			} else {
+				bmap = &chain->data->bmdata[
+				    (int)(pos >> HAMMER2_SEGRADIX) &
+				    (HAMMER2_FREEMAP_COUNT - 1)];
+				el = (int)((pos & HAMMER2_SEGMASK64) /
+				    (HAMMER2_SEGSIZE / HAMMER2_BMAP_ELEMENTS));
+				sh = (int)(((pos & HAMMER2_SEGMASK64) %
+				    (HAMMER2_SEGSIZE / HAMMER2_BMAP_ELEMENTS)) /
+				    HAMMER2_FREEMAP_BLOCK_SIZE) * 2;
+				bits = bmap->bitmapq[el] >> sh;
+				alloc = (bits & 0xff) != 0;
+			}
+			if (alloc) {
+				size_t ci = (size_t)((pos - off) /
+						     HAMMER2_PBUFSIZE);
+				map[ci / 8] |= (uint8_t)(1 << (ci % 8));
+			}
+		}
+		if (chain) {
+			hammer2_chain_unlock(chain);
+			hammer2_chain_drop(chain);
+		}
+	}
+	hammer2_chain_unlock(parent);
+	hammer2_chain_drop(parent);
+}
+
+/*
  * Return 1 if the 4MB segment at `base` lies wholly inside the
  * iterator's hard bounds.  A level1 leaf covers 1GB, more than the v3
  * metadata zone, so the leaf scan must check each segment; otherwise
