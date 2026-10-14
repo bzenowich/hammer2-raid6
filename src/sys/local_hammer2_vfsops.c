@@ -149,7 +149,7 @@ long hammer2_cw_wait_ns;
 long hammer2_cw_pool_jobs;
 long hammer2_cw_pool_inline;
 int hammer2_comp_workers = -1;		/* -1: ncpus capped at 4 (set at init) */
-u_int hammer2_comp_depth = 32;
+u_int hammer2_comp_depth = 128;	/* > hammer2_flush_pipe (100) */
 u_int hammer2_comp_inflight;
 long hammer2_rz_bf_rows_freed;
 long hammer2_rz_bf_reclaimed;

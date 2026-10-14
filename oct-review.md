@@ -674,6 +674,76 @@ async_seal=1 gives P1 +40% and P1c +5-7%. Group P then fails one check: P1c >= 9
 85-86, 85-90%). P1c is now CPU-bound in the single strategy thread (4096 x 370 us = 1.5 s of 3.3 s), so
 the compression worker pool above is what would close it; the check itself is right.
 
+*LZ4 worker pool (fix/lz4-pool, 2026-10-14).* The design above, as built; all of it in
+`local_hammer2_strategy.c`.
+
+- *Where.* `hammer2_strategy_write()` (the VOP_STRATEGY caller, so the thread that flushes the
+  buffer) decides per bio whether to start a job and stores it in the xop (`xop->cjob`). The
+  job holds the bio data pointer (workers read `bp->b_data` in place: the bio cannot complete
+  before the xop thread has consumed the job), one `cache_buffer_write` object (32 KB output +
+  LZ4 hash table in its tail, so still no per-block allocation) and a `struct task`. The pool is
+  one taskqueue (`h2comp`) with min(ncpus, 4) kthreads spread over the CPUs, created in
+  `vfs_init`, freed in `vfs_uninit`; taskqueue is already used there for `h2gone`. The worker
+  runs the all-zeros test (when the check code is on) and `LZ4_compress64k_heap_limitedOutput()`,
+  stores `comp_size`, sets `done` and `wakeup()`s. The xop thread, at the point where it used to
+  test for zeros and call LZ4, waits for the job (`tsleep_interlock`/`PINTERLOCKED`), takes the
+  compressed buffer and carries on into `hammer2_assign_physical`, the buffer fill, the dedup
+  record and `subcol_done` exactly as before. Chain allocation, row fill and block order stay in
+  the xop thread, so the media layout is unchanged (P1c columns/write-amp identical).
+- *Only 64 KB LZ4 blocks.* A job is started only when the inode's algorithm is LZ4, there is one
+  cluster member, the block is a full 64 KB physical block (not an EOF tail, not inode-embedded
+  data) and `comp_heuristic < 8` (or `always_compress`). The 1-in-8 probes of an incompressible
+  file and everything else run inline. The xop thread re-validates the job (pblksize, algorithm,
+  check code: `setcomp`/truncate may have changed since submission) and falls back to inline
+  compression if it no longer matches. `comp_heuristic` is still updated only by the xop thread.
+  A worker that finds a zero block returns without compressing and the xop thread takes the
+  usual `zero_write` path.
+- *Bounds and fallback.* `vfs.hammer2.comp_workers` (RW, default min(ncpus,4), clamped to the
+  threads started at load; **0 = inline exactly as before**) and `vfs.hammer2.comp_depth` (RW,
+  default 128, jobs in flight = bios already queued to a strategy xop; must exceed
+  `flush_pipe` (100), which already bounds queued bios, or most blocks fall back inline: with 32
+  only 1500 of 4096 blocks used the pool). Memory is at most `comp_depth` x 48 KB. Allocation
+  failure or a full pool simply compresses inline (`cw_pool_inline`).
+- *Lifetime.* Every job is consumed by exactly one xop run (also on the `finished` early
+  returns), which waits for the worker, returns the buffer and frees it. Unmount drains
+  `lwinprog` (the strategy xops) before the flush, so no job outlives its xop; `vfs_uninit`
+  runs only after all mounts are gone and `taskqueue_free()` waits for a running task.
+  `vfs.hammer2.comp_inflight` is the live count (0 after every unmount in tests P6/P7).
+- *Counters.* `cw_lz4_ns` / `cw_zero_ns` now count worker time (so "lz4" per block grows to
+  250-265 us in the pool runs on h2dev: it runs concurrently on busy vCPUs); new
+  `cw_wait_ns` (time the xop thread waited for a result), `cw_pool_jobs`, `cw_pool_inline`.
+  The group P "write path" line prints `comp-wait` ns/block and the pool job count.
+- *Tests.* Group P: `P6` five files written in parallel with LZ4 (compressible, random, zero
+  blocks mixed), remount, sha256 of each, `comp_inflight` 0, scrub clean; `P7` umount of dirty
+  compressible data (flush compresses), data intact; `P7b` `umount -f` while four writers are
+  compressing: returns, nothing in flight, array mounts and scrubs. `P_ONLY=P1` runs only
+  P1/P1c, `P_ONLY=P6` only P6/P7.
+
+*Results (h2dev, x86 4 vCPU, 4 x vbd, async 0 / 1, workers 0 vs 4).* P1c is not CPU-bound in the
+xop thread on this host, so the pool shows up in the counters, not in MB/s. Write path per 64 KB
+block, async_seal=1, P1c: inline zero 14 + lz4 176 + assign 38 + buffer 18 + done 172 us (xop
+thread busy about 418 us per block, 42% of the 4.2 s wall); pool: assign 47 + buffer 22 + done
+178 us, **comp-wait about 1 us per block** (3 ms over the whole run) = about 250 us per block
+(-40%), the 266 us of LZ4 now overlap on the workers. Throughput (4 alternating runs, first run of
+the sequence dropped; MB/s, P1 / P1c):
+
+| | P1 | P1c |
+|---|---|---|
+| async 0, workers 0 | 45.6, 42.2, 42.9 | 72.9, 76.2, 70.7 |
+| async 0, workers 4 | 63.1, 45.8, 35.8 | 63.7, 52.0, 46.4 |
+| async 1, workers 0 | 41.8, 61.4, 48.8 | 58.4, 61.7, 63.1 |
+| async 1, workers 4 | 56.9, 50.1, 53.6 | 60.0, 73.8, 47.1 |
+
+A second sweep (async 0, P1c only, workers 0/1/2/4, 2 runs each) gave 67.2 62.6 / 63.1 72.5 /
+64.8 60.4 / 71.7 57.4. Run to run spread (35-76 MB/s for the same configuration) is larger than
+any pool effect, and P1c >= 90% of P1 holds on h2dev with or without the pool because P1 is the
+slower one here (disk bound, 2x write-amp). So h2dev proves correctness and that LZ4 is off the
+xop thread; whether the Pi reaches P1c >= 90% of P1 (72-77 vs 85-86 before) has to be measured
+there (`vfs.hammer2.comp_workers` 0 vs 4, 2, 3 are the knobs; 4 workers + the xop thread + the
+dd front end share four A72 cores).
+
+Full suite on the final build (`comp_workers` 4, `comp_depth` 128; groups X Z R G A B C D E F H I J K L N O P Q S T U V W Y, P5 asserts on): async_seal=0 **638 pass / 0 fail**, async_seal=1 **638 / 0** (group P, with the new P6/P7 and the P1c >= 90% check, 100-104 s).
+
 *P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
 runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
 P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs

@@ -1450,7 +1450,7 @@ index 9c5abb1..45e7278 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729..0abe696 100644
+index a29c729..40c5355 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -92,6 +92,7 @@
@@ -1483,7 +1483,15 @@ index a29c729..0abe696 100644
  #define HAMMER2_CHAIN_VOLUMESYNC	0x00000800	/* needs volume sync */
  #define HAMMER2_CHAIN_UNUSED1000	0x00001000
  #define HAMMER2_CHAIN_COUNTEDBREFS	0x00002000	/* block table stats */
-@@ -1122,6 +1123,83 @@ typedef struct hammer2_volume hammer2_volume_t;
+@@ -924,6 +925,7 @@ struct hammer2_xop_strategy {
+ 	int			finished;
+ 	hammer2_mtx_t		lock;
+ 	struct bio		*bio;
++	struct hammer2_cjob	*cjob;	/* pre-compression job or NULL */
+ };
+ 
+ struct hammer2_xop_readdir {
+@@ -1122,6 +1124,83 @@ typedef struct hammer2_volume hammer2_volume_t;
   * many PFSs and those PFSs might combine together in various ways to form
   * the set of available clusters.
   */
@@ -1567,7 +1575,7 @@ index a29c729..0abe696 100644
  struct hammer2_dev {
  	struct vnode	*devvp;		/* device vnode for root volume */
  	int		ronly;		/* read-only mount */
-@@ -1158,6 +1236,208 @@ struct hammer2_dev {
+@@ -1158,6 +1237,208 @@ struct hammer2_dev {
  
  	hammer2_devvp_list_t devvpl;	/* list of device vnodes including *devvp */
  	hammer2_volume_t volumes[HAMMER2_MAX_VOLUMES]; /* list of volumes */
@@ -1776,7 +1784,7 @@ index a29c729..0abe696 100644
  };
  
  typedef struct hammer2_dev hammer2_dev_t;
-@@ -1289,6 +1569,20 @@ MPTOPMP(struct mount *mp)
+@@ -1289,6 +1570,20 @@ MPTOPMP(struct mount *mp)
  #define HAMMER2_DEDUP_FRAG      (HAMMER2_PBUFSIZE / 64)
  #define HAMMER2_DEDUP_FRAGRADIX (HAMMER2_PBUFRADIX - 6)
  
@@ -1797,7 +1805,7 @@ index a29c729..0abe696 100644
  static __inline
  uint64_t
  hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
-@@ -1297,8 +1591,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
+@@ -1297,8 +1592,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
  	int bits;
  	uint64_t mask;
  
@@ -1807,7 +1815,7 @@ index a29c729..0abe696 100644
  	bits = (int)((bytes + (HAMMER2_DEDUP_FRAG - 1)) >>
  	       HAMMER2_DEDUP_FRAGRADIX);
  	if (bbeg + bits == 64)
-@@ -1414,6 +1707,8 @@ extern int hammer2_xop_xbase;
+@@ -1414,6 +1708,8 @@ extern int hammer2_xop_xbase;
  extern int hammer2_xop_mod;
  extern long hammer2_debug_inode;
  extern int hammer2_cluster_meta_read;
@@ -1816,7 +1824,7 @@ index a29c729..0abe696 100644
  extern int hammer2_cluster_data_read;
  extern int hammer2_cluster_write;
  extern int hammer2_dedup_enable;
-@@ -1642,15 +1937,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -1642,15 +1938,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
  				u_int bytes);
  int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
@@ -1842,7 +1850,7 @@ index a29c729..0abe696 100644
  hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  				int lsize HAMMER2_IO_DEBUG_ARGS);
  void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
-@@ -1663,8 +1964,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1663,8 +1965,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  
  #ifndef HAMMER2_IO_DEBUG
  
@@ -1853,7 +1861,7 @@ index a29c729..0abe696 100644
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
  	_hammer2_io_getquick((hmp), (lbase), (lsize))
  #define hammer2_io_putblk(diop)						\
-@@ -1682,13 +1983,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1682,13 +1984,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio))
  
@@ -1871,7 +1879,7 @@ index a29c729..0abe696 100644
  	__FILE__, __LINE__)
  
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
-@@ -1710,8 +2011,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1710,8 +2012,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio), __FILE__, __LINE__)
  
@@ -1882,7 +1890,7 @@ index a29c729..0abe696 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1900,6 +2201,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
+@@ -1900,6 +2202,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
  int hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes);
  void hammer2_freemap_adjust(hammer2_dev_t *hmp,
  				hammer2_blockref_t *bref, int how);
@@ -1891,7 +1899,7 @@ index a29c729..0abe696 100644
  
  /*
   * hammer2_cluster.c
-@@ -1944,16 +2247,351 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
+@@ -1944,16 +2248,367 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
   * hammer2_ondisk.c
   */
  int hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
@@ -2181,6 +2189,22 @@ index a29c729..0abe696 100644
 +extern long hammer2_rz_pq_wait_cnt;
 +extern long hammer2_rz_seal_ns;		/* ns inside row_io, total */
 +extern long hammer2_rz_seal_cnt;
++#define HAMMER2_LZ4_CTXSIZE	16384	/* hammer2_lz4.c HASHTABLESIZE */
++extern long hammer2_cw_cnt;		/* blocks through compress_and_write */
++extern long hammer2_cw_zero_ns;		/* ... ns in the zero test */
++extern long hammer2_cw_lz4_cnt;		/* ... compression attempts */
++extern long hammer2_cw_lz4_ns;		/* ... ns compressing */
++extern long hammer2_cw_assign_ns;	/* ... ns in assign_physical */
++extern long hammer2_cw_done_ns;		/* ... ns in subcol_done (row seal) */
++extern long hammer2_cw_wait_ns;		/* ... ns the xop thread waited for a worker */
++extern long hammer2_cw_pool_jobs;	/* ... blocks compressed by the worker pool */
++extern long hammer2_cw_pool_inline;	/* ... blocks that could not use the pool */
++extern int hammer2_comp_workers;
++extern u_int hammer2_comp_depth;
++extern u_int hammer2_comp_inflight;
++void hammer2_comp_init(void);
++void hammer2_comp_uninit(void);
++extern long hammer2_cw_io_ns;		/* ... ns loading/copying/queueing the buffer */
 +extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
 +extern int hammer2_async_seal;		/* seal without waiting for P/Q */
 +extern int hammer2_async_seal_max;	/* rows with parity in flight */
@@ -14550,18 +14574,285 @@ index 0000000..6b80c37
 +	ret
 +END(hammer2_raid6_mulacc_neon)
 diff --git a/sys/vfs/hammer2/hammer2_strategy.c b/sys/vfs/hammer2/hammer2_strategy.c
-index 32367cc..28c2c53 100644
+index 32367cc..526ae18 100644
 --- a/sys/vfs/hammer2/hammer2_strategy.c
 +++ b/sys/vfs/hammer2/hammer2_strategy.c
-@@ -528,6 +528,7 @@ static void zero_write(char *data, hammer2_inode_t *ip,
+@@ -51,6 +51,7 @@
+ #include <sys/mount.h>
+ #include <sys/vnode.h>
+ #include <sys/objcache.h>
++#include <sys/taskqueue.h>
+ 
+ #include "hammer2.h"
+ #include "hammer2_lz4.h"
+@@ -512,12 +513,14 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
+ static void hammer2_write_file_core(char *data, hammer2_inode_t *ip,
+ 				hammer2_chain_t **parentp,
+ 				hammer2_key_t lbase, int ioflag, int pblksize,
+-				hammer2_tid_t mtid, int *errorp);
++				hammer2_tid_t mtid, int *errorp,
++				struct hammer2_cjob *cjob);
+ static void hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 				hammer2_chain_t **parentp,
+ 				hammer2_key_t lbase, int ioflag, int pblksize,
+ 				hammer2_tid_t mtid, int *errorp,
+-				int comp_algo, int check_algo);
++				int comp_algo, int check_algo,
++				struct hammer2_cjob *cjob);
+ static void hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
+ 				hammer2_chain_t **parentp,
+ 				hammer2_key_t lbase, int ioflag, int pblksize,
+@@ -528,11 +531,200 @@ static void zero_write(char *data, hammer2_inode_t *ip,
  				hammer2_chain_t **parentp,
  				hammer2_key_t lbase,
  				hammer2_tid_t mtid, int *errorp);
 +static void hammer2_put_stall(void);
++
++/*
++ * hammer2_lz4.c exports the caller-supplied-table entry points;
++ * LZ4_compress_limitedOutput() kmalloc()s and frees a 16 KB table per
++ * call, which is a kmem_slab (VM map) round trip for every 64 KB block.
++ */
++int LZ4_compress64k_heap_limitedOutput(void *ctx, char *source, char *dest,
++				int inputSize, int maxOutputSize);
++
++/* ns since *ts0, advancing *ts0 to now (write path stage timing) */
++static __inline long
++cw_lap(struct timespec *ts0)
++{
++	struct timespec ts1;
++	long ns;
++
++	nanouptime(&ts1);
++	ns = (ts1.tv_sec - ts0->tv_sec) * 1000000000L +
++	     (ts1.tv_nsec - ts0->tv_nsec);
++	*ts0 = ts1;
++	return ns;
++}
  static void hammer2_write_bp(hammer2_chain_t *chain, char *data,
  				int ioflag, int pblksize,
  				hammer2_tid_t mtid, int *errorp,
-@@ -676,7 +677,20 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
+ 				int check_algo);
+ 
++/*
++ * LZ4 worker pool.
++ *
++ * Compressing a 64 KB block costs 170 us (x86) to 370 us (Cortex-A72) and
++ * used to run serially in the per-inode strategy xop thread, between the
++ * zero test and hammer2_assign_physical.  hammer2_strategy_write() now
++ * hands the block to a small kernel thread pool when it is queued, and the
++ * xop thread only waits for the result when it reaches that block.  Chain
++ * allocation, hammer2_assign_physical, the row fill and the order of
++ * blocks are untouched, so the media layout is identical.
++ *
++ * Each job owns one cache_buffer_write object (32 KB of output plus the
++ * LZ4 hash table in its tail).  Workers read the bio data in place: the
++ * bio is not completed until the xop thread has consumed the job.
++ *
++ * vfs.hammer2.comp_workers == 0 (or a full pool) compresses inline in the
++ * xop thread exactly as before.
++ */
++struct hammer2_cjob {
++	struct task	task;
++	volatile u_int	done;
++	int		pblksize;
++	int		ztest;		/* worker ran the zero test */
++	int		zero;		/* block is all zeros */
++	int		comp_size;	/* 0 = incompressible, else incl. int */
++	char		*data;		/* bp->b_data */
++	char		*buf;		/* cache_buffer_write object */
++};
++
++static struct taskqueue *hammer2_comp_tq;
++static int hammer2_comp_nthreads;
++
++void
++hammer2_comp_init(void)
++{
++	int n;
++
++	n = ncpus < 4 ? ncpus : 4;
++	if (hammer2_comp_workers < 0 || hammer2_comp_workers > n)
++		hammer2_comp_workers = n;
++	hammer2_comp_nthreads = n;
++	hammer2_comp_tq = taskqueue_create("h2comp", M_WAITOK,
++					   taskqueue_thread_enqueue,
++					   &hammer2_comp_tq);
++	taskqueue_start_threads(&hammer2_comp_tq, n, TDPRI_KERN_DAEMON, -1,
++				"h2comp");
++}
++
++void
++hammer2_comp_uninit(void)
++{
++	taskqueue_free(hammer2_comp_tq);
++	hammer2_comp_tq = NULL;
++}
++
++static void
++hammer2_cjob_run(void *arg, int pending __unused)
++{
++	struct hammer2_cjob *job = arg;
++	struct timespec ts;
++	long ns;
++	int cs = 0;
++
++	nanouptime(&ts);
++	if (job->ztest && test_block_zeros(job->data, job->pblksize)) {
++		job->zero = 1;
++		ns = cw_lap(&ts);
++		atomic_add_long(&hammer2_cw_zero_ns, ns);
++	} else {
++		cs = LZ4_compress64k_heap_limitedOutput(
++				job->buf + 32768, job->data,
++				&job->buf[sizeof(int)], job->pblksize,
++				job->pblksize / 2 - sizeof(int64_t));
++		*(int *)job->buf = cs;
++		if (cs)
++			cs += sizeof(int);
++		job->comp_size = cs;
++		ns = cw_lap(&ts);
++		atomic_add_long(&hammer2_cw_lz4_cnt, 1);
++		atomic_add_long(&hammer2_cw_lz4_ns, ns);
++	}
++	/* the job may be freed by its waiter as soon as done is set */
++	atomic_store_rel_int(&job->done, 1);
++	wakeup(job);
++}
++
++/*
++ * Called from hammer2_strategy_write().  Returns a job (data is being
++ * compressed) or NULL (caller's xop compresses inline as before).
++ */
++static struct hammer2_cjob *
++hammer2_cjob_submit(hammer2_inode_t *ip, struct buf *bp, hammer2_off_t boff)
++{
++	struct hammer2_cjob *job;
++	hammer2_key_t lbase;
++	int workers;
++
++	workers = hammer2_comp_workers;
++	if (workers > hammer2_comp_nthreads)
++		workers = hammer2_comp_nthreads;
++	if (workers <= 0 || hammer2_comp_tq == NULL)
++		return NULL;
++	if (HAMMER2_DEC_ALGO(ip->meta.comp_algo) != HAMMER2_COMP_LZ4 ||
++	    ip->cluster.nchains != 1)
++		return NULL;
++	if (ip->comp_heuristic >= 8 && !hammer2_always_compress)
++		return NULL;		/* probes run inline, 1 in 8 */
++	hammer2_calc_logical(ip, boff, &lbase, NULL);
++	if (hammer2_calc_physical(ip, lbase) != HAMMER2_PBUFSIZE)
++		return NULL;
++
++	if (atomic_fetchadd_int(&hammer2_comp_inflight, 1) >=
++	    hammer2_comp_depth) {
++		atomic_add_int(&hammer2_comp_inflight, -1);
++		atomic_add_long(&hammer2_cw_pool_inline, 1);
++		return NULL;
++	}
++	job = kmalloc(sizeof(*job), M_HAMMER2, M_NOWAIT | M_ZERO);
++	if (job)
++		job->buf = objcache_get(cache_buffer_write, M_NOWAIT);
++	if (job == NULL || job->buf == NULL) {
++		if (job)
++			kfree(job, M_HAMMER2);
++		atomic_add_int(&hammer2_comp_inflight, -1);
++		atomic_add_long(&hammer2_cw_pool_inline, 1);
++		return NULL;
++	}
++	bkvasync(bp);
++	job->data = bp->b_data;
++	job->pblksize = HAMMER2_PBUFSIZE;
++	job->ztest = (ip->meta.check_algo != HAMMER2_CHECK_NONE);
++	TASK_INIT(&job->task, 0, hammer2_cjob_run, job);
++	atomic_add_long(&hammer2_cw_pool_jobs, 1);
++	taskqueue_enqueue(hammer2_comp_tq, &job->task);
++	return job;
++}
++
++static void
++hammer2_cjob_wait(struct hammer2_cjob *job)
++{
++	struct timespec ts;
++
++	if (atomic_load_acq_int(&job->done))
++		return;
++	nanouptime(&ts);
++	while (atomic_load_acq_int(&job->done) == 0) {
++		tsleep_interlock(job, 0);
++		if (atomic_load_acq_int(&job->done))
++			break;
++		tsleep(job, PINTERLOCKED, "h2comp", hz);
++	}
++	atomic_add_long(&hammer2_cw_wait_ns, cw_lap(&ts));
++}
++
++/* Wait for the worker, return the buffer and free the job. */
++static void
++hammer2_cjob_release(struct hammer2_cjob *job)
++{
++	hammer2_cjob_wait(job);
++	if (job->buf)
++		objcache_put(cache_buffer_write, job->buf);
++	kfree(job, M_HAMMER2);
++	atomic_add_int(&hammer2_comp_inflight, -1);
++}
++
++
+ int
+ hammer2_strategy_write(struct vop_strategy_args *ap)
+ {
+@@ -555,6 +747,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
+ 	xop->finished = 0;
+ 	xop->bio = bio;
+ 	xop->lbase = bio->bio_offset;
++	xop->cjob = hammer2_cjob_submit(ip, bio->bio_buf, bio->bio_offset);
+ 	hammer2_mtx_init(&xop->lock, "h2biow");
+ 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
+ 	/* asynchronous completion */
+@@ -586,16 +779,26 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
+ 	int lblksize;
+ 	int pblksize;
+ 	char *bio_data;
++	struct hammer2_cjob *cjob;
+ 
+ 	/*
+ 	 * We can only access the bp/bio if the frontend has not yet
+ 	 * completed.
+ 	 */
+-	if (xop->finished)
++	if (xop->finished) {
++		if (xop->cjob) {
++			hammer2_cjob_release(xop->cjob);
++			xop->cjob = NULL;
++		}
+ 		return;
++	}
+ 	hammer2_mtx_sh(&xop->lock);
+ 	if (xop->finished) {
+ 		hammer2_mtx_unlock(&xop->lock);
++		if (xop->cjob) {
++			hammer2_cjob_release(xop->cjob);
++			xop->cjob = NULL;
++		}
+ 		return;
+ 	}
+ 
+@@ -621,9 +824,11 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
+ 	 * Actual operation
+ 	 */
+ 	parent = hammer2_inode_chain(ip, clindex, HAMMER2_RESOLVE_ALWAYS);
++	cjob = xop->cjob;
++	xop->cjob = NULL;
+ 	hammer2_write_file_core(bio_data, ip, &parent,
+ 				lbase, IO_ASYNC, pblksize,
+-				xop->head.mtid, &error);
++				xop->head.mtid, &error, cjob);
+ 	if (parent) {
+ 		hammer2_chain_unlock(parent);
+ 		hammer2_chain_drop(parent);
+@@ -676,7 +881,20 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
  		kprintf("xop_strategy_write: error %d loff=%016jx\n",
  			error, (intmax_t)bp->b_loffset);
  		bp->b_flags |= B_ERROR;
@@ -14583,7 +14874,28 @@ index 32367cc..28c2c53 100644
  		biodone(bio);
  	}
  	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
-@@ -870,6 +884,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
+@@ -826,12 +1044,19 @@ void
+ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
+ 			hammer2_chain_t **parentp,
+ 			hammer2_key_t lbase, int ioflag, int pblksize,
+-			hammer2_tid_t mtid, int *errorp)
++			hammer2_tid_t mtid, int *errorp,
++			struct hammer2_cjob *cjob)
+ {
+ 	hammer2_chain_t *chain;
+ 	char *bdata;
+ 
+ 	*errorp = 0;
++	if (cjob &&
++	    HAMMER2_DEC_ALGO(ip->meta.comp_algo) != HAMMER2_COMP_LZ4) {
++		/* compression setting changed since the job was queued */
++		hammer2_cjob_release(cjob);
++		cjob = NULL;
++	}
+ 
+ 	switch(HAMMER2_DEC_ALGO(ip->meta.comp_algo)) {
+ 	case HAMMER2_COMP_NONE:
+@@ -870,6 +1095,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
  					 mtid, errorp, ip->meta.check_algo);
  		}
  		if (chain) {
@@ -14591,7 +14903,125 @@ index 32367cc..28c2c53 100644
  			hammer2_chain_unlock(chain);
  			hammer2_chain_drop(chain);
  		}
-@@ -1112,7 +1127,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+@@ -893,7 +1119,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
+ 					   lbase, ioflag, pblksize,
+ 					   mtid, errorp,
+ 					   ip->meta.comp_algo,
+-					   ip->meta.check_algo);
++					   ip->meta.check_algo, cjob);
+ 		break;
+ 	}
+ }
+@@ -910,13 +1136,33 @@ void
+ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 	hammer2_chain_t **parentp,
+ 	hammer2_key_t lbase, int ioflag, int pblksize,
+-	hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo)
++	hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo,
++	struct hammer2_cjob *cjob)
+ {
+ 	hammer2_chain_t *chain;
+ 	int comp_size;
+ 	int comp_block_size;
+ 	char *comp_buffer;
+ 	char *bdata;
++	struct timespec cwts;
++
++	nanouptime(&cwts);
++	atomic_add_long(&hammer2_cw_cnt, 1);
++
++	/*
++	 * A pre-compression job from the worker pool: wait for it (the wait
++	 * is counted in cw_wait_ns, the worker counts its own lz4/zero ns).
++	 * It is only usable if the block shape is what it assumed.
++	 */
++	if (cjob) {
++		hammer2_cjob_wait(cjob);
++		nanouptime(&cwts);
++		if (cjob->pblksize != pblksize ||
++		    HAMMER2_DEC_ALGO(comp_algo) != HAMMER2_COMP_LZ4) {
++			hammer2_cjob_release(cjob);
++			cjob = NULL;
++		}
++	}
+ 
+ 	/*
+ 	 * An all-zeros write creates a hole unless the check code
+@@ -927,10 +1173,14 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 	 *	 (see the HAMMER2_CHECK_NONE in hammer2_chain.c).
+ 	 */
+ 	if (check_algo != HAMMER2_CHECK_NONE &&
+-	    test_block_zeros(data, pblksize)) {
++	    ((cjob && cjob->ztest) ? cjob->zero :
++	     test_block_zeros(data, pblksize))) {
++		if (cjob)
++			hammer2_cjob_release(cjob);
+ 		zero_write(data, ip, parentp, lbase, mtid, errorp);
+ 		return;
+ 	}
++	atomic_add_long(&hammer2_cw_zero_ns, cw_lap(&cwts));
+ 
+ 	/*
+ 	 * Compression requested.  Try to compress the block.  We store
+@@ -946,12 +1196,25 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 
+ 	KKASSERT(pblksize / 2 <= 32768);
+ 
+-	if (ip->comp_heuristic < 8 || (ip->comp_heuristic & 7) == 0 ||
++	if (cjob && !cjob->zero) {
++		/* the worker already compressed this block (or failed to) */
++		comp_buffer = cjob->buf;
++		comp_size = cjob->comp_size;
++		cjob->buf = NULL;
++		hammer2_cjob_release(cjob);
++		cjob = NULL;
++	} else if (ip->comp_heuristic < 8 || (ip->comp_heuristic & 7) == 0 ||
+ 	    hammer2_always_compress) {
+ 		z_stream strm_compress;
+ 		int comp_level;
+ 		int ret;
+ 
++		if (cjob) {
++			/* zero block but no zero test wanted: compress inline */
++			hammer2_cjob_release(cjob);
++			cjob = NULL;
++		}
++		atomic_add_long(&hammer2_cw_lz4_cnt, 1);
+ 		switch(HAMMER2_DEC_ALGO(comp_algo)) {
+ 		case HAMMER2_COMP_LZ4:
+ 			/*
+@@ -966,7 +1229,9 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 			 */
+ 			comp_buffer = objcache_get(cache_buffer_write,
+ 						   M_INTWAIT);
+-			comp_size = LZ4_compress_limitedOutput(
++			KKASSERT(pblksize <= 65536);
++			comp_size = LZ4_compress64k_heap_limitedOutput(
++					comp_buffer + 32768,
+ 					data,
+ 					&comp_buffer[sizeof(int)],
+ 					pblksize,
+@@ -1012,6 +1277,11 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 		}
+ 	}
+ 
++	if (cjob) {
++		hammer2_cjob_release(cjob);	/* zero block, no zero test */
++		cjob = NULL;
++	}
++	atomic_add_long(&hammer2_cw_lz4_ns, cw_lap(&cwts));
+ 	if (comp_size == 0) {
+ 		/*
+ 		 * compression failed or turned off
+@@ -1060,6 +1330,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 	bdata = comp_size ? comp_buffer : data;
+ 	chain = hammer2_assign_physical(ip, parentp, lbase, comp_block_size,
+ 					mtid, &bdata, errorp);
++	atomic_add_long(&hammer2_cw_assign_ns, cw_lap(&cwts));
+ 
+ 	if (*errorp) {
+ 		goto done;
+@@ -1112,7 +1383,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
  						   chain->bref.type,
  						   chain->bref.data_off,
  						   chain->bytes,
@@ -14600,7 +15030,7 @@ index 32367cc..28c2c53 100644
  			if (*errorp) {
  				hammer2_io_brelse(&dio);
  				kprintf("hammer2: WRITE PATH: "
-@@ -1153,6 +1168,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+@@ -1153,6 +1424,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
  			 */
  			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
  			hammer2_dedup_record(chain, dio, bdata);
@@ -14608,15 +15038,21 @@ index 32367cc..28c2c53 100644
  
  			/* Now write the related bdp. */
  			if (ioflag & IO_SYNC) {
-@@ -1180,6 +1196,7 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+@@ -1179,10 +1451,13 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
+ 		}
  	}
  done:
++	atomic_add_long(&hammer2_cw_io_ns, cw_lap(&cwts));
  	if (chain) {
 +		hammer2_raid6_subcol_done(chain);
  		hammer2_chain_unlock(chain);
  		hammer2_chain_drop(chain);
  	}
-@@ -1236,6 +1253,7 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
++	atomic_add_long(&hammer2_cw_done_ns, cw_lap(&cwts));
+ 	if (comp_buffer)
+ 		objcache_put(cache_buffer_write, comp_buffer);
+ }
+@@ -1236,6 +1511,7 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
  			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
  		}
  		if (chain) {
@@ -14624,7 +15060,7 @@ index 32367cc..28c2c53 100644
  			hammer2_chain_unlock(chain);
  			hammer2_chain_drop(chain);
  		}
-@@ -1266,6 +1284,23 @@ test_block_zeros(const char *buf, size_t bytes)
+@@ -1266,6 +1542,23 @@ test_block_zeros(const char *buf, size_t bytes)
   *
   * Function to "write" a block that contains only zeros.
   */
@@ -14648,7 +15084,7 @@ index 32367cc..28c2c53 100644
  static
  void
  zero_write(char *data, hammer2_inode_t *ip,
-@@ -1342,7 +1377,7 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag,
+@@ -1342,7 +1635,7 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag,
  		error = hammer2_io_newnz(chain->hmp,
  					 chain->bref.type,
  					 chain->bref.data_off,
@@ -14657,7 +15093,7 @@ index 32367cc..28c2c53 100644
  		if (error) {
  			hammer2_io_bqrelse(&dio);
  			kprintf("hammer2: WRITE PATH: "
-@@ -1371,6 +1406,8 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag,
+@@ -1371,6 +1664,8 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag,
  		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
  		hammer2_dedup_record(chain, dio, bdata);
  
@@ -14666,7 +15102,7 @@ index 32367cc..28c2c53 100644
  		if (ioflag & IO_SYNC) {
  			/*
  			 * Synchronous I/O requested.
-@@ -1433,6 +1470,8 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
+@@ -1433,6 +1728,8 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
  	 */
  	if (hammer2_dedup_enable == 0)
  		return;
@@ -14675,7 +15111,7 @@ index 32367cc..28c2c53 100644
  	if (dio == NULL) {
  		dio = chain->dio;
  		if (dio == NULL)
-@@ -1552,6 +1591,8 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
+@@ -1552,6 +1849,8 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
  
  	if (hammer2_dedup_enable == 0)
  		return 0;
@@ -14685,7 +15121,7 @@ index 32367cc..28c2c53 100644
  	if (data == NULL)
  		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467..daedf9e 100644
+index 98c8467..0f3b6af 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -47,7 +47,16 @@
@@ -14714,7 +15150,7 @@ index 98c8467..daedf9e 100644
  int hammer2_cluster_data_read = 4;	/* physical read-ahead */
  int hammer2_cluster_write = 0;		/* physical write clustering */
  int hammer2_dedup_enable = 1;
-@@ -76,6 +87,73 @@ int hammer2_dio_limit = 256;
+@@ -76,6 +87,86 @@ int hammer2_dio_limit = 256;
  int hammer2_bulkfree_tps = 5000;
  int hammer2_spread_workers;
  int hammer2_limit_saved_depth;
@@ -14769,6 +15205,19 @@ index 98c8467..daedf9e 100644
 +long hammer2_rz_pq_wait_cnt;
 +long hammer2_rz_seal_ns;
 +long hammer2_rz_seal_cnt;
++long hammer2_cw_cnt;
++long hammer2_cw_zero_ns;
++long hammer2_cw_lz4_cnt;
++long hammer2_cw_lz4_ns;
++long hammer2_cw_assign_ns;
++long hammer2_cw_done_ns;
++long hammer2_cw_io_ns;
++long hammer2_cw_wait_ns;
++long hammer2_cw_pool_jobs;
++long hammer2_cw_pool_inline;
++int hammer2_comp_workers = -1;		/* -1: ncpus capped at 4 (set at init) */
++u_int hammer2_comp_depth = 128;	/* > hammer2_flush_pipe (100) */
++u_int hammer2_comp_inflight;
 +long hammer2_rz_bf_rows_freed;
 +long hammer2_rz_bf_reclaimed;
 +long hammer2_rz_bf_rows_live;
@@ -14788,7 +15237,7 @@ index 98c8467..daedf9e 100644
  long hammer2_chain_allocs;
  long hammer2_limit_saved_chains;
  long hammer2_limit_dirty_chains;
-@@ -122,6 +200,12 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
+@@ -122,6 +213,12 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
  	   &hammer2_spread_workers, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
  	   &hammer2_cluster_meta_read, 0, "");
@@ -14801,7 +15250,7 @@ index 98c8467..daedf9e 100644
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read, CTLFLAG_RW,
  	   &hammer2_cluster_data_read, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_write, CTLFLAG_RW,
-@@ -134,6 +218,216 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
+@@ -134,6 +231,244 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
  	   &hammer2_flush_pipe, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, bulkfree_tps, CTLFLAG_RW,
  	   &hammer2_bulkfree_tps, 0, "");
@@ -15012,13 +15461,41 @@ index 98c8467..daedf9e 100644
 +	   &hammer2_rz_seal_ns, 0, "v3 RAID6: ns inside row seal I/O, total");
 +SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_cnt, CTLFLAG_RW,
 +	   &hammer2_rz_seal_cnt, 0, "v3 RAID6: rows sealed (timed)");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_cnt, CTLFLAG_RW,
++	   &hammer2_cw_cnt, 0, "write path: blocks through compress_and_write");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_zero_ns, CTLFLAG_RW,
++	   &hammer2_cw_zero_ns, 0, "write path: ns in the zero-block test");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_lz4_cnt, CTLFLAG_RW,
++	   &hammer2_cw_lz4_cnt, 0, "write path: compression attempts");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_lz4_ns, CTLFLAG_RW,
++	   &hammer2_cw_lz4_ns, 0, "write path: ns compressing");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_assign_ns, CTLFLAG_RW,
++	   &hammer2_cw_assign_ns, 0, "write path: ns in assign_physical");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_io_ns, CTLFLAG_RW,
++	   &hammer2_cw_io_ns, 0, "write path: ns filling and queueing the buffer");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_wait_ns, CTLFLAG_RW,
++	   &hammer2_cw_wait_ns, 0, "write path: ns the xop thread waited for a compression worker");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_pool_jobs, CTLFLAG_RW,
++	   &hammer2_cw_pool_jobs, 0, "write path: blocks pre-compressed by the worker pool");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_pool_inline, CTLFLAG_RW,
++	   &hammer2_cw_pool_inline, 0, "write path: LZ4 candidates compressed inline (pool off/full)");
++SYSCTL_INT(_vfs_hammer2, OID_AUTO, comp_workers, CTLFLAG_RW,
++	   &hammer2_comp_workers, 0,
++	   "LZ4 worker threads used (0 = compress inline in the xop thread; "
++	   "capped at the threads started at load, min(ncpus,4))");
++SYSCTL_UINT(_vfs_hammer2, OID_AUTO, comp_depth, CTLFLAG_RW,
++	   &hammer2_comp_depth, 0, "max blocks with a compression job in flight");
++SYSCTL_UINT(_vfs_hammer2, OID_AUTO, comp_inflight, CTLFLAG_RD,
++	   &hammer2_comp_inflight, 0, "compression jobs in flight now");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_done_ns, CTLFLAG_RW,
++	   &hammer2_cw_done_ns, 0, "write path: ns in subcol_done/unlock (row seal)");
 +SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
 +	   &hammer2_rz_seal_flush_short, 0,
 +	   "v3 RAID6: flush-sealed rows with fewer than ndata columns");
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
  	   &hammer2_chain_allocs, 0, "");
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,
-@@ -190,8 +484,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
+@@ -190,8 +525,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
  
  static int hammer2_vfs_init(struct vfsconf *conf);
  static int hammer2_vfs_uninit(struct vfsconf *vfsp);
@@ -15047,11 +15524,25 @@ index 98c8467..daedf9e 100644
  static int hammer2_remount(hammer2_dev_t *, struct mount *, char *,
  				struct ucred *);
  static int hammer2_recovery(hammer2_dev_t *hmp);
-@@ -349,6 +663,21 @@ hammer2_vfs_init(struct vfsconf *conf)
+@@ -298,7 +653,11 @@ hammer2_vfs_init(struct vfsconf *conf)
+ 	margs_read.objsize = 65536;
+ 	margs_read.mtype = M_HAMMER2_DEBUFFER;
+ 
+-	margs_write.objsize = 32768;
++	/*
++	 * 32 KB of compressed output plus the LZ4 hash table
++	 * (HAMMER2_LZ4_CTXSIZE), so compression needs no allocation.
++	 */
++	margs_write.objsize = 32768 + HAMMER2_LZ4_CTXSIZE;
+ 	margs_write.mtype = M_HAMMER2_CBUFFER;
+ 
+ 	margs_vop.objsize = sizeof(hammer2_xop_t);
+@@ -349,6 +708,22 @@ hammer2_vfs_init(struct vfsconf *conf)
  
  	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
  
 +	hammer2_raid6_init();
++	hammer2_comp_init();
 +	TASK_INIT(&hammer2_persist_task, 0, hammer2_persist_task_fn, NULL);
 +
 +	spin_init(&hammer2_gone_spin, "h2gone");
@@ -15069,7 +15560,7 @@ index 98c8467..daedf9e 100644
  	return (error);
  }
  
-@@ -356,12 +685,284 @@ static
+@@ -356,12 +731,285 @@ static
  int
  hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
  {
@@ -15079,6 +15570,7 @@ index 98c8467..daedf9e 100644
 +	taskqueue_drain(hammer2_gone_tq, &hammer2_gone_task);
 +	taskqueue_free(hammer2_gone_tq);
 +	taskqueue_drain(taskqueue_thread[0], &hammer2_persist_task);
++	hammer2_comp_uninit();
  	objcache_destroy(cache_buffer_read);
  	objcache_destroy(cache_buffer_write);
  	objcache_destroy(cache_xops);
@@ -15354,7 +15846,7 @@ index 98c8467..daedf9e 100644
  /*
   * Core PFS allocator.  Used to allocate or reference the pmp structure
   * for PFS cluster mounts and the spmp structure for media (hmp) structures.
-@@ -718,6 +1319,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
+@@ -718,6 +1366,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
  	if (chains_still_present) {
  		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
  	} else {
@@ -15366,7 +15858,7 @@ index 98c8467..daedf9e 100644
  		kmalloc_destroy_obj(&pmp->minode);
  		kfree(pmp, M_HAMMER2);
  	}
-@@ -888,6 +1494,55 @@ again:
+@@ -888,6 +1541,55 @@ again:
  	}
  }
  
@@ -15422,7 +15914,7 @@ index 98c8467..daedf9e 100644
  /*
   * Mount or remount HAMMER2 fileystem from physical media
   *
-@@ -912,6 +1567,67 @@ static
+@@ -912,6 +1614,67 @@ static
  int
  hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		  struct ucred *cred)
@@ -15490,7 +15982,7 @@ index 98c8467..daedf9e 100644
  {
  	struct hammer2_mount_info info;
  	hammer2_pfs_t *pmp;
-@@ -927,7 +1643,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -927,7 +1690,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	hammer2_devvp_list_t devvpl;
  	hammer2_devvp_t *e, *e_tmp;
  	struct file *fp;
@@ -15498,7 +15990,7 @@ index 98c8467..daedf9e 100644
  	size_t size;
  	size_t done;
  	char *label;
-@@ -981,12 +1696,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -981,12 +1743,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		 * Root mount
  		 */
  		info.cluster_fd = -1;
@@ -15513,7 +16005,7 @@ index 98c8467..daedf9e 100644
  		if (error)
  			return (error);
  		kprintf("hammer2_mount: devstr=\"%s\"\n", devstr);
-@@ -1042,6 +1757,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1042,6 +1804,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	 */
  	TAILQ_INIT(&devvpl);
  	error = hammer2_init_devvp(devstr, path == NULL, &devvpl);
@@ -15522,7 +16014,7 @@ index 98c8467..daedf9e 100644
  	if (error) {
  		kprintf("hammer2: failed to initialize devvp in %s\n", devstr);
  		hammer2_cleanup_devvp(&devvpl);
-@@ -1063,11 +1780,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1063,11 +1827,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		TAILQ_FOREACH(hmp_tmp, &hammer2_mntlist, mntentry) {
  			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
  				int devvp_found = 0;
@@ -15546,7 +16038,7 @@ index 98c8467..daedf9e 100644
  					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
  						devvp_found = 1;
  				}
-@@ -1088,7 +1815,9 @@ next_hmp:
+@@ -1088,7 +1862,9 @@ next_hmp:
  		if (hmp == NULL) {
  			TAILQ_FOREACH(e, &devvpl, entry) {
  				struct vnode *devvp = e->devvp;
@@ -15557,7 +16049,7 @@ index 98c8467..daedf9e 100644
  				error = vfs_mountedon(devvp);
  				if (error) {
  					kprintf("hammer2_mount: %s mounted %d\n",
-@@ -1136,8 +1865,10 @@ next_hmp:
+@@ -1136,8 +1912,10 @@ next_hmp:
  		 */
  		KKASSERT(!TAILQ_EMPTY(&devvpl));
  		error = hammer2_open_devvp(&devvpl, ronly);
@@ -15569,7 +16061,7 @@ index 98c8467..daedf9e 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			return error;
-@@ -1151,8 +1882,10 @@ next_hmp:
+@@ -1151,8 +1929,10 @@ next_hmp:
  		error = hammer2_init_volumes(mp, &devvpl, hmp->volumes,
  					     &hmp->voldata, &hmp->volhdrno,
  					     &hmp->devvp);
@@ -15581,7 +16073,7 @@ index 98c8467..daedf9e 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			kfree(hmp, M_HAMMER2);
-@@ -1160,12 +1893,16 @@ next_hmp:
+@@ -1160,12 +1940,16 @@ next_hmp:
  		}
  		if (!hmp->devvp) {
  			kprintf("hammer2: failed to initialize root volume\n");
@@ -15600,7 +16092,7 @@ index 98c8467..daedf9e 100644
  		ksnprintf(hmp->devrepname, sizeof(hmp->devrepname), "%s", devstr);
  		hmp->ronly = ronly;
  		hmp->hflags = info.hflags & HMNT2_DEVFLAGS;
-@@ -1175,12 +1912,31 @@ next_hmp:
+@@ -1175,12 +1959,31 @@ next_hmp:
  				   sizeof(struct hammer2_io));
  		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
  		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
@@ -15632,7 +16124,7 @@ index 98c8467..daedf9e 100644
  
  		/*
  		 * vchain setup. vchain.data is embedded.
-@@ -1224,7 +1980,146 @@ next_hmp:
+@@ -1224,7 +2027,146 @@ next_hmp:
  		 * Must use hmp instead of volume header for these two
  		 * in order to handle volume versions transparently.
  		 */
@@ -15780,7 +16272,7 @@ index 98c8467..daedf9e 100644
  			hmp->nvolumes = hmp->voldata.nvolumes;
  			hmp->total_size = hmp->voldata.total_size;
  		} else {
-@@ -1234,15 +2129,32 @@ next_hmp:
+@@ -1234,15 +2176,32 @@ next_hmp:
  		KKASSERT(hmp->nvolumes > 0);
  
  		/*
@@ -15820,7 +16312,7 @@ index 98c8467..daedf9e 100644
  
  		/*
  		 * Really important to get these right or the flush and
-@@ -1275,6 +2187,11 @@ next_hmp:
+@@ -1275,6 +2234,11 @@ next_hmp:
  				      HAMMER2_SROOT_KEY, HAMMER2_SROOT_KEY,
  				      &error, 0);
  		hammer2_chain_lookup_done(parent);
@@ -15832,7 +16324,7 @@ index 98c8467..daedf9e 100644
  		if (schain == NULL) {
  			kprintf("hammer2_mount: invalid super-root\n");
  			hammer2_unmount_helper(mp, NULL, hmp);
-@@ -1282,7 +2199,7 @@ next_hmp:
+@@ -1282,7 +2246,7 @@ next_hmp:
  			hammer2_vfs_unmount(mp, MNT_FORCE);
  			return EINVAL;
  		}
@@ -15841,7 +16333,7 @@ index 98c8467..daedf9e 100644
  			kprintf("hammer2_mount: error %s reading super-root\n",
  				hammer2_error_str(schain->error));
  			hammer2_chain_unlock(schain);
-@@ -1403,6 +2320,13 @@ next_hmp:
+@@ -1403,6 +2367,13 @@ next_hmp:
  	}
  	hammer2_inode_unlock(spmp->iroot);
  
@@ -15855,7 +16347,7 @@ index 98c8467..daedf9e 100644
  	/*
  	 * PFS could not be found?
  	 */
-@@ -1425,7 +2349,7 @@ next_hmp:
+@@ -1425,7 +2396,7 @@ next_hmp:
  	 * Acquire the pmp structure (it should have already been allocated
  	 * via hammer2_update_pmps()).
  	 */
@@ -15864,7 +16356,7 @@ index 98c8467..daedf9e 100644
  		kprintf("hammer2_mount: PFS label I/O error\n");
  	} else {
  		ripdata = &chain->data->ipdata;
-@@ -1462,6 +2386,18 @@ next_hmp:
+@@ -1462,6 +2433,18 @@ next_hmp:
  	pmp->ronly = ronly;
  	pmp->hflags = info.hflags;
  	mp->mnt_flag |= MNT_LOCAL;
@@ -15883,7 +16375,7 @@ index 98c8467..daedf9e 100644
  	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;   /* all entry pts are SMP */
  	mp->mnt_kern_flag |= MNTK_THR_SYNC;     /* new vsyncscan semantics */
  
-@@ -1493,7 +2429,10 @@ next_hmp:
+@@ -1493,7 +2476,10 @@ next_hmp:
  	vfs_add_vnodeops(mp, &hammer2_spec_vops, &mp->mnt_vn_spec_ops);
  	vfs_add_vnodeops(mp, &hammer2_fifo_vops, &mp->mnt_vn_fifo_ops);
  
@@ -15895,7 +16387,7 @@ index 98c8467..daedf9e 100644
  		copyinstr(info.volume, mp->mnt_stat.f_mntfromname,
  			  MNAMELEN - 1, &size);
  		bzero(mp->mnt_stat.f_mntfromname + size, MNAMELEN - size);
-@@ -1580,6 +2519,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1580,6 +2566,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	hammer2_volume_t *vol;
  	struct vnode *devvp;
  	int i, ronly_save, error, result = 0;
@@ -15903,7 +16395,7 @@ index 98c8467..daedf9e 100644
  
  	pmp = MPTOPMP(mp);
  	ronly_save = pmp->ronly;
-@@ -1593,13 +2533,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1593,13 +2580,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  
  	for (i = 0; i < hmp->nvolumes; ++i) {
  		vol = &hmp->volumes[i];
@@ -15930,7 +16422,7 @@ index 98c8467..daedf9e 100644
  			error = hammer2_recovery(hmp);
  			if (error == 0)
  				error |= hammer2_fixup_pfses(hmp);
-@@ -1624,6 +2576,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1624,6 +2623,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	return result;
  }
  
@@ -15961,7 +16453,7 @@ index 98c8467..daedf9e 100644
  static
  int
  hammer2_vfs_unmount(struct mount *mp, int mntflags)
-@@ -1637,6 +2613,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1637,6 +2660,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	if (pmp == NULL)
  		return(0);
  
@@ -15978,7 +16470,7 @@ index 98c8467..daedf9e 100644
  	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
  
  	/*
-@@ -1650,9 +2636,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1650,9 +2683,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	else
  		flags = 0;
  	if (pmp->iroot) {
@@ -16002,7 +16494,7 @@ index 98c8467..daedf9e 100644
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
-@@ -1777,6 +2777,19 @@ again:
+@@ -1777,6 +2824,19 @@ again:
  	hammer2_iocom_uninit(hmp);
  
  	hammer2_bulkfree_uninit(hmp);
@@ -16022,7 +16514,7 @@ index 98c8467..daedf9e 100644
  	hammer2_pfsfree_scan(hmp, 0);
  
  	/*
-@@ -1828,11 +2841,15 @@ again:
+@@ -1828,11 +2888,15 @@ again:
  
  	KKASSERT(hmp->spmp == NULL);
  
@@ -16039,7 +16531,7 @@ index 98c8467..daedf9e 100644
  		hammer2_cleanup_devvp(&hmp->devvpl);
  	}
  	KKASSERT(TAILQ_EMPTY(&hmp->devvpl));
-@@ -1896,6 +2913,13 @@ again:
+@@ -1896,6 +2960,13 @@ again:
  	kmalloc_destroy_obj(&hmp->mchain);
  	kmalloc_destroy_obj(&hmp->mio);
  	kmalloc_destroy(&hmp->mmsg);
@@ -16053,7 +16545,7 @@ index 98c8467..daedf9e 100644
  	kfree(hmp, M_HAMMER2);
  }
  
-@@ -2040,6 +3064,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2040,6 +3111,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statfs tmp;
@@ -16063,7 +16555,7 @@ index 98c8467..daedf9e 100644
  	int i;
  
  	/*
-@@ -2060,17 +3087,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2060,17 +3134,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16092,7 +16584,7 @@ index 98c8467..daedf9e 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2095,6 +3128,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2095,6 +3175,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statvfs tmp;
@@ -16102,7 +16594,7 @@ index 98c8467..daedf9e 100644
  	int i;
  
  	/*
-@@ -2114,17 +3150,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2114,17 +3197,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16131,7 +16623,7 @@ index 98c8467..daedf9e 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2964,6 +4006,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2964,6 +4053,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		if (waiting > hammer2_limit_dirty_chains / 2 ||
  		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2)
  		{
@@ -16139,7 +16631,7 @@ index 98c8467..daedf9e 100644
  			trigger_syncer(pmp->mp);
  		}
  
-@@ -2979,6 +4022,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2979,6 +4069,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		}
  
  		if (started == 0) {
@@ -16147,7 +16639,7 @@ index 98c8467..daedf9e 100644
  			trigger_syncer_start(pmp->mp);
  			started = 1;
  		}
-@@ -3099,6 +4143,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
+@@ -3099,6 +4190,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
  			    pmp->pfs_types[i] != HAMMER2_PFSTYPE_SOFT_MASTER)
  				continue;
  
