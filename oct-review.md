@@ -655,6 +655,25 @@ is a design, not a tweak: compress on a small per-mount worker pool (or per CPU)
 sub-column layout stay as they are. Measure with the "write path" INFO line first (lz4 ns/block vs
 the wall time per block: 8 s / 4096 = 1.9 ms on the Pi).
 
+*Pi results (k46 = k44 overlay + bcmmbox clock sysctls, 2026-10-13).* The Pi firmware leaves the ARM
+at 600 MHz unless the OS asks for more; every earlier Pi number was measured at 600 MHz. The new
+`dev.bcmmbox.0.arm_mhz` (RW) / `arm_max_mhz` (1500) set it at runtime; it reverts at reboot. At 600 MHz
+LZ4 cost 877 us/block and P1c was 34-35 MB/s in both modes. At 1500 MHz (md5 of 512 MB: 5.17 -> 2.12 s
+user; SoC about 61 C, never throttled), group P four times alternating async_seal 0,1,0,1 after a
+warm-up run:
+
+| | async 0 | async 1 |
+|---|---|---|
+| P1 | 61.1, 61.5 MB/s (P/Q wait 1.8 s, 43% of wall) | 86.2, 85.3 MB/s (wait 0) |
+| P1c | 73.4, 67.4 MB/s | 77.1, 72.1 MB/s |
+| lz4 ns/block (P1c) | about 370 us | about 370 us |
+
+The first P1 of every sequence is slow (15.9-19.5 MB/s) whatever the mode, which is what made k43/k44
+look like a 2x async win on P1; it is SSD state after the previous run, not async. With that excluded,
+async_seal=1 gives P1 +40% and P1c +5-7%. Group P then fails one check: P1c >= 90% of P1 (72-77 vs
+85-86, 85-90%). P1c is now CPU-bound in the single strategy thread (4096 x 370 us = 1.5 s of 3.3 s), so
+the compression worker pool above is what would close it; the check itself is right.
+
 *P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
 runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
 P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs
