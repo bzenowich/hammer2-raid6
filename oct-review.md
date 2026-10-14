@@ -744,6 +744,17 @@ dd front end share four A72 cores).
 
 Full suite on the final build (`comp_workers` 4, `comp_depth` 128; groups X Z R G A B C D E F H I J K L N O P Q S T U V W Y, P5 asserts on): async_seal=0 **638 pass / 0 fail**, async_seal=1 **638 / 0** (group P, with the new P6/P7 and the P1c >= 90% check, 100-104 s).
 
+*Results (Pi k48, 1200 MHz, 4 x USB SSD, async_seal=1, 2026-10-14).* `P_ONLY=P1`, alternating
+`comp_workers` 4 / 0 after a warm-up run (MB/s):
+
+| | P1 | P1c | P1c >= 90% of P1 |
+|---|---|---|---|
+| workers 4 | 69.2, 68.8, 70.3 | 85.6, 81.0, 83.4 | pass (3/3) |
+| workers 0 | 69.9, 74.2, 70.1 | 60.5, 58.9, 58.3 | fail (3/3) |
+
+On the A72 the xop thread was CPU-bound on LZ4 (460 us/block inline); with the pool it waits 0 us
+for results and P1c is 35-40% faster. Full group P with workers 4: 34/34 (P6, P7, P7b included).
+
 *P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
 runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
 P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs
