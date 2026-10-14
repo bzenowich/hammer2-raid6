@@ -125,7 +125,7 @@ long hammer2_rz_seal_full;
 long hammer2_rz_seal_flush;
 long hammer2_rz_seal_flush_short;
 long hammer2_rz_pq_wait_ns;
-int hammer2_async_seal = 0;		/* P3 phase 2: seal without waiting for P/Q */
+int hammer2_async_seal = 1;		/* P3 phase 2: seal without waiting for P/Q */
 int hammer2_async_seal_max = 16;	/* ... rows with parity in flight */
 int hammer2_inject_pq_defer_ms = 0;	/* test: start parity writes this late */
 long hammer2_rz_pq_err;
@@ -407,7 +407,7 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, scrub_pq_skipped, CTLFLAG_RD,
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal, CTLFLAG_RW,
 	   &hammer2_async_seal, 0,
 	   "v3 RAID6: seal rows without the writer waiting for P/Q (oct-review "
-	   "P3 phase 2); 0 = wait, as before");
+	   "P3 phase 2); 0 = the writer waits for P/Q, as before");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal_max, CTLFLAG_RW,
 	   &hammer2_async_seal_max, 0,
 	   "v3 RAID6: rows with parity in flight before a writer waits");

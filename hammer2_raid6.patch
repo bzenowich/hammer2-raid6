@@ -15121,7 +15121,7 @@ index 32367cc..526ae18 100644
  	if (data == NULL)
  		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467..0f3b6af 100644
+index 98c8467..b27609a 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -47,7 +47,16 @@
@@ -15192,7 +15192,7 @@ index 98c8467..0f3b6af 100644
 +long hammer2_rz_seal_flush;
 +long hammer2_rz_seal_flush_short;
 +long hammer2_rz_pq_wait_ns;
-+int hammer2_async_seal = 0;		/* P3 phase 2: seal without waiting for P/Q */
++int hammer2_async_seal = 1;		/* P3 phase 2: seal without waiting for P/Q */
 +int hammer2_async_seal_max = 16;	/* ... rows with parity in flight */
 +int hammer2_inject_pq_defer_ms = 0;	/* test: start parity writes this late */
 +long hammer2_rz_pq_err;
@@ -15430,7 +15430,7 @@ index 98c8467..0f3b6af 100644
 +SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal, CTLFLAG_RW,
 +	   &hammer2_async_seal, 0,
 +	   "v3 RAID6: seal rows without the writer waiting for P/Q (oct-review "
-+	   "P3 phase 2); 0 = wait, as before");
++	   "P3 phase 2); 0 = the writer waits for P/Q, as before");
 +SYSCTL_INT(_vfs_hammer2, OID_AUTO, async_seal_max, CTLFLAG_RW,
 +	   &hammer2_async_seal_max, 0,
 +	   "v3 RAID6: rows with parity in flight before a writer waits");

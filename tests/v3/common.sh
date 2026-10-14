@@ -44,10 +44,10 @@ while [ "$i" -lt "$NDISKS" ]; do
 done
 PFSPATH="${DEVSPEC}@V3TEST"
 
-# ASYNC_SEAL=1 runs the group with vfs.hammer2.async_seal on (oct-review
-# P3 phase 2); the default is off, as in the kernel.  The test hook that
+# ASYNC_SEAL=0 runs the group with vfs.hammer2.async_seal off (oct-review
+# P3 phase 2); the default is on, as in the kernel.  The test hook that
 # holds parity back is always cleared.
-sysctl -w vfs.hammer2.async_seal="${ASYNC_SEAL:-0}" > /dev/null 2>&1 || true
+sysctl -w vfs.hammer2.async_seal="${ASYNC_SEAL:-1}" > /dev/null 2>&1 || true
 sysctl -w vfs.hammer2.inject_pq_defer_ms=0 > /dev/null 2>&1 || true
 
 # Return the device path for disk index $1 (logical 0..NDISKS-1)

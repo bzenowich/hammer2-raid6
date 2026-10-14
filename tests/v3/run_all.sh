@@ -18,9 +18,9 @@
 #   Z metadata on 3 copies (placement, any 2 failures, heal, resilver, layout 2),
 #   T slot reuse, U sub-column offsets (test hook raid6_subcol_test),
 #   V sub-column allocation (raid6_subcol_max), Q small files on sub-columns.
-#   O async sealing (opt-in; forces vfs.hammer2.async_seal=1),
+#   O async sealing (opt-in; forces vfs.hammer2.async_seal=1, the default),
 #   Run R with: sh run_all.sh R
-#   Run any group with async sealing on: ASYNC_SEAL=1 sh run_all.sh A B
+#   Run any group with async sealing off: ASYNC_SEAL=0 sh run_all.sh A B
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6

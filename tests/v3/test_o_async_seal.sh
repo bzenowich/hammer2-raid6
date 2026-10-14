@@ -37,7 +37,7 @@ o_off() {
     sysctl -w vfs.hammer2.inject_pq_defer_ms=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.inject_wio_disk_mask=0 > /dev/null 2>&1
     sysctl -w vfs.hammer2.async_seal_max=${SMAX_DEF:-16} > /dev/null 2>&1
-    sysctl -w vfs.hammer2.async_seal=0 > /dev/null 2>&1
+    sysctl -w vfs.hammer2.async_seal=${ASYNC_DEF:-1} > /dev/null 2>&1
 }
 trap o_off EXIT
 
@@ -426,5 +426,5 @@ diff -q /var/tmp/v3_o9.txt /var/tmp/v3_o9c.txt > /dev/null &&
 scrub_clean "O9"
 teardown "O9"
 
-sysctl -w vfs.hammer2.async_seal=${ASYNC_DEF:-0} > /dev/null
+sysctl -w vfs.hammer2.async_seal=${ASYNC_DEF:-1} > /dev/null
 summary
