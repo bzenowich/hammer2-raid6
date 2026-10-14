@@ -755,6 +755,10 @@ Full suite on the final build (`comp_workers` 4, `comp_depth` 128; groups X Z R 
 On the A72 the xop thread was CPU-bound on LZ4 (460 us/block inline); with the pool it waits 0 us
 for results and P1c is 35-40% faster. Full group P with workers 4: 34/34 (P6, P7, P7b included).
 
+*Defaults on (k49 = 77d89ab, 2026-10-14).* async_seal now defaults to 1 and comp_workers to 4.
+Pi full suite at 1200 MHz with the defaults: **638 pass / 0 fail**, no under-voltage during the
+run, SoC at most 69.6 C. k49 is the Pi's kernel8-good.img.
+
 *P2/P2c write-amp: noise, not async (h2dev, 8 runs per mode, alternating, 2026-10-13).* `P_ONLY=P2`
 runs only P2/P2c of group P. Write-amp, async 0 / 1 (mean, range):
 P2 4.50 (3.97-5.15) / 4.50 (3.90-5.19); P2c 3.06 (2.41-3.38) / 3.04 (2.28-3.71). The first 4 runs
