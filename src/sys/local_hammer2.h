@@ -925,6 +925,7 @@ struct hammer2_xop_strategy {
 	int			finished;
 	hammer2_mtx_t		lock;
 	struct bio		*bio;
+	struct hammer2_cjob	*cjob;	/* pre-compression job or NULL */
 };
 
 struct hammer2_xop_readdir {
@@ -2538,6 +2539,14 @@ extern long hammer2_cw_lz4_cnt;		/* ... compression attempts */
 extern long hammer2_cw_lz4_ns;		/* ... ns compressing */
 extern long hammer2_cw_assign_ns;	/* ... ns in assign_physical */
 extern long hammer2_cw_done_ns;		/* ... ns in subcol_done (row seal) */
+extern long hammer2_cw_wait_ns;		/* ... ns the xop thread waited for a worker */
+extern long hammer2_cw_pool_jobs;	/* ... blocks compressed by the worker pool */
+extern long hammer2_cw_pool_inline;	/* ... blocks that could not use the pool */
+extern int hammer2_comp_workers;
+extern u_int hammer2_comp_depth;
+extern u_int hammer2_comp_inflight;
+void hammer2_comp_init(void);
+void hammer2_comp_uninit(void);
 extern long hammer2_cw_io_ns;		/* ... ns loading/copying/queueing the buffer */
 extern long hammer2_rz_seal_flush_short; /* ... with n_alloc < ndata */
 extern int hammer2_async_seal;		/* seal without waiting for P/Q */
