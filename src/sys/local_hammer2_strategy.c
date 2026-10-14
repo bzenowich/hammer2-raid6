@@ -51,6 +51,7 @@
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/objcache.h>
+#include <sys/taskqueue.h>
 
 #include "hammer2.h"
 #include "hammer2_lz4.h"
@@ -512,12 +513,14 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 static void hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 				hammer2_chain_t **parentp,
 				hammer2_key_t lbase, int ioflag, int pblksize,
-				hammer2_tid_t mtid, int *errorp);
+				hammer2_tid_t mtid, int *errorp,
+				struct hammer2_cjob *cjob);
 static void hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 				hammer2_chain_t **parentp,
 				hammer2_key_t lbase, int ioflag, int pblksize,
 				hammer2_tid_t mtid, int *errorp,
-				int comp_algo, int check_algo);
+				int comp_algo, int check_algo,
+				struct hammer2_cjob *cjob);
 static void hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
 				hammer2_chain_t **parentp,
 				hammer2_key_t lbase, int ioflag, int pblksize,
@@ -556,6 +559,172 @@ static void hammer2_write_bp(hammer2_chain_t *chain, char *data,
 				hammer2_tid_t mtid, int *errorp,
 				int check_algo);
 
+/*
+ * LZ4 worker pool.
+ *
+ * Compressing a 64 KB block costs 170 us (x86) to 370 us (Cortex-A72) and
+ * used to run serially in the per-inode strategy xop thread, between the
+ * zero test and hammer2_assign_physical.  hammer2_strategy_write() now
+ * hands the block to a small kernel thread pool when it is queued, and the
+ * xop thread only waits for the result when it reaches that block.  Chain
+ * allocation, hammer2_assign_physical, the row fill and the order of
+ * blocks are untouched, so the media layout is identical.
+ *
+ * Each job owns one cache_buffer_write object (32 KB of output plus the
+ * LZ4 hash table in its tail).  Workers read the bio data in place: the
+ * bio is not completed until the xop thread has consumed the job.
+ *
+ * vfs.hammer2.comp_workers == 0 (or a full pool) compresses inline in the
+ * xop thread exactly as before.
+ */
+struct hammer2_cjob {
+	struct task	task;
+	volatile u_int	done;
+	int		pblksize;
+	int		ztest;		/* worker ran the zero test */
+	int		zero;		/* block is all zeros */
+	int		comp_size;	/* 0 = incompressible, else incl. int */
+	char		*data;		/* bp->b_data */
+	char		*buf;		/* cache_buffer_write object */
+};
+
+static struct taskqueue *hammer2_comp_tq;
+static int hammer2_comp_nthreads;
+
+void
+hammer2_comp_init(void)
+{
+	int n;
+
+	n = ncpus < 4 ? ncpus : 4;
+	if (hammer2_comp_workers < 0 || hammer2_comp_workers > n)
+		hammer2_comp_workers = n;
+	hammer2_comp_nthreads = n;
+	hammer2_comp_tq = taskqueue_create("h2comp", M_WAITOK,
+					   taskqueue_thread_enqueue,
+					   &hammer2_comp_tq);
+	taskqueue_start_threads(&hammer2_comp_tq, n, TDPRI_KERN_DAEMON, -1,
+				"h2comp");
+}
+
+void
+hammer2_comp_uninit(void)
+{
+	taskqueue_free(hammer2_comp_tq);
+	hammer2_comp_tq = NULL;
+}
+
+static void
+hammer2_cjob_run(void *arg, int pending __unused)
+{
+	struct hammer2_cjob *job = arg;
+	struct timespec ts;
+	long ns;
+	int cs = 0;
+
+	nanouptime(&ts);
+	if (job->ztest && test_block_zeros(job->data, job->pblksize)) {
+		job->zero = 1;
+		ns = cw_lap(&ts);
+		atomic_add_long(&hammer2_cw_zero_ns, ns);
+	} else {
+		cs = LZ4_compress64k_heap_limitedOutput(
+				job->buf + 32768, job->data,
+				&job->buf[sizeof(int)], job->pblksize,
+				job->pblksize / 2 - sizeof(int64_t));
+		*(int *)job->buf = cs;
+		if (cs)
+			cs += sizeof(int);
+		job->comp_size = cs;
+		ns = cw_lap(&ts);
+		atomic_add_long(&hammer2_cw_lz4_cnt, 1);
+		atomic_add_long(&hammer2_cw_lz4_ns, ns);
+	}
+	/* the job may be freed by its waiter as soon as done is set */
+	atomic_store_rel_int(&job->done, 1);
+	wakeup(job);
+}
+
+/*
+ * Called from hammer2_strategy_write().  Returns a job (data is being
+ * compressed) or NULL (caller's xop compresses inline as before).
+ */
+static struct hammer2_cjob *
+hammer2_cjob_submit(hammer2_inode_t *ip, struct buf *bp, hammer2_off_t boff)
+{
+	struct hammer2_cjob *job;
+	hammer2_key_t lbase;
+	int workers;
+
+	workers = hammer2_comp_workers;
+	if (workers > hammer2_comp_nthreads)
+		workers = hammer2_comp_nthreads;
+	if (workers <= 0 || hammer2_comp_tq == NULL)
+		return NULL;
+	if (HAMMER2_DEC_ALGO(ip->meta.comp_algo) != HAMMER2_COMP_LZ4 ||
+	    ip->cluster.nchains != 1)
+		return NULL;
+	if (ip->comp_heuristic >= 8 && !hammer2_always_compress)
+		return NULL;		/* probes run inline, 1 in 8 */
+	hammer2_calc_logical(ip, boff, &lbase, NULL);
+	if (hammer2_calc_physical(ip, lbase) != HAMMER2_PBUFSIZE)
+		return NULL;
+
+	if (atomic_fetchadd_int(&hammer2_comp_inflight, 1) >=
+	    hammer2_comp_depth) {
+		atomic_add_int(&hammer2_comp_inflight, -1);
+		atomic_add_long(&hammer2_cw_pool_inline, 1);
+		return NULL;
+	}
+	job = kmalloc(sizeof(*job), M_HAMMER2, M_NOWAIT | M_ZERO);
+	if (job)
+		job->buf = objcache_get(cache_buffer_write, M_NOWAIT);
+	if (job == NULL || job->buf == NULL) {
+		if (job)
+			kfree(job, M_HAMMER2);
+		atomic_add_int(&hammer2_comp_inflight, -1);
+		atomic_add_long(&hammer2_cw_pool_inline, 1);
+		return NULL;
+	}
+	bkvasync(bp);
+	job->data = bp->b_data;
+	job->pblksize = HAMMER2_PBUFSIZE;
+	job->ztest = (ip->meta.check_algo != HAMMER2_CHECK_NONE);
+	TASK_INIT(&job->task, 0, hammer2_cjob_run, job);
+	atomic_add_long(&hammer2_cw_pool_jobs, 1);
+	taskqueue_enqueue(hammer2_comp_tq, &job->task);
+	return job;
+}
+
+static void
+hammer2_cjob_wait(struct hammer2_cjob *job)
+{
+	struct timespec ts;
+
+	if (atomic_load_acq_int(&job->done))
+		return;
+	nanouptime(&ts);
+	while (atomic_load_acq_int(&job->done) == 0) {
+		tsleep_interlock(job, 0);
+		if (atomic_load_acq_int(&job->done))
+			break;
+		tsleep(job, PINTERLOCKED, "h2comp", hz);
+	}
+	atomic_add_long(&hammer2_cw_wait_ns, cw_lap(&ts));
+}
+
+/* Wait for the worker, return the buffer and free the job. */
+static void
+hammer2_cjob_release(struct hammer2_cjob *job)
+{
+	hammer2_cjob_wait(job);
+	if (job->buf)
+		objcache_put(cache_buffer_write, job->buf);
+	kfree(job, M_HAMMER2);
+	atomic_add_int(&hammer2_comp_inflight, -1);
+}
+
+
 int
 hammer2_strategy_write(struct vop_strategy_args *ap)
 {
@@ -578,6 +747,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	xop->finished = 0;
 	xop->bio = bio;
 	xop->lbase = bio->bio_offset;
+	xop->cjob = hammer2_cjob_submit(ip, bio->bio_buf, bio->bio_offset);
 	hammer2_mtx_init(&xop->lock, "h2biow");
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
 	/* asynchronous completion */
@@ -609,16 +779,26 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	int lblksize;
 	int pblksize;
 	char *bio_data;
+	struct hammer2_cjob *cjob;
 
 	/*
 	 * We can only access the bp/bio if the frontend has not yet
 	 * completed.
 	 */
-	if (xop->finished)
+	if (xop->finished) {
+		if (xop->cjob) {
+			hammer2_cjob_release(xop->cjob);
+			xop->cjob = NULL;
+		}
 		return;
+	}
 	hammer2_mtx_sh(&xop->lock);
 	if (xop->finished) {
 		hammer2_mtx_unlock(&xop->lock);
+		if (xop->cjob) {
+			hammer2_cjob_release(xop->cjob);
+			xop->cjob = NULL;
+		}
 		return;
 	}
 
@@ -644,9 +824,11 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	 * Actual operation
 	 */
 	parent = hammer2_inode_chain(ip, clindex, HAMMER2_RESOLVE_ALWAYS);
+	cjob = xop->cjob;
+	xop->cjob = NULL;
 	hammer2_write_file_core(bio_data, ip, &parent,
 				lbase, IO_ASYNC, pblksize,
-				xop->head.mtid, &error);
+				xop->head.mtid, &error, cjob);
 	if (parent) {
 		hammer2_chain_unlock(parent);
 		hammer2_chain_drop(parent);
@@ -862,12 +1044,19 @@ void
 hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 			hammer2_chain_t **parentp,
 			hammer2_key_t lbase, int ioflag, int pblksize,
-			hammer2_tid_t mtid, int *errorp)
+			hammer2_tid_t mtid, int *errorp,
+			struct hammer2_cjob *cjob)
 {
 	hammer2_chain_t *chain;
 	char *bdata;
 
 	*errorp = 0;
+	if (cjob &&
+	    HAMMER2_DEC_ALGO(ip->meta.comp_algo) != HAMMER2_COMP_LZ4) {
+		/* compression setting changed since the job was queued */
+		hammer2_cjob_release(cjob);
+		cjob = NULL;
+	}
 
 	switch(HAMMER2_DEC_ALGO(ip->meta.comp_algo)) {
 	case HAMMER2_COMP_NONE:
@@ -930,7 +1119,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 					   lbase, ioflag, pblksize,
 					   mtid, errorp,
 					   ip->meta.comp_algo,
-					   ip->meta.check_algo);
+					   ip->meta.check_algo, cjob);
 		break;
 	}
 }
@@ -947,7 +1136,8 @@ void
 hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	hammer2_chain_t **parentp,
 	hammer2_key_t lbase, int ioflag, int pblksize,
-	hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo)
+	hammer2_tid_t mtid, int *errorp, int comp_algo, int check_algo,
+	struct hammer2_cjob *cjob)
 {
 	hammer2_chain_t *chain;
 	int comp_size;
@@ -960,6 +1150,21 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	atomic_add_long(&hammer2_cw_cnt, 1);
 
 	/*
+	 * A pre-compression job from the worker pool: wait for it (the wait
+	 * is counted in cw_wait_ns, the worker counts its own lz4/zero ns).
+	 * It is only usable if the block shape is what it assumed.
+	 */
+	if (cjob) {
+		hammer2_cjob_wait(cjob);
+		nanouptime(&cwts);
+		if (cjob->pblksize != pblksize ||
+		    HAMMER2_DEC_ALGO(comp_algo) != HAMMER2_COMP_LZ4) {
+			hammer2_cjob_release(cjob);
+			cjob = NULL;
+		}
+	}
+
+	/*
 	 * An all-zeros write creates a hole unless the check code
 	 * is disabled.  When the check code is disabled all writes
 	 * are done in-place, including any all-zeros writes.
@@ -968,7 +1173,10 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	 *	 (see the HAMMER2_CHECK_NONE in hammer2_chain.c).
 	 */
 	if (check_algo != HAMMER2_CHECK_NONE &&
-	    test_block_zeros(data, pblksize)) {
+	    ((cjob && cjob->ztest) ? cjob->zero :
+	     test_block_zeros(data, pblksize))) {
+		if (cjob)
+			hammer2_cjob_release(cjob);
 		zero_write(data, ip, parentp, lbase, mtid, errorp);
 		return;
 	}
@@ -988,12 +1196,24 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 
 	KKASSERT(pblksize / 2 <= 32768);
 
-	if (ip->comp_heuristic < 8 || (ip->comp_heuristic & 7) == 0 ||
+	if (cjob && !cjob->zero) {
+		/* the worker already compressed this block (or failed to) */
+		comp_buffer = cjob->buf;
+		comp_size = cjob->comp_size;
+		cjob->buf = NULL;
+		hammer2_cjob_release(cjob);
+		cjob = NULL;
+	} else if (ip->comp_heuristic < 8 || (ip->comp_heuristic & 7) == 0 ||
 	    hammer2_always_compress) {
 		z_stream strm_compress;
 		int comp_level;
 		int ret;
 
+		if (cjob) {
+			/* zero block but no zero test wanted: compress inline */
+			hammer2_cjob_release(cjob);
+			cjob = NULL;
+		}
 		atomic_add_long(&hammer2_cw_lz4_cnt, 1);
 		switch(HAMMER2_DEC_ALGO(comp_algo)) {
 		case HAMMER2_COMP_LZ4:
@@ -1057,6 +1277,10 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 		}
 	}
 
+	if (cjob) {
+		hammer2_cjob_release(cjob);	/* zero block, no zero test */
+		cjob = NULL;
+	}
 	atomic_add_long(&hammer2_cw_lz4_ns, cw_lap(&cwts));
 	if (comp_size == 0) {
 		/*

@@ -22,6 +22,7 @@
 #   P2c columns reserved <= 1/3 of P2
 #   P1c columns reserved <= 0.6x P1, throughput >= 90% of P1
 # P_ONLY=P2 skips P1/P1c/P3/P4/P5 (A/B runs of the small-file part).
+# P_ONLY=P1 runs only P1/P1c; P_ONLY=P6 only the pool concurrency tests.
 # P5_ASSERT=0 only prints them (for a kernel with raid6_subcol_max=0, or
 # when the throughput ratio is too noisy on a loaded host).
 #
@@ -211,7 +212,8 @@ cw_snap() {
     CW_N=$(cw_get cw_cnt); CW_L=$(cw_get cw_lz4_cnt)
     CW_Z=$(cw_get cw_zero_ns); CW_C=$(cw_get cw_lz4_ns)
     CW_A=$(cw_get cw_assign_ns); CW_I=$(cw_get cw_io_ns)
-    CW_D=$(cw_get cw_done_ns)
+    CW_D=$(cw_get cw_done_ns); CW_W=$(cw_get cw_wait_ns)
+    CW_J=$(cw_get cw_pool_jobs)
 }
 cw_report() {
     local n l
@@ -222,7 +224,9 @@ cw_report() {
          "lz4 $(( ($(cw_get cw_lz4_ns) - CW_C) / n ))," \
          "assign $(( ($(cw_get cw_assign_ns) - CW_A) / n ))," \
          "buffer $(( ($(cw_get cw_io_ns) - CW_I) / n ))," \
-         "done $(( ($(cw_get cw_done_ns) - CW_D) / n ))"
+         "done $(( ($(cw_get cw_done_ns) - CW_D) / n ))," \
+         "comp-wait $(( ($(cw_get cw_wait_ns) - CW_W) / n ))" \
+         "(pool: $(( $(cw_get cw_pool_jobs) - CW_J )) jobs, comp_workers=$(sysctl -n vfs.hammer2.comp_workers 2>/dev/null))"
 }
 
 # big_write <label> <src>: P1-style write of a 256 MB file into a fresh
@@ -378,6 +382,119 @@ if [ ! -s $CMPSRC ] || [ "$(stat -f %z $CMPSRC)" != "$((BIG_MB * 1048576))" ]; t
     fi
 fi
 
+# P6/P7: the LZ4 worker pool under concurrency (oct-review P3 "LZ4 worker
+# pool").  Pool jobs hold bio data and a compression buffer until the xop
+# thread has consumed them, so these check that nothing leaks or corrupts.
+#   P6  five files written in parallel with LZ4 on (compressible, random,
+#       zero blocks mixed), remount, sha256 of every file equals its
+#       generator, no job in flight, parity scrub clean, the pool was used
+#   P7  umount (no -f) straight after dd, before anything was flushed: the
+#       unmount flush compresses the dirty blocks; data intact afterwards.
+#       Then umount -f while writers are compressing: returns, nothing in
+#       flight, the array mounts again and scrubs clean.
+p6_gen() {	# p6_gen <i>: deterministic content of file i
+    case $1 in
+    0|1|2) { echo "stream $1"; dd if=$CMPSRC bs=1048576 count=40 2>/dev/null; } ;;
+    3) dd if=$BIGSRC bs=1048576 count=24 skip=$1 2>/dev/null ;;
+    4) { dd if=$CMPSRC bs=1048576 count=8 2>/dev/null
+         dd if=/dev/zero bs=1048576 count=8 2>/dev/null
+         dd if=$CMPSRC bs=1048576 count=8 skip=8 2>/dev/null; } ;;
+    esac
+}
+if [ "$P_ONLY" != P2 ] && [ "$P_ONLY" != P1 ]; then
+setup_fresh full
+check_v3
+set_lz4
+j0=$(cw_get cw_pool_jobs)
+i=0
+while [ $i -lt 5 ]; do
+    p6_gen $i > $MNTPT/pc$i &
+    i=$((i + 1))
+done
+wait
+i=0
+while [ $i -lt 5 ]; do p6_gen $i | sha256 > /var/tmp/p6_ref$i; i=$((i + 1)); done
+pjobs=$(( $(cw_get cw_pool_jobs) - j0 ))
+remount
+bad=0
+i=0
+while [ $i -lt 5 ]; do
+    sha256 < $MNTPT/pc$i | cmp -s - /var/tmp/p6_ref$i || { bad=$((bad + 1)); echo "  P6: pc$i differs"; }
+    i=$((i + 1))
+done
+if [ "$bad" = 0 ]; then
+    result PASS "P6: 5 parallel compressed writers, all files identical after remount"
+else
+    result FAIL "P6: $bad of 5 files differ after remount"
+fi
+if [ "$(sysctl -n vfs.hammer2.comp_workers)" -gt 0 ] && [ "$pjobs" -le 0 ]; then
+    result FAIL "P6: comp_workers > 0 but the pool compressed nothing"
+else
+    echo "  INFO: P6 pool jobs $pjobs, comp_workers=$(sysctl -n vfs.hammer2.comp_workers)," \
+         "inline fallbacks $(cw_get cw_pool_inline)"
+fi
+[ "$(sysctl -n vfs.hammer2.comp_inflight)" = 0 ] &&
+    result PASS "P6: no compression job in flight" ||
+    result FAIL "P6: $(sysctl -n vfs.hammer2.comp_inflight) compression jobs in flight"
+scrub_clean "P6"
+teardown "P6"
+
+# P7a: unmount flushes unwritten compressible data
+setup_fresh full
+check_v3
+set_lz4
+i=0
+while [ $i -lt 3 ]; do p6_gen $i > $MNTPT/pc$i & i=$((i + 1)); done
+wait
+if guarded 300 umount $MNTPT; then
+    result PASS "P7: umount with dirty compressible data returned"
+else
+    result FAIL "P7: umount with dirty data failed or hung"
+    umount -f $MNTPT 2>/dev/null
+fi
+[ "$(sysctl -n vfs.hammer2.comp_inflight)" = 0 ] &&
+    result PASS "P7: no compression job in flight after umount" ||
+    result FAIL "P7: $(sysctl -n vfs.hammer2.comp_inflight) compression jobs in flight after umount"
+mount -t hammer2 $PFSPATH $MNTPT
+bad=0
+i=0
+while [ $i -lt 3 ]; do
+    p6_gen $i | sha256 > /var/tmp/p7_ref$i
+    sha256 < $MNTPT/pc$i | cmp -s - /var/tmp/p7_ref$i || bad=$((bad + 1))
+    i=$((i + 1))
+done
+[ "$bad" = 0 ] && result PASS "P7: data intact after umount of dirty data" ||
+    result FAIL "P7: $bad of 3 files differ after umount of dirty data"
+scrub_clean "P7"
+
+# P7b: umount -f while writers are compressing
+rm -f $MNTPT/pc*
+i=0
+while [ $i -lt 4 ]; do p6_gen 0 > $MNTPT/pf$i 2>/dev/null & i=$((i + 1)); done
+sleep 1
+if guarded 300 umount -f $MNTPT; then
+    result PASS "P7: umount -f while compressing returned"
+else
+    result FAIL "P7: umount -f while compressing failed or hung"
+fi
+wait
+mount | grep -q " $MNTPT " && { result FAIL "P7: still mounted"; umount -f $MNTPT; }
+[ "$(sysctl -n vfs.hammer2.comp_inflight)" = 0 ] &&
+    result PASS "P7: no compression job in flight after umount -f" ||
+    result FAIL "P7: $(sysctl -n vfs.hammer2.comp_inflight) compression jobs in flight after umount -f"
+if mount -t hammer2 $PFSPATH $MNTPT; then
+    result PASS "P7: array mounts after umount -f"
+    scrub_clean "P7b"
+else
+    result FAIL "P7: array does not mount after umount -f"
+fi
+teardown "P7"
+fi
+if [ "$P_ONLY" = P6 ]; then
+    summary
+    exit 0
+fi
+
 # P1: large incompressible write; P1c: compressible (about 2x)
 if [ "$P_ONLY" != P2 ]; then
 big_write P1 $BIGSRC
@@ -390,6 +507,11 @@ p5_target "P1c" $(awk -v c=$P1C_COLS -v p=$P1_COLS 'BEGIN { print (c <= 0.6 * p)
     "columns reserved $P1C_COLS vs P1 $P1_COLS (target <= 0.6x)"
 p5_target "P1c" $(awk -v c=$P1C_MBS -v p=$P1_MBS 'BEGIN { print (c >= 0.9 * p) }') \
     "throughput $P1C_MBS vs P1 $P1_MBS MB/s (target >= 90%)"
+
+if [ "$P_ONLY" = P1 ]; then
+    summary
+    exit 0
+fi
 
 # P3 first needs P1's file, so run it before P2 re-creates the array.
 setup_fresh full

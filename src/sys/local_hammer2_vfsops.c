@@ -145,6 +145,12 @@ long hammer2_cw_lz4_ns;
 long hammer2_cw_assign_ns;
 long hammer2_cw_done_ns;
 long hammer2_cw_io_ns;
+long hammer2_cw_wait_ns;
+long hammer2_cw_pool_jobs;
+long hammer2_cw_pool_inline;
+int hammer2_comp_workers = -1;		/* -1: ncpus capped at 4 (set at init) */
+u_int hammer2_comp_depth = 32;
+u_int hammer2_comp_inflight;
 long hammer2_rz_bf_rows_freed;
 long hammer2_rz_bf_reclaimed;
 long hammer2_rz_bf_rows_live;
@@ -444,6 +450,20 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_assign_ns, CTLFLAG_RW,
 	   &hammer2_cw_assign_ns, 0, "write path: ns in assign_physical");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_io_ns, CTLFLAG_RW,
 	   &hammer2_cw_io_ns, 0, "write path: ns filling and queueing the buffer");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_wait_ns, CTLFLAG_RW,
+	   &hammer2_cw_wait_ns, 0, "write path: ns the xop thread waited for a compression worker");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_pool_jobs, CTLFLAG_RW,
+	   &hammer2_cw_pool_jobs, 0, "write path: blocks pre-compressed by the worker pool");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_pool_inline, CTLFLAG_RW,
+	   &hammer2_cw_pool_inline, 0, "write path: LZ4 candidates compressed inline (pool off/full)");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, comp_workers, CTLFLAG_RW,
+	   &hammer2_comp_workers, 0,
+	   "LZ4 worker threads used (0 = compress inline in the xop thread; "
+	   "capped at the threads started at load, min(ncpus,4))");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, comp_depth, CTLFLAG_RW,
+	   &hammer2_comp_depth, 0, "max blocks with a compression job in flight");
+SYSCTL_UINT(_vfs_hammer2, OID_AUTO, comp_inflight, CTLFLAG_RD,
+	   &hammer2_comp_inflight, 0, "compression jobs in flight now");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, cw_done_ns, CTLFLAG_RW,
 	   &hammer2_cw_done_ns, 0, "write path: ns in subcol_done/unlock (row seal)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_seal_flush_short, CTLFLAG_RD,
@@ -689,6 +709,7 @@ hammer2_vfs_init(struct vfsconf *conf)
 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
 
 	hammer2_raid6_init();
+	hammer2_comp_init();
 	TASK_INIT(&hammer2_persist_task, 0, hammer2_persist_task_fn, NULL);
 
 	spin_init(&hammer2_gone_spin, "h2gone");
@@ -716,6 +737,7 @@ hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
 	taskqueue_drain(hammer2_gone_tq, &hammer2_gone_task);
 	taskqueue_free(hammer2_gone_tq);
 	taskqueue_drain(taskqueue_thread[0], &hammer2_persist_task);
+	hammer2_comp_uninit();
 	objcache_destroy(cache_buffer_read);
 	objcache_destroy(cache_buffer_write);
 	objcache_destroy(cache_xops);
