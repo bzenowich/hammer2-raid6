@@ -114,8 +114,19 @@ if mount | grep -q hammer2; then
 fi
 # Drop any hammer2 .ko by id (handles modules loaded under non-standard
 # names — e.g. /tmp/kmod_hammer2.ko shows up in kldstat as kmod_hammer2).
+# A kldunload that hangs (seen twice on 2026-10-15, wait channel
+# taskqueue_terminate) leaves its thread states in
+# /var/tmp/kldunload-hang.txt before failing the reload.
 kldstat | awk '/hammer2/ { print $1 }' | while read id; do
-    [ -n "$id" ] && kldunload -i "$id" 2>/dev/null || true
+    [ -n "$id" ] || continue
+    kldunload -i "$id" 2>/dev/null &
+    p=$!; n=0
+    while kill -0 $p 2>/dev/null && [ $n -lt 60 ]; do sleep 1; n=$((n+1)); done
+    if kill -0 $p 2>/dev/null; then
+        { date; ps -axlH; } > /var/tmp/kldunload-hang.txt 2>&1
+        echo "    ERROR: kldunload hung; thread states in /var/tmp/kldunload-hang.txt"
+        exit 1
+    fi
 done
 kldload /usr/src/sys/vfs/hammer2/hammer2.ko
 kldstat | grep hammer2
