@@ -1711,6 +1711,7 @@ extern int hammer2_cluster_meta_read;
 extern int hammer2_md_read_spread;
 extern int hammer2_md_3copy_upgrade;
 extern int hammer2_cluster_data_read;
+extern int hammer2_cluster_data_read_v3;
 extern int hammer2_cluster_write;
 extern int hammer2_dedup_enable;
 extern int hammer2_always_compress;

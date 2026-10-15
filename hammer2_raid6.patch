@@ -1450,7 +1450,7 @@ index 9c5abb1..45e7278 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729..40c5355 100644
+index a29c729..5f1bcd0 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
 @@ -92,6 +92,7 @@
@@ -1815,16 +1815,18 @@ index a29c729..40c5355 100644
  	bits = (int)((bytes + (HAMMER2_DEDUP_FRAG - 1)) >>
  	       HAMMER2_DEDUP_FRAGRADIX);
  	if (bbeg + bits == 64)
-@@ -1414,6 +1708,8 @@ extern int hammer2_xop_xbase;
+@@ -1414,7 +1708,10 @@ extern int hammer2_xop_xbase;
  extern int hammer2_xop_mod;
  extern long hammer2_debug_inode;
  extern int hammer2_cluster_meta_read;
 +extern int hammer2_md_read_spread;
 +extern int hammer2_md_3copy_upgrade;
  extern int hammer2_cluster_data_read;
++extern int hammer2_cluster_data_read_v3;
  extern int hammer2_cluster_write;
  extern int hammer2_dedup_enable;
-@@ -1642,15 +1938,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+ extern int hammer2_always_compress;
+@@ -1642,15 +1939,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
  				u_int bytes);
  int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
@@ -1850,7 +1852,7 @@ index a29c729..40c5355 100644
  hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  				int lsize HAMMER2_IO_DEBUG_ARGS);
  void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
-@@ -1663,8 +1965,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1663,8 +1966,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  
  #ifndef HAMMER2_IO_DEBUG
  
@@ -1861,7 +1863,7 @@ index a29c729..40c5355 100644
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
  	_hammer2_io_getquick((hmp), (lbase), (lsize))
  #define hammer2_io_putblk(diop)						\
-@@ -1682,13 +1984,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1682,13 +1985,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio))
  
@@ -1879,7 +1881,7 @@ index a29c729..40c5355 100644
  	__FILE__, __LINE__)
  
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
-@@ -1710,8 +2012,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1710,8 +2013,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio), __FILE__, __LINE__)
  
@@ -1890,7 +1892,7 @@ index a29c729..40c5355 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1900,6 +2202,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
+@@ -1900,6 +2203,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
  int hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes);
  void hammer2_freemap_adjust(hammer2_dev_t *hmp,
  				hammer2_blockref_t *bref, int how);
@@ -1899,7 +1901,7 @@ index a29c729..40c5355 100644
  
  /*
   * hammer2_cluster.c
-@@ -1944,16 +2248,367 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
+@@ -1944,16 +2249,367 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
   * hammer2_ondisk.c
   */
  int hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
@@ -4143,7 +4145,7 @@ index 4b3656b..2c05594 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24e..6c22319 100644
+index 31be24e..7cbb356 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,10 @@
@@ -4450,7 +4452,7 @@ index 31be24e..6c22319 100644
  
  			switch(op) {
  			case HAMMER2_DOP_NEW:
-@@ -251,7 +438,17 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -251,21 +438,141 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  	 * We break to here if GOOD is not set and we acquired INPROG for
  	 * the I/O.
  	 */
@@ -4464,11 +4466,24 @@ index 31be24e..6c22319 100644
 +		dio->bp = NULL;
 +	}
  	KKASSERT(dio->bp == NULL);
+-	if (btype == HAMMER2_BREF_TYPE_DATA)
+-		hce = hammer2_cluster_data_read;
+-	else
 +	dio->rdisk = -1;
- 	if (btype == HAMMER2_BREF_TYPE_DATA)
- 		hce = hammer2_cluster_data_read;
- 	else
-@@ -259,13 +456,113 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
++	if (btype == HAMMER2_BREF_TYPE_DATA) {
++		/*
++		 * v3 Path A: the dio is one column on one member and the
++		 * next slots on that member are other rows' columns, half
++		 * of them P/Q, so physical read-ahead only reads parity
++		 * (oct-review P9a, about 2.2x read amplification).  Rely on
++		 * the logical read-ahead of the file instead.
++		 */
++		if (hammer2_raid6_v3(hmp))
++			hce = hammer2_cluster_data_read_v3;
++		else
++			hce = hammer2_cluster_data_read;
++	} else
+ 		hce = hammer2_cluster_meta_read;
  
  	error = 0;
  	dev_pbase = dio->pbase - dio->dbase;
@@ -4586,7 +4601,7 @@ index 31be24e..6c22319 100644
  					 GETBLK_KVABIO, 0);
  			if (op == HAMMER2_DOP_NEW) {
  				bkvasync(dio->bp);
-@@ -276,43 +573,52 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -276,43 +583,52 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		case HAMMER2_DOP_READ:
  		default:
  			KKASSERT(dio->bp == NULL);
@@ -4670,7 +4685,7 @@ index 31be24e..6c22319 100644
  		}
  		if (dio->bp) {
  			/*
-@@ -347,14 +653,109 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -347,14 +663,109 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		}
  	}
  
@@ -4780,7 +4795,7 @@ index 31be24e..6c22319 100644
  	/*
  	 * Clear INPROG and WAITING, set GOOD wake up anyone waiting.
  	 */
-@@ -465,8 +866,63 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -465,8 +876,63 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		 * Non-errored disposal of bp
  		 */
  		if (orefs & HAMMER2_DIO_DIRTY) {
@@ -4844,7 +4859,7 @@ index 31be24e..6c22319 100644
  			/*
  			 * Allows dirty buffers to accumulate and
  			 * possibly be canceled (e.g. by a 'rm'),
-@@ -482,35 +938,120 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -482,35 +948,120 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  			 * write.  This typically occurs in the write-behind
  			 * case when writing to large files.
  			 */
@@ -4984,7 +4999,7 @@ index 31be24e..6c22319 100644
  	/*
  	 * Update iofree_count before disposing of the dio
  	 */
-@@ -557,41 +1098,45 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
+@@ -557,41 +1108,45 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
  	struct buf *bp;
  	int off;
  
@@ -5038,7 +5053,7 @@ index 31be24e..6c22319 100644
  #ifdef HAMMER2_IO_DEBUG
  	if ((dio = *diop) != NULL) {
  #if 0
-@@ -610,7 +1155,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
+@@ -610,7 +1165,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  	hammer2_io_t *dio;
  
  	dio = _hammer2_io_getblk(hmp, 0, lbase, lsize,
@@ -5048,7 +5063,7 @@ index 31be24e..6c22319 100644
  	return dio;
  }
  
-@@ -691,7 +1237,9 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -691,7 +1247,9 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
  	int lsize;
  	int isgood;
  
@@ -5059,7 +5074,7 @@ index 31be24e..6c22319 100644
  	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
  		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
  	else
-@@ -707,6 +1255,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -707,6 +1265,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
   * a modified chain is destroyed or by the bulkfree code.  No buffer
   * is needed for this operation.  If the DIO no longer exists it is
   * equivalent to the bits not being set.
@@ -5072,7 +5087,7 @@ index 31be24e..6c22319 100644
   */
  void
  hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
-@@ -720,7 +1274,9 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -720,7 +1284,9 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  		return;
  	if (btype != HAMMER2_BREF_TYPE_DATA)
  		return;
@@ -5083,7 +5098,7 @@ index 31be24e..6c22319 100644
  	if (dio) {
  		if (data_off < dio->pbase ||
  		    (data_off & ~HAMMER2_OFF_MASK_RADIX) + bytes >
-@@ -746,8 +1302,10 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
+@@ -746,8 +1312,10 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
  	hammer2_io_t *dio;
  	int isgood;
  
@@ -5095,7 +5110,7 @@ index 31be24e..6c22319 100644
  	if (dio) {
  		KASSERT((dio->dedup_alloc &
  			  hammer2_dedup_mask(dio, data_off, bytes)) == 0,
-@@ -764,7 +1322,7 @@ static
+@@ -764,7 +1332,7 @@ static
  void
  dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
  {
@@ -5104,7 +5119,7 @@ index 31be24e..6c22319 100644
  		return;
  	hammer2_adjwritecounter(dio->btype, dio->psize);
  }
-@@ -786,94 +1344,3542 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,91 +1354,3539 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -5296,9 +5311,6 @@ index 31be24e..6c22319 100644
 +	struct hammer2_iowd *w;
  
 -	count = hmp->iofree_count - dio_limit + 32;
--	if (count <= 0)
--		return;
--	cleanbase = NULL;
 +	if (disk_idx < 0 || disk_idx >= HAMMER2_MAX_VOLUMES)
 +		return -1;
 +	w = &hmp->iowd[disk_idx];
@@ -8706,13 +8718,10 @@ index 31be24e..6c22319 100644
 +	int i;
 +
 +	count = hmp->iofree_count - dio_limit + 32;
-+	if (count <= 0)
-+		return;
-+	cleanbase = NULL;
- 	cleanapp = &cleanbase;
- 
- 	i = hmp->io_iterator++;
-@@ -961,3 +4967,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
+ 	if (count <= 0)
+ 		return;
+ 	cleanbase = NULL;
+@@ -961,3 +4977,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
  		}
  	}
  }
@@ -15162,7 +15171,7 @@ index 32367cc..526ae18 100644
  	if (data == NULL)
  		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467..b27609a 100644
+index 98c8467..39c612e 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -47,7 +47,16 @@
@@ -15182,16 +15191,18 @@ index 98c8467..b27609a 100644
  
  TAILQ_HEAD(hammer2_mntlist, hammer2_dev);
  static struct hammer2_mntlist hammer2_mntlist;
-@@ -66,6 +75,8 @@ int hammer2_xop_xbase;
+@@ -66,7 +75,10 @@ int hammer2_xop_xbase;
  int hammer2_xop_mod;
  long hammer2_debug_inode;
  int hammer2_cluster_meta_read = 1;	/* physical read-ahead */
 +int hammer2_md_3copy_upgrade;		/* mount: layout 2 -> 3 copies */
 +int hammer2_md_read_spread = 1;		/* v3: cold metadata reads use all mirrors */
  int hammer2_cluster_data_read = 4;	/* physical read-ahead */
++int hammer2_cluster_data_read_v3 = 0;	/* same, v3 RAID6 DATA (P9a) */
  int hammer2_cluster_write = 0;		/* physical write clustering */
  int hammer2_dedup_enable = 1;
-@@ -76,6 +87,86 @@ int hammer2_dio_limit = 256;
+ int hammer2_always_compress = 0;	/* always try to compress */
+@@ -76,6 +88,86 @@ int hammer2_dio_limit = 256;
  int hammer2_bulkfree_tps = 5000;
  int hammer2_spread_workers;
  int hammer2_limit_saved_depth;
@@ -15278,7 +15289,7 @@ index 98c8467..b27609a 100644
  long hammer2_chain_allocs;
  long hammer2_limit_saved_chains;
  long hammer2_limit_dirty_chains;
-@@ -122,6 +213,12 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
+@@ -122,8 +214,17 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
  	   &hammer2_spread_workers, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
  	   &hammer2_cluster_meta_read, 0, "");
@@ -15290,8 +15301,13 @@ index 98c8467..b27609a 100644
 +	   &hammer2_md_read_spread, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read, CTLFLAG_RW,
  	   &hammer2_cluster_data_read, 0, "");
++SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read_v3, CTLFLAG_RW,
++	   &hammer2_cluster_data_read_v3, 0,
++	   "physical read-ahead (64K units) for v3 RAID6 data columns");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_write, CTLFLAG_RW,
-@@ -134,6 +231,244 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
+ 	   &hammer2_cluster_write, 0, "");
+ SYSCTL_INT(_vfs_hammer2, OID_AUTO, dedup_enable, CTLFLAG_RW,
+@@ -134,6 +235,244 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
  	   &hammer2_flush_pipe, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, bulkfree_tps, CTLFLAG_RW,
  	   &hammer2_bulkfree_tps, 0, "");
@@ -15536,7 +15552,7 @@ index 98c8467..b27609a 100644
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
  	   &hammer2_chain_allocs, 0, "");
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,
-@@ -190,8 +525,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
+@@ -190,8 +529,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
  
  static int hammer2_vfs_init(struct vfsconf *conf);
  static int hammer2_vfs_uninit(struct vfsconf *vfsp);
@@ -15565,7 +15581,7 @@ index 98c8467..b27609a 100644
  static int hammer2_remount(hammer2_dev_t *, struct mount *, char *,
  				struct ucred *);
  static int hammer2_recovery(hammer2_dev_t *hmp);
-@@ -298,7 +653,11 @@ hammer2_vfs_init(struct vfsconf *conf)
+@@ -298,7 +657,11 @@ hammer2_vfs_init(struct vfsconf *conf)
  	margs_read.objsize = 65536;
  	margs_read.mtype = M_HAMMER2_DEBUFFER;
  
@@ -15578,7 +15594,7 @@ index 98c8467..b27609a 100644
  	margs_write.mtype = M_HAMMER2_CBUFFER;
  
  	margs_vop.objsize = sizeof(hammer2_xop_t);
-@@ -349,6 +708,22 @@ hammer2_vfs_init(struct vfsconf *conf)
+@@ -349,6 +712,22 @@ hammer2_vfs_init(struct vfsconf *conf)
  
  	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
  
@@ -15601,7 +15617,7 @@ index 98c8467..b27609a 100644
  	return (error);
  }
  
-@@ -356,12 +731,285 @@ static
+@@ -356,12 +735,285 @@ static
  int
  hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
  {
@@ -15887,7 +15903,7 @@ index 98c8467..b27609a 100644
  /*
   * Core PFS allocator.  Used to allocate or reference the pmp structure
   * for PFS cluster mounts and the spmp structure for media (hmp) structures.
-@@ -718,6 +1366,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
+@@ -718,6 +1370,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
  	if (chains_still_present) {
  		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
  	} else {
@@ -15899,7 +15915,7 @@ index 98c8467..b27609a 100644
  		kmalloc_destroy_obj(&pmp->minode);
  		kfree(pmp, M_HAMMER2);
  	}
-@@ -888,6 +1541,55 @@ again:
+@@ -888,6 +1545,55 @@ again:
  	}
  }
  
@@ -15955,7 +15971,7 @@ index 98c8467..b27609a 100644
  /*
   * Mount or remount HAMMER2 fileystem from physical media
   *
-@@ -912,6 +1614,67 @@ static
+@@ -912,6 +1618,67 @@ static
  int
  hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		  struct ucred *cred)
@@ -16023,7 +16039,7 @@ index 98c8467..b27609a 100644
  {
  	struct hammer2_mount_info info;
  	hammer2_pfs_t *pmp;
-@@ -927,7 +1690,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -927,7 +1694,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	hammer2_devvp_list_t devvpl;
  	hammer2_devvp_t *e, *e_tmp;
  	struct file *fp;
@@ -16031,7 +16047,7 @@ index 98c8467..b27609a 100644
  	size_t size;
  	size_t done;
  	char *label;
-@@ -981,12 +1743,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -981,12 +1747,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		 * Root mount
  		 */
  		info.cluster_fd = -1;
@@ -16046,7 +16062,7 @@ index 98c8467..b27609a 100644
  		if (error)
  			return (error);
  		kprintf("hammer2_mount: devstr=\"%s\"\n", devstr);
-@@ -1042,6 +1804,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1042,6 +1808,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	 */
  	TAILQ_INIT(&devvpl);
  	error = hammer2_init_devvp(devstr, path == NULL, &devvpl);
@@ -16055,7 +16071,7 @@ index 98c8467..b27609a 100644
  	if (error) {
  		kprintf("hammer2: failed to initialize devvp in %s\n", devstr);
  		hammer2_cleanup_devvp(&devvpl);
-@@ -1063,11 +1827,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1063,11 +1831,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		TAILQ_FOREACH(hmp_tmp, &hammer2_mntlist, mntentry) {
  			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
  				int devvp_found = 0;
@@ -16079,7 +16095,7 @@ index 98c8467..b27609a 100644
  					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
  						devvp_found = 1;
  				}
-@@ -1088,7 +1862,9 @@ next_hmp:
+@@ -1088,7 +1866,9 @@ next_hmp:
  		if (hmp == NULL) {
  			TAILQ_FOREACH(e, &devvpl, entry) {
  				struct vnode *devvp = e->devvp;
@@ -16090,7 +16106,7 @@ index 98c8467..b27609a 100644
  				error = vfs_mountedon(devvp);
  				if (error) {
  					kprintf("hammer2_mount: %s mounted %d\n",
-@@ -1136,8 +1912,10 @@ next_hmp:
+@@ -1136,8 +1916,10 @@ next_hmp:
  		 */
  		KKASSERT(!TAILQ_EMPTY(&devvpl));
  		error = hammer2_open_devvp(&devvpl, ronly);
@@ -16102,7 +16118,7 @@ index 98c8467..b27609a 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			return error;
-@@ -1151,8 +1929,10 @@ next_hmp:
+@@ -1151,8 +1933,10 @@ next_hmp:
  		error = hammer2_init_volumes(mp, &devvpl, hmp->volumes,
  					     &hmp->voldata, &hmp->volhdrno,
  					     &hmp->devvp);
@@ -16114,7 +16130,7 @@ index 98c8467..b27609a 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			kfree(hmp, M_HAMMER2);
-@@ -1160,12 +1940,16 @@ next_hmp:
+@@ -1160,12 +1944,16 @@ next_hmp:
  		}
  		if (!hmp->devvp) {
  			kprintf("hammer2: failed to initialize root volume\n");
@@ -16133,7 +16149,7 @@ index 98c8467..b27609a 100644
  		ksnprintf(hmp->devrepname, sizeof(hmp->devrepname), "%s", devstr);
  		hmp->ronly = ronly;
  		hmp->hflags = info.hflags & HMNT2_DEVFLAGS;
-@@ -1175,12 +1959,31 @@ next_hmp:
+@@ -1175,12 +1963,31 @@ next_hmp:
  				   sizeof(struct hammer2_io));
  		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
  		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
@@ -16165,7 +16181,7 @@ index 98c8467..b27609a 100644
  
  		/*
  		 * vchain setup. vchain.data is embedded.
-@@ -1224,7 +2027,146 @@ next_hmp:
+@@ -1224,7 +2031,146 @@ next_hmp:
  		 * Must use hmp instead of volume header for these two
  		 * in order to handle volume versions transparently.
  		 */
@@ -16313,7 +16329,7 @@ index 98c8467..b27609a 100644
  			hmp->nvolumes = hmp->voldata.nvolumes;
  			hmp->total_size = hmp->voldata.total_size;
  		} else {
-@@ -1234,15 +2176,32 @@ next_hmp:
+@@ -1234,15 +2180,32 @@ next_hmp:
  		KKASSERT(hmp->nvolumes > 0);
  
  		/*
@@ -16353,7 +16369,7 @@ index 98c8467..b27609a 100644
  
  		/*
  		 * Really important to get these right or the flush and
-@@ -1275,6 +2234,11 @@ next_hmp:
+@@ -1275,6 +2238,11 @@ next_hmp:
  				      HAMMER2_SROOT_KEY, HAMMER2_SROOT_KEY,
  				      &error, 0);
  		hammer2_chain_lookup_done(parent);
@@ -16365,7 +16381,7 @@ index 98c8467..b27609a 100644
  		if (schain == NULL) {
  			kprintf("hammer2_mount: invalid super-root\n");
  			hammer2_unmount_helper(mp, NULL, hmp);
-@@ -1282,7 +2246,7 @@ next_hmp:
+@@ -1282,7 +2250,7 @@ next_hmp:
  			hammer2_vfs_unmount(mp, MNT_FORCE);
  			return EINVAL;
  		}
@@ -16374,7 +16390,7 @@ index 98c8467..b27609a 100644
  			kprintf("hammer2_mount: error %s reading super-root\n",
  				hammer2_error_str(schain->error));
  			hammer2_chain_unlock(schain);
-@@ -1403,6 +2367,13 @@ next_hmp:
+@@ -1403,6 +2371,13 @@ next_hmp:
  	}
  	hammer2_inode_unlock(spmp->iroot);
  
@@ -16388,7 +16404,7 @@ index 98c8467..b27609a 100644
  	/*
  	 * PFS could not be found?
  	 */
-@@ -1425,7 +2396,7 @@ next_hmp:
+@@ -1425,7 +2400,7 @@ next_hmp:
  	 * Acquire the pmp structure (it should have already been allocated
  	 * via hammer2_update_pmps()).
  	 */
@@ -16397,7 +16413,7 @@ index 98c8467..b27609a 100644
  		kprintf("hammer2_mount: PFS label I/O error\n");
  	} else {
  		ripdata = &chain->data->ipdata;
-@@ -1462,6 +2433,18 @@ next_hmp:
+@@ -1462,6 +2437,18 @@ next_hmp:
  	pmp->ronly = ronly;
  	pmp->hflags = info.hflags;
  	mp->mnt_flag |= MNT_LOCAL;
@@ -16416,7 +16432,7 @@ index 98c8467..b27609a 100644
  	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;   /* all entry pts are SMP */
  	mp->mnt_kern_flag |= MNTK_THR_SYNC;     /* new vsyncscan semantics */
  
-@@ -1493,7 +2476,10 @@ next_hmp:
+@@ -1493,7 +2480,10 @@ next_hmp:
  	vfs_add_vnodeops(mp, &hammer2_spec_vops, &mp->mnt_vn_spec_ops);
  	vfs_add_vnodeops(mp, &hammer2_fifo_vops, &mp->mnt_vn_fifo_ops);
  
@@ -16428,7 +16444,7 @@ index 98c8467..b27609a 100644
  		copyinstr(info.volume, mp->mnt_stat.f_mntfromname,
  			  MNAMELEN - 1, &size);
  		bzero(mp->mnt_stat.f_mntfromname + size, MNAMELEN - size);
-@@ -1580,6 +2566,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1580,6 +2570,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	hammer2_volume_t *vol;
  	struct vnode *devvp;
  	int i, ronly_save, error, result = 0;
@@ -16436,7 +16452,7 @@ index 98c8467..b27609a 100644
  
  	pmp = MPTOPMP(mp);
  	ronly_save = pmp->ronly;
-@@ -1593,13 +2580,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1593,13 +2584,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  
  	for (i = 0; i < hmp->nvolumes; ++i) {
  		vol = &hmp->volumes[i];
@@ -16463,7 +16479,7 @@ index 98c8467..b27609a 100644
  			error = hammer2_recovery(hmp);
  			if (error == 0)
  				error |= hammer2_fixup_pfses(hmp);
-@@ -1624,6 +2623,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1624,6 +2627,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	return result;
  }
  
@@ -16494,7 +16510,7 @@ index 98c8467..b27609a 100644
  static
  int
  hammer2_vfs_unmount(struct mount *mp, int mntflags)
-@@ -1637,6 +2660,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1637,6 +2664,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	if (pmp == NULL)
  		return(0);
  
@@ -16511,7 +16527,7 @@ index 98c8467..b27609a 100644
  	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
  
  	/*
-@@ -1650,9 +2683,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1650,9 +2687,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	else
  		flags = 0;
  	if (pmp->iroot) {
@@ -16535,7 +16551,7 @@ index 98c8467..b27609a 100644
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
-@@ -1777,6 +2824,19 @@ again:
+@@ -1777,6 +2828,19 @@ again:
  	hammer2_iocom_uninit(hmp);
  
  	hammer2_bulkfree_uninit(hmp);
@@ -16555,7 +16571,7 @@ index 98c8467..b27609a 100644
  	hammer2_pfsfree_scan(hmp, 0);
  
  	/*
-@@ -1828,11 +2888,15 @@ again:
+@@ -1828,11 +2892,15 @@ again:
  
  	KKASSERT(hmp->spmp == NULL);
  
@@ -16572,7 +16588,7 @@ index 98c8467..b27609a 100644
  		hammer2_cleanup_devvp(&hmp->devvpl);
  	}
  	KKASSERT(TAILQ_EMPTY(&hmp->devvpl));
-@@ -1896,6 +2960,13 @@ again:
+@@ -1896,6 +2964,13 @@ again:
  	kmalloc_destroy_obj(&hmp->mchain);
  	kmalloc_destroy_obj(&hmp->mio);
  	kmalloc_destroy(&hmp->mmsg);
@@ -16586,7 +16602,7 @@ index 98c8467..b27609a 100644
  	kfree(hmp, M_HAMMER2);
  }
  
-@@ -2040,6 +3111,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2040,6 +3115,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statfs tmp;
@@ -16596,7 +16612,7 @@ index 98c8467..b27609a 100644
  	int i;
  
  	/*
-@@ -2060,17 +3134,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2060,17 +3138,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16625,7 +16641,7 @@ index 98c8467..b27609a 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2095,6 +3175,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2095,6 +3179,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statvfs tmp;
@@ -16635,7 +16651,7 @@ index 98c8467..b27609a 100644
  	int i;
  
  	/*
-@@ -2114,17 +3197,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2114,17 +3201,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16664,7 +16680,7 @@ index 98c8467..b27609a 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2964,6 +4053,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2964,6 +4057,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		if (waiting > hammer2_limit_dirty_chains / 2 ||
  		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2)
  		{
@@ -16672,7 +16688,7 @@ index 98c8467..b27609a 100644
  			trigger_syncer(pmp->mp);
  		}
  
-@@ -2979,6 +4069,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2979,6 +4073,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		}
  
  		if (started == 0) {
@@ -16680,7 +16696,7 @@ index 98c8467..b27609a 100644
  			trigger_syncer_start(pmp->mp);
  			started = 1;
  		}
-@@ -3099,6 +4190,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
+@@ -3099,6 +4194,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
  			    pmp->pfs_types[i] != HAMMER2_PFSTYPE_SOFT_MASTER)
  				continue;
  

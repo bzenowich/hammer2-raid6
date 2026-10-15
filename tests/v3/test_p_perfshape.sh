@@ -12,7 +12,7 @@
 #       judge balance on data columns per disk instead (see below).
 #   P1c 256 MB of text-like data LZ4 halves (about 2x), then sync
 #   P2c 4000 files of 4 KB that LZ4 shrinks to about 1 KB, then sync
-#   P3  cold sequential read of the P1 file; informational only.
+#   P3  cold sequential read of the P1 file: read amplification <= 1.2, MB/s printed (P9a)
 #
 # P1/P1c/P2/P2c also print the columns reserved (vfs.hammer2.rz_cols_alloc),
 # the df space used and, for the big writes, the throughput.  The sub-column
@@ -401,7 +401,7 @@ p6_gen() {	# p6_gen <i>: deterministic content of file i
          dd if=$CMPSRC bs=1048576 count=8 skip=8 2>/dev/null; } ;;
     esac
 }
-if [ "$P_ONLY" != P2 ] && [ "$P_ONLY" != P1 ]; then
+if [ "$P_ONLY" != P2 ] && [ "$P_ONLY" != P1 ] && [ "$P_ONLY" != P3 ]; then
 setup_fresh full
 check_v3
 set_lz4
@@ -496,7 +496,7 @@ if [ "$P_ONLY" = P6 ]; then
 fi
 
 # P1: large incompressible write; P1c: compressible (about 2x)
-if [ "$P_ONLY" != P2 ]; then
+if [ "$P_ONLY" != P2 ] && [ "$P_ONLY" != P3 ]; then
 big_write P1 $BIGSRC
 P1_COLS=$BW_COLS; P1_MBS=$BW_MBS; P1_WRT=$BW_WRT
 big_write P1c $CMPSRC
@@ -513,20 +513,47 @@ if [ "$P_ONLY" = P1 ]; then
     exit 0
 fi
 
+fi
+if [ "$P_ONLY" != P2 ]; then
 # P3 first needs P1's file, so run it before P2 re-creates the array.
+# Cold sequential read (unmount/remount drops the cache): array bytes read
+# versus file bytes (oct-review P9a).  v3 data columns are not read ahead
+# physically (vfs.hammer2.cluster_data_read_v3 = 0), so the amplification
+# must stay <= 1.2 (it was 2.2 with the old read-ahead of 4).  A/B:
+#   P3_RA=4 P_ONLY=P3 sh test_p_perfshape.sh   (asserts nothing, prints)
+# P3_RUNS=N repeats the cold read N times (all printed).
 setup_fresh full
 dd if=$BIGSRC of=$MNTPT/big bs=1048576 2>/dev/null
 sync; sync
-remount
-sleep 2
-ds_snap /var/tmp/p_b3
-dd if=$MNTPT/big of=/dev/null bs=1048576 2>/dev/null
-ds_snap /var/tmp/p_a3
-rd=$(join /var/tmp/p_b3 /var/tmp/p_a3 | awk '{ t += $7 - $3 } END { print t + 0 }')
-echo "  INFO: P3 cold read: $((rd / 1048576)) MB read from members for $BIG_MB MB file," \
-     "ratio $(awk -v r=$rd -v b=$((BIG_MB * 1048576)) 'BEGIN { printf "%.2f", r / b }')"
+[ -n "$P3_RA" ] && sysctl vfs.hammer2.cluster_data_read_v3=$P3_RA
+P3_RUNS=${P3_RUNS:-1}
+p3=1
+while [ $p3 -le $P3_RUNS ]; do
+    remount
+    sleep 2
+    ds_snap /var/tmp/p_b3
+    /usr/bin/time -p dd if=$MNTPT/big of=/dev/null bs=1048576 2> /var/tmp/p_time3.txt
+    ds_snap /var/tmp/p_a3
+    rd=$(join /var/tmp/p_b3 /var/tmp/p_a3 | awk '{ t += $7 - $3 } END { print t + 0 }')
+    secs=$(awk '$1 == "real" { print $2 }' /var/tmp/p_time3.txt)
+    P3_AMP=$(awk -v r=$rd -v b=$((BIG_MB * 1048576)) 'BEGIN { printf "%.2f", r / b }')
+    echo "  P3 run $p3: cold read $((rd / 1048576)) MB from members for $BIG_MB MB file," \
+         "amplification $P3_AMP, $(awk -v s="$secs" -v m=$BIG_MB 'BEGIN { printf "%.1f", (s > 0) ? m / s : 0 }') MB/s" \
+         "(cluster_data_read_v3=$(sysctl -n vfs.hammer2.cluster_data_read_v3))"
+    p3=$((p3 + 1))
+done
+if [ -n "$P3_RA" ] && [ "$P3_RA" != 0 ]; then
+    echo "  INFO: P3 read-ahead forced to $P3_RA, amplification not asserted"
+elif awk -v a="$P3_AMP" 'BEGIN { exit !(a <= 1.2) }'; then
+    result PASS "P3: cold sequential read amplification $P3_AMP (<= 1.2)"
+else
+    result FAIL "P3: cold sequential read amplification $P3_AMP (> 1.2)"
+fi
+cmp -s $BIGSRC $MNTPT/big && result PASS "P3: cold read data identical" ||
+    result FAIL "P3: cold read data differs"
 teardown "P3"
 fi
+[ "$P_ONLY" = P3 ] && { summary; exit 0; }
 
 # P2: many small files
 small_write P2 $SMALLSRC

@@ -449,9 +449,19 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	}
 	KKASSERT(dio->bp == NULL);
 	dio->rdisk = -1;
-	if (btype == HAMMER2_BREF_TYPE_DATA)
-		hce = hammer2_cluster_data_read;
-	else
+	if (btype == HAMMER2_BREF_TYPE_DATA) {
+		/*
+		 * v3 Path A: the dio is one column on one member and the
+		 * next slots on that member are other rows' columns, half
+		 * of them P/Q, so physical read-ahead only reads parity
+		 * (oct-review P9a, about 2.2x read amplification).  Rely on
+		 * the logical read-ahead of the file instead.
+		 */
+		if (hammer2_raid6_v3(hmp))
+			hce = hammer2_cluster_data_read_v3;
+		else
+			hce = hammer2_cluster_data_read;
+	} else
 		hce = hammer2_cluster_meta_read;
 
 	error = 0;
