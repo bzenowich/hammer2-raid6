@@ -452,6 +452,10 @@ through `bwrite_start`/`bwrite_wait`.
 - `bdwrite` the mirror copies, or queue them for the flush. The R1 ordering already makes them durable before the header.
 - Move row sealing to an async per-mount seal path (`bwrite_start` + `biodone`, throttled by `runningbufspace`).
 
+**Status: done.** All three steps are built; async sealing (`vfs.hammer2.async_seal`) has been the
+default since 77d89ab (2026-10-14), with the LZ4 worker pool (b4b1b0e). Pi results at the end of
+this section.
+
 **Step 3 measurement (async sealing; branch fix/async-seal, h2dev 4 x virtio, 2+2).** Counters
 `vfs.hammer2.rz_pq_wait_ns/_cnt` (time `write_row` waits for the P and Q writes) and
 `rz_seal_ns/_cnt` (time inside `row_io`, rebuild_lk included) are summed over all threads; test P
