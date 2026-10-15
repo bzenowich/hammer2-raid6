@@ -1637,3 +1637,13 @@ layout 3 4.08 4.66 4.26 5.06 4.60, mean 4.53x (mean 70 MB, 173 blocks). The savi
 of the 33 MB the mirrors cost (174 blocks x 64 KB x 3), as the model says (base cost, everything but
 the mirrors, is 47-50 MB in every run). On the Pi (4 disks, 422 blocks x 64 KB) that is 79 MB -> 53 MB,
 26 MB less: P2 8.5x -> about 6.9x, to be measured. A 6-disk array would save half of the mirror cost.
+
+*Pi measurement (k49, 1200 MHz, async on, 2026-10-15; `P_ONLY=P2`, 8 runs alternating
+`HAMMER2_MKFS_LAYOUT2=1` / layout 3).* Write-amp P2 / P2c: layout 2 5.08/7.47, 11.74/13.39,
+9.94/10.09, 9.72/4.94 (mean 9.1/9.0); layout 3 7.42/9.10, 15.04/6.31, 12.83/12.70, 12.74/10.28
+(mean 12.0/9.6). The spread (5-15x in both layouts) swamps the predicted saving. It follows
+`mf_blocks` (150-936 per run), i.e. the number of flush passes, which follows `dc_trigger`
+(4-2602: the dirty-chain limit, `limit_dirty_chains` 4710 at hw.physmem=2g, kicking the syncer).
+Group P's `write-amp <= 12` check failed in 4 of the 8 runs (6 of 7 failing checks on layout 3).
+Next: P10b, make the number of flush passes during a small-file burst predictable (throttle or
+coalesce the limit-triggered syncer kicks), then re-measure layout 2 vs 3.
