@@ -78,6 +78,7 @@ int hammer2_cluster_meta_read = 1;	/* physical read-ahead */
 int hammer2_md_3copy_upgrade;		/* mount: layout 2 -> 3 copies */
 int hammer2_md_read_spread = 1;		/* v3: cold metadata reads use all mirrors */
 int hammer2_cluster_data_read = 4;	/* physical read-ahead */
+int hammer2_cluster_data_read_v3 = 0;	/* same, v3 RAID6 DATA (P9a) */
 int hammer2_cluster_write = 0;		/* physical write clustering */
 int hammer2_dedup_enable = 1;
 int hammer2_always_compress = 0;	/* always try to compress */
@@ -221,6 +222,9 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, md_read_spread, CTLFLAG_RW,
 	   &hammer2_md_read_spread, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read, CTLFLAG_RW,
 	   &hammer2_cluster_data_read, 0, "");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_data_read_v3, CTLFLAG_RW,
+	   &hammer2_cluster_data_read_v3, 0,
+	   "physical read-ahead (64K units) for v3 RAID6 data columns");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_write, CTLFLAG_RW,
 	   &hammer2_cluster_write, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, dedup_enable, CTLFLAG_RW,

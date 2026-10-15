@@ -29,7 +29,7 @@ Test disks are `/dev/vbd1..vbd4`; `vbd0` is the system disk.
 | K | scrub: clean array is not modified, corruption detected and repaired, scrub under writes |
 | L | read-path self-heal, data and metadata |
 | N | capacity: fill past the old 2 GB-per-disk limit, two-pass bulkfree frees deleted space and it is reused, a snapshot survives the allocator wrapping the disk |
-| P | I/O shape (devstat at the members): 256 MB write and 4000 x 4 KB files read nothing from the array while writing; P1 balance and write amplification asserted; cold-read ratio printed |
+| P | I/O shape (devstat at the members): 256 MB write and 4000 x 4 KB files read nothing from the array while writing; P1 balance and write amplification asserted; cold sequential read amplification asserted <= 1.2 (P3, `P_ONLY=P3`, `P3_RA=n` A/B) |
 | T | disks reused from an earlier filesystem: newfs with a smaller `-s` must clear the old header zones, the mount ignores a stale header zone of another fsid; a refused RW mount closes the devices and frees its memory (newfs works again, the live HAMMER2-mount object count does not grow) |
 | M | silent corruption in two columns (runs last: it can hang the kernel) |
 | crash_host.sh | power loss under a write+sync loop: every synced file must survive, scrub clean |
