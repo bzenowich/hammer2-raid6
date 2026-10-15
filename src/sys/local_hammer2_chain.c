@@ -5775,22 +5775,36 @@ hammer2_raid6_selfheal_data(hammer2_dev_t *hmp, const hammer2_blockref_t *bref,
 	hammer2_off_t col_base = phys & ~(hammer2_off_t)(stripe_unit - 1);
 	size_t off = (size_t)(phys - col_base);
 	int target_failed = hmp->raid_failed[disk_idx];
+	hammer2_raid6_row_t row;
+	void *wp[HAMMER2_MAX_VOLUMES];
 	char *recon;
 	char *extra;
 	uint64_t badhash;
 	int error;
+	int tgt_col;
+	int ext_col;
 	int e;
 
 	/* the repair kthread writes only while the slot still holds this */
 	badhash = hammer2_io_repair_hash(bdata, bytes);
-	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK);
+
+	/*
+	 * The row is read once, as the candidates need it: the surviving
+	 * data and one parity column for the first try, the rest only if
+	 * a second bad column has to be found.  The reconstructions go to
+	 * work buffers, so a failed try leaves the row as it was read.
+	 */
+	hammer2_raid6_row_init(hmp, &row, col_base);
+	tgt_col = hammer2_raid6_row_col(&row, disk_idx);
+	bcopy(row.ptrs, wp, sizeof(wp));
+	wp[tgt_col] = recon;
 	if (!target_failed) {
-		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
-						       recon,
-						       (size_t)stripe_unit, 1);
+		error = hammer2_raid6_row_solve(&row, tgt_col, -1, wp);
 		if (error == 0 &&
 		    hammer2_bref_check_match(bref, recon + off,
 					     bytes)) {
+			hammer2_raid6_row_done(&row);
 			bcopy(recon + off, bdata, bytes);
 			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
 			krateprintf(&krate_h2heal,
@@ -5805,16 +5819,21 @@ hammer2_raid6_selfheal_data(hammer2_dev_t *hmp, const hammer2_blockref_t *bref,
 		}
 	}
 
-	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
+	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK);
 	for (e = 0; e < hmp->raid_config.ndisks; e++) {
 		if (e == disk_idx || hmp->raid_failed[e])
 			continue;
-		error = hammer2_io_raid6_read_degraded_x(hmp, lbase, disk_idx,
-		    recon, (size_t)stripe_unit, 1, e, extra);
+		ext_col = hammer2_raid6_row_col(&row, e);
+		if (row.erased & (1ULL << ext_col))
+			continue;
+		wp[ext_col] = extra;
+		error = hammer2_raid6_row_solve(&row, tgt_col, ext_col, wp);
+		wp[ext_col] = row.ptrs[ext_col];
 		if (error || !hammer2_bref_check_match(bref, recon + off,
 						       bytes))
 			continue;
 
+		hammer2_raid6_row_done(&row);
 		bcopy(recon + off, bdata, bytes);
 		atomic_add_64(&hmp->raid_cksum_errors[e], 1);
 		atomic_add_64(&hmp->raid_cksum_healed[e], 1);
@@ -5836,6 +5855,7 @@ hammer2_raid6_selfheal_data(hammer2_dev_t *hmp, const hammer2_blockref_t *bref,
 		}
 		return 0;
 	}
+	hammer2_raid6_row_done(&row);
 	kfree(extra, M_HAMMER2);
 	kfree(recon, M_HAMMER2);
 	return HAMMER2_ERROR_CHECK;

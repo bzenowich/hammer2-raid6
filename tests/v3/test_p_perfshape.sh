@@ -13,6 +13,8 @@
 #   P1c 256 MB of text-like data LZ4 halves (about 2x), then sync
 #   P2c 4000 files of 4 KB that LZ4 shrinks to about 1 KB, then sync
 #   P3  cold sequential read of the P1 file: read amplification <= 1.2, MB/s printed (P9a)
+#   P8  the same file read cold with one disk failed, then two: MB/s and member reads per
+#       file byte printed; a single erasure reads ndata columns per row, no Q (oct-review P7)
 #
 # P1/P1c/P2/P2c also print the columns reserved (vfs.hammer2.rz_cols_alloc),
 # the df space used and, for the big writes, the throughput.  The sub-column
@@ -401,6 +403,66 @@ p6_gen() {	# p6_gen <i>: deterministic content of file i
          dd if=$CMPSRC bs=1048576 count=8 skip=8 2>/dev/null; } ;;
     esac
 }
+
+# P8: degraded cold sequential read (oct-review P7).  The BIG file is
+# written healthy, then read cold with one disk failed and with two.  A
+# single erasure reads the other data columns and P, never Q (asserted:
+# dr_q_reads 0, dr_cols = dr_reads x ndata); two erasures read P and Q.
+# Prints MB/s, member bytes read per file byte, and the cost of one row
+# reconstruction, for before/after comparisons (Pi: INFO lines).
+run_p8() {
+    local nf d label rd secs dr dc dq dns mbs
+    setup_fresh full
+    check_v3
+    dd if=$BIGSRC of=$MNTPT/big bs=1048576 2>/dev/null
+    sync; sync
+    nf=1
+    while [ $nf -le 2 ]; do
+        label="P8 ($nf failed)"
+        d=$((nf - 1))
+        fail_disk $d "$label" || break
+        remount
+        sleep 2
+        sysctl -w vfs.hammer2.dr_reads=0 vfs.hammer2.dr_cols=0 \
+            vfs.hammer2.dr_q_reads=0 vfs.hammer2.dr_ns=0 > /dev/null 2>&1
+        ds_snap /var/tmp/p_b8
+        /usr/bin/time -p dd if=$MNTPT/big of=/dev/null bs=1048576 2> /var/tmp/p_time8.txt
+        ds_snap /var/tmp/p_a8
+        rd=$(join /var/tmp/p_b8 /var/tmp/p_a8 | awk '{ t += $7 - $3 } END { print t + 0 }')
+        secs=$(awk '$1 == "real" { print $2 }' /var/tmp/p_time8.txt)
+        dr=$(sysctl -n vfs.hammer2.dr_reads 2>/dev/null || echo 0)
+        dc=$(sysctl -n vfs.hammer2.dr_cols 2>/dev/null || echo 0)
+        dq=$(sysctl -n vfs.hammer2.dr_q_reads 2>/dev/null || echo 0)
+        dns=$(sysctl -n vfs.hammer2.dr_ns 2>/dev/null || echo 0)
+        mbs=$(awk -v s="$secs" -v m=$BIG_MB 'BEGIN { printf "%.1f", (s > 0) ? m / s : 0 }')
+        echo "  INFO: $label cold read: $mbs MB/s, member reads $((rd / 1048576)) MB =" \
+             "$(awk -v r=$rd -v b=$((BIG_MB * 1048576)) 'BEGIN { printf "%.2f", r / b }') per file byte;" \
+             "reconstructions $dr, columns read $dc, Q columns $dq," \
+             "$(awk -v n=$dns -v r=$dr 'BEGIN { printf "%.0f", (r > 0) ? n / r / 1000 : 0 }') us each"
+        cmp -s $BIGSRC $MNTPT/big && result PASS "$label: data identical" ||
+            result FAIL "$label: data differs"
+        if [ "$dr" -gt 0 ]; then
+            result PASS "$label: degraded reads happened ($dr)"
+        else
+            result FAIL "$label: no reconstruction counted"
+        fi
+        if [ $nf = 1 ]; then
+            if [ "$dq" = 0 ] && [ "$dc" = "$((dr * (NDISKS - 2)))" ]; then
+                result PASS "$label: $((NDISKS - 2)) columns per row, no Q"
+            else
+                result FAIL "$label: dr_cols=$dc dr_q_reads=$dq for $dr rows (want $((NDISKS - 2)) per row, no Q)"
+            fi
+        fi
+        nf=$((nf + 1))
+    done
+    teardown "P8"
+}
+if [ "$P_ONLY" = P8 ]; then
+    run_p8
+    summary
+    exit 0
+fi
+
 if [ "$P_ONLY" != P2 ] && [ "$P_ONLY" != P1 ] && [ "$P_ONLY" != P3 ]; then
 setup_fresh full
 check_v3
@@ -554,6 +616,7 @@ cmp -s $BIGSRC $MNTPT/big && result PASS "P3: cold read data identical" ||
 teardown "P3"
 fi
 [ "$P_ONLY" = P3 ] && { summary; exit 0; }
+[ "$P_ONLY" != P2 ] && run_p8
 
 # P2: many small files
 small_write P2 $SMALLSRC

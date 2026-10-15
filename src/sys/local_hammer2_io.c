@@ -385,6 +385,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	uint64_t nrefs;
 	int isgood;
 	int error;
+	int preempted = 0;
 	int hce;
 	int bflags;
 
@@ -520,7 +521,38 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				    HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 			if (dio->bp)
 				bkvasync(dio->bp);
-			if (is_meta &&
+			int newbuf = 0;
+
+			/*
+			 * A NEW that replaces the whole buffer has no use
+			 * for the old contents, nor has a NEW/NEWNZ of a v3
+			 * data column (one chain's own 64K, see below), so
+			 * do not reconstruct what is about to be zeroed or
+			 * overwritten.
+			 */
+			if (op == HAMMER2_DOP_NEW || op == HAMMER2_DOP_NEWNZ) {
+				if (dio->psize == lsize)
+					newbuf = 1;
+				else if (hammer2_raid6_v3(hmp) &&
+					 (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+					  dio->btype == HAMMER2_BREF_TYPE_DIRENT))
+					newbuf = 2;
+			}
+			if (newbuf) {
+				if (newbuf == 2) {
+					int off = (int)(hammer2_io_data(dio,
+							lbase) - preempt_data);
+
+					if (op == HAMMER2_DOP_NEW) {
+						bzero(preempt_data, dio->psize);
+					} else {
+						bzero(preempt_data, off);
+						bzero(preempt_data + off + lsize,
+						      dio->psize - off - lsize);
+					}
+				}
+				error = 0;
+			} else if (is_meta &&
 			    hmp->voldata.version >=
 			     HAMMER2_VOL_VERSION_RAIDZ2) {
 				/*
@@ -559,6 +591,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			}
 		}
 		dio->error = error;
+		preempted = 1;
 		goto io_done;
 	}
 
@@ -693,7 +726,7 @@ io_done:
 	 * RAID6 reconstruction block below sees error != 0, releases the
 	 * read bp via brelse, then getblk()s a fresh one for reconstruction.
 	 */
-	if (error == 0 && dio->disk_idx >= 0 &&
+	if (error == 0 && !preempted && dio->disk_idx >= 0 &&
 	    hammer2_inject_eio(dio->disk_idx)) {
 		error = EIO;
 	}
@@ -703,7 +736,7 @@ io_done:
 	 * RAID6: on read error, mark disk failed and attempt degraded
 	 * reconstruction from surviving disks + parity.
 	 */
-	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+	if (error && !preempted && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
 		int injected = (dio->disk_idx >= 0 &&
 				hammer2_inject_eio(dio->disk_idx) != 0);
 		int merr = 0;
@@ -2418,6 +2451,342 @@ hammer2_io_raid6_read_degraded(hammer2_dev_t *hmp, hammer2_off_t logical_off,
  * so the caller can repair it.  Fails with EIO when the erasures
  * exceed what P and Q can recover.
  */
+/*
+ * Scratch sets for degraded row reads: ndisks columns of stripe_unit
+ * each.  A few are kept per mount for reuse; past that a set is
+ * allocated for the call and freed after it.  Never wait for one: a
+ * caller may hold a buffer another degraded read needs.
+ */
+void
+hammer2_io_rowpool_init(hammer2_dev_t *hmp)
+{
+	if (hmp->rowpool_inited)
+		return;
+	hammer2_spin_init(&hmp->rowpool_spin, "h2rowpl");
+	hmp->rowpool_n = 0;
+	hmp->rowpool_inited = 1;
+}
+
+void
+hammer2_io_rowpool_fini(hammer2_dev_t *hmp)
+{
+	if (!hmp->rowpool_inited)
+		return;
+	while (hmp->rowpool_n > 0)
+		kfree(hmp->rowpool[--hmp->rowpool_n], M_HAMMER2);
+}
+
+/*
+ * Set up a row at per-disk offset phys_off.  Columns of failed members
+ * start out erased.
+ */
+void
+hammer2_raid6_row_init(hammer2_dev_t *hmp, hammer2_raid6_row_t *row,
+		       hammer2_off_t phys_off)
+{
+	hammer2_raid_config_t *rc = &hmp->raid_config;
+	uint64_t slot;
+	int d, col, di;
+
+	bzero(row, sizeof(*row));
+	nanouptime(&row->t0);
+	atomic_add_long(&hammer2_dr_reads, 1);
+	row->hmp = hmp;
+	row->su = rc->stripe_unit;
+	row->ndisks = rc->ndisks;
+	row->ndata = rc->ndata;
+	row->phys_off = phys_off;
+	slot = hammer2_raid6_slot(phys_off, row->su);
+	hammer2_raid6_pq(slot, row->ndisks, &row->p_disk, &row->q_disk);
+
+	row->mem = NULL;
+	if (hmp->rowpool_inited) {
+		hammer2_spin_ex(&hmp->rowpool_spin);
+		if (hmp->rowpool_n > 0)
+			row->mem = hmp->rowpool[--hmp->rowpool_n];
+		hammer2_spin_unex(&hmp->rowpool_spin);
+	}
+	if (row->mem == NULL) {
+		atomic_add_long(&hammer2_dr_pool_miss, 1);
+		row->mem = kmalloc(row->su * row->ndisks, M_HAMMER2,
+				   M_WAITOK);
+	}
+
+	di = 0;
+	for (d = 0; d < row->ndisks; d++) {
+		if (d == row->p_disk)
+			col = row->ndata;
+		else if (d == row->q_disk)
+			col = row->ndata + 1;
+		else
+			col = di++;
+		row->col_disk[col] = d;
+		row->ptrs[col] = row->mem + (size_t)col * row->su;
+		if (hmp->raid_failed[d])
+			row->erased |= 1ULL << col;
+	}
+}
+
+void
+hammer2_raid6_row_done(hammer2_raid6_row_t *row)
+{
+	hammer2_dev_t *hmp = row->hmp;
+	struct timespec ts;
+
+	if (row->mem == NULL)
+		return;
+	nanouptime(&ts);
+	atomic_add_long(&hammer2_dr_ns,
+	    (long)((ts.tv_sec - row->t0.tv_sec) * 1000000000L +
+		   (ts.tv_nsec - row->t0.tv_nsec)));
+	if (hmp->rowpool_inited) {
+		hammer2_spin_ex(&hmp->rowpool_spin);
+		if (hmp->rowpool_n < HAMMER2_ROWPOOL_MAX) {
+			hmp->rowpool[hmp->rowpool_n++] = row->mem;
+			row->mem = NULL;
+		}
+		hammer2_spin_unex(&hmp->rowpool_spin);
+	}
+	if (row->mem)
+		kfree(row->mem, M_HAMMER2);
+	row->mem = NULL;
+}
+
+/* Logical column of a member in this row. */
+int
+hammer2_raid6_row_col(hammer2_raid6_row_t *row, int disk)
+{
+	int col;
+
+	for (col = 0; col < row->ndisks; col++) {
+		if (row->col_disk[col] == disk)
+			return col;
+	}
+	return -1;
+}
+
+/*
+ * Read the columns in colmask that are not yet read or erased, all in
+ * flight together.  Like hammer2_io_raid6_read_sibling(), a column in
+ * the buffer cache is taken from there (and a miss is read through the
+ * cache, so the neighbours' own reads find it), a buffer another thread
+ * holds is bypassed through a pbuf, and no buffer is waited for, so the
+ * columns of a row can be held at once.  A column that fails to read
+ * becomes erased and its member is failed, unless the error was
+ * injected.  Returns EIO if failing a member exceeds what RAID6 allows.
+ */
+#define ROWRD_NONE	0
+#define ROWRD_HIT	1
+#define ROWRD_BUF	2
+#define ROWRD_PBUF	3
+
+static int
+hammer2_raid6_row_read(hammer2_raid6_row_t *row, uint64_t colmask)
+{
+	hammer2_dev_t *hmp = row->hmp;
+	struct buf *bps[HAMMER2_MAX_VOLUMES];
+	int kind[HAMMER2_MAX_VOLUMES];
+	int gen[HAMMER2_MAX_VOLUMES];
+	int cerr[HAMMER2_MAX_VOLUMES];
+	int col, d, error = 0, nread = 0;
+	struct vnode *devvp;
+	off_t off = row->phys_off;
+	int su = (int)row->su;
+	struct buf *bp;
+
+	colmask &= ~(row->have | row->erased);
+	if (colmask == 0)
+		return 0;
+
+	/* parity (or a zero column) of a sealed row may be in flight */
+	hammer2_pq_wait_slot(hmp, off);
+
+	for (col = 0; col < row->ndisks; col++) {
+		kind[col] = ROWRD_NONE;
+		cerr[col] = 0;
+		if ((colmask & (1ULL << col)) == 0)
+			continue;
+		d = row->col_disk[col];
+		if (hmp->raid_failed[d]) {
+			/* failed since the row was set up: no I/O to it */
+			row->erased |= 1ULL << col;
+			continue;
+		}
+		devvp = hmp->volumes[d].dev->devvp;
+		++nread;
+		if (col == row->ndata + 1)
+			atomic_add_long(&hammer2_dr_q_reads, 1);
+		cerr[col] = hammer2_inject_eio(d);
+		if (cerr[col])
+			continue;
+		bp = getblk(devvp, off, su, GETBLK_NOWAIT, 0);
+		if (bp == NULL) {
+			HAMMER2_RSTAT_RD(hmp, d, HAMMER2_RSC_DEGRADED, su);
+			bps[col] = hammer2_pbuf_read_start(devvp, off, su,
+							   1, d);
+			kind[col] = ROWRD_PBUF;
+		} else if (bp->b_flags & B_CACHE) {
+			bps[col] = bp;
+			kind[col] = ROWRD_HIT;
+		} else {
+			bp->b_flags &= ~(B_ERROR | B_EINTR | B_INVAL |
+					 B_NOTMETA);
+			bp->b_cmd = BUF_CMD_READ;
+			bp->b_bio1.bio_done = biodone_sync;
+			bp->b_bio1.bio_flags |= BIO_SYNC;
+			vfs_busy_pages(devvp, bp);
+			gen[col] = hammer2_iowd_begin(hmp, d);
+			HAMMER2_RSTAT_RD(hmp, d, HAMMER2_RSC_DEGRADED, su);
+			vn_strategy(devvp, &bp->b_bio1);
+			bps[col] = bp;
+			kind[col] = ROWRD_BUF;
+		}
+	}
+	atomic_add_long(&hammer2_dr_cols, nread);
+
+	for (col = 0; col < row->ndisks; col++) {
+		if (kind[col] == ROWRD_NONE)
+			continue;
+		bp = bps[col];
+		d = row->col_disk[col];
+		switch (kind[col]) {
+		case ROWRD_HIT:
+			bkvasync(bp);
+			bcopy(bp->b_data, row->ptrs[col], su);
+			brelse(bp);
+			break;
+		case ROWRD_BUF:
+			cerr[col] = biowait(&bp->b_bio1, "h2dr");
+			hammer2_iowd_end(hmp, d, gen[col]);
+			if (cerr[col] == 0) {
+				bkvasync(bp);
+				bcopy(bp->b_data, row->ptrs[col], su);
+			}
+			brelse(bp);
+			break;
+		case ROWRD_PBUF:
+			cerr[col] = hammer2_biowait_timed(bp, "h2dr");
+			if (cerr[col] == ETIMEDOUT)
+				break;	/* the completion's now */
+			if (cerr[col] == 0)
+				bcopy(bp->b_data, row->ptrs[col], su);
+			relpbuf(bp, NULL);
+			break;
+		}
+	}
+
+	for (col = 0; col < row->ndisks; col++) {
+		if ((colmask & (1ULL << col)) == 0 ||
+		    (row->erased & (1ULL << col)))
+			continue;
+		d = row->col_disk[col];
+		if (cerr[col] == 0) {
+			row->have |= 1ULL << col;
+			continue;
+		}
+		if (!hammer2_inject_eio(d) &&
+		    hammer2_raid6_auto_fail_disk(hmp, d))
+			error = EIO;
+		row->erased |= 1ULL << col;
+	}
+	return error;
+}
+
+/*
+ * Reconstruct column tgt_col, and ext_col too if >= 0, treating both as
+ * erased on top of the row's own erasures.  Reads whatever else is
+ * needed that has not been read yet: the surviving data columns, then
+ * one parity column for a single data erasure (P, or Q when P is gone),
+ * both for two.  A read that fails adds an erasure and the plan is
+ * redone.  The results are left in wp[tgt_col] and wp[ext_col]; wp is
+ * the row's own ptrs for a one-shot call, or a copy with work buffers
+ * for those two columns, which keeps the row's columns intact for the
+ * next try with a different second erasure.  EIO if more than two
+ * columns are lost.
+ */
+int
+hammer2_raid6_row_solve(hammer2_raid6_row_t *row, int tgt_col, int ext_col,
+			void **wp)
+{
+	int ndisks = row->ndisks, ndata = row->ndata;
+	size_t su = row->su;
+	uint64_t er, need, extra_bits;
+	int nd, fp, fq, a, b, col, error;
+	int p_done = 0;
+	void *rp[HAMMER2_MAX_VOLUMES];
+
+	extra_bits = 1ULL << tgt_col;
+	if (ext_col >= 0)
+		extra_bits |= 1ULL << ext_col;
+	for (;;) {
+		er = row->erased | extra_bits;
+		nd = 0;
+		a = b = -1;
+		for (col = 0; col < ndata; col++) {
+			if (er & (1ULL << col)) {
+				if (a < 0)
+					a = col;
+				else
+					b = col;
+				++nd;
+			}
+		}
+		fp = (er >> ndata) & 1;
+		fq = (er >> (ndata + 1)) & 1;
+		if (nd + fp + fq > 2)
+			return EIO;
+
+		need = ((1ULL << ndata) - 1) & ~er;
+		if (nd == 2)
+			need |= 3ULL << ndata;
+		else if (nd == 1)
+			need |= 1ULL << (fp ? ndata + 1 : ndata);
+		if ((need & ~row->have) == 0)
+			break;
+		error = hammer2_raid6_row_read(row, need & ~row->have);
+		if (error)
+			return error;
+	}
+
+	/* rp: the survivors from the row, an erased column's result slot */
+	for (col = 0; col < ndisks; col++)
+		rp[col] = (er & (1ULL << col)) ? wp[col] : row->ptrs[col];
+
+	if (nd == 2) {
+		hammer2_raid6_dual_recov(ndisks, su, a, b, rp);
+	} else if (nd == 1) {
+		if (fp) {
+			/* the data from Q; this also makes P */
+			hammer2_raid6_datap_recov(ndisks, su, a, rp);
+			p_done = 1;
+		} else {
+			/* the data is P ^ the other data columns */
+			bcopy(rp[ndata], rp[a], su);
+			for (col = 0; col < ndata; col++) {
+				if (col != a)
+					hammer2_raid6_xor(rp[a], rp[col], su);
+			}
+		}
+	}
+
+	/*
+	 * An erased parity column is only worth computing if asked for;
+	 * it comes from the data columns, the recovered ones included.
+	 */
+	if ((extra_bits >> ndata) & 1 && !p_done) {
+		bcopy(rp[0], rp[ndata], su);
+		for (col = 1; col < ndata; col++)
+			hammer2_raid6_xor(rp[ndata], rp[col], su);
+	}
+	if ((extra_bits >> (ndata + 1)) & 1) {
+		bcopy(rp[0], rp[ndata + 1], su);
+		for (col = 1; col < ndata; col++)
+			hammer2_raid6_mul(rp[ndata + 1], rp[col], su,
+			    hammer2_gf_exp[col], 1);
+	}
+	return 0;
+}
+
 int
 hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 				 hammer2_off_t logical_off,
@@ -2425,140 +2794,12 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 				 int is_physical, int extra_disk,
 				 void *extra_buf)
 {
-	hammer2_raid_config_t *rc = &hmp->raid_config;
-	int ndisks = rc->ndisks;
-	int ndata = rc->ndata;
-	uint64_t stripe_unit = rc->stripe_unit;
-	int p_disk, q_disk;
-	int target_col;
-	int phys_disk, di, col;
-	int extra_col = -1;
-	int nerased = 0;
-	hammer2_off_t phys_off;
-	void *ptrs[HAMMER2_MAX_VOLUMES];
-	void *col_bufs[HAMMER2_MAX_VOLUMES];
-	hammer2_volume_t *vol;
-	int error = 0;
-	int fail_data_a = -1, fail_data_b = -1;
-	int fail_p = 0, fail_q = 0;
+	hammer2_raid6_row_t row;
+	int tgt_col, ext_col = -1;
+	int error;
 
-	bzero(ptrs, sizeof(ptrs));
-	bzero(col_bufs, sizeof(col_bufs));
-
-	KKASSERT(bytes == stripe_unit);
+	KKASSERT(bytes == hmp->raid_config.stripe_unit);
 	KKASSERT(hammer2_raid6_v3(hmp));
-	if (is_physical) {
-		/*
-		 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
-		 *
-		 * logical_off is the encoded key (top byte = disk_idx,
-		 * middle bits = per-disk physical offset; see
-		 * HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).  All
-		 * columns in the same stripe slot share the same
-		 * per-disk physical offset.
-		 *
-		 * P disk = stripe_slot % ndisks
-		 * Q disk = (P disk + 1) % ndisks
-		 * Data columns: all other disks in disk-index order.
-		 *
-		 * target_col: the logical column index for data_disk_idx.
-		 *   data_disk_idx == p_disk -> target_col = ndata (P)
-		 *   data_disk_idx == q_disk -> target_col = ndata+1 (Q)
-		 *   otherwise count data disks below data_disk_idx.
-		 */
-		uint64_t stripe_slot;
-
-		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK &
-			      ~(hammer2_off_t)(stripe_unit - 1);
-		stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
-		hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
-		target_col = hammer2_raid6_lcol(data_disk_idx, p_disk, q_disk,
-						ndata);
-
-		di = 0;
-		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-			int lerror;
-			if (phys_disk == p_disk)
-				col = ndata;
-			else if (phys_disk == q_disk)
-				col = ndata + 1;
-			else
-				col = di++;
-
-			col_bufs[col] = kmalloc(stripe_unit, M_HAMMER2,
-						M_WAITOK | M_ZERO);
-			ptrs[col] = col_bufs[col];
-
-			if (phys_disk == extra_disk)
-				extra_col = col;
-			if (phys_disk == data_disk_idx ||
-			    phys_disk == extra_disk) {
-				/*
-				 * A column being reconstructed.
-				 * Leave the buffer zeroed and mark failed.
-				 */
-				++nerased;
-				if (col < ndata) {
-					if (fail_data_a == -1)
-						fail_data_a = col;
-					else if (fail_data_b == -1)
-						fail_data_b = col;
-				} else if (col == ndata) {
-					fail_p = 1;
-				} else {
-					fail_q = 1;
-				}
-				continue;
-			}
-
-			if (hmp->raid_failed[phys_disk]) {
-				++nerased;
-				if (col < ndata) {
-					if (fail_data_a == -1)
-						fail_data_a = col;
-					else if (fail_data_b == -1)
-						fail_data_b = col;
-				} else if (col == ndata) {
-					fail_p = 1;
-				} else {
-					fail_q = 1;
-				}
-				continue;
-			}
-
-			vol = &hmp->volumes[phys_disk];
-			lerror = hammer2_inject_eio(phys_disk);
-			if (lerror == 0)
-				lerror = hammer2_io_raid6_read_sibling(hmp,
-				    phys_disk, vol->dev->devvp, phys_off,
-				    col_bufs[col], (int)stripe_unit, 0,
-				    HAMMER2_RSC_DEGRADED);
-			if (lerror) {
-				int injected = hammer2_inject_eio(phys_disk);
-				if (!injected) {
-					int aerr =
-					    hammer2_raid6_auto_fail_disk(
-						hmp, phys_disk);
-					if (aerr) {
-						error = EIO;
-						break;
-					}
-				}
-				++nerased;
-				if (col < ndata) {
-					if (fail_data_a == -1)
-						fail_data_a = col;
-					else if (fail_data_b == -1)
-						fail_data_b = col;
-				} else if (col == ndata) {
-					fail_p = 1;
-				} else {
-					fail_q = 1;
-				}
-			}
-		}
-		goto do_recovery;
-	}
 
 	/*
 	 * Non-physical call: INODE/INDIRECT/FREEMAP on a failed disk.
@@ -2566,78 +2807,37 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 	 * logical reconstruction is gone. Return EIO; Group I lands the
 	 * metadata-zone mirror.
 	 */
-	error = EIO;
-	goto read_degraded_done;
+	if (!is_physical)
+		return EIO;
 
-do_recovery:
-	/* Perform recovery */
-	if (error)
-		goto read_degraded_done;
-	if (nerased == 1 || nerased == 2)
-		atomic_add_64(&hmp->rs_degraded_read[nerased - 1], 1);
-	if (nerased > 2) {
-		error = EIO;
-		goto read_degraded_done;
-	}
-	error = 0;
-	if (fail_data_a != -1) {
-		if (fail_data_b != -1) {
-			/* Two data disks failed - requires BOTH P and Q */
-			if (fail_p || fail_q) {
-				error = EIO;
-			} else {
-				if (fail_data_a > fail_data_b) {
-					int tmp = fail_data_a;
-					fail_data_a = fail_data_b;
-					fail_data_b = tmp;
-				}
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 fail_data_a,
-							 fail_data_b, ptrs);
-			}
-		} else {
-			/* One data disk failed - requires either P or Q */
-			if (fail_p) {
-				if (fail_q) {
-					/* Both P and Q failed */
-					error = EIO;
-				} else {
-					/* Data fail_data_a + P failed: use Q */
-					hammer2_raid6_datap_recov(ndisks,
-								  stripe_unit,
-								  fail_data_a,
-								  ptrs);
-				}
-			} else {
-				/* Use P to recover fail_data_a */
-				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-							 fail_data_a,
-							 ndisks - 1, ptrs);
-			}
-		}
-	}
-
-	/* If target_col failed and reconstruction was impossible, return error */
 	/*
-	 * Every data column is now valid.  An erased P or Q column is
-	 * still zero (the recovery above only rebuilds data), so
-	 * regenerate both before handing out a parity column.
+	 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
+	 * logical_off is the encoded key (top byte = disk_idx, middle
+	 * bits = per-disk physical offset; see HAMMER2_RAID6_DISK_SHIFT in
+	 * hammer2_disk.h).  All columns in the same stripe slot share the
+	 * same per-disk physical offset.
 	 */
-	if (error == 0 && (fail_p || fail_q))
-		hammer2_raid6_gen_syndrome(ndisks, stripe_unit, ptrs);
-
+	hammer2_raid6_row_init(hmp, &row,
+	    logical_off & HAMMER2_RAID6_PHYS_MASK &
+	    ~(hammer2_off_t)(bytes - 1));
+	tgt_col = hammer2_raid6_row_col(&row, data_disk_idx);
+	if (extra_disk >= 0)
+		ext_col = hammer2_raid6_row_col(&row, extra_disk);
+	error = hammer2_raid6_row_solve(&row, tgt_col, ext_col, row.ptrs);
 	if (error == 0) {
-		bcopy(ptrs[target_col], buf, stripe_unit);
-		if (extra_buf && extra_col >= 0)
-			bcopy(ptrs[extra_col], extra_buf, stripe_unit);
-	}
-read_degraded_done:
-	/* Free temporary buffers */
-	for (col = 0; col <= ndata + 1; col++) {
-		if (col_bufs[col])
-			kfree(col_bufs[col], M_HAMMER2);
-	}
+		uint64_t er = row.erased | (1ULL << tgt_col);
+		int nerased;
 
+		if (ext_col >= 0)
+			er |= 1ULL << ext_col;
+		nerased = __builtin_popcountll(er);
+		if (nerased == 1 || nerased == 2)
+			atomic_add_64(&hmp->rs_degraded_read[nerased - 1], 1);
+		bcopy(row.ptrs[tgt_col], buf, bytes);
+		if (extra_buf && ext_col >= 0)
+			bcopy(row.ptrs[ext_col], extra_buf, bytes);
+	}
+	hammer2_raid6_row_done(&row);
 	return error;
 }
 

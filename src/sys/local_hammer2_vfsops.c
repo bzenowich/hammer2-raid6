@@ -133,6 +133,11 @@ long hammer2_rz_pq_err;
 long hammer2_rz_pq_async;
 long hammer2_rz_pq_bp_wait;
 long hammer2_rz_pq_rd_wait;
+long hammer2_dr_reads;
+long hammer2_dr_cols;
+long hammer2_dr_q_reads;
+long hammer2_dr_ns;
+long hammer2_dr_pool_miss;
 long hammer2_rz_pq_drain_wait;
 long hammer2_rz_pq_high;
 long hammer2_rz_pq_hdr_viol;
@@ -425,6 +430,16 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_async, CTLFLAG_RW,
 	   &hammer2_rz_pq_async, 0, "v3 RAID6: rows handed to the parity reaper");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_bp_wait, CTLFLAG_RW,
 	   &hammer2_rz_pq_bp_wait, 0, "v3 RAID6: writers held by async back-pressure");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_reads, CTLFLAG_RW,
+	   &hammer2_dr_reads, 0, "v3 RAID6: degraded row reconstructions");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_cols, CTLFLAG_RW,
+	   &hammer2_dr_cols, 0, "v3 RAID6: member columns read by degraded reconstructions");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_q_reads, CTLFLAG_RW,
+	   &hammer2_dr_q_reads, 0, "v3 RAID6: Q columns read by degraded reconstructions");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_ns, CTLFLAG_RW,
+	   &hammer2_dr_ns, 0, "v3 RAID6: ns spent in degraded reconstructions");
+SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_pool_miss, CTLFLAG_RW,
+	   &hammer2_dr_pool_miss, 0, "v3 RAID6: degraded scratch sets allocated (pool empty)");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_rd_wait, CTLFLAG_RW,
 	   &hammer2_rz_pq_rd_wait, 0, "v3 RAID6: parity reads that waited for a row in flight");
 SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_drain_wait, CTLFLAG_RW,
@@ -2165,6 +2180,7 @@ next_hmp:
 			 * hammer2_chain_selfheal().
 			 */
 			hammer2_io_repair_start(hmp);
+			hammer2_io_rowpool_init(hmp);
 
 			/* async seal: parity reaper (idle unless async_seal) */
 			hammer2_pq_start(hmp);
@@ -2837,6 +2853,7 @@ again:
 	 */
 	hammer2_pq_stop(hmp);
 	hammer2_io_repair_stop(hmp);
+	hammer2_io_rowpool_fini(hmp);
 
 	/* a failure queued by a read completion must reach the final flush */
 	hammer2_raid6_persist_failed(hmp);

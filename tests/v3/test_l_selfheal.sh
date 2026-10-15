@@ -62,6 +62,7 @@ dd if=/dev/urandom of="$CORRUPT_DEV" bs=65536 count=256 seek=$DATA_BLK \
 
 mount -t hammer2 $PFSPATH $MNTPT
 kmsg_clear
+sysctl -w vfs.hammer2.dr_reads=0 vfs.hammer2.dr_cols=0 vfs.hammer2.dr_q_reads=0 > /dev/null
 
 # THE test: read the file with NO scrub.  Self-heal must reconstruct
 # every corrupt column inline.
@@ -70,6 +71,18 @@ if diff -q /var/tmp/l1_ref.txt /var/tmp/l1_check.txt > /dev/null 2>&1; then
     result PASS "L1: read-path returned correct content over corrupt disk"
 else
     result FAIL "L1: content mismatch on read (self-heal failed)"
+fi
+
+# P7: a heal of one corrupt data column reads the other data columns and
+# P (ndata columns), never Q; the row is read once per heal.
+L1_DR=$(sysctl -n vfs.hammer2.dr_reads)
+L1_DC=$(sysctl -n vfs.hammer2.dr_cols)
+L1_DQ=$(sysctl -n vfs.hammer2.dr_q_reads)
+if [ "$L1_DR" -gt 0 ] && [ "$L1_DQ" = 0 ] && \
+   [ "$L1_DC" = "$((L1_DR * (NDISKS - 2)))" ]; then
+    result PASS "L1: heal reads $((NDISKS - 2)) columns per row, no Q ($L1_DR rows, $L1_DC columns)"
+else
+    result FAIL "L1: heal reads dr_reads=$L1_DR dr_cols=$L1_DC dr_q_reads=$L1_DQ (want cols = rows x $((NDISKS - 2)), no Q)"
 fi
 
 if kmsg | grep -q 'selfheal: read-path repair'; then
