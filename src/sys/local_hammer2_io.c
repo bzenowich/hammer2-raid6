@@ -710,7 +710,7 @@ io_done:
 	 * RAID6 reconstruction block below sees error != 0, releases the
 	 * read bp via brelse, then getblk()s a fresh one for reconstruction.
 	 */
-	if (error == 0 && dio->disk_idx >= 0 &&
+	if (error == 0 && !preempted && dio->disk_idx >= 0 &&
 	    hammer2_inject_eio(dio->disk_idx)) {
 		error = EIO;
 	}
@@ -2568,6 +2568,11 @@ hammer2_raid6_row_read(hammer2_raid6_row_t *row, uint64_t colmask)
 		if ((colmask & (1ULL << col)) == 0)
 			continue;
 		d = row->col_disk[col];
+		if (hmp->raid_failed[d]) {
+			/* failed since the row was set up: no I/O to it */
+			row->erased |= 1ULL << col;
+			continue;
+		}
 		devvp = hmp->volumes[d].dev->devvp;
 		++nread;
 		if (col == row->ndata + 1)
@@ -2630,7 +2635,8 @@ hammer2_raid6_row_read(hammer2_raid6_row_t *row, uint64_t colmask)
 	}
 
 	for (col = 0; col < row->ndisks; col++) {
-		if ((colmask & (1ULL << col)) == 0)
+		if ((colmask & (1ULL << col)) == 0 ||
+		    (row->erased & (1ULL << col)))
 			continue;
 		d = row->col_disk[col];
 		if (cerr[col] == 0) {
