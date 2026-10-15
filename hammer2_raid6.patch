@@ -1450,10 +1450,18 @@ index 9c5abb1..45e7278 100644
  SRCS+=  hammer2_zlib_inffast.c hammer2_zlib_inflate.c
  SRCS+=  hammer2_zlib_inftrees.c hammer2_zlib_trees.c
 diff --git a/sys/vfs/hammer2/hammer2.h b/sys/vfs/hammer2/hammer2.h
-index a29c729..5f1bcd0 100644
+index a29c729..8c2a36b 100644
 --- a/sys/vfs/hammer2/hammer2.h
 +++ b/sys/vfs/hammer2/hammer2.h
-@@ -92,6 +92,7 @@
+@@ -75,6 +75,7 @@
+ #endif
+ #include <sys/diskslice.h>
+ #include <sys/tree.h>
++#define HAMMER2_ROWPOOL_MAX	4	/* scratch sets kept per mount */
+ #include <sys/malloc.h>
+ #include <sys/mount.h>
+ #include <sys/vnode.h>
+@@ -92,6 +93,7 @@
  #include <sys/file.h>
  #include <sys/filio.h>
  #include <sys/objcache.h>
@@ -1461,7 +1469,7 @@ index a29c729..5f1bcd0 100644
  
  #ifdef _KERNEL
  #include <sys/signal2.h>
-@@ -279,10 +280,10 @@ struct hammer2_io {
+@@ -279,10 +281,10 @@ struct hammer2_io {
  	int		btype;		/* approximate BREF_TYPE_* */
  	int		ticks;
  	int		error;
@@ -1474,7 +1482,7 @@ index a29c729..5f1bcd0 100644
  #endif
  	uint64_t	dedup_valid;	/* valid for dedup operation */
  	uint64_t	dedup_alloc;	/* allocated / de-dupable */
-@@ -382,7 +383,7 @@ RB_PROTOTYPE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
+@@ -382,7 +384,7 @@ RB_PROTOTYPE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
  #define HAMMER2_CHAIN_NOTTESTED		0x00000080	/* crc not generated */
  #define HAMMER2_CHAIN_TESTEDGOOD	0x00000100	/* crc tested good */
  #define HAMMER2_CHAIN_ONFLUSH		0x00000200	/* on a flush list */
@@ -1483,7 +1491,7 @@ index a29c729..5f1bcd0 100644
  #define HAMMER2_CHAIN_VOLUMESYNC	0x00000800	/* needs volume sync */
  #define HAMMER2_CHAIN_UNUSED1000	0x00001000
  #define HAMMER2_CHAIN_COUNTEDBREFS	0x00002000	/* block table stats */
-@@ -924,6 +925,7 @@ struct hammer2_xop_strategy {
+@@ -924,6 +926,7 @@ struct hammer2_xop_strategy {
  	int			finished;
  	hammer2_mtx_t		lock;
  	struct bio		*bio;
@@ -1491,7 +1499,7 @@ index a29c729..5f1bcd0 100644
  };
  
  struct hammer2_xop_readdir {
-@@ -1122,6 +1124,83 @@ typedef struct hammer2_volume hammer2_volume_t;
+@@ -1122,6 +1125,83 @@ typedef struct hammer2_volume hammer2_volume_t;
   * many PFSs and those PFSs might combine together in various ways to form
   * the set of available clusters.
   */
@@ -1575,7 +1583,7 @@ index a29c729..5f1bcd0 100644
  struct hammer2_dev {
  	struct vnode	*devvp;		/* device vnode for root volume */
  	int		ronly;		/* read-only mount */
-@@ -1158,6 +1237,208 @@ struct hammer2_dev {
+@@ -1158,6 +1238,217 @@ struct hammer2_dev {
  
  	hammer2_devvp_list_t devvpl;	/* list of device vnodes including *devvp */
  	hammer2_volume_t volumes[HAMMER2_MAX_VOLUMES]; /* list of volumes */
@@ -1774,6 +1782,15 @@ index a29c729..5f1bcd0 100644
 +	volatile uint64_t repair_writes_dropped; /* queue-full drops */
 +
 +	/*
++	 * Scratch sets for degraded row reads (ndisks columns of
++	 * stripe_unit each), a few kept for reuse (P7).
++	 */
++	hammer2_spin_t	rowpool_spin;
++	void		*rowpool[HAMMER2_ROWPOOL_MAX];
++	int		rowpool_n;
++	int		rowpool_inited;
++
++	/*
 +	 * Cumulative per-disk checksum-error accounting (zpool status
 +	 * CKSUM equivalent).  In-memory; zeroed at mount.  Written by
 +	 * both the read-path self-heal and the scrub.
@@ -1784,7 +1801,7 @@ index a29c729..5f1bcd0 100644
  };
  
  typedef struct hammer2_dev hammer2_dev_t;
-@@ -1289,6 +1570,20 @@ MPTOPMP(struct mount *mp)
+@@ -1289,6 +1580,20 @@ MPTOPMP(struct mount *mp)
  #define HAMMER2_DEDUP_FRAG      (HAMMER2_PBUFSIZE / 64)
  #define HAMMER2_DEDUP_FRAGRADIX (HAMMER2_PBUFRADIX - 6)
  
@@ -1805,7 +1822,7 @@ index a29c729..5f1bcd0 100644
  static __inline
  uint64_t
  hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
-@@ -1297,8 +1592,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
+@@ -1297,8 +1602,7 @@ hammer2_dedup_mask(hammer2_io_t *dio, hammer2_off_t data_off, u_int bytes)
  	int bits;
  	uint64_t mask;
  
@@ -1815,7 +1832,7 @@ index a29c729..5f1bcd0 100644
  	bits = (int)((bytes + (HAMMER2_DEDUP_FRAG - 1)) >>
  	       HAMMER2_DEDUP_FRAGRADIX);
  	if (bbeg + bits == 64)
-@@ -1414,7 +1708,10 @@ extern int hammer2_xop_xbase;
+@@ -1414,7 +1718,10 @@ extern int hammer2_xop_xbase;
  extern int hammer2_xop_mod;
  extern long hammer2_debug_inode;
  extern int hammer2_cluster_meta_read;
@@ -1826,7 +1843,7 @@ index a29c729..5f1bcd0 100644
  extern int hammer2_cluster_write;
  extern int hammer2_dedup_enable;
  extern int hammer2_always_compress;
-@@ -1642,15 +1939,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -1642,15 +1949,21 @@ void hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  void hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
  				u_int bytes);
  int hammer2_io_new(hammer2_dev_t *hmp, int btype, off_t lbase, int lsize,
@@ -1852,7 +1869,7 @@ index a29c729..5f1bcd0 100644
  hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  				int lsize HAMMER2_IO_DEBUG_ARGS);
  void _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS);
-@@ -1663,8 +1966,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1663,8 +1976,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  
  #ifndef HAMMER2_IO_DEBUG
  
@@ -1863,7 +1880,7 @@ index a29c729..5f1bcd0 100644
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
  	_hammer2_io_getquick((hmp), (lbase), (lsize))
  #define hammer2_io_putblk(diop)						\
-@@ -1682,13 +1985,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1682,13 +1995,13 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio))
  
@@ -1881,7 +1898,7 @@ index a29c729..5f1bcd0 100644
  	__FILE__, __LINE__)
  
  #define hammer2_io_getquick(hmp, lbase, lsize)				\
-@@ -1710,8 +2013,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
+@@ -1710,8 +2023,8 @@ void _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS);
  #define hammer2_io_ref(dio)						\
  	_hammer2_io_ref((dio), __FILE__, __LINE__)
  
@@ -1892,7 +1909,7 @@ index a29c729..5f1bcd0 100644
  			  __FILE__, __LINE__)
  
  #endif
-@@ -1900,6 +2203,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
+@@ -1900,6 +2213,8 @@ void hammer2_voldata_modify(hammer2_dev_t *hmp);
  int hammer2_freemap_alloc(hammer2_chain_t *chain, size_t bytes);
  void hammer2_freemap_adjust(hammer2_dev_t *hmp,
  				hammer2_blockref_t *bref, int how);
@@ -1901,7 +1918,7 @@ index a29c729..5f1bcd0 100644
  
  /*
   * hammer2_cluster.c
-@@ -1944,16 +2249,367 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
+@@ -1944,16 +2259,403 @@ void hammer2_dedup_clear(hammer2_dev_t *hmp);
   * hammer2_ondisk.c
   */
  int hammer2_open_devvp(const hammer2_devvp_list_t *devvpl, int ronly);
@@ -2073,6 +2090,37 @@ index a29c729..5f1bcd0 100644
 +		hammer2_off_t logical_off, int data_disk_idx,
 +		void *buf, size_t bytes, int is_physical,
 +		int extra_disk, void *extra_buf);
++void hammer2_io_rowpool_init(hammer2_dev_t *hmp);
++void hammer2_io_rowpool_fini(hammer2_dev_t *hmp);
++
++/*
++ * One stripe row read for reconstruction.  Columns are logical
++ * (data 0..ndata-1, P = ndata, Q = ndata+1); mem holds one slot per
++ * column.  have: column contents valid; erased: column known lost (a
++ * failed member, a read error, or a column the caller distrusts).
++ */
++typedef struct hammer2_raid6_row {
++	hammer2_dev_t	*hmp;
++	char		*mem;
++	void		*ptrs[HAMMER2_MAX_VOLUMES];
++	int		col_disk[HAMMER2_MAX_VOLUMES];
++	uint64_t	have;
++	uint64_t	erased;
++	hammer2_off_t	phys_off;
++	struct timespec	t0;
++	size_t		su;
++	int		ndisks;
++	int		ndata;
++	int		p_disk;
++	int		q_disk;
++} hammer2_raid6_row_t;
++
++void hammer2_raid6_row_init(hammer2_dev_t *hmp, hammer2_raid6_row_t *row,
++		hammer2_off_t phys_off);
++void hammer2_raid6_row_done(hammer2_raid6_row_t *row);
++int hammer2_raid6_row_col(hammer2_raid6_row_t *row, int disk);
++int hammer2_raid6_row_solve(hammer2_raid6_row_t *row, int tgt_col,
++		int ext_col, void **wp);
 +int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 +		int failed_disk_idx, struct vnode *new_devvp);
 +int hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
@@ -2214,6 +2262,11 @@ index a29c729..5f1bcd0 100644
 +extern long hammer2_rz_pq_err;		/* parity writes that failed */
 +extern long hammer2_rz_pq_async;	/* rows handed to the reaper */
 +extern long hammer2_rz_pq_bp_wait;	/* writers held by back-pressure */
++extern long hammer2_dr_reads;		/* degraded row reconstructions */
++extern long hammer2_dr_cols;		/* member columns read for them */
++extern long hammer2_dr_q_reads;		/* ... of which Q columns */
++extern long hammer2_dr_ns;		/* time spent in them */
++extern long hammer2_dr_pool_miss;	/* scratch sets allocated fresh */
 +extern long hammer2_rz_pq_rd_wait;	/* readers that waited for parity */
 +extern long hammer2_rz_pq_drain_wait;	/* drains that had to wait */
 +extern long hammer2_rz_pq_high;		/* peak rows in flight */
@@ -2308,7 +2361,7 @@ index f4b9559..c862783 100644
  	 * Calculate the data offset and determine if it is within
  	 * the current freemap range being gathered.
 diff --git a/sys/vfs/hammer2/hammer2_chain.c b/sys/vfs/hammer2/hammer2_chain.c
-index 256422e..883f222 100644
+index 256422e..986b0dd 100644
 --- a/sys/vfs/hammer2/hammer2_chain.c
 +++ b/sys/vfs/hammer2/hammer2_chain.c
 @@ -85,6 +85,14 @@ static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *chain,
@@ -2742,7 +2795,7 @@ index 256422e..883f222 100644
  	if (ochain->hmp) {
  		const char *pfsname = "UNKNOWN";
  		int i;
-@@ -5514,6 +5706,273 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
+@@ -5514,6 +5706,293 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
  	//print_backtrace(-1);
  }
  
@@ -2815,22 +2868,36 @@ index 256422e..883f222 100644
 +	hammer2_off_t col_base = phys & ~(hammer2_off_t)(stripe_unit - 1);
 +	size_t off = (size_t)(phys - col_base);
 +	int target_failed = hmp->raid_failed[disk_idx];
++	hammer2_raid6_row_t row;
++	void *wp[HAMMER2_MAX_VOLUMES];
 +	char *recon;
 +	char *extra;
 +	uint64_t badhash;
 +	int error;
++	int tgt_col;
++	int ext_col;
 +	int e;
 +
 +	/* the repair kthread writes only while the slot still holds this */
 +	badhash = hammer2_io_repair_hash(bdata, bytes);
-+	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++	recon = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK);
++
++	/*
++	 * The row is read once, as the candidates need it: the surviving
++	 * data and one parity column for the first try, the rest only if
++	 * a second bad column has to be found.  The reconstructions go to
++	 * work buffers, so a failed try leaves the row as it was read.
++	 */
++	hammer2_raid6_row_init(hmp, &row, col_base);
++	tgt_col = hammer2_raid6_row_col(&row, disk_idx);
++	bcopy(row.ptrs, wp, sizeof(wp));
++	wp[tgt_col] = recon;
 +	if (!target_failed) {
-+		error = hammer2_io_raid6_read_degraded(hmp, lbase, disk_idx,
-+						       recon,
-+						       (size_t)stripe_unit, 1);
++		error = hammer2_raid6_row_solve(&row, tgt_col, -1, wp);
 +		if (error == 0 &&
 +		    hammer2_bref_check_match(bref, recon + off,
 +					     bytes)) {
++			hammer2_raid6_row_done(&row);
 +			bcopy(recon + off, bdata, bytes);
 +			atomic_add_64(&hmp->raid_cksum_healed[disk_idx], 1);
 +			krateprintf(&krate_h2heal,
@@ -2845,16 +2912,21 @@ index 256422e..883f222 100644
 +		}
 +	}
 +
-+	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK | M_ZERO);
++	extra = kmalloc((size_t)stripe_unit, M_HAMMER2, M_WAITOK);
 +	for (e = 0; e < hmp->raid_config.ndisks; e++) {
 +		if (e == disk_idx || hmp->raid_failed[e])
 +			continue;
-+		error = hammer2_io_raid6_read_degraded_x(hmp, lbase, disk_idx,
-+		    recon, (size_t)stripe_unit, 1, e, extra);
++		ext_col = hammer2_raid6_row_col(&row, e);
++		if (row.erased & (1ULL << ext_col))
++			continue;
++		wp[ext_col] = extra;
++		error = hammer2_raid6_row_solve(&row, tgt_col, ext_col, wp);
++		wp[ext_col] = row.ptrs[ext_col];
 +		if (error || !hammer2_bref_check_match(bref, recon + off,
 +						       bytes))
 +			continue;
 +
++		hammer2_raid6_row_done(&row);
 +		bcopy(recon + off, bdata, bytes);
 +		atomic_add_64(&hmp->raid_cksum_errors[e], 1);
 +		atomic_add_64(&hmp->raid_cksum_healed[e], 1);
@@ -2876,6 +2948,7 @@ index 256422e..883f222 100644
 +		}
 +		return 0;
 +	}
++	hammer2_raid6_row_done(&row);
 +	kfree(extra, M_HAMMER2);
 +	kfree(recon, M_HAMMER2);
 +	return HAMMER2_ERROR_CHECK;
@@ -3016,7 +3089,7 @@ index 256422e..883f222 100644
  /*
   * Returns non-zero on success, 0 on failure.
   */
-@@ -5596,15 +6055,7 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
+@@ -5596,15 +6075,7 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
  					chain->bref.check.freemap.icrc32,
  					hammer2_icrc32(bdata, chain->bytes),
  					chain->bytes);
@@ -4145,7 +4218,7 @@ index 4b3656b..2c05594 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24e..7cbb356 100644
+index 31be24e..fa9a014 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,10 @@
@@ -4304,7 +4377,7 @@ index 31be24e..7cbb356 100644
  		dio->pbase = pbase;
  		dio->psize = psize;
  		dio->btype = btype;
-@@ -169,17 +252,120 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
+@@ -169,21 +252,125 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
  	return dio;
  }
  
@@ -4427,7 +4500,12 @@ index 31be24e..7cbb356 100644
  	uint64_t orefs;
  	uint64_t nrefs;
  	int isgood;
-@@ -193,12 +379,12 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+ 	int error;
++	int preempted = 0;
+ 	int hce;
+ 	int bflags;
+ 
+@@ -193,12 +380,12 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  	KKASSERT((1 << (int)(lbase & HAMMER2_OFF_MASK_RADIX)) == lsize);
  
  	if (op == HAMMER2_DOP_READQ) {
@@ -4442,7 +4520,7 @@ index 31be24e..7cbb356 100644
  	}
  
  	for (;;) {
-@@ -211,7 +397,8 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -211,7 +398,8 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		if (orefs & HAMMER2_DIO_GOOD) {
  			if (isgood == 0)
  				cpu_mfence();
@@ -4452,7 +4530,7 @@ index 31be24e..7cbb356 100644
  
  			switch(op) {
  			case HAMMER2_DOP_NEW:
-@@ -251,21 +438,141 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -251,21 +439,173 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  	 * We break to here if GOOD is not set and we acquired INPROG for
  	 * the I/O.
  	 */
@@ -4528,7 +4606,38 @@ index 31be24e..7cbb356 100644
 +				    HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 +			if (dio->bp)
 +				bkvasync(dio->bp);
-+			if (is_meta &&
++			int newbuf = 0;
++
++			/*
++			 * A NEW that replaces the whole buffer has no use
++			 * for the old contents, nor has a NEW/NEWNZ of a v3
++			 * data column (one chain's own 64K, see below), so
++			 * do not reconstruct what is about to be zeroed or
++			 * overwritten.
++			 */
++			if (op == HAMMER2_DOP_NEW || op == HAMMER2_DOP_NEWNZ) {
++				if (dio->psize == lsize)
++					newbuf = 1;
++				else if (hammer2_raid6_v3(hmp) &&
++					 (dio->btype == HAMMER2_BREF_TYPE_DATA ||
++					  dio->btype == HAMMER2_BREF_TYPE_DIRENT))
++					newbuf = 2;
++			}
++			if (newbuf) {
++				if (newbuf == 2) {
++					int off = (int)(hammer2_io_data(dio,
++							lbase) - preempt_data);
++
++					if (op == HAMMER2_DOP_NEW) {
++						bzero(preempt_data, dio->psize);
++					} else {
++						bzero(preempt_data, off);
++						bzero(preempt_data + off + lsize,
++						      dio->psize - off - lsize);
++					}
++				}
++				error = 0;
++			} else if (is_meta &&
 +			    hmp->voldata.version >=
 +			     HAMMER2_VOL_VERSION_RAIDZ2) {
 +				/*
@@ -4567,6 +4676,7 @@ index 31be24e..7cbb356 100644
 +			}
 +		}
 +		dio->error = error;
++		preempted = 1;
 +		goto io_done;
 +	}
 +
@@ -4601,7 +4711,7 @@ index 31be24e..7cbb356 100644
  					 GETBLK_KVABIO, 0);
  			if (op == HAMMER2_DOP_NEW) {
  				bkvasync(dio->bp);
-@@ -276,43 +583,52 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -276,43 +616,52 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		case HAMMER2_DOP_READ:
  		default:
  			KKASSERT(dio->bp == NULL);
@@ -4685,7 +4795,7 @@ index 31be24e..7cbb356 100644
  		}
  		if (dio->bp) {
  			/*
-@@ -347,14 +663,109 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
+@@ -347,14 +696,109 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
  		}
  	}
  
@@ -4703,7 +4813,7 @@ index 31be24e..7cbb356 100644
 +	 * RAID6 reconstruction block below sees error != 0, releases the
 +	 * read bp via brelse, then getblk()s a fresh one for reconstruction.
 +	 */
-+	if (error == 0 && dio->disk_idx >= 0 &&
++	if (error == 0 && !preempted && dio->disk_idx >= 0 &&
 +	    hammer2_inject_eio(dio->disk_idx)) {
 +		error = EIO;
 +	}
@@ -4713,7 +4823,7 @@ index 31be24e..7cbb356 100644
 +	 * RAID6: on read error, mark disk failed and attempt degraded
 +	 * reconstruction from surviving disks + parity.
 +	 */
-+	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
++	if (error && !preempted && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
 +		int injected = (dio->disk_idx >= 0 &&
 +				hammer2_inject_eio(dio->disk_idx) != 0);
 +		int merr = 0;
@@ -4795,7 +4905,7 @@ index 31be24e..7cbb356 100644
  	/*
  	 * Clear INPROG and WAITING, set GOOD wake up anyone waiting.
  	 */
-@@ -465,8 +876,63 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -465,8 +909,63 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  		 * Non-errored disposal of bp
  		 */
  		if (orefs & HAMMER2_DIO_DIRTY) {
@@ -4859,7 +4969,7 @@ index 31be24e..7cbb356 100644
  			/*
  			 * Allows dirty buffers to accumulate and
  			 * possibly be canceled (e.g. by a 'rm'),
-@@ -482,35 +948,120 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
+@@ -482,35 +981,120 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
  			 * write.  This typically occurs in the write-behind
  			 * case when writing to large files.
  			 */
@@ -4999,7 +5109,7 @@ index 31be24e..7cbb356 100644
  	/*
  	 * Update iofree_count before disposing of the dio
  	 */
-@@ -557,41 +1108,45 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
+@@ -557,41 +1141,45 @@ hammer2_io_data(hammer2_io_t *dio, off_t lbase)
  	struct buf *bp;
  	int off;
  
@@ -5053,7 +5163,7 @@ index 31be24e..7cbb356 100644
  #ifdef HAMMER2_IO_DEBUG
  	if ((dio = *diop) != NULL) {
  #if 0
-@@ -610,7 +1165,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
+@@ -610,7 +1198,8 @@ _hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
  	hammer2_io_t *dio;
  
  	dio = _hammer2_io_getblk(hmp, 0, lbase, lsize,
@@ -5063,7 +5173,7 @@ index 31be24e..7cbb356 100644
  	return dio;
  }
  
-@@ -691,7 +1247,9 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -691,7 +1280,9 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
  	int lsize;
  	int isgood;
  
@@ -5074,7 +5184,7 @@ index 31be24e..7cbb356 100644
  	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
  		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
  	else
-@@ -707,6 +1265,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
+@@ -707,6 +1298,12 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
   * a modified chain is destroyed or by the bulkfree code.  No buffer
   * is needed for this operation.  If the DIO no longer exists it is
   * equivalent to the bits not being set.
@@ -5087,7 +5197,7 @@ index 31be24e..7cbb356 100644
   */
  void
  hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
-@@ -720,7 +1284,9 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
+@@ -720,7 +1317,9 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
  		return;
  	if (btype != HAMMER2_BREF_TYPE_DATA)
  		return;
@@ -5098,7 +5208,7 @@ index 31be24e..7cbb356 100644
  	if (dio) {
  		if (data_off < dio->pbase ||
  		    (data_off & ~HAMMER2_OFF_MASK_RADIX) + bytes >
-@@ -746,8 +1312,10 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
+@@ -746,8 +1345,10 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off, u_int bytes)
  	hammer2_io_t *dio;
  	int isgood;
  
@@ -5110,7 +5220,7 @@ index 31be24e..7cbb356 100644
  	if (dio) {
  		KASSERT((dio->dedup_alloc &
  			  hammer2_dedup_mask(dio, data_off, bytes)) == 0,
-@@ -764,7 +1332,7 @@ static
+@@ -764,7 +1365,7 @@ static
  void
  dio_write_stats_update(hammer2_io_t *dio, struct buf *bp)
  {
@@ -5119,7 +5229,7 @@ index 31be24e..7cbb356 100644
  		return;
  	hammer2_adjwritecounter(dio->btype, dio->psize);
  }
-@@ -786,91 +1354,3539 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,84 +1387,3692 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -5243,13 +5353,13 @@ index 31be24e..7cbb356 100644
 +				"disk %d but already %d disk(s) failed\n",
 +				disk_idx, n);
 +			return ENXIO;
-+		}
+ 		}
 +		if (!atomic_cmpset_int(&hmp->raid_nfailed, n, n + 1))
 +			continue;
 +		if (atomic_cmpset_int(&hmp->raid_failed[disk_idx], 0, 1)) {
 +			kprintf("hammer2: RAID6 disk %d failed\n", disk_idx);
 +			break;
- 		}
++		}
 +		atomic_add_int(&hmp->raid_nfailed, -1);
  	}
 -	dio->next = NULL;
@@ -5303,14 +5413,8 @@ index 31be24e..7cbb356 100644
 -	hammer2_io_hash_t *hash;
 -	hammer2_io_t *dio;
 -	hammer2_io_t **diop;
--	hammer2_io_t **cleanapp;
--	hammer2_io_t *cleanbase;
--	int count;
--	int maxscan;
--	int i;
 +	struct hammer2_iowd *w;
- 
--	count = hmp->iofree_count - dio_limit + 32;
++
 +	if (disk_idx < 0 || disk_idx >= HAMMER2_MAX_VOLUMES)
 +		return -1;
 +	w = &hmp->iowd[disk_idx];
@@ -6210,6 +6314,340 @@ index 31be24e..7cbb356 100644
 + * so the caller can repair it.  Fails with EIO when the erasures
 + * exceed what P and Q can recover.
 + */
++/*
++ * Scratch sets for degraded row reads: ndisks columns of stripe_unit
++ * each.  A few are kept per mount for reuse; past that a set is
++ * allocated for the call and freed after it.  Never wait for one: a
++ * caller may hold a buffer another degraded read needs.
++ */
++void
++hammer2_io_rowpool_init(hammer2_dev_t *hmp)
++{
++	if (hmp->rowpool_inited)
++		return;
++	hammer2_spin_init(&hmp->rowpool_spin, "h2rowpl");
++	hmp->rowpool_n = 0;
++	hmp->rowpool_inited = 1;
++}
++
++void
++hammer2_io_rowpool_fini(hammer2_dev_t *hmp)
++{
++	if (!hmp->rowpool_inited)
++		return;
++	while (hmp->rowpool_n > 0)
++		kfree(hmp->rowpool[--hmp->rowpool_n], M_HAMMER2);
++}
++
++/*
++ * Set up a row at per-disk offset phys_off.  Columns of failed members
++ * start out erased.
++ */
++void
++hammer2_raid6_row_init(hammer2_dev_t *hmp, hammer2_raid6_row_t *row,
++		       hammer2_off_t phys_off)
++{
++	hammer2_raid_config_t *rc = &hmp->raid_config;
++	uint64_t slot;
++	int d, col, di;
++
++	bzero(row, sizeof(*row));
++	nanouptime(&row->t0);
++	atomic_add_long(&hammer2_dr_reads, 1);
++	row->hmp = hmp;
++	row->su = rc->stripe_unit;
++	row->ndisks = rc->ndisks;
++	row->ndata = rc->ndata;
++	row->phys_off = phys_off;
++	slot = hammer2_raid6_slot(phys_off, row->su);
++	hammer2_raid6_pq(slot, row->ndisks, &row->p_disk, &row->q_disk);
++
++	row->mem = NULL;
++	if (hmp->rowpool_inited) {
++		hammer2_spin_ex(&hmp->rowpool_spin);
++		if (hmp->rowpool_n > 0)
++			row->mem = hmp->rowpool[--hmp->rowpool_n];
++		hammer2_spin_unex(&hmp->rowpool_spin);
++	}
++	if (row->mem == NULL) {
++		atomic_add_long(&hammer2_dr_pool_miss, 1);
++		row->mem = kmalloc(row->su * row->ndisks, M_HAMMER2,
++				   M_WAITOK);
++	}
++
++	di = 0;
++	for (d = 0; d < row->ndisks; d++) {
++		if (d == row->p_disk)
++			col = row->ndata;
++		else if (d == row->q_disk)
++			col = row->ndata + 1;
++		else
++			col = di++;
++		row->col_disk[col] = d;
++		row->ptrs[col] = row->mem + (size_t)col * row->su;
++		if (hmp->raid_failed[d])
++			row->erased |= 1ULL << col;
++	}
++}
++
++void
++hammer2_raid6_row_done(hammer2_raid6_row_t *row)
++{
++	hammer2_dev_t *hmp = row->hmp;
++	struct timespec ts;
++
++	if (row->mem == NULL)
++		return;
++	nanouptime(&ts);
++	atomic_add_long(&hammer2_dr_ns,
++	    (long)((ts.tv_sec - row->t0.tv_sec) * 1000000000L +
++		   (ts.tv_nsec - row->t0.tv_nsec)));
++	if (hmp->rowpool_inited) {
++		hammer2_spin_ex(&hmp->rowpool_spin);
++		if (hmp->rowpool_n < HAMMER2_ROWPOOL_MAX) {
++			hmp->rowpool[hmp->rowpool_n++] = row->mem;
++			row->mem = NULL;
++		}
++		hammer2_spin_unex(&hmp->rowpool_spin);
++	}
++	if (row->mem)
++		kfree(row->mem, M_HAMMER2);
++	row->mem = NULL;
++}
++
++/* Logical column of a member in this row. */
++int
++hammer2_raid6_row_col(hammer2_raid6_row_t *row, int disk)
++{
++	int col;
++
++	for (col = 0; col < row->ndisks; col++) {
++		if (row->col_disk[col] == disk)
++			return col;
++	}
++	return -1;
++}
++
++/*
++ * Read the columns in colmask that are not yet read or erased, all in
++ * flight together.  Like hammer2_io_raid6_read_sibling(), a column in
++ * the buffer cache is taken from there (and a miss is read through the
++ * cache, so the neighbours' own reads find it), a buffer another thread
++ * holds is bypassed through a pbuf, and no buffer is waited for, so the
++ * columns of a row can be held at once.  A column that fails to read
++ * becomes erased and its member is failed, unless the error was
++ * injected.  Returns EIO if failing a member exceeds what RAID6 allows.
++ */
++#define ROWRD_NONE	0
++#define ROWRD_HIT	1
++#define ROWRD_BUF	2
++#define ROWRD_PBUF	3
++
++static int
++hammer2_raid6_row_read(hammer2_raid6_row_t *row, uint64_t colmask)
++{
++	hammer2_dev_t *hmp = row->hmp;
++	struct buf *bps[HAMMER2_MAX_VOLUMES];
++	int kind[HAMMER2_MAX_VOLUMES];
++	int gen[HAMMER2_MAX_VOLUMES];
++	int cerr[HAMMER2_MAX_VOLUMES];
++	int col, d, error = 0, nread = 0;
++	struct vnode *devvp;
++	off_t off = row->phys_off;
++	int su = (int)row->su;
++	struct buf *bp;
++
++	colmask &= ~(row->have | row->erased);
++	if (colmask == 0)
++		return 0;
++
++	/* parity (or a zero column) of a sealed row may be in flight */
++	hammer2_pq_wait_slot(hmp, off);
++
++	for (col = 0; col < row->ndisks; col++) {
++		kind[col] = ROWRD_NONE;
++		cerr[col] = 0;
++		if ((colmask & (1ULL << col)) == 0)
++			continue;
++		d = row->col_disk[col];
++		if (hmp->raid_failed[d]) {
++			/* failed since the row was set up: no I/O to it */
++			row->erased |= 1ULL << col;
++			continue;
++		}
++		devvp = hmp->volumes[d].dev->devvp;
++		++nread;
++		if (col == row->ndata + 1)
++			atomic_add_long(&hammer2_dr_q_reads, 1);
++		cerr[col] = hammer2_inject_eio(d);
++		if (cerr[col])
++			continue;
++		bp = getblk(devvp, off, su, GETBLK_NOWAIT, 0);
++		if (bp == NULL) {
++			bps[col] = hammer2_pbuf_read_start(devvp, off, su,
++							   1, d);
++			kind[col] = ROWRD_PBUF;
++		} else if (bp->b_flags & B_CACHE) {
++			bps[col] = bp;
++			kind[col] = ROWRD_HIT;
++		} else {
++			bp->b_flags &= ~(B_ERROR | B_EINTR | B_INVAL |
++					 B_NOTMETA);
++			bp->b_cmd = BUF_CMD_READ;
++			bp->b_bio1.bio_done = biodone_sync;
++			bp->b_bio1.bio_flags |= BIO_SYNC;
++			vfs_busy_pages(devvp, bp);
++			gen[col] = hammer2_iowd_begin(hmp, d);
++			vn_strategy(devvp, &bp->b_bio1);
++			bps[col] = bp;
++			kind[col] = ROWRD_BUF;
++		}
++	}
++	atomic_add_long(&hammer2_dr_cols, nread);
++
++	for (col = 0; col < row->ndisks; col++) {
++		if (kind[col] == ROWRD_NONE)
++			continue;
++		bp = bps[col];
++		d = row->col_disk[col];
++		switch (kind[col]) {
++		case ROWRD_HIT:
++			bkvasync(bp);
++			bcopy(bp->b_data, row->ptrs[col], su);
++			brelse(bp);
++			break;
++		case ROWRD_BUF:
++			cerr[col] = biowait(&bp->b_bio1, "h2dr");
++			hammer2_iowd_end(hmp, d, gen[col]);
++			if (cerr[col] == 0) {
++				bkvasync(bp);
++				bcopy(bp->b_data, row->ptrs[col], su);
++			}
++			brelse(bp);
++			break;
++		case ROWRD_PBUF:
++			cerr[col] = hammer2_biowait_timed(bp, "h2dr");
++			if (cerr[col] == ETIMEDOUT)
++				break;	/* the completion's now */
++			if (cerr[col] == 0)
++				bcopy(bp->b_data, row->ptrs[col], su);
++			relpbuf(bp, NULL);
++			break;
++		}
++	}
++
++	for (col = 0; col < row->ndisks; col++) {
++		if ((colmask & (1ULL << col)) == 0 ||
++		    (row->erased & (1ULL << col)))
++			continue;
++		d = row->col_disk[col];
++		if (cerr[col] == 0) {
++			row->have |= 1ULL << col;
++			continue;
++		}
++		if (!hammer2_inject_eio(d) &&
++		    hammer2_raid6_auto_fail_disk(hmp, d))
++			error = EIO;
++		row->erased |= 1ULL << col;
++	}
++	return error;
++}
++
++/*
++ * Reconstruct column tgt_col, and ext_col too if >= 0, treating both as
++ * erased on top of the row's own erasures.  Reads whatever else is
++ * needed that has not been read yet: the surviving data columns, then
++ * one parity column for a single data erasure (P, or Q when P is gone),
++ * both for two.  A read that fails adds an erasure and the plan is
++ * redone.  The results are left in wp[tgt_col] and wp[ext_col]; wp is
++ * the row's own ptrs for a one-shot call, or a copy with work buffers
++ * for those two columns, which keeps the row's columns intact for the
++ * next try with a different second erasure.  EIO if more than two
++ * columns are lost.
++ */
++int
++hammer2_raid6_row_solve(hammer2_raid6_row_t *row, int tgt_col, int ext_col,
++			void **wp)
++{
++	int ndisks = row->ndisks, ndata = row->ndata;
++	size_t su = row->su;
++	uint64_t er, need, extra_bits;
++	int nd, fp, fq, a, b, col, error;
++	int p_done = 0;
++	void *rp[HAMMER2_MAX_VOLUMES];
++
++	extra_bits = 1ULL << tgt_col;
++	if (ext_col >= 0)
++		extra_bits |= 1ULL << ext_col;
++	for (;;) {
++		er = row->erased | extra_bits;
++		nd = 0;
++		a = b = -1;
++		for (col = 0; col < ndata; col++) {
++			if (er & (1ULL << col)) {
++				if (a < 0)
++					a = col;
++				else
++					b = col;
++				++nd;
++			}
++		}
++		fp = (er >> ndata) & 1;
++		fq = (er >> (ndata + 1)) & 1;
++		if (nd + fp + fq > 2)
++			return EIO;
++
++		need = ((1ULL << ndata) - 1) & ~er;
++		if (nd == 2)
++			need |= 3ULL << ndata;
++		else if (nd == 1)
++			need |= 1ULL << (fp ? ndata + 1 : ndata);
++		if ((need & ~row->have) == 0)
++			break;
++		error = hammer2_raid6_row_read(row, need & ~row->have);
++		if (error)
++			return error;
++	}
++
++	/* rp: the survivors from the row, an erased column's result slot */
++	for (col = 0; col < ndisks; col++)
++		rp[col] = (er & (1ULL << col)) ? wp[col] : row->ptrs[col];
++
++	if (nd == 2) {
++		hammer2_raid6_dual_recov(ndisks, su, a, b, rp);
++	} else if (nd == 1) {
++		if (fp) {
++			/* the data from Q; this also makes P */
++			hammer2_raid6_datap_recov(ndisks, su, a, rp);
++			p_done = 1;
++		} else {
++			/* the data is P ^ the other data columns */
++			bcopy(rp[ndata], rp[a], su);
++			for (col = 0; col < ndata; col++) {
++				if (col != a)
++					hammer2_raid6_xor(rp[a], rp[col], su);
++			}
++		}
++	}
++
++	/*
++	 * An erased parity column is only worth computing if asked for;
++	 * it comes from the data columns, the recovered ones included.
++	 */
++	if ((extra_bits >> ndata) & 1 && !p_done) {
++		bcopy(rp[0], rp[ndata], su);
++		for (col = 1; col < ndata; col++)
++			hammer2_raid6_xor(rp[ndata], rp[col], su);
++	}
++	if ((extra_bits >> (ndata + 1)) & 1) {
++		bcopy(rp[0], rp[ndata + 1], su);
++		for (col = 1; col < ndata; col++)
++			hammer2_raid6_mul(rp[ndata + 1], rp[col], su,
++			    hammer2_gf_exp[col], 1);
++	}
++	return 0;
++}
++
 +int
 +hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 +				 hammer2_off_t logical_off,
@@ -6217,139 +6655,12 @@ index 31be24e..7cbb356 100644
 +				 int is_physical, int extra_disk,
 +				 void *extra_buf)
 +{
-+	hammer2_raid_config_t *rc = &hmp->raid_config;
-+	int ndisks = rc->ndisks;
-+	int ndata = rc->ndata;
-+	uint64_t stripe_unit = rc->stripe_unit;
-+	int p_disk, q_disk;
-+	int target_col;
-+	int phys_disk, di, col;
-+	int extra_col = -1;
-+	int nerased = 0;
-+	hammer2_off_t phys_off;
-+	void *ptrs[HAMMER2_MAX_VOLUMES];
-+	void *col_bufs[HAMMER2_MAX_VOLUMES];
-+	hammer2_volume_t *vol;
-+	int error = 0;
-+	int fail_data_a = -1, fail_data_b = -1;
-+	int fail_p = 0, fail_q = 0;
++	hammer2_raid6_row_t row;
++	int tgt_col, ext_col = -1;
++	int error;
 +
-+	bzero(ptrs, sizeof(ptrs));
-+	bzero(col_bufs, sizeof(col_bufs));
-+
-+	KKASSERT(bytes == stripe_unit);
++	KKASSERT(bytes == hmp->raid_config.stripe_unit);
 +	KKASSERT(hammer2_raid6_v3(hmp));
-+	if (is_physical) {
-+		/*
-+		 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
-+		 *
-+		 * logical_off is the encoded key (top byte = disk_idx,
-+		 * middle bits = per-disk physical offset; see
-+		 * HAMMER2_RAID6_DISK_SHIFT in hammer2_disk.h).  All
-+		 * columns in the same stripe slot share the same
-+		 * per-disk physical offset.
-+		 *
-+		 * P disk = stripe_slot % ndisks
-+		 * Q disk = (P disk + 1) % ndisks
-+		 * Data columns: all other disks in disk-index order.
-+		 *
-+		 * target_col: the logical column index for data_disk_idx.
-+		 *   data_disk_idx == p_disk -> target_col = ndata (P)
-+		 *   data_disk_idx == q_disk -> target_col = ndata+1 (Q)
-+		 *   otherwise count data disks below data_disk_idx.
-+		 */
-+		uint64_t stripe_slot;
-+
-+		phys_off    = logical_off & HAMMER2_RAID6_PHYS_MASK &
-+			      ~(hammer2_off_t)(stripe_unit - 1);
-+		stripe_slot = hammer2_raid6_slot(phys_off, stripe_unit);
-+		hammer2_raid6_pq(stripe_slot, ndisks, &p_disk, &q_disk);
-+		target_col = hammer2_raid6_lcol(data_disk_idx, p_disk, q_disk,
-+						ndata);
-+
-+		di = 0;
-+		for (phys_disk = 0; phys_disk < ndisks; phys_disk++) {
-+			int lerror;
-+			if (phys_disk == p_disk)
-+				col = ndata;
-+			else if (phys_disk == q_disk)
-+				col = ndata + 1;
-+			else
-+				col = di++;
-+
-+			col_bufs[col] = kmalloc(stripe_unit, M_HAMMER2,
-+						M_WAITOK | M_ZERO);
-+			ptrs[col] = col_bufs[col];
-+
-+			if (phys_disk == extra_disk)
-+				extra_col = col;
-+			if (phys_disk == data_disk_idx ||
-+			    phys_disk == extra_disk) {
-+				/*
-+				 * A column being reconstructed.
-+				 * Leave the buffer zeroed and mark failed.
-+				 */
-+				++nerased;
-+				if (col < ndata) {
-+					if (fail_data_a == -1)
-+						fail_data_a = col;
-+					else if (fail_data_b == -1)
-+						fail_data_b = col;
-+				} else if (col == ndata) {
-+					fail_p = 1;
-+				} else {
-+					fail_q = 1;
-+				}
-+				continue;
-+			}
-+
-+			if (hmp->raid_failed[phys_disk]) {
-+				++nerased;
-+				if (col < ndata) {
-+					if (fail_data_a == -1)
-+						fail_data_a = col;
-+					else if (fail_data_b == -1)
-+						fail_data_b = col;
-+				} else if (col == ndata) {
-+					fail_p = 1;
-+				} else {
-+					fail_q = 1;
-+				}
-+				continue;
-+			}
-+
-+			vol = &hmp->volumes[phys_disk];
-+			lerror = hammer2_inject_eio(phys_disk);
-+			if (lerror == 0)
-+				lerror = hammer2_io_raid6_read_sibling(hmp,
-+				    phys_disk, vol->dev->devvp, phys_off,
-+				    col_bufs[col], (int)stripe_unit, 0);
-+			if (lerror) {
-+				int injected = hammer2_inject_eio(phys_disk);
-+				if (!injected) {
-+					int aerr =
-+					    hammer2_raid6_auto_fail_disk(
-+						hmp, phys_disk);
-+					if (aerr) {
-+						error = EIO;
-+						break;
-+					}
-+				}
-+				++nerased;
-+				if (col < ndata) {
-+					if (fail_data_a == -1)
-+						fail_data_a = col;
-+					else if (fail_data_b == -1)
-+						fail_data_b = col;
-+				} else if (col == ndata) {
-+					fail_p = 1;
-+				} else {
-+					fail_q = 1;
-+				}
-+			}
-+		}
-+		goto do_recovery;
-+	}
 +
 +	/*
 +	 * Non-physical call: INODE/INDIRECT/FREEMAP on a failed disk.
@@ -6357,76 +6668,29 @@ index 31be24e..7cbb356 100644
 +	 * logical reconstruction is gone. Return EIO; Group I lands the
 +	 * metadata-zone mirror.
 +	 */
-+	error = EIO;
-+	goto read_degraded_done;
++	if (!is_physical)
++		return EIO;
 +
-+do_recovery:
-+	/* Perform recovery */
-+	if (error)
-+		goto read_degraded_done;
-+	if (nerased > 2) {
-+		error = EIO;
-+		goto read_degraded_done;
-+	}
-+	error = 0;
-+	if (fail_data_a != -1) {
-+		if (fail_data_b != -1) {
-+			/* Two data disks failed - requires BOTH P and Q */
-+			if (fail_p || fail_q) {
-+				error = EIO;
-+			} else {
-+				if (fail_data_a > fail_data_b) {
-+					int tmp = fail_data_a;
-+					fail_data_a = fail_data_b;
-+					fail_data_b = tmp;
-+				}
-+				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-+							 fail_data_a,
-+							 fail_data_b, ptrs);
-+			}
-+		} else {
-+			/* One data disk failed - requires either P or Q */
-+			if (fail_p) {
-+				if (fail_q) {
-+					/* Both P and Q failed */
-+					error = EIO;
-+				} else {
-+					/* Data fail_data_a + P failed: use Q */
-+					hammer2_raid6_datap_recov(ndisks,
-+								  stripe_unit,
-+								  fail_data_a,
-+								  ptrs);
-+				}
-+			} else {
-+				/* Use P to recover fail_data_a */
-+				hammer2_raid6_dual_recov(ndisks, stripe_unit,
-+							 fail_data_a,
-+							 ndisks - 1, ptrs);
-+			}
-+		}
-+	}
-+
-+	/* If target_col failed and reconstruction was impossible, return error */
 +	/*
-+	 * Every data column is now valid.  An erased P or Q column is
-+	 * still zero (the recovery above only rebuilds data), so
-+	 * regenerate both before handing out a parity column.
++	 * v3 RAIDZ2-native physical addressing for DATA/DIRENT.
++	 * logical_off is the encoded key (top byte = disk_idx, middle
++	 * bits = per-disk physical offset; see HAMMER2_RAID6_DISK_SHIFT in
++	 * hammer2_disk.h).  All columns in the same stripe slot share the
++	 * same per-disk physical offset.
 +	 */
-+	if (error == 0 && (fail_p || fail_q))
-+		hammer2_raid6_gen_syndrome(ndisks, stripe_unit, ptrs);
-+
++	hammer2_raid6_row_init(hmp, &row,
++	    logical_off & HAMMER2_RAID6_PHYS_MASK &
++	    ~(hammer2_off_t)(bytes - 1));
++	tgt_col = hammer2_raid6_row_col(&row, data_disk_idx);
++	if (extra_disk >= 0)
++		ext_col = hammer2_raid6_row_col(&row, extra_disk);
++	error = hammer2_raid6_row_solve(&row, tgt_col, ext_col, row.ptrs);
 +	if (error == 0) {
-+		bcopy(ptrs[target_col], buf, stripe_unit);
-+		if (extra_buf && extra_col >= 0)
-+			bcopy(ptrs[extra_col], extra_buf, stripe_unit);
++		bcopy(row.ptrs[tgt_col], buf, bytes);
++		if (extra_buf && ext_col >= 0)
++			bcopy(row.ptrs[ext_col], extra_buf, bytes);
 +	}
-+read_degraded_done:
-+	/* Free temporary buffers */
-+	for (col = 0; col <= ndata + 1; col++) {
-+		if (col_bufs[col])
-+			kfree(col_bufs[col], M_HAMMER2);
-+	}
-+
++	hammer2_raid6_row_done(&row);
 +	return error;
 +}
 +
@@ -8711,17 +8975,10 @@ index 31be24e..7cbb356 100644
 +	hammer2_io_hash_t *hash;
 +	hammer2_io_t *dio;
 +	hammer2_io_t **diop;
-+	hammer2_io_t **cleanapp;
-+	hammer2_io_t *cleanbase;
-+	int count;
-+	int maxscan;
-+	int i;
-+
-+	count = hmp->iofree_count - dio_limit + 32;
- 	if (count <= 0)
- 		return;
- 	cleanbase = NULL;
-@@ -961,3 +4977,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
+ 	hammer2_io_t **cleanapp;
+ 	hammer2_io_t *cleanbase;
+ 	int count;
+@@ -961,3 +5170,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
  		}
  	}
  }
@@ -15171,7 +15428,7 @@ index 32367cc..526ae18 100644
  	if (data == NULL)
  		return 0;
 diff --git a/sys/vfs/hammer2/hammer2_vfsops.c b/sys/vfs/hammer2/hammer2_vfsops.c
-index 98c8467..39c612e 100644
+index 98c8467..54216c1 100644
 --- a/sys/vfs/hammer2/hammer2_vfsops.c
 +++ b/sys/vfs/hammer2/hammer2_vfsops.c
 @@ -47,7 +47,16 @@
@@ -15202,7 +15459,7 @@ index 98c8467..39c612e 100644
  int hammer2_cluster_write = 0;		/* physical write clustering */
  int hammer2_dedup_enable = 1;
  int hammer2_always_compress = 0;	/* always try to compress */
-@@ -76,6 +88,86 @@ int hammer2_dio_limit = 256;
+@@ -76,6 +88,91 @@ int hammer2_dio_limit = 256;
  int hammer2_bulkfree_tps = 5000;
  int hammer2_spread_workers;
  int hammer2_limit_saved_depth;
@@ -15251,6 +15508,11 @@ index 98c8467..39c612e 100644
 +long hammer2_rz_pq_async;
 +long hammer2_rz_pq_bp_wait;
 +long hammer2_rz_pq_rd_wait;
++long hammer2_dr_reads;
++long hammer2_dr_cols;
++long hammer2_dr_q_reads;
++long hammer2_dr_ns;
++long hammer2_dr_pool_miss;
 +long hammer2_rz_pq_drain_wait;
 +long hammer2_rz_pq_high;
 +long hammer2_rz_pq_hdr_viol;
@@ -15289,7 +15551,7 @@ index 98c8467..39c612e 100644
  long hammer2_chain_allocs;
  long hammer2_limit_saved_chains;
  long hammer2_limit_dirty_chains;
-@@ -122,8 +214,17 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
+@@ -122,8 +219,17 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
  	   &hammer2_spread_workers, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
  	   &hammer2_cluster_meta_read, 0, "");
@@ -15307,7 +15569,7 @@ index 98c8467..39c612e 100644
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_write, CTLFLAG_RW,
  	   &hammer2_cluster_write, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, dedup_enable, CTLFLAG_RW,
-@@ -134,6 +235,244 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
+@@ -134,6 +240,254 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, flush_pipe, CTLFLAG_RW,
  	   &hammer2_flush_pipe, 0, "");
  SYSCTL_INT(_vfs_hammer2, OID_AUTO, bulkfree_tps, CTLFLAG_RW,
  	   &hammer2_bulkfree_tps, 0, "");
@@ -15501,6 +15763,16 @@ index 98c8467..39c612e 100644
 +	   &hammer2_rz_pq_async, 0, "v3 RAID6: rows handed to the parity reaper");
 +SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_bp_wait, CTLFLAG_RW,
 +	   &hammer2_rz_pq_bp_wait, 0, "v3 RAID6: writers held by async back-pressure");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_reads, CTLFLAG_RW,
++	   &hammer2_dr_reads, 0, "v3 RAID6: degraded row reconstructions");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_cols, CTLFLAG_RW,
++	   &hammer2_dr_cols, 0, "v3 RAID6: member columns read by degraded reconstructions");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_q_reads, CTLFLAG_RW,
++	   &hammer2_dr_q_reads, 0, "v3 RAID6: Q columns read by degraded reconstructions");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_ns, CTLFLAG_RW,
++	   &hammer2_dr_ns, 0, "v3 RAID6: ns spent in degraded reconstructions");
++SYSCTL_LONG(_vfs_hammer2, OID_AUTO, dr_pool_miss, CTLFLAG_RW,
++	   &hammer2_dr_pool_miss, 0, "v3 RAID6: degraded scratch sets allocated (pool empty)");
 +SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_rd_wait, CTLFLAG_RW,
 +	   &hammer2_rz_pq_rd_wait, 0, "v3 RAID6: parity reads that waited for a row in flight");
 +SYSCTL_LONG(_vfs_hammer2, OID_AUTO, rz_pq_drain_wait, CTLFLAG_RW,
@@ -15552,7 +15824,7 @@ index 98c8467..39c612e 100644
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, chain_allocs, CTLFLAG_RD,
  	   &hammer2_chain_allocs, 0, "");
  SYSCTL_LONG(_vfs_hammer2, OID_AUTO, limit_saved_chains, CTLFLAG_RW,
-@@ -190,8 +529,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
+@@ -190,8 +544,28 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, process_xxhash64, CTLFLAG_RD,
  
  static int hammer2_vfs_init(struct vfsconf *conf);
  static int hammer2_vfs_uninit(struct vfsconf *vfsp);
@@ -15581,7 +15853,7 @@ index 98c8467..39c612e 100644
  static int hammer2_remount(hammer2_dev_t *, struct mount *, char *,
  				struct ucred *);
  static int hammer2_recovery(hammer2_dev_t *hmp);
-@@ -298,7 +657,11 @@ hammer2_vfs_init(struct vfsconf *conf)
+@@ -298,7 +672,11 @@ hammer2_vfs_init(struct vfsconf *conf)
  	margs_read.objsize = 65536;
  	margs_read.mtype = M_HAMMER2_DEBUFFER;
  
@@ -15594,7 +15866,7 @@ index 98c8467..39c612e 100644
  	margs_write.mtype = M_HAMMER2_CBUFFER;
  
  	margs_vop.objsize = sizeof(hammer2_xop_t);
-@@ -349,6 +712,22 @@ hammer2_vfs_init(struct vfsconf *conf)
+@@ -349,6 +727,22 @@ hammer2_vfs_init(struct vfsconf *conf)
  
  	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
  
@@ -15617,7 +15889,7 @@ index 98c8467..39c612e 100644
  	return (error);
  }
  
-@@ -356,12 +735,285 @@ static
+@@ -356,12 +750,285 @@ static
  int
  hammer2_vfs_uninit(struct vfsconf *vfsp __unused)
  {
@@ -15903,7 +16175,7 @@ index 98c8467..39c612e 100644
  /*
   * Core PFS allocator.  Used to allocate or reference the pmp structure
   * for PFS cluster mounts and the spmp structure for media (hmp) structures.
-@@ -718,6 +1370,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
+@@ -718,6 +1385,11 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
  	if (chains_still_present) {
  		kprintf("hammer2: cannot free pmp %p, still in use\n", pmp);
  	} else {
@@ -15915,7 +16187,7 @@ index 98c8467..39c612e 100644
  		kmalloc_destroy_obj(&pmp->minode);
  		kfree(pmp, M_HAMMER2);
  	}
-@@ -888,6 +1545,55 @@ again:
+@@ -888,6 +1560,55 @@ again:
  	}
  }
  
@@ -15971,7 +16243,7 @@ index 98c8467..39c612e 100644
  /*
   * Mount or remount HAMMER2 fileystem from physical media
   *
-@@ -912,6 +1618,67 @@ static
+@@ -912,6 +1633,67 @@ static
  int
  hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		  struct ucred *cred)
@@ -16039,7 +16311,7 @@ index 98c8467..39c612e 100644
  {
  	struct hammer2_mount_info info;
  	hammer2_pfs_t *pmp;
-@@ -927,7 +1694,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -927,7 +1709,6 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	hammer2_devvp_list_t devvpl;
  	hammer2_devvp_t *e, *e_tmp;
  	struct file *fp;
@@ -16047,7 +16319,7 @@ index 98c8467..39c612e 100644
  	size_t size;
  	size_t done;
  	char *label;
-@@ -981,12 +1747,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -981,12 +1762,12 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		 * Root mount
  		 */
  		info.cluster_fd = -1;
@@ -16062,7 +16334,7 @@ index 98c8467..39c612e 100644
  		if (error)
  			return (error);
  		kprintf("hammer2_mount: devstr=\"%s\"\n", devstr);
-@@ -1042,6 +1808,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1042,6 +1823,8 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  	 */
  	TAILQ_INIT(&devvpl);
  	error = hammer2_init_devvp(devstr, path == NULL, &devvpl);
@@ -16071,7 +16343,7 @@ index 98c8467..39c612e 100644
  	if (error) {
  		kprintf("hammer2: failed to initialize devvp in %s\n", devstr);
  		hammer2_cleanup_devvp(&devvpl);
-@@ -1063,11 +1831,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
+@@ -1063,11 +1846,21 @@ hammer2_vfs_mount(struct mount *mp, char *path, caddr_t data,
  		TAILQ_FOREACH(hmp_tmp, &hammer2_mntlist, mntentry) {
  			TAILQ_FOREACH(e_tmp, &hmp_tmp->devvpl, entry) {
  				int devvp_found = 0;
@@ -16095,7 +16367,7 @@ index 98c8467..39c612e 100644
  					    e_tmp->devvp->v_rdev == e->devvp->v_rdev)
  						devvp_found = 1;
  				}
-@@ -1088,7 +1866,9 @@ next_hmp:
+@@ -1088,7 +1881,9 @@ next_hmp:
  		if (hmp == NULL) {
  			TAILQ_FOREACH(e, &devvpl, entry) {
  				struct vnode *devvp = e->devvp;
@@ -16106,7 +16378,7 @@ index 98c8467..39c612e 100644
  				error = vfs_mountedon(devvp);
  				if (error) {
  					kprintf("hammer2_mount: %s mounted %d\n",
-@@ -1136,8 +1916,10 @@ next_hmp:
+@@ -1136,8 +1931,10 @@ next_hmp:
  		 */
  		KKASSERT(!TAILQ_EMPTY(&devvpl));
  		error = hammer2_open_devvp(&devvpl, ronly);
@@ -16118,7 +16390,7 @@ index 98c8467..39c612e 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			return error;
-@@ -1151,8 +1933,10 @@ next_hmp:
+@@ -1151,8 +1948,10 @@ next_hmp:
  		error = hammer2_init_volumes(mp, &devvpl, hmp->volumes,
  					     &hmp->voldata, &hmp->volhdrno,
  					     &hmp->devvp);
@@ -16130,7 +16402,7 @@ index 98c8467..39c612e 100644
  			hammer2_cleanup_devvp(&devvpl);
  			lockmgr(&hammer2_mntlk, LK_RELEASE);
  			kfree(hmp, M_HAMMER2);
-@@ -1160,12 +1944,16 @@ next_hmp:
+@@ -1160,12 +1959,16 @@ next_hmp:
  		}
  		if (!hmp->devvp) {
  			kprintf("hammer2: failed to initialize root volume\n");
@@ -16149,7 +16421,7 @@ index 98c8467..39c612e 100644
  		ksnprintf(hmp->devrepname, sizeof(hmp->devrepname), "%s", devstr);
  		hmp->ronly = ronly;
  		hmp->hflags = info.hflags & HMNT2_DEVFLAGS;
-@@ -1175,12 +1963,31 @@ next_hmp:
+@@ -1175,12 +1978,31 @@ next_hmp:
  				   sizeof(struct hammer2_io));
  		kmalloc_create(&hmp->mmsg, "HAMMER2-msg");
  		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
@@ -16181,7 +16453,7 @@ index 98c8467..39c612e 100644
  
  		/*
  		 * vchain setup. vchain.data is embedded.
-@@ -1224,7 +2031,146 @@ next_hmp:
+@@ -1224,7 +2046,147 @@ next_hmp:
  		 * Must use hmp instead of volume header for these two
  		 * in order to handle volume versions transparently.
  		 */
@@ -16320,6 +16592,7 @@ index 98c8467..39c612e 100644
 +			 * hammer2_chain_selfheal().
 +			 */
 +			hammer2_io_repair_start(hmp);
++			hammer2_io_rowpool_init(hmp);
 +
 +			/* async seal: parity reaper (idle unless async_seal) */
 +			hammer2_pq_start(hmp);
@@ -16329,7 +16602,7 @@ index 98c8467..39c612e 100644
  			hmp->nvolumes = hmp->voldata.nvolumes;
  			hmp->total_size = hmp->voldata.total_size;
  		} else {
-@@ -1234,15 +2180,32 @@ next_hmp:
+@@ -1234,15 +2196,32 @@ next_hmp:
  		KKASSERT(hmp->nvolumes > 0);
  
  		/*
@@ -16369,7 +16642,7 @@ index 98c8467..39c612e 100644
  
  		/*
  		 * Really important to get these right or the flush and
-@@ -1275,6 +2238,11 @@ next_hmp:
+@@ -1275,6 +2254,11 @@ next_hmp:
  				      HAMMER2_SROOT_KEY, HAMMER2_SROOT_KEY,
  				      &error, 0);
  		hammer2_chain_lookup_done(parent);
@@ -16381,7 +16654,7 @@ index 98c8467..39c612e 100644
  		if (schain == NULL) {
  			kprintf("hammer2_mount: invalid super-root\n");
  			hammer2_unmount_helper(mp, NULL, hmp);
-@@ -1282,7 +2250,7 @@ next_hmp:
+@@ -1282,7 +2266,7 @@ next_hmp:
  			hammer2_vfs_unmount(mp, MNT_FORCE);
  			return EINVAL;
  		}
@@ -16390,7 +16663,7 @@ index 98c8467..39c612e 100644
  			kprintf("hammer2_mount: error %s reading super-root\n",
  				hammer2_error_str(schain->error));
  			hammer2_chain_unlock(schain);
-@@ -1403,6 +2371,13 @@ next_hmp:
+@@ -1403,6 +2387,13 @@ next_hmp:
  	}
  	hammer2_inode_unlock(spmp->iroot);
  
@@ -16404,7 +16677,7 @@ index 98c8467..39c612e 100644
  	/*
  	 * PFS could not be found?
  	 */
-@@ -1425,7 +2400,7 @@ next_hmp:
+@@ -1425,7 +2416,7 @@ next_hmp:
  	 * Acquire the pmp structure (it should have already been allocated
  	 * via hammer2_update_pmps()).
  	 */
@@ -16413,7 +16686,7 @@ index 98c8467..39c612e 100644
  		kprintf("hammer2_mount: PFS label I/O error\n");
  	} else {
  		ripdata = &chain->data->ipdata;
-@@ -1462,6 +2437,18 @@ next_hmp:
+@@ -1462,6 +2453,18 @@ next_hmp:
  	pmp->ronly = ronly;
  	pmp->hflags = info.hflags;
  	mp->mnt_flag |= MNT_LOCAL;
@@ -16432,7 +16705,7 @@ index 98c8467..39c612e 100644
  	mp->mnt_kern_flag |= MNTK_ALL_MPSAFE;   /* all entry pts are SMP */
  	mp->mnt_kern_flag |= MNTK_THR_SYNC;     /* new vsyncscan semantics */
  
-@@ -1493,7 +2480,10 @@ next_hmp:
+@@ -1493,7 +2496,10 @@ next_hmp:
  	vfs_add_vnodeops(mp, &hammer2_spec_vops, &mp->mnt_vn_spec_ops);
  	vfs_add_vnodeops(mp, &hammer2_fifo_vops, &mp->mnt_vn_fifo_ops);
  
@@ -16444,7 +16717,7 @@ index 98c8467..39c612e 100644
  		copyinstr(info.volume, mp->mnt_stat.f_mntfromname,
  			  MNAMELEN - 1, &size);
  		bzero(mp->mnt_stat.f_mntfromname + size, MNAMELEN - size);
-@@ -1580,6 +2570,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1580,6 +2586,7 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	hammer2_volume_t *vol;
  	struct vnode *devvp;
  	int i, ronly_save, error, result = 0;
@@ -16452,7 +16725,7 @@ index 98c8467..39c612e 100644
  
  	pmp = MPTOPMP(mp);
  	ronly_save = pmp->ronly;
-@@ -1593,13 +2584,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1593,13 +2600,25 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  
  	for (i = 0; i < hmp->nvolumes; ++i) {
  		vol = &hmp->volumes[i];
@@ -16479,7 +16752,7 @@ index 98c8467..39c612e 100644
  			error = hammer2_recovery(hmp);
  			if (error == 0)
  				error |= hammer2_fixup_pfses(hmp);
-@@ -1624,6 +2627,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
+@@ -1624,6 +2643,30 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp, char *path __unused,
  	return result;
  }
  
@@ -16510,7 +16783,7 @@ index 98c8467..39c612e 100644
  static
  int
  hammer2_vfs_unmount(struct mount *mp, int mntflags)
-@@ -1637,6 +2664,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1637,6 +2680,16 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	if (pmp == NULL)
  		return(0);
  
@@ -16527,7 +16800,7 @@ index 98c8467..39c612e 100644
  	lockmgr(&hammer2_mntlk, LK_EXCLUSIVE);
  
  	/*
-@@ -1650,9 +2687,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
+@@ -1650,9 +2703,23 @@ hammer2_vfs_unmount(struct mount *mp, int mntflags)
  	else
  		flags = 0;
  	if (pmp->iroot) {
@@ -16551,7 +16824,7 @@ index 98c8467..39c612e 100644
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
  		hammer2_vfs_sync(mp, MNT_WAIT);
-@@ -1777,6 +2828,19 @@ again:
+@@ -1777,6 +2844,20 @@ again:
  	hammer2_iocom_uninit(hmp);
  
  	hammer2_bulkfree_uninit(hmp);
@@ -16564,6 +16837,7 @@ index 98c8467..39c612e 100644
 +	 */
 +	hammer2_pq_stop(hmp);
 +	hammer2_io_repair_stop(hmp);
++	hammer2_io_rowpool_fini(hmp);
 +
 +	/* a failure queued by a read completion must reach the final flush */
 +	hammer2_raid6_persist_failed(hmp);
@@ -16571,7 +16845,7 @@ index 98c8467..39c612e 100644
  	hammer2_pfsfree_scan(hmp, 0);
  
  	/*
-@@ -1828,11 +2892,15 @@ again:
+@@ -1828,11 +2909,15 @@ again:
  
  	KKASSERT(hmp->spmp == NULL);
  
@@ -16588,7 +16862,7 @@ index 98c8467..39c612e 100644
  		hammer2_cleanup_devvp(&hmp->devvpl);
  	}
  	KKASSERT(TAILQ_EMPTY(&hmp->devvpl));
-@@ -1896,6 +2964,13 @@ again:
+@@ -1896,6 +2981,13 @@ again:
  	kmalloc_destroy_obj(&hmp->mchain);
  	kmalloc_destroy_obj(&hmp->mio);
  	kmalloc_destroy(&hmp->mmsg);
@@ -16602,7 +16876,7 @@ index 98c8467..39c612e 100644
  	kfree(hmp, M_HAMMER2);
  }
  
-@@ -2040,6 +3115,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2040,6 +3132,9 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statfs tmp;
@@ -16612,7 +16886,7 @@ index 98c8467..39c612e 100644
  	int i;
  
  	/*
-@@ -2060,17 +3138,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
+@@ -2060,17 +3155,23 @@ hammer2_vfs_statfs(struct mount *mp, struct statfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16641,7 +16915,7 @@ index 98c8467..39c612e 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2095,6 +3179,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2095,6 +3196,9 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  	hammer2_dev_t *hmp;
  	hammer2_blockref_t bref;
  	struct statvfs tmp;
@@ -16651,7 +16925,7 @@ index 98c8467..39c612e 100644
  	int i;
  
  	/*
-@@ -2114,17 +3201,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
+@@ -2114,17 +3218,23 @@ hammer2_vfs_statvfs(struct mount *mp, struct statvfs *sbp, struct ucred *cred)
  
  		tmp.f_files = bref.embed.stats.inode_count;
  		tmp.f_ffree = 0;
@@ -16680,7 +16954,7 @@ index 98c8467..39c612e 100644
  			tmp.f_blocks -= adj;
  			tmp.f_bfree -= adj;
  			tmp.f_bavail -= adj;
-@@ -2964,6 +4057,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2964,6 +4074,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		if (waiting > hammer2_limit_dirty_chains / 2 ||
  		    pmp->sideq_count > hammer2_limit_dirty_inodes / 2)
  		{
@@ -16688,7 +16962,7 @@ index 98c8467..39c612e 100644
  			trigger_syncer(pmp->mp);
  		}
  
-@@ -2979,6 +4073,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+@@ -2979,6 +4090,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
  		}
  
  		if (started == 0) {
@@ -16696,7 +16970,7 @@ index 98c8467..39c612e 100644
  			trigger_syncer_start(pmp->mp);
  			started = 1;
  		}
-@@ -3099,6 +4194,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
+@@ -3099,6 +4211,29 @@ hammer2_vfs_enospace(hammer2_inode_t *ip, off_t bytes, struct ucred *cred)
  			    pmp->pfs_types[i] != HAMMER2_PFSTYPE_SOFT_MASTER)
  				continue;
  
