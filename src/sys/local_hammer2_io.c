@@ -4726,9 +4726,23 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint32_t flags)
 	 */
 	error = 0;
 	if ((flags & HAMMER2_SCRUB_NOTREE) == 0) {
-		vsnap = hammer2_chain_bulksnap(hmp);
-		error = hammer2_scrub_walk(&ctx, vsnap);
-		hammer2_chain_bulkdrop(vsnap);
+		/*
+		 * The walk follows brefs of the snapshot.  A bulkfree that
+		 * runs meanwhile frees blocks the live tree dropped, and a
+		 * write can reuse them, so the walk would find another
+		 * block's data and call it bad and unrepairable.  Hold
+		 * bflock shared for the walk: a bulkfree waits (it takes it
+		 * exclusive, first, before any other lock, so there is no
+		 * order problem; the syncer and writers never take it).  The
+		 * parity pass does not need it, it checks the free epoch.
+		 */
+		error = lockmgr(&hmp->bflock, LK_SHARED | LK_PCATCH);
+		if (error == 0) {
+			vsnap = hammer2_chain_bulksnap(hmp);
+			error = hammer2_scrub_walk(&ctx, vsnap);
+			hammer2_chain_bulkdrop(vsnap);
+			lockmgr(&hmp->bflock, LK_RELEASE);
+		}
 	}
 	kfree(ctx.rbuf, M_HAMMER2);
 
