@@ -2412,18 +2412,22 @@ hammer2_raid6_open_row_pack_locked(hammer2_dev_t *hmp,
 		}
 		candidate = hammer2_raid6_pick_data_disk(hmp, r->p_disk,
 		    r->q_disk, failed_mask | r->alloc_mask);
-		if (candidate >= 0) {
-			r->alloc_mask |= (1U << candidate);
-			r->n_alloc++;
-			if (!hammer2_raid6_row_can_take(hmp, r)) {
-				TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
-				r->packable = 0;
-			}
-			*phys_off_out = r->phys_off;
-			*disk_idx_out = candidate;
-			*row_out = r;
-			return 1;
+		if (candidate < 0) {
+			/* every writable data disk is taken: the row is full */
+			TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+			r->packable = 0;
+			continue;
 		}
+		r->alloc_mask |= (1U << candidate);
+		r->n_alloc++;
+		if (!hammer2_raid6_row_can_take(hmp, r)) {
+			TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
+			r->packable = 0;
+		}
+		*phys_off_out = r->phys_off;
+		*disk_idx_out = candidate;
+		*row_out = r;
+		return 1;
 	}
 	return 0;
 }
@@ -3111,6 +3115,8 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 	hammer2_off_t phys_off;
 	hammer2_off_t pack_off;
 	int pack_disk_idx;
+	uint32_t failed_mask = 0;
+	int d, tries;
 
 	/*
 	 * 6C packing: try to land in an existing open row first so a row
@@ -3128,14 +3134,36 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 	}
 
 	/*
-	 * Next free data slot from the cursor, wrapping once.
+	 * Next free data slot from the cursor, wrapping once, with a data
+	 * disk that is not P, Q or failed (round-robin).  A failed disk
+	 * gets no data: a column there would only be rebuilt from parity
+	 * and discarded.  If P/Q of the slot leave no live data disk (two
+	 * data disks down), try the next slot: P/Q rotate, so one of any
+	 * ndisks slots has a live data disk unless too many are failed.
 	 */
+	for (d = 0; d < rc->ndisks; d++) {
+		if (hmp->raid_failed[d])
+			failed_mask |= 1U << d;
+	}
 	start = hmp->stripe_cursor;
 	if (start >= max_stripes)
 		start = 0;
-	if (!hammer2_raid6_find_free_slot(hmp, start, max_stripes, &slot) &&
-	    !hammer2_raid6_find_free_slot(hmp, 0, start, &slot))
-		return ENOSPC;
+	for (tries = 0; ; tries++) {
+		if (tries >= rc->ndisks)
+			return ENOSPC;
+		if (!hammer2_raid6_find_free_slot(hmp, start, max_stripes,
+		    &slot) &&
+		    !hammer2_raid6_find_free_slot(hmp, 0, start, &slot))
+			return ENOSPC;
+		hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
+		disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk,
+		    failed_mask);
+		if (disk_idx >= 0)
+			break;
+		start = slot + 1;
+		if (start >= max_stripes)
+			start = 0;
+	}
 	byte_idx = slot / 8;
 	bit_idx  = (int)(slot % 8);
 	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
@@ -3144,17 +3172,6 @@ hammer2_raid6_col_reserve_locked(hammer2_dev_t *hmp,
 		setbit(hmp->stripe_bf_new, slot);
 	hmp->stripe_cursor = slot + 1;
 
-	/*
-	 * Choose data disk (round-robin, skipping the P and Q disks for
-	 * this stripe).
-	 */
-	hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
-	disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk, 0);
-	if (disk_idx < 0) {
-		/* All disks are P or Q: can't happen for ndisks >= 4 */
-		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
-		return ENOSPC;
-	}
 	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
 	/*
 	 * Register the newly-allocated row so subsequent allocations
