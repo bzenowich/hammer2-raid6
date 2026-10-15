@@ -884,8 +884,9 @@ and windowed Phase A part is in `e098809`; this finishes the other two items.
 - **Results (h2dev, 4 disks, cold sequential read of 256 MB; before = 14e58d2, two runs):**
   | | before | after |
   |---|---|---|
-  | 1 failed | 120.2 / 119.1 MB/s, 1.99 / 2.03 member bytes per file byte | 195.4 MB/s, 1.76 (2 columns per row, 0 Q, 344 us per row) |
-  | 2 failed | 91.8 / 92.8 MB/s, 1.83 / 1.79 | 162.0 MB/s, 1.75 (Q read for 2492 of 3479 rows, 392 us per row) |
+  | 1 failed | 120.2 / 119.1 MB/s, 1.99 / 2.03 member bytes per file byte | 195.4 / 226.5 / 230.6 MB/s, 1.75-1.80 (2 columns per row, 0 Q, 260-340 us per row) |
+  | 2 failed | 91.8 / 92.8 MB/s, 1.83 / 1.79 | 162.0 / 163.1 / 169.5 MB/s, 1.75-1.95 (Q read for about 2500 of 3500 rows, 390-460 us per row) |
+  Full suite on the final build (groups X Z R G A B C D E F H I J K L N O P Q S T U V W Y, default async): **662 pass / 0 fail**; L D X A B with `ASYNC_SEAL=0`: 246 / 0. M was not run. G4 caught one mistake on the way: the preempt path's injected EIO used to be "healed" by the retry block that P7 removed, so injection is now skipped for a preempted dio.
   The Pi (USB, latency per member) should gain more from the parallel reads; A/B there with `P_ONLY=P8 sh test_p_perfshape.sh` (the INFO lines).
 
 ### P8. Allocator data structures [V2]
