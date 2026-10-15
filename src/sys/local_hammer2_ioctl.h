@@ -258,6 +258,7 @@ typedef struct hammer2_ioc_volume_list hammer2_ioc_volume_list_t;
 #define HAMMER2IOC_RAID_RESILVER_STATUS	_IOWR('h', 100, struct hammer2_ioc_resilver_status)
 #define HAMMER2IOC_RAID_SCRUB		_IOWR('h', 101, struct hammer2_ioc_raid_scrub)
 #define HAMMER2IOC_RAID_SCRUB_STATUS	_IOWR('h', 102, struct hammer2_ioc_raid_scrub)
+#define HAMMER2IOC_RAID_STATS		_IOWR('h', 103, struct hammer2_ioc_raid_stats)
 
 /*
  * Ioctl to query resilver progress.
@@ -321,5 +322,85 @@ struct hammer2_ioc_raid_scrub {
 #define HAMMER2_SCRUB_NOTREE	0x00000002	/* parity pass only */
 
 typedef struct hammer2_ioc_raid_scrub hammer2_ioc_raid_scrub_t;
+
+/*
+ * Ioctl to read (and optionally zero) the per-mount RAID6 I/O counters
+ * (oct-review.md S6).  Issue against any mounted path on the filesystem.
+ *
+ * version/size are filled in by the caller and checked by the kernel
+ * (EINVAL on a mismatch, with the kernel's own values written back), so
+ * a stale tool refuses instead of misreading.  The per-disk table is
+ * copied out to the user array `disks` (disks_max entries); the number
+ * of valid entries is ndisks.
+ *
+ * Counters are cumulative since mount.  Writes are counted when handed
+ * to the buffer cache or the device: a metadata block rewritten before
+ * the buffer cache flushes it counts each hand-over, so metadata write
+ * bytes can exceed what reaches the media.  Reads count only buffer
+ * cache misses.
+ */
+#define HAMMER2_RSTAT_VERSION	1
+
+/* I/O classes (index into the per-disk arrays) */
+#define HAMMER2_RSC_DATA	0	/* DATA/DIRENT column (primary) */
+#define HAMMER2_RSC_META	1	/* metadata block, primary copy */
+#define HAMMER2_RSC_P		2	/* P parity column */
+#define HAMMER2_RSC_Q		3	/* Q parity column */
+#define HAMMER2_RSC_ZERO	4	/* zero-fill of unused row columns */
+#define HAMMER2_RSC_MMIRROR	5	/* metadata mirror copies */
+#define HAMMER2_RSC_VOLHDR	6	/* volume header, space map */
+#define HAMMER2_RSC_RESILVER	7	/* resilver (rebuild) */
+#define HAMMER2_RSC_SCRUB	8	/* scrub reads/repairs */
+#define HAMMER2_RSC_DEGRADED	9	/* sibling reads to reconstruct */
+#define HAMMER2_RSC_SELFHEAL	10	/* read-path self-heal repair */
+#define HAMMER2_RSC_OTHER	11
+#define HAMMER2_RSC_NCLASS	12
+
+struct hammer2_raid_stat_disk {
+	uint64_t	rd_ops[HAMMER2_RSC_NCLASS];
+	uint64_t	rd_bytes[HAMMER2_RSC_NCLASS];
+	uint64_t	wr_ops[HAMMER2_RSC_NCLASS];
+	uint64_t	wr_bytes[HAMMER2_RSC_NCLASS];
+};
+
+typedef struct hammer2_raid_stat_disk hammer2_raid_stat_disk_t;
+
+#define HAMMER2_RSTAT_ZERO	0x00000001	/* in: zero after reading */
+
+struct hammer2_ioc_raid_stats {
+	uint32_t	version;	/* in/out: HAMMER2_RSTAT_VERSION */
+	uint32_t	size;		/* in/out: sizeof(this struct) */
+	uint32_t	flags;		/* in: HAMMER2_RSTAT_* */
+	uint32_t	ndisks;		/* out: disks in the array */
+	uint32_t	nclass;		/* out: HAMMER2_RSC_NCLASS */
+	uint32_t	disk_size;	/* in/out: sizeof(struct hammer2_raid_stat_disk) */
+	uint32_t	disks_max;	/* in: entries available in disks[] */
+	uint32_t	reserved0;
+	struct hammer2_raid_stat_disk *disks;	/* in: user array */
+
+	/*
+	 * Mount-wide counters
+	 */
+	uint64_t	new_preread;	/* media read under DOP_NEW/NEWNZ of
+					   DATA/DIRENT; must stay 0 */
+	uint64_t	new_preread_meta; /* same, metadata (can be legitimate) */
+	uint64_t	degraded_read_1; /* reconstructions with 1 erasure */
+	uint64_t	degraded_read_2; /* ... with 2 erasures */
+	uint64_t	selfheal_queued; /* repair writes queued */
+	uint64_t	selfheal_done;	/* repair writes completed */
+	uint64_t	selfheal_dropped; /* queue-full drops */
+	uint64_t	seal_full;	/* rows sealed when filled */
+	uint64_t	seal_flush;	/* rows sealed by a flush */
+	uint64_t	seal_partial;	/* ... of those with unused columns */
+	uint64_t	seal_reseal;	/* reserved: not counted yet */
+	uint64_t	seal_idle_warn;	/* reserved: not counted yet */
+	uint64_t	open_rows_cur;	/* rows open now */
+	uint64_t	open_rows_high;	/* peak open rows since mount */
+	uint64_t	resilver_slots_copied; /* slots rebuilt (data columns) */
+	uint64_t	resilver_slots_skipped; /* slots skipped (not allocated) */
+	uint64_t	spare[16];
+};
+
+typedef struct hammer2_ioc_raid_stats hammer2_ioc_raid_stats_t;
 
 #endif /* !_VFS_HAMMER2_IOCTL_H_ */

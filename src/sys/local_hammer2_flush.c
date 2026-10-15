@@ -1979,6 +1979,8 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch __unused, int clindex)
 					break;
 				}
 			}
+			HAMMER2_RSTAT_WR(hmp, mdi[k], HAMMER2_RSC_VOLHDR,
+					 bp->b_bcount);
 			if (hammer2_bwrite_start(bp, mdi[k]))
 				mbp[k] = bp;
 			else

@@ -11,6 +11,12 @@
  *	HAMMER2IOC_RAID_REPLACE — synchronous online resilver of <old>'s
  *	stripe positions onto <new>.  Same path for both args is the
  *	"reattach the same slot" case used by the test suite.
+ *   raid stats [-z] [-p] [<mountpoint>]
+ *	HAMMER2IOC_RAID_STATS — per-mount I/O counters: per-disk read and
+ *	write ops/bytes by class, row seal counts, new_preread, degraded
+ *	reads, self-heal queue, resilver slots.  -z zeroes the counters
+ *	after reading them (root).  -p prints one "name value" line per
+ *	counter for scripts instead of the table.
  *   raid scrub [-n] [-t | -p]
  *	HAMMER2IOC_RAID_SCRUB — walk every live DATA/DIRENT bref, verify
  *	the CHECK code, parity-repair on mismatch; then read every
@@ -80,6 +86,146 @@ raid_status(const char *sel_path)
 	printf("selfheal_writes: %llu done, %llu dropped\n",
 	       (unsigned long long)st.selfheal_writes_done,
 	       (unsigned long long)st.selfheal_writes_dropped);
+	return 0;
+}
+
+static const char *const rstat_cls[HAMMER2_RSC_NCLASS] = {
+	"data", "meta", "P", "Q", "zero", "mmirror", "volhdr",
+	"resilver", "scrub", "degraded", "selfheal", "other"
+};
+
+static void
+rstat_hum(char *buf, size_t len, uint64_t v)
+{
+	if (v >= (1ULL << 30))
+		snprintf(buf, len, "%.1fG", (double)v / (1 << 30));
+	else if (v >= (1ULL << 20))
+		snprintf(buf, len, "%.1fM", (double)v / (1 << 20));
+	else if (v >= (1ULL << 10))
+		snprintf(buf, len, "%.1fK", (double)v / (1 << 10));
+	else
+		snprintf(buf, len, "%llu", (unsigned long long)v);
+}
+
+static int
+raid_stats(const char *sel_path, int zero, int parse)
+{
+	struct hammer2_ioc_raid_stats st;
+	struct hammer2_raid_stat_disk *dk;
+	char b1[32], b2[32];
+	uint32_t i, c;
+	int fd;
+	int rc;
+	int w;
+
+	dk = calloc(HAMMER2_MAX_VOLUMES, sizeof(*dk));
+	if (dk == NULL) {
+		fprintf(stderr, "raid stats: out of memory\n");
+		return 1;
+	}
+	fd = hammer2_ioctl_handle(sel_path);
+	if (fd < 0) {
+		free(dk);
+		return 1;
+	}
+	bzero(&st, sizeof(st));
+	st.version = HAMMER2_RSTAT_VERSION;
+	st.size = sizeof(st);
+	st.disk_size = sizeof(*dk);
+	st.disks_max = HAMMER2_MAX_VOLUMES;
+	st.disks = dk;
+	st.flags = zero ? HAMMER2_RSTAT_ZERO : 0;
+	rc = ioctl(fd, HAMMER2IOC_RAID_STATS, &st);
+	close(fd);
+	if (rc < 0) {
+		if (errno == EINVAL)
+			fprintf(stderr, "raid stats: tool and kernel disagree "
+			    "(tool version %u size %zu, kernel version %u "
+			    "size %u): rebuild hammer2 and the module "
+			    "from the same tree\n", HAMMER2_RSTAT_VERSION,
+			    sizeof(st), st.version, st.size);
+		else
+			fprintf(stderr, "raid stats: %s\n", strerror(errno));
+		free(dk);
+		return 1;
+	}
+
+	if (parse) {
+		for (i = 0; i < st.ndisks; i++) {
+			for (c = 0; c < HAMMER2_RSC_NCLASS; c++) {
+				printf("rd_ops.%u.%s %llu\n", i, rstat_cls[c],
+				    (unsigned long long)dk[i].rd_ops[c]);
+				printf("rd_bytes.%u.%s %llu\n", i, rstat_cls[c],
+				    (unsigned long long)dk[i].rd_bytes[c]);
+				printf("wr_ops.%u.%s %llu\n", i, rstat_cls[c],
+				    (unsigned long long)dk[i].wr_ops[c]);
+				printf("wr_bytes.%u.%s %llu\n", i, rstat_cls[c],
+				    (unsigned long long)dk[i].wr_bytes[c]);
+			}
+		}
+#define P(f) printf(#f " %llu\n", (unsigned long long)st.f)
+		printf("ndisks %u\n", st.ndisks);
+		P(new_preread); P(new_preread_meta);
+		P(degraded_read_1); P(degraded_read_2);
+		P(selfheal_queued); P(selfheal_done); P(selfheal_dropped);
+		P(seal_full); P(seal_flush); P(seal_partial);
+		P(open_rows_cur); P(open_rows_high);
+		P(resilver_slots_copied); P(resilver_slots_skipped);
+#undef P
+		free(dk);
+		return 0;
+	}
+
+	for (w = 0; w < 2; w++) {
+		printf("%s (ops/bytes since %s)\n",
+		    w ? "writes" : "reads", zero ? "last zero" : "mount");
+		printf("%-5s", "disk");
+		for (c = 0; c < HAMMER2_RSC_NCLASS; c++)
+			printf(" %15s", rstat_cls[c]);
+		printf("\n");
+		for (i = 0; i < st.ndisks; i++) {
+			printf("%-5u", i);
+			for (c = 0; c < HAMMER2_RSC_NCLASS; c++) {
+				char cell[40];
+				uint64_t ops = w ? dk[i].wr_ops[c] :
+				    dk[i].rd_ops[c];
+				uint64_t by = w ? dk[i].wr_bytes[c] :
+				    dk[i].rd_bytes[c];
+
+				if (ops == 0) {
+					printf(" %15s", "-");
+					continue;
+				}
+				rstat_hum(b1, sizeof(b1), ops);
+				rstat_hum(b2, sizeof(b2), by);
+				snprintf(cell, sizeof(cell), "%s/%s", b1, b2);
+				printf(" %15s", cell);
+			}
+			printf("\n");
+		}
+		printf("\n");
+	}
+	printf("new_preread:       %llu   (must stay 0; metadata: %llu)\n",
+	    (unsigned long long)st.new_preread,
+	    (unsigned long long)st.new_preread_meta);
+	printf("degraded_read:     1 erasure %llu, 2 erasures %llu\n",
+	    (unsigned long long)st.degraded_read_1,
+	    (unsigned long long)st.degraded_read_2);
+	printf("selfheal:          queued %llu, done %llu, dropped %llu\n",
+	    (unsigned long long)st.selfheal_queued,
+	    (unsigned long long)st.selfheal_done,
+	    (unsigned long long)st.selfheal_dropped);
+	printf("row seals:         full %llu, flush %llu (partial %llu)\n",
+	    (unsigned long long)st.seal_full,
+	    (unsigned long long)st.seal_flush,
+	    (unsigned long long)st.seal_partial);
+	printf("open rows:         now %llu, peak %llu\n",
+	    (unsigned long long)st.open_rows_cur,
+	    (unsigned long long)st.open_rows_high);
+	printf("resilver slots:    copied %llu, skipped %llu\n",
+	    (unsigned long long)st.resilver_slots_copied,
+	    (unsigned long long)st.resilver_slots_skipped);
+	free(dk);
 	return 0;
 }
 
@@ -296,13 +442,32 @@ cmd_raid(const char *sel_path, int ac, const char **av)
 {
 	if (ac < 1) {
 		fprintf(stderr,
-		    "raid: subcommand required (status|fail-disk|replace|scrub)\n");
+		    "raid: subcommand required (status|stats|fail-disk|replace|scrub)\n");
 		return 1;
 	}
 	if (strcmp(av[0], "status") == 0) {
 		/* Optional positional path overrides -s sel_path. */
 		const char *path = (ac >= 2) ? av[1] : sel_path;
 		return raid_status(path);
+	} else if (strcmp(av[0], "stats") == 0) {
+		const char *path = sel_path;
+		int zero = 0, parse = 0;
+		int i;
+
+		for (i = 1; i < ac; i++) {
+			if (strcmp(av[i], "-z") == 0) {
+				zero = 1;
+			} else if (strcmp(av[i], "-p") == 0) {
+				parse = 1;
+			} else if (av[i][0] != '-' && i == ac - 1) {
+				path = av[i];
+			} else {
+				fprintf(stderr, "raid stats: usage: "
+				    "stats [-z] [-p] [<mountpoint>]\n");
+				return 1;
+			}
+		}
+		return raid_stats(path, zero, parse);
 	} else if (strcmp(av[0], "fail-disk") == 0) {
 		if (ac != 2) {
 			fprintf(stderr, "raid fail-disk: requires <dev>\n");

@@ -1439,6 +1439,21 @@ struct hammer2_dev {
 	volatile uint64_t raid_cksum_errors[HAMMER2_MAX_VOLUMES];
 	volatile uint64_t raid_cksum_healed[HAMMER2_MAX_VOLUMES];
 	volatile uint64_t raid_cksum_unrepairable[HAMMER2_MAX_VOLUMES];
+
+	/*
+	 * Per-mount RAID6 I/O statistics (HAMMER2IOC_RAID_STATS, oct-review
+	 * S6).  atomic_add_64 at the I/O sites; see hammer2_rstat_io().
+	 */
+	struct hammer2_raid_stat_disk rs_disk[HAMMER2_MAX_VOLUMES];
+	volatile uint64_t rs_new_preread;
+	volatile uint64_t rs_new_preread_meta;
+	volatile uint64_t rs_degraded_read[2];
+	volatile uint64_t rs_selfheal_queued;
+	volatile uint64_t rs_seal_full;
+	volatile uint64_t rs_seal_flush;
+	volatile uint64_t rs_seal_partial;
+	volatile uint64_t rs_resilver_copied;
+	volatile uint64_t rs_resilver_skipped;
 };
 
 typedef struct hammer2_dev hammer2_dev_t;
@@ -2284,6 +2299,30 @@ void hammer2_raid6_datap_recov(int ndisks, size_t bytes,
 		int faila, void **ptrs);
 void hammer2_raid6_dual_recov(int ndisks, size_t bytes,
 		int faila, int failb, void **ptrs);
+/*
+ * Per-mount I/O accounting: wr = 0 read, 1 write.  cls is HAMMER2_RSC_*.
+ */
+static __inline void
+hammer2_rstat_io(hammer2_dev_t *hmp, int disk, int cls, int wr, size_t bytes)
+{
+	struct hammer2_raid_stat_disk *d;
+
+	if ((u_int)disk >= HAMMER2_MAX_VOLUMES)
+		return;
+	d = &hmp->rs_disk[disk];
+	if (wr) {
+		atomic_add_64(&d->wr_ops[cls], 1);
+		atomic_add_64(&d->wr_bytes[cls], bytes);
+	} else {
+		atomic_add_64(&d->rd_ops[cls], 1);
+		atomic_add_64(&d->rd_bytes[cls], bytes);
+	}
+}
+#define HAMMER2_RSTAT_RD(hmp, disk, cls, bytes) \
+	hammer2_rstat_io((hmp), (disk), (cls), 0, (bytes))
+#define HAMMER2_RSTAT_WR(hmp, disk, cls, bytes) \
+	hammer2_rstat_io((hmp), (disk), (cls), 1, (bytes))
+
 int hammer2_bwrite_start(struct buf *bp, int disk_idx);
 int hammer2_bwrite_wait(struct buf *bp);
 int hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int primary,
@@ -2296,10 +2335,10 @@ int hammer2_io_metadata_mirror_read(hammer2_dev_t *hmp, int skip_disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes);
 int hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
 				   struct vnode *devvp, off_t off,
-		void *dst, int bytes, int nocache);
+		void *dst, int bytes, int nocache, int cls);
 int hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 				  struct vnode *devvp, off_t off,
-		void *dst, int bytes, int nocache);
+		void *dst, int bytes, int nocache, int cls);
 int hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t per_disk_off, void *buf, size_t bytes, int block);
 int hammer2_io_metadata_read_disk(hammer2_dev_t *hmp, int primary,
@@ -2451,6 +2490,7 @@ struct hammer2_repair_req {
 	int		chk_off;	/* verified range within buffer */
 	int		chk_len;	/* 0 = no stale-slot check */
 	uint64_t	chk_hash;	/* XXH64 of that range, as found bad */
+	int		cls;		/* HAMMER2_RSC_* for the statistics */
 };
 
 typedef struct hammer2_repair_req hammer2_repair_req_t;
@@ -2465,6 +2505,10 @@ void hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 		hammer2_off_t base, int bufsize, int patch_off,
 		int patch_len, char *data, int chk_off, int chk_len,
 		uint64_t chk_hash);
+void hammer2_io_repair_enqueue_cls(hammer2_dev_t *hmp, int disk_idx,
+		hammer2_off_t base, int bufsize, int patch_off,
+		int patch_len, char *data, int chk_off, int chk_len,
+		uint64_t chk_hash, int cls);
 uint64_t hammer2_io_repair_hash(const void *data, size_t bytes);
 int hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		int alt_disk_idx,

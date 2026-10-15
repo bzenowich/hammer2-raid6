@@ -78,6 +78,8 @@ static int hammer2_ioctl_raid_scrub(hammer2_inode_t *ip, void *data);
 static int hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
 			int (*func)(hammer2_inode_t *, void *));
 static int hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data);
+static int hammer2_ioctl_raid_stats(hammer2_inode_t *ip, void *data,
+			struct ucred *cred);
 
 int
 hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
@@ -196,6 +198,10 @@ hammer2_ioctl(hammer2_inode_t *ip, u_long com, void *data, int fflag,
 	case HAMMER2IOC_RAID_SCRUB_STATUS:
 		/* No privilege required — read-only status query */
 		error = hammer2_ioctl_raid_scrub_status(ip, data);
+		break;
+	case HAMMER2IOC_RAID_STATS:
+		/* reading needs no privilege; zeroing is checked inside */
+		error = hammer2_ioctl_raid_stats(ip, data, cred);
 		break;
 	case FIOSEEKDATA:
 	case FIOSEEKHOLE:
@@ -2046,5 +2052,92 @@ hammer2_ioctl_raid_scrub_status(hammer2_inode_t *ip, void *data)
 	rs->parity_repaired	= hmp->scrub_parity_repaired;
 	rs->parity_unlocatable	= hmp->scrub_parity_unlocatable;
 	rs->rows_skipped	= hmp->scrub_rows_skipped;
+	return 0;
+}
+
+/*
+ * HAMMER2IOC_RAID_STATS: return the per-mount I/O counters (oct-review S6).
+ * Read-only unless HAMMER2_RSTAT_ZERO is set, which needs the same
+ * privilege as the other mutating ioctls.  Zeroing subtracts what was
+ * read, so a concurrent increment is never lost.
+ */
+#define RSTAT_TAKE(ctr, zero)	({					\
+	uint64_t _v = (ctr);						\
+	if (zero)							\
+		atomic_add_64(&(ctr), (uint64_t)0 - _v);		\
+	_v; })
+
+static int
+hammer2_ioctl_raid_stats(hammer2_inode_t *ip, void *data, struct ucred *cred)
+{
+	hammer2_ioc_raid_stats_t *st = data;
+	hammer2_dev_t *hmp;
+	struct hammer2_raid_stat_disk *tmp;
+	uint32_t n, i, c;
+	int zero;
+	int error = 0;
+
+	hmp = ip->pmp->pfs_hmps[0];
+	if (hmp == NULL)
+		return EINVAL;
+	if (hmp->raid_type != HAMMER2_RAID_TYPE_RAID6)
+		return ENOTSUP;
+	if (st->version != HAMMER2_RSTAT_VERSION ||
+	    st->size != sizeof(*st) ||
+	    st->disk_size != sizeof(struct hammer2_raid_stat_disk)) {
+		/* tell the tool what this kernel speaks */
+		st->version = HAMMER2_RSTAT_VERSION;
+		st->size = sizeof(*st);
+		st->disk_size = sizeof(struct hammer2_raid_stat_disk);
+		return EINVAL;
+	}
+	zero = (st->flags & HAMMER2_RSTAT_ZERO) != 0;
+	if (zero) {
+		error = caps_priv_check(cred, SYSCAP_NOVFS_IOCTL);
+		if (error)
+			return error;
+	}
+	n = hmp->raid_config.ndisks;
+	if (n > HAMMER2_MAX_VOLUMES)
+		n = HAMMER2_MAX_VOLUMES;
+	if (st->disks_max < n || st->disks == NULL)
+		return ENOSPC;
+
+	tmp = kmalloc(sizeof(*tmp) * n, M_HAMMER2, M_WAITOK | M_ZERO);
+	for (i = 0; i < n; i++) {
+		struct hammer2_raid_stat_disk *d = &hmp->rs_disk[i];
+
+		for (c = 0; c < HAMMER2_RSC_NCLASS; c++) {
+			tmp[i].rd_ops[c] = RSTAT_TAKE(d->rd_ops[c], zero);
+			tmp[i].rd_bytes[c] = RSTAT_TAKE(d->rd_bytes[c], zero);
+			tmp[i].wr_ops[c] = RSTAT_TAKE(d->wr_ops[c], zero);
+			tmp[i].wr_bytes[c] = RSTAT_TAKE(d->wr_bytes[c], zero);
+		}
+	}
+	error = copyout(tmp, st->disks, sizeof(*tmp) * n);
+	kfree(tmp, M_HAMMER2);
+	if (error)
+		return error;
+
+	st->ndisks = n;
+	st->nclass = HAMMER2_RSC_NCLASS;
+	st->new_preread = RSTAT_TAKE(hmp->rs_new_preread, zero);
+	st->new_preread_meta = RSTAT_TAKE(hmp->rs_new_preread_meta, zero);
+	st->degraded_read_1 = RSTAT_TAKE(hmp->rs_degraded_read[0], zero);
+	st->degraded_read_2 = RSTAT_TAKE(hmp->rs_degraded_read[1], zero);
+	st->selfheal_queued = RSTAT_TAKE(hmp->rs_selfheal_queued, zero);
+	st->selfheal_done = hmp->repair_writes_done;
+	st->selfheal_dropped = hmp->repair_writes_dropped;
+	st->seal_full = RSTAT_TAKE(hmp->rs_seal_full, zero);
+	st->seal_flush = RSTAT_TAKE(hmp->rs_seal_flush, zero);
+	st->seal_partial = RSTAT_TAKE(hmp->rs_seal_partial, zero);
+	st->seal_reseal = 0;
+	st->seal_idle_warn = 0;
+	st->open_rows_cur = hmp->open_rows_count;
+	st->open_rows_high = hmp->open_rows_high;
+	st->resilver_slots_copied = RSTAT_TAKE(hmp->rs_resilver_copied, zero);
+	st->resilver_slots_skipped = RSTAT_TAKE(hmp->rs_resilver_skipped, zero);
+	if (zero)
+		hmp->open_rows_high = hmp->open_rows_count;
 	return 0;
 }
