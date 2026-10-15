@@ -79,15 +79,21 @@ if [ -n "$DBG" ]; then
     make DEBUG_FLAGS="$DBG"
     echo "    (built with $DBG)"
 else
+    # No header dependencies without .depend: a changed struct in
+    # hammer2.h would leave stale objects with the old layout (P10b's
+    # 2026-10-15 panic).  mkdep is cheap; run it every time.
+    make depend > /dev/null
     make
 fi
 
 echo "--- newfs_hammer2 ---"
 cd /usr/src/sbin/newfs_hammer2
+make depend > /dev/null
 make
 
 echo "--- hammer2 utility ---"
 cd /usr/src/sbin/hammer2
+make depend > /dev/null
 make
 
 echo "--- Build complete ---"
