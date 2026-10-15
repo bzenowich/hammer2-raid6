@@ -2442,6 +2442,7 @@ typedef struct hammer2_raid6_row {
 	uint64_t	have;
 	uint64_t	erased;
 	hammer2_off_t	phys_off;
+	struct timespec	t0;
 	size_t		su;
 	int		ndisks;
 	int		ndata;

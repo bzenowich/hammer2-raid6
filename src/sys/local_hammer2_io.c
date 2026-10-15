@@ -2450,6 +2450,8 @@ hammer2_raid6_row_init(hammer2_dev_t *hmp, hammer2_raid6_row_t *row,
 	int d, col, di;
 
 	bzero(row, sizeof(*row));
+	nanouptime(&row->t0);
+	atomic_add_long(&hammer2_dr_reads, 1);
 	row->hmp = hmp;
 	row->su = rc->stripe_unit;
 	row->ndisks = rc->ndisks;
@@ -2490,9 +2492,14 @@ void
 hammer2_raid6_row_done(hammer2_raid6_row_t *row)
 {
 	hammer2_dev_t *hmp = row->hmp;
+	struct timespec ts;
 
 	if (row->mem == NULL)
 		return;
+	nanouptime(&ts);
+	atomic_add_long(&hammer2_dr_ns,
+	    (long)((ts.tv_sec - row->t0.tv_sec) * 1000000000L +
+		   (ts.tv_nsec - row->t0.tv_nsec)));
 	if (hmp->rowpool_inited) {
 		hammer2_spin_ex(&hmp->rowpool_spin);
 		if (hmp->rowpool_n < HAMMER2_ROWPOOL_MAX) {
@@ -2741,7 +2748,6 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 				 void *extra_buf)
 {
 	hammer2_raid6_row_t row;
-	struct timespec ts1, ts2;
 	int tgt_col, ext_col = -1;
 	int error;
 
@@ -2764,7 +2770,6 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 	 * hammer2_disk.h).  All columns in the same stripe slot share the
 	 * same per-disk physical offset.
 	 */
-	nanouptime(&ts1);
 	hammer2_raid6_row_init(hmp, &row,
 	    logical_off & HAMMER2_RAID6_PHYS_MASK &
 	    ~(hammer2_off_t)(bytes - 1));
@@ -2778,11 +2783,6 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 			bcopy(row.ptrs[ext_col], extra_buf, bytes);
 	}
 	hammer2_raid6_row_done(&row);
-	nanouptime(&ts2);
-	atomic_add_long(&hammer2_dr_reads, 1);
-	atomic_add_long(&hammer2_dr_ns,
-	    (long)((ts2.tv_sec - ts1.tv_sec) * 1000000000L +
-		   (ts2.tv_nsec - ts1.tv_nsec)));
 	return error;
 }
 
