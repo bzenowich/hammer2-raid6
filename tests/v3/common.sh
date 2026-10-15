@@ -259,6 +259,109 @@ check_no_checkfail() {
     return 0
 }
 
+# ---------------------------------------------------------------------
+# Parity check after every array (oct-review 0.2, 0.7 item 1).
+#
+# RAID6 reads stay correct whatever P/Q hold (checksums plus self-heal),
+# so bad parity shows only at a second failure.  This is the analogue of
+# md's "check, mismatch_cnt == 0": h2stripe_check reads the UNMOUNTED
+# members, takes the allocated rows from the committed space map,
+# recomputes P and Q of every row and compares; it also requires every
+# ONLINE member's newest volume header sequence to match.  A disk the
+# committed header does not call ONLINE is left out, and rows with one
+# column missing are still verified (data column rebuilt from P, checked
+# against Q).  A mismatch is a counted FAIL naming the row and disk.
+#
+# When it runs: at the end of the group (summary) and before each
+# setup_fresh replaces the array of the previous test, so every array a
+# group builds is checked once, in the state the test left it.  Unmount
+# is the quiescent point: it flushes and drains the async seal, so every
+# sealed row is on disk.
+#
+#   PARITY_CHECK=0  off     1  end of group only     2  (default) also
+#                              before each setup_fresh
+#   parity_skip "why"   for a test that leaves media deliberately
+#                       corrupt: skip this array, annotated, never silent
+#   parity_check label  explicit check (unmounts the array)
+#
+# The time spent is summed and printed by summary().
+_PARITY_DIRTY=0
+_PARITY_SKIP=
+_PARITY_RUNS=0
+_PARITY_ROWS=0
+_PARITY_SECS=0
+_PARITY_SKIPS=0
+
+if [ -x /root/h2diag/h2stripe_check ]; then
+    H2CHECK=/root/h2diag/h2stripe_check
+elif command -v h2stripe_check > /dev/null 2>&1; then
+    H2CHECK=h2stripe_check
+else
+    H2CHECK=$(find /usr/local/bin /usr/bin /root /var/tmp -name h2stripe_check 2>/dev/null | head -1)
+fi
+
+parity_skip() {
+    _PARITY_SKIP="$1"
+}
+
+# parity_unmount_all: unmount every mount of this array (the test mount,
+# snapshot mounts).  Returns 1 when something stays mounted.
+parity_unmount_all() {
+    local dev0 mp n=0
+    dev0=$(disk_dev 0)
+    while [ "$n" -lt 8 ]; do
+        mp=$(mount | awk -v d="$dev0" 'index($1, d) == 1 && substr($1, length(d) + 1, 1) !~ /[0-9a-z]/ { print $3; exit }')
+        [ -n "$mp" ] || return 0
+        umount "$mp" 2>/dev/null || umount -f "$mp" 2>/dev/null || return 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+parity_check() {
+    local label="$1" out=/var/tmp/v3_parity.txt rc t0 rows el nerr
+    [ "${PARITY_CHECK:-2}" != 0 ] || return 0
+    [ "$_PARITY_DIRTY" = 1 ] || return 0
+    if [ -n "$_PARITY_SKIP" ]; then
+        echo "  NOTE: parity check skipped ($label): $_PARITY_SKIP"
+        _PARITY_SKIPS=$((_PARITY_SKIPS + 1))
+        _PARITY_DIRTY=0
+        _PARITY_SKIP=
+        return 0
+    fi
+    _PARITY_DIRTY=0
+    if [ -z "$H2CHECK" ]; then
+        result FAIL "$label: parity check: h2stripe_check not installed (deploy.sh builds it)"
+        return 1
+    fi
+    if ! parity_unmount_all; then
+        echo "  NOTE: parity check skipped ($label): array would not unmount"
+        _PARITY_SKIPS=$((_PARITY_SKIPS + 1))
+        return 0
+    fi
+    t0=$(date +%s)
+    # shellcheck disable=SC2086
+    $H2CHECK $DEVS > $out 2>&1
+    rc=$?
+    _PARITY_SECS=$((_PARITY_SECS + $(date +%s) - t0))
+    _PARITY_RUNS=$((_PARITY_RUNS + 1))
+    rows=$(awk -F: '/Allocated slots checked/ { print $2 + 0 }' $out)
+    el=$(awk -F: '/^Elapsed/ { print $2 + 0 }' $out)
+    _PARITY_ROWS=$((_PARITY_ROWS + ${rows:-0}))
+    if [ "$rc" = 0 ]; then
+        echo "  parity ok ($label): ${rows:-0} rows, ${el:-?}s"
+        return 0
+    fi
+    nerr=$(grep -cE "PARITY_ERROR|HDR_ERROR|READ_ERROR" $out)
+    if [ "${nerr:-0}" = 0 ]; then
+        result FAIL "$label: parity check could not run (rc=$rc): $(grep -v '^$' $out | tail -1)"
+    else
+        result FAIL "$label: parity check: $nerr bad (first: $(grep -E 'PARITY_ERROR|HDR_ERROR|READ_ERROR' $out | head -1))"
+    fi
+    grep -E "PARITY_ERROR|HDR_ERROR|READ_ERROR|^open|^No |rror|space map" $out | head -20 | sed 's/^/      /'
+    return 1
+}
+
 # setup_fresh [size]: new array.  With a size (2g, say) it is built from
 # that much of each disk (newfs_hammer2 -s, one size per disk) instead of
 # the whole device; "full" forces the whole device.  Without an argument
@@ -277,6 +380,7 @@ fresh_size_opt() {
 }
 
 setup_fresh() {
+    [ "${PARITY_CHECK:-2}" -ge 2 ] && parity_check "array before setup_fresh"
     umount $MNTPT 2>/dev/null || true
     local newfs_ok=0
     local attempt=0
@@ -325,6 +429,8 @@ setup_fresh() {
         exit 1
     fi
     kmsg_clear
+    _PARITY_DIRTY=1
+    _PARITY_SKIP=
 }
 
 teardown() {
@@ -376,6 +482,10 @@ rz_stats() {
 }
 
 summary() {
+    parity_check "end of group"
+    if [ "$_PARITY_RUNS" != 0 ] || [ "$_PARITY_SKIPS" != 0 ]; then
+        echo "parity check: $_PARITY_RUNS runs, $_PARITY_ROWS rows, ${_PARITY_SECS}s, $_PARITY_SKIPS skipped"
+    fi
     rz_stats
     echo "========================================="
     echo "=== $PASS/$TOTAL PASS, $FAIL FAIL ==="

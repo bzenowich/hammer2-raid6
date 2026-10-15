@@ -160,12 +160,14 @@ do_tests() {
     tar -C "$DIR/src" -cf - diag | ssh $VM_SSH_OPTS "$VM" tar -xf - -C /root/h2diag --strip-components=1
     echo "    Diagnostics synced to /root/h2diag/"
 
-    # F2 and R need h2stripe_check; build it when missing or stale.
+    # the tests (every group, via tests/v3/common.sh) need h2stripe_check; build it when missing or stale.
     ssh $VM_SSH_OPTS "$VM" sh <<'ENDSSH'
 cd /root/h2diag
-if [ ! -x h2stripe_check ] || [ h2stripe_check.c -nt h2stripe_check ]; then
+# always rebuild: /root/h2diag is shared by every worktree that deploys, and
+# tar keeps source mtimes, so a stale binary can look newer than the source
+if true; then
     echo "==> Building h2stripe_check"
-    cc -O2 -o h2stripe_check h2stripe_check.c || echo "    WARNING: h2stripe_check build failed (F2/R will fail)"
+    cc -O2 -o h2stripe_check h2stripe_check.c || echo "    WARNING: h2stripe_check build failed (every group will report a failure)"
 fi
 ENDSSH
 }

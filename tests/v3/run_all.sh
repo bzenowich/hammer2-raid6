@@ -24,6 +24,9 @@
 #
 # Environment:
 #   NDISKS=4         (default) number of disks; supports 4-6
+#   PARITY_CHECK=2   h2stripe_check on the unmounted members after every
+#                    array a group builds: 0 off, 1 end of group only,
+#                    2 (default) also before each setup_fresh
 
 NDISKS="${NDISKS:-4}"
 export NDISKS
@@ -49,6 +52,12 @@ run_group() {
     cat "$tmpout"
     echo "=== $name time: $(( $(date +%s) - t0 ))s ==="
     GROUP_TIMES="${GROUP_TIMES} ${name#Group }=$(( $(date +%s) - t0 ))s"
+    # Parity check cost, from the "parity check: N runs, R rows, Ts, ..." line.
+    local pc
+    pc=$(grep "^parity check: " "$tmpout" | tail -1)
+    if [ -n "$pc" ]; then
+        PARITY_TIMES="${PARITY_TIMES} ${name#Group }=$(echo "$pc" | sed 's/^parity check: [0-9]* runs, [0-9]* rows, \([0-9]*\)s.*/\1/')s"
+    fi
     # Parse PASS/FAIL counts from summary line (e.g. "=== 4/5 PASS, 1 FAIL ===")
     local pass fail
     pass=$(grep "^=== " "$tmpout" | grep -oE '[0-9]+/[0-9]+' | cut -d/ -f1)
@@ -110,6 +119,7 @@ echo "  v3 RAIDZ2-native Integration Test Suite"
 echo "  NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
 echo "  Group times:$GROUP_TIMES"
+echo "  Parity check time (PARITY_CHECK=${PARITY_CHECK:-2}):${PARITY_TIMES:- none}"
 echo "========================================="
 if [ -n "$SUITE_ERRORS" ]; then
     printf "Groups with failures:\n%b" "$SUITE_ERRORS"

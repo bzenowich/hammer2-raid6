@@ -19,6 +19,15 @@
  *
  * The number of devices must match the ndisks value in the volume header.
  *
+ * A disk the newest volume header does not call ONLINE is "missing".  With
+ * one missing column in a row the row is still checked: a missing data
+ * column is rebuilt from P and must then agree with Q; a missing P or Q
+ * leaves the other to check the data.  Two missing columns cannot be
+ * checked and are counted as degraded.  A mismatch is localised to a
+ * column with the syndrome when all columns are present.  The newest
+ * volume header sequence (rz_txg_seq) of every ONLINE disk must also equal
+ * the array's newest (HDR_ERROR otherwise).
+ *
  * Compile on DragonFlyBSD:
  *   gcc -O2 -o h2stripe_check h2stripe_check.c
  *
@@ -36,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 /* -------------------------------------------------------------------------
  * HAMMER2 on-disk constants (replicated from hammer2_disk.h to avoid kernel
@@ -108,6 +118,7 @@
 #define RAIDCFG_FLAGS_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x04)	/* uint32_t */
 #define RAIDCFG_STRIPE_UNIT_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x08)	/* uint64_t */
 #define RAIDCFG_DISK_STATE_OFF	(VOLHDR_RAID_CONFIG_OFF + 0x18)	/* uint8_t[64] */
+#define RAIDCFG_RZ_TXG_SEQ_OFF	0x0658		/* uint64_t */
 #define RAIDCFG_RZ_LAYOUT_OFF	0x0700		/* uint32_t */
 #define RAIDCFG_RZ_SM_PAGES_OFF	0x0704		/* uint32_t */
 #define RAIDCFG_RZ_NUM_SLOTS_OFF 0x0708		/* uint64_t */
@@ -180,6 +191,9 @@ gf_mul(uint8_t a, uint8_t b)
 static int	fds[MAX_DISKS];
 static char    *disk_paths[MAX_DISKS];
 static int	disk_state[MAX_DISKS];	/* HAMMER2_RAID6_DISK_* */
+static int	hdr_valid[MAX_DISKS];	/* disk has a valid volume header */
+static uint64_t	hdr_seq[MAX_DISKS];	/* its newest rz_txg_seq */
+static uint64_t	hdr_seq_best;		/* newest rz_txg_seq on any disk */
 static int	ndisks_arg;		/* number of disk paths given on cmdline */
 
 /* -------------------------------------------------------------------------
@@ -220,7 +234,7 @@ disk_read(int disk, uint64_t off, void *buf, size_t len)
  * ------------------------------------------------------------------------- */
 
 /*
- * Read the volume header from disk 0 (the root volume) and populate:
+ * Read the newest volume header of the array (from any disk) and populate:
  *   *ndisks_out, *ndata_out, *stripe_unit_out, disk_state[]
  *
  * Returns 0 on success, -1 on failure.
@@ -233,34 +247,54 @@ read_volhdr(int *ndisks_out, int *ndata_out, uint64_t *stripe_unit_out)
 	static uint8_t buf[HAMMER2_PBUFSIZE];
 	uint64_t magic;
 	uint64_t tid;
-	uint64_t best_tid = 0;
+	uint64_t best_tid = 0, seq, best_seq = 0;
 	uint32_t version;
 	uint8_t  raid_type, nd, ndat;
 	uint64_t su;
 	int      best = -1;
-	int      i;
+	int      i, d;
 
 	/*
-	 * Flushes rotate through the volume header copies; the one with
-	 * the highest mirror_tid is current.
+	 * Flushes rotate through the volume header copies of every disk;
+	 * on each disk the one with the highest (rz_txg_seq, mirror_tid)
+	 * is current.  The array's header is the newest of those; the
+	 * per-disk newest sequence is kept for the consistency check.
 	 */
-	for (i = 0; i < HAMMER2_NUM_VOLHDRS; i++) {
-		if (fds[0] < 0 ||
-		    pread(fds[0], buf, HAMMER2_PBUFSIZE,
-			  (off_t)i * HAMMER2_ZONE_BYTES64) != HAMMER2_PBUFSIZE)
-			break;
-		memcpy(&magic, buf + VOLHDR_MAGIC_OFF, 8);
-		memcpy(&tid, buf + VOLHDR_MIRROR_TID_OFF, 8);
-		if (magic != HAMMER2_VOLUME_ID_HBO)
+	for (d = 0; d < ndisks_arg; d++) {
+		uint64_t dseq = 0, dtid = 0;
+		int dvalid = 0;
+
+		if (fds[d] < 0)
 			continue;
-		if (best < 0 || tid > best_tid) {
-			best = i;
-			best_tid = tid;
-			memcpy(volhdr, buf, HAMMER2_PBUFSIZE);
+		for (i = 0; i < HAMMER2_NUM_VOLHDRS; i++) {
+			if (pread(fds[d], buf, HAMMER2_PBUFSIZE,
+			    (off_t)i * HAMMER2_ZONE_BYTES64) != HAMMER2_PBUFSIZE)
+				break;
+			memcpy(&magic, buf + VOLHDR_MAGIC_OFF, 8);
+			if (magic != HAMMER2_VOLUME_ID_HBO)
+				continue;
+			memcpy(&tid, buf + VOLHDR_MIRROR_TID_OFF, 8);
+			memcpy(&seq, buf + RAIDCFG_RZ_TXG_SEQ_OFF, 8);
+			if (!dvalid || seq > dseq ||
+			    (seq == dseq && tid > dtid)) {
+				dvalid = 1;
+				dseq = seq;
+				dtid = tid;
+			}
+			if (best < 0 || seq > best_seq ||
+			    (seq == best_seq && tid > best_tid)) {
+				best = d;
+				best_seq = seq;
+				best_tid = tid;
+				memcpy(volhdr, buf, HAMMER2_PBUFSIZE);
+			}
 		}
+		hdr_valid[d] = dvalid;
+		hdr_seq[d] = dseq;
 	}
+	hdr_seq_best = best_seq;
 	if (best < 0) {
-		fprintf(stderr, "No valid volume header on disk 0\n");
+		fprintf(stderr, "No valid volume header on any disk\n");
 		return -1;
 	}
 
@@ -399,6 +433,30 @@ read_space_map(int ndisks, uint64_t *nslots_out)
 		if (pg == npages)
 			break;
 	}
+	if (d == ndisks) {
+		/* say what each disk's copy holds, for the bug report */
+		for (d = 0; d < ndisks; d++) {
+			if (disk_state[d] != HAMMER2_RAID6_DISK_ONLINE)
+				continue;
+			if (disk_read(d, base, hdr, HAMMER2_PBUFSIZE) < 0) {
+				fprintf(stderr, "  disk%d: space map header "
+				    "unreadable\n", d);
+				continue;
+			}
+			memcpy(&magic, hdr + SMHDR_MAGIC_OFF, 8);
+			memcpy(&hslots, hdr + SMHDR_NUM_SLOTS_OFF, 8);
+			memcpy(&hgen, hdr + SMHDR_GENERATION_OFF, 8);
+			memcpy(&hpages, hdr + SMHDR_NPAGES_OFF, 4);
+			fprintf(stderr, "  disk%d: space map copy magic %s "
+			    "gen %llu slots %llu pages %u (want gen %llu "
+			    "slots %llu pages %u)\n", d,
+			    magic == HAMMER2_SM_MAGIC ? "ok" : "BAD",
+			    (unsigned long long)hgen,
+			    (unsigned long long)hslots, hpages,
+			    (unsigned long long)gen,
+			    (unsigned long long)nslots, npages);
+		}
+	}
 	free(hdr);
 	if (d == ndisks) {
 		fprintf(stderr, "No disk has space map generation %llu "
@@ -477,6 +535,18 @@ stripe_col_map(uint64_t slot, int ndisks, int ndata,
  *
  * This matches hammer2_raid6_gen_syndrome() in the kernel.
  */
+static inline uint64_t
+mul2_swar(uint64_t v)
+{
+	return ((v & 0x7f7f7f7f7f7f7f7fULL) << 1) ^
+	    (((v >> 7) & 0x0101010101010101ULL) * HAMMER2_RAID6_POLY);
+}
+
+/*
+ * Q by Horner's rule, eight bytes at a time: Q = (((d[n-1])*2 ^ d[n-2])*2
+ * ... ^ d[0]), which is the XOR of 2^col * d[col].  stripe_unit is a
+ * multiple of 8.
+ */
 static void
 gen_syndrome(int ndata, size_t stripe_unit,
     uint8_t *ptrs[], uint8_t *p_out, uint8_t *q_out)
@@ -484,15 +554,16 @@ gen_syndrome(int ndata, size_t stripe_unit,
 	size_t d;
 	int    col;
 
-	memset(p_out, 0, stripe_unit);
-	memset(q_out, 0, stripe_unit);
+	for (d = 0; d < stripe_unit; d += 8) {
+		uint64_t p = 0, q = 0, v;
 
-	for (col = 0; col < ndata; col++) {
-		uint8_t coeff = gf_exp[col]; /* 2^col */
-		for (d = 0; d < stripe_unit; d++) {
-			p_out[d] ^= ptrs[col][d];
-			q_out[d] ^= gf_mul(coeff, ptrs[col][d]);
+		for (col = ndata - 1; col >= 0; col--) {
+			memcpy(&v, ptrs[col] + d, 8);
+			p ^= v;
+			q = mul2_swar(q) ^ v;
 		}
+		memcpy(p_out + d, &p, 8);
+		memcpy(q_out + d, &q, 8);
 	}
 }
 
@@ -533,7 +604,10 @@ main(int argc, char *argv[])
 	uint64_t n_parity_err = 0;
 	uint64_t n_read_err   = 0;
 	uint64_t n_degraded   = 0;
+	uint64_t n_deg_checked = 0;
+	uint64_t n_hdr_err    = 0;
 
+	struct timespec t_start, t_end;
 	int verbose = 0;
 	int argi    = 1;
 	int i, col;
@@ -567,6 +641,7 @@ main(int argc, char *argv[])
 		}
 	}
 
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
 	gf_init();
 
 	/* Read volume header from disk 0 */
@@ -582,6 +657,27 @@ main(int argc, char *argv[])
 		    ndisks, ndisks_arg);
 		ret = 1;
 		goto out_fds;
+	}
+
+	/*
+	 * Every disk the newest header calls ONLINE must carry that
+	 * header's sequence: a lagging member is trusted for data by the
+	 * kernel and must not be (oct-review R1, R2).
+	 */
+	for (i = 0; i < ndisks; i++) {
+		if (disk_state[i] != HAMMER2_RAID6_DISK_ONLINE)
+			continue;
+		if (!hdr_valid[i]) {
+			n_hdr_err++;
+			printf("HDR_ERROR  disk%d is ONLINE but has no valid "
+			    "volume header\n", i);
+		} else if (hdr_seq[i] != hdr_seq_best) {
+			n_hdr_err++;
+			printf("HDR_ERROR  disk%d newest txg_seq %llu != "
+			    "array newest %llu\n", i,
+			    (unsigned long long)hdr_seq[i],
+			    (unsigned long long)hdr_seq_best);
+		}
 	}
 
 	/* Read the space map */
@@ -628,198 +724,177 @@ main(int argc, char *argv[])
 	}
 
 	/* ------------------------------------------------------------------ */
-	/* Main scan loop: iterate over all possible stripe slots               */
+	/* Main scan loop: iterate over all allocated stripe slots              */
 	/* ------------------------------------------------------------------ */
 
 	for (slot = 0; slot < max_stripes; slot++) {
 		int    p_disk, q_disk;
 		uint64_t phys_off;
-		int    n_failed_data = 0;
-		int    read_error    = 0;
+		int    miss = -1;	/* column (0..ndata+1) on a missing disk */
+		int    nmiss = 0;
+		int    read_error = 0;
+		int    p_mismatch = 0, q_mismatch = 0;
 
-		/* Skip unallocated slots */
 		if (refcount[slot] == 0)
 			continue;
-
 		n_checked++;
-
-		/* Physical byte offset on each disk for this stripe slot */
 		phys_off = HAMMER2_ZONE_SEG + slot * stripe_unit;
-
-		/* Compute which disk holds each column */
-		stripe_col_map(slot, ndisks, ndata,
-		    &p_disk, &q_disk, col_disk);
+		stripe_col_map(slot, ndisks, ndata, &p_disk, &q_disk, col_disk);
 
 		/*
-		 * Read data columns.  A disk that is absent/failed/not-opened
-		 * produces a read error; we still attempt the check if enough
-		 * columns are healthy (degrade gracefully).
+		 * Read every column that is on a usable disk.  A disk the
+		 * volume header does not call ONLINE (failed, rebuilding,
+		 * absent) or that did not open is "missing"; one missing column
+		 * is still fully checkable (see below), two are not.
 		 */
-		for (col = 0; col < ndata; col++) {
+		for (col = 0; col < ndata + 2; col++) {
 			int disk = col_disk[col];
-			int ds   = (disk < ndisks_arg) ?
-			    disk_state[disk] : HAMMER2_RAID6_DISK_ABSENT;
+			uint8_t *buf = col < ndata ? col_data[col] :
+			    (col == ndata ? p_ondisk : q_ondisk);
 
-			if (ds != HAMMER2_RAID6_DISK_ONLINE ||
+			if (disk_state[disk] != HAMMER2_RAID6_DISK_ONLINE ||
 			    fds[disk] < 0) {
-				/*
-				 * Absent / failed disk: zero-fill so syndrome
-				 * computation can still proceed on surviving
-				 * columns.  Mark the column as bad.
-				 */
-				memset(col_data[col], 0, stripe_unit);
-				n_failed_data++;
+				miss = col;
+				nmiss++;
+				memset(buf, 0, stripe_unit);
 				continue;
 			}
-
-			if (disk_read(disk, phys_off,
-			    col_data[col], stripe_unit) < 0) {
+			if (disk_read(disk, phys_off, buf, stripe_unit) < 0) {
 				read_error = 1;
 				n_read_err++;
+				printf("SLOT %7llu  READ_ERROR disk%d "
+				    "(phys=0x%llx p_disk=%d q_disk=%d)\n",
+				    (unsigned long long)slot, disk,
+				    (unsigned long long)phys_off, p_disk, q_disk);
 				break;
 			}
 		}
-
-		if (read_error) {
-			printf("SLOT %7llu  READ_ERROR (phys=0x%llx "
-			    "p_disk=%d q_disk=%d)\n",
-			    (unsigned long long)slot,
-			    (unsigned long long)phys_off,
-			    p_disk, q_disk);
+		if (read_error)
 			continue;
-		}
-
-		/*
-		 * Read P and Q from their respective disks.  If either parity
-		 * disk is failed/absent, we can still compute the syndrome but
-		 * cannot compare — flag as degraded.
-		 */
-		int p_ok = 1, q_ok = 1;
-
-		{
-			int ds_p = (p_disk < ndisks_arg) ?
-			    disk_state[p_disk] : HAMMER2_RAID6_DISK_ABSENT;
-			if (ds_p != HAMMER2_RAID6_DISK_ONLINE ||
-			    fds[p_disk] < 0) {
-				p_ok = 0;
-			} else if (disk_read(p_disk, phys_off,
-			    p_ondisk, stripe_unit) < 0) {
-				read_error = 1;
-				n_read_err++;
-			}
-		}
-		if (read_error) {
-			printf("SLOT %7llu  READ_ERROR P-disk (phys=0x%llx "
-			    "p_disk=%d q_disk=%d)\n",
-			    (unsigned long long)slot,
-			    (unsigned long long)phys_off,
-			    p_disk, q_disk);
-			continue;
-		}
-
-		{
-			int ds_q = (q_disk < ndisks_arg) ?
-			    disk_state[q_disk] : HAMMER2_RAID6_DISK_ABSENT;
-			if (ds_q != HAMMER2_RAID6_DISK_ONLINE ||
-			    fds[q_disk] < 0) {
-				q_ok = 0;
-			} else if (disk_read(q_disk, phys_off,
-			    q_ondisk, stripe_unit) < 0) {
-				read_error = 1;
-				n_read_err++;
-			}
-		}
-		if (read_error) {
-			printf("SLOT %7llu  READ_ERROR Q-disk (phys=0x%llx "
-			    "p_disk=%d q_disk=%d)\n",
-			    (unsigned long long)slot,
-			    (unsigned long long)phys_off,
-			    p_disk, q_disk);
-			continue;
-		}
-
-		/*
-		 * If any data or parity column is on a failed disk we cannot
-		 * fully verify parity — report as degraded and skip.
-		 */
-		if (n_failed_data > 0 || !p_ok || !q_ok) {
+		if (nmiss > 1) {
 			n_degraded++;
-			if (verbose) {
-				printf("SLOT %7llu  DEGRADED  "
-				    "(phys=0x%llx p_disk=%d q_disk=%d "
-				    "failed_data_cols=%d p_avail=%d q_avail=%d)\n",
-				    (unsigned long long)slot,
-				    (unsigned long long)phys_off,
-				    p_disk, q_disk,
-				    n_failed_data, p_ok, q_ok);
-			}
+			if (verbose)
+				printf("SLOT %7llu  DEGRADED (%d columns on "
+				    "missing disks, not checkable)\n",
+				    (unsigned long long)slot, nmiss);
 			continue;
 		}
 
-		/* Compute expected P and Q from the data columns */
+		/*
+		 * Syndrome of the data columns that are present (a missing
+		 * data column is zero here).
+		 */
 		gen_syndrome(ndata, (size_t)stripe_unit,
 		    (uint8_t **)col_data, p_computed, q_computed);
 
-		/* Compare computed vs on-disk */
-		int p_mismatch = memcmp(p_computed, p_ondisk, stripe_unit);
-		int q_mismatch = memcmp(q_computed, q_ondisk, stripe_unit);
+		if (nmiss == 0) {
+			p_mismatch = memcmp(p_computed, p_ondisk, stripe_unit) != 0;
+			q_mismatch = memcmp(q_computed, q_ondisk, stripe_unit) != 0;
+		} else if (miss == ndata) {
+			/* P missing: Q still checks the data */
+			q_mismatch = memcmp(q_computed, q_ondisk, stripe_unit) != 0;
+		} else if (miss == ndata + 1) {
+			p_mismatch = memcmp(p_computed, p_ondisk, stripe_unit) != 0;
+		} else {
+			/*
+			 * Data column 'miss' missing: P gives it, Q then must
+			 * agree with the rebuilt column.
+			 */
+			size_t d;
+			uint8_t coeff = gf_exp[miss];
+
+			for (d = 0; d < stripe_unit; d++) {
+				uint8_t dm = p_ondisk[d] ^ p_computed[d];
+
+				if ((uint8_t)(q_computed[d] ^ gf_mul(coeff, dm)) !=
+				    q_ondisk[d]) {
+					q_mismatch = 1;
+					break;
+				}
+			}
+			n_deg_checked++;
+		}
+		if (nmiss == 1 && miss >= ndata)
+			n_deg_checked++;
 
 		if (p_mismatch || q_mismatch) {
-			n_parity_err++;
-			printf("SLOT %7llu  PARITY_ERROR  "
-			    "(phys=0x%llx p_disk=%d q_disk=%d",
-			    (unsigned long long)slot,
-			    (unsigned long long)phys_off,
-			    p_disk, q_disk);
-			if (p_mismatch)
-				printf(" P_MISMATCH");
-			if (q_mismatch)
-				printf(" Q_MISMATCH");
-			printf(")\n");
+			int loc = -3;	/* -3 none, -2 several, 0..ndata+1 col */
+			size_t d;
 
-			/* Print first 8 bytes of each column for diagnosis */
+			n_parity_err++;
+			/*
+			 * Localise with the syndrome when everything is present: a
+			 * single bad column c gives P^P' = e and Q^Q' = 2^c * e.
+			 */
+			if (nmiss == 0) {
+				for (d = 0; d < stripe_unit; d++) {
+					uint8_t pd = p_computed[d] ^ p_ondisk[d];
+					uint8_t qd = q_computed[d] ^ q_ondisk[d];
+					int c;
+
+					if (pd == 0 && qd == 0)
+						continue;
+					if (qd == 0)
+						c = ndata;
+					else if (pd == 0)
+						c = ndata + 1;
+					else {
+						c = (int)gf_log[qd] -
+						    (int)gf_log[pd];
+						if (c < 0)
+							c += 255;
+						if (c >= ndata)
+							c = -2;
+					}
+					if (loc == -3)
+						loc = c;
+					else if (loc != c)
+						loc = -2;
+					if (loc == -2)
+						break;
+				}
+			}
+			printf("SLOT %7llu  PARITY_ERROR  (phys=0x%llx p_disk=%d "
+			    "q_disk=%d%s%s%s",
+			    (unsigned long long)slot, (unsigned long long)phys_off,
+			    p_disk, q_disk,
+			    p_mismatch ? " P_MISMATCH" : "",
+			    q_mismatch ? " Q_MISMATCH" : "",
+			    nmiss ? " DEGRADED" : "");
+			if (nmiss)
+				printf(" missing_disk=%d", col_disk[miss]);
+			if (loc >= 0)
+				printf(" suspect_disk=%d suspect_%s", col_disk[loc],
+				    loc == ndata ? "P" : loc == ndata + 1 ? "Q" :
+				    "data");
+			else if (loc == -2)
+				printf(" suspect=several columns");
+			printf(")\n");
 			if (verbose) {
 				for (col = 0; col < ndata; col++) {
-					printf("  data[%d][0..7]:", col);
+					printf("  data[%d] disk%d [0..7]:", col,
+					    col_disk[col]);
 					for (i = 0; i < 8; i++)
-						printf(" %02x",
-						    col_data[col][i]);
+						printf(" %02x", col_data[col][i]);
 					printf("\n");
 				}
-				if (p_mismatch) {
-					printf("  P_computed[0..7]:");
-					for (i = 0; i < 8; i++)
-						printf(" %02x",
-						    p_computed[i]);
-					printf("\n");
-					printf("  P_ondisk  [0..7]:");
-					for (i = 0; i < 8; i++)
-						printf(" %02x",
-						    p_ondisk[i]);
-					printf("\n");
-				}
-				if (q_mismatch) {
-					printf("  Q_computed[0..7]:");
-					for (i = 0; i < 8; i++)
-						printf(" %02x",
-						    q_computed[i]);
-					printf("\n");
-					printf("  Q_ondisk  [0..7]:");
-					for (i = 0; i < 8; i++)
-						printf(" %02x",
-						    q_ondisk[i]);
-					printf("\n");
-				}
+				printf("  P comp/disk [0..7]:");
+				for (i = 0; i < 8; i++)
+					printf(" %02x/%02x", p_computed[i],
+					    p_ondisk[i]);
+				printf("\n  Q comp/disk [0..7]:");
+				for (i = 0; i < 8; i++)
+					printf(" %02x/%02x", q_computed[i],
+					    q_ondisk[i]);
+				printf("\n");
 			}
 		} else {
 			n_ok++;
-			if (verbose) {
-				printf("SLOT %7llu  OK  "
-				    "(phys=0x%llx p_disk=%d q_disk=%d)\n",
-				    (unsigned long long)slot,
-				    (unsigned long long)phys_off,
-				    p_disk, q_disk);
-			}
+			if (verbose)
+				printf("SLOT %7llu  OK  (phys=0x%llx p_disk=%d "
+				    "q_disk=%d%s)\n", (unsigned long long)slot,
+				    (unsigned long long)phys_off, p_disk, q_disk,
+				    nmiss ? " degraded" : "");
 		}
 	}
 
@@ -827,7 +902,11 @@ main(int argc, char *argv[])
 	/* Summary                                                              */
 	/* ------------------------------------------------------------------ */
 
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	printf("\n=== h2stripe_check Summary ===\n");
+	printf("Elapsed                 : %.2f s\n",
+	    (double)(t_end.tv_sec - t_start.tv_sec) +
+	    (double)(t_end.tv_nsec - t_start.tv_nsec) / 1e9);
 	printf("Allocated slots checked : %llu\n",
 	    (unsigned long long)n_checked);
 	printf("OK                      : %llu\n",
@@ -836,10 +915,14 @@ main(int argc, char *argv[])
 	    (unsigned long long)n_parity_err);
 	printf("Read errors             : %llu\n",
 	    (unsigned long long)n_read_err);
+	printf("Checked with 1 disk out : %llu (included in OK/errors)\n",
+	    (unsigned long long)n_deg_checked);
 	printf("Degraded (skipped)      : %llu\n",
 	    (unsigned long long)n_degraded);
+	printf("Header errors           : %llu\n",
+	    (unsigned long long)n_hdr_err);
 
-	ret = (n_parity_err > 0 || n_read_err > 0) ? 1 : 0;
+	ret = (n_parity_err > 0 || n_read_err > 0 || n_hdr_err > 0) ? 1 : 0;
 
 out_bufs:
 	if (col_data) {
