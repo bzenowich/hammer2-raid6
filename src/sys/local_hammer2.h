@@ -75,6 +75,7 @@
 #endif
 #include <sys/diskslice.h>
 #include <sys/tree.h>
+#define HAMMER2_ROWPOOL_MAX	4	/* scratch sets kept per mount */
 #include <sys/malloc.h>
 #include <sys/mount.h>
 #include <sys/vnode.h>
@@ -1432,6 +1433,15 @@ struct hammer2_dev {
 	volatile uint64_t repair_writes_dropped; /* queue-full drops */
 
 	/*
+	 * Scratch sets for degraded row reads (ndisks columns of
+	 * stripe_unit each), a few kept for reuse (P7).
+	 */
+	hammer2_spin_t	rowpool_spin;
+	void		*rowpool[HAMMER2_ROWPOOL_MAX];
+	int		rowpool_n;
+	int		rowpool_inited;
+
+	/*
 	 * Cumulative per-disk checksum-error accounting (zpool status
 	 * CKSUM equivalent).  In-memory; zeroed at mount.  Written by
 	 * both the read-path self-heal and the scrub.
@@ -2415,6 +2425,36 @@ int hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 		hammer2_off_t logical_off, int data_disk_idx,
 		void *buf, size_t bytes, int is_physical,
 		int extra_disk, void *extra_buf);
+void hammer2_io_rowpool_init(hammer2_dev_t *hmp);
+void hammer2_io_rowpool_fini(hammer2_dev_t *hmp);
+
+/*
+ * One stripe row read for reconstruction.  Columns are logical
+ * (data 0..ndata-1, P = ndata, Q = ndata+1); mem holds one slot per
+ * column.  have: column contents valid; erased: column known lost (a
+ * failed member, a read error, or a column the caller distrusts).
+ */
+typedef struct hammer2_raid6_row {
+	hammer2_dev_t	*hmp;
+	char		*mem;
+	void		*ptrs[HAMMER2_MAX_VOLUMES];
+	int		col_disk[HAMMER2_MAX_VOLUMES];
+	uint64_t	have;
+	uint64_t	erased;
+	hammer2_off_t	phys_off;
+	size_t		su;
+	int		ndisks;
+	int		ndata;
+	int		p_disk;
+	int		q_disk;
+} hammer2_raid6_row_t;
+
+void hammer2_raid6_row_init(hammer2_dev_t *hmp, hammer2_raid6_row_t *row,
+		hammer2_off_t phys_off);
+void hammer2_raid6_row_done(hammer2_raid6_row_t *row);
+int hammer2_raid6_row_col(hammer2_raid6_row_t *row, int disk);
+int hammer2_raid6_row_solve(hammer2_raid6_row_t *row, int tgt_col,
+		int ext_col, void **wp);
 int hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 		int failed_disk_idx, struct vnode *new_devvp);
 int hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
@@ -2556,6 +2596,11 @@ extern int hammer2_inject_pq_defer_ms;	/* test: start parity this late */
 extern long hammer2_rz_pq_err;		/* parity writes that failed */
 extern long hammer2_rz_pq_async;	/* rows handed to the reaper */
 extern long hammer2_rz_pq_bp_wait;	/* writers held by back-pressure */
+extern long hammer2_dr_reads;		/* degraded row reconstructions */
+extern long hammer2_dr_cols;		/* member columns read for them */
+extern long hammer2_dr_q_reads;		/* ... of which Q columns */
+extern long hammer2_dr_ns;		/* time spent in them */
+extern long hammer2_dr_pool_miss;	/* scratch sets allocated fresh */
 extern long hammer2_rz_pq_rd_wait;	/* readers that waited for parity */
 extern long hammer2_rz_pq_drain_wait;	/* drains that had to wait */
 extern long hammer2_rz_pq_high;		/* peak rows in flight */
