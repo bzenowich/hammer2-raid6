@@ -30,6 +30,8 @@
 #       data intact, replace onto the same path, scrub clean
 #   X8  Phase A copies only the freemap-allocated metadata; what it
 #       skipped is never read as metadata
+#   X10 new rows put no data column on a failed disk (1 and 2 failed),
+#       degraded-written data reads back and survives a resilver
 #   X6  disk count: the number of vbd test disks the guest has against
 #       NDISKS (information; a 6-disk matrix needs a harness change)
 #
@@ -1034,7 +1036,79 @@ x9() {
     done
 }
 
-for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8 x9}; do
+# ----------------------------------------------------------------
+# X10: new rows put no data column on a failed disk (oct-review §2)
+#
+# Fail 1 disk (X10a) or 2 (X10b), write a mix of big and small files, and
+# read the blockrefs from the media: no new data block may name a
+# failed disk.  Then the data must read back cold, the disks must
+# resilver (fresh media) and the scrub be clean.  With two data disks
+# down, a row whose P and Q sit on the two survivors has no data disk
+# left: the allocator must go on to the next slot, not fail the write.
+# ----------------------------------------------------------------
+x10_round() {
+    local label="$1"
+    shift
+    local f i new bad
+    setup_fresh $X_SIZE
+    check_v3
+    write_ref_data "ref"
+    data_slots > /var/tmp/x10_before.txt
+    for f in "$@"; do
+        fail_disk "$f" "$label" || { teardown "$label"; return; }
+    done
+    write_ref_data "dw"
+    i=0
+    mkdir $MNTPT/small
+    while [ "$i" -lt 150 ]; do
+        dd if=/dev/urandom of=$MNTPT/small/f$i bs=4096 count=1 2>/dev/null
+        i=$((i + 1))
+    done
+    sync; sync
+    data_slots > /var/tmp/x10_after.txt
+    comm -13 /var/tmp/x10_before.txt /var/tmp/x10_after.txt > /var/tmp/x10_new.txt
+    new=$(wc -l < /var/tmp/x10_new.txt | tr -d ' ')
+    bad=0
+    for f in "$@"; do
+        bad=$((bad + $(grep -c "^$f:" /var/tmp/x10_new.txt)))
+    done
+    if [ "$new" -lt 100 ]; then
+        result FAIL "$label: only $new new data blocks seen"
+    elif [ "$bad" = "0" ]; then
+        result PASS "$label: $new new data blocks, none on failed disk(s) $*"
+    else
+        result FAIL "$label: $bad of $new new data blocks on failed disk(s) $*"
+    fi
+    remount
+    verify_ref "$label: pre-failure data (cold, degraded)" "ref"
+    verify_ref "$label: degraded-written data (cold, degraded)" "dw"
+    for f in "$@"; do
+        fresh_disk $f
+    done
+    bad=0
+    for f in "$@"; do
+        hammer2 -s $MNTPT raid replace "$(disk_dev $f)" "$(disk_dev $f)" \
+            > /var/tmp/x_replace.txt 2>&1 || bad=1
+    done
+    if [ "$bad" = "0" ]; then
+        result PASS "$label: resilver completes"
+    else
+        result FAIL "$label: replace failed"
+        sed 's/^/      /' /var/tmp/x_replace.txt
+    fi
+    remount
+    verify_ref "$label: pre-failure data (cold, resilvered)" "ref"
+    verify_ref "$label: degraded-written data (cold, resilvered)" "dw"
+    scrub_clean "$label"
+    teardown "$label"
+}
+
+x10() {
+    x10_round X10a 1
+    x10_round X10b 1 2
+}
+
+for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8 x9 x10}; do
     $t
 done
 

@@ -4726,9 +4726,23 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint32_t flags)
 	 */
 	error = 0;
 	if ((flags & HAMMER2_SCRUB_NOTREE) == 0) {
-		vsnap = hammer2_chain_bulksnap(hmp);
-		error = hammer2_scrub_walk(&ctx, vsnap);
-		hammer2_chain_bulkdrop(vsnap);
+		/*
+		 * The walk follows brefs of the snapshot.  A bulkfree that
+		 * runs meanwhile frees blocks the live tree dropped, and a
+		 * write can reuse them, so the walk would find another
+		 * block's data and call it bad and unrepairable.  Hold
+		 * bflock shared for the walk: a bulkfree waits (it takes it
+		 * exclusive, first, before any other lock, so there is no
+		 * order problem; the syncer and writers never take it).  The
+		 * parity pass does not need it, it checks the free epoch.
+		 */
+		error = lockmgr(&hmp->bflock, LK_SHARED | LK_PCATCH);
+		if (error == 0) {
+			vsnap = hammer2_chain_bulksnap(hmp);
+			error = hammer2_scrub_walk(&ctx, vsnap);
+			hammer2_chain_bulkdrop(vsnap);
+			lockmgr(&hmp->bflock, LK_RELEASE);
+		}
 	}
 	kfree(ctx.rbuf, M_HAMMER2);
 
@@ -4775,9 +4789,15 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint32_t flags)
 static __inline hammer2_io_hash_t *
 hammer2_io_hashv(hammer2_dev_t *hmp, hammer2_off_t pbase)
 {
-	int hv;
+	uint32_t hv;
 
-	hv = (int)pbase + (int)(pbase >> 16);
+	/*
+	 * A v3 data dio's pbase is (disk_idx << 56) | per-disk offset, and
+	 * the columns of a row share the offset.  Mix the disk in, or all
+	 * of a row's columns land in one bucket.
+	 */
+	hv = (uint32_t)pbase + (uint32_t)(pbase >> 16) +
+	     (uint32_t)(pbase >> 56) * 0x2F0B;
 	return (&hmp->iohash[hv & HAMMER2_IOHASH_MASK]);
 }
 

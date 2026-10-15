@@ -15,6 +15,7 @@
 #   Y7  scrub concurrent with writes and deletes: no false repairs
 #   Y8  degraded array: the parity pass is skipped
 #   Y9  scrub concurrent with bulkfree, deletes and row reuse: no false repairs
+#   Y10 the same with tree-walk-only scrubs: no bad or unrepairable brefs
 
 SCRIPTDIR=$(dirname "$0")
 . "$SCRIPTDIR/common.sh"
@@ -263,36 +264,52 @@ if fail_disk 1 "Y8"; then
 fi
 teardown
 
-# Y9: rows freed by bulkfree and handed out again while scrubs run.
-setup_fresh
-check_v3
-(
-    j=0
-    while [ $j -lt 12 ]; do
-        dd if=/dev/urandom of=$MNTPT/y_b$((j % 6)) bs=65536 count=24 2>/dev/null
-        sync
-        rm -f $MNTPT/y_b$(((j + 3) % 6))
-        hammer2 bulkfree $MNTPT > /dev/null 2>&1
-        hammer2 bulkfree $MNTPT > /dev/null 2>&1
-        j=$((j + 1))
+# y9_run <label> <scrub args...>: rows freed by bulkfree and handed out
+# again while scrubs run.  No scrub may report a bad or unrepairable bref
+# (a bulkfree that frees and reuses a block the scrub's snapshot still
+# names looks like corruption: the scrub's tree walk holds bflock shared
+# so that bulkfree waits) nor repair or fail to locate a row.
+y9_run() {
+    local label="$1" nscrub=0 ok=1 rc r u bb ub
+    shift
+    setup_fresh
+    check_v3
+    (
+        j=0
+        while [ $j -lt 12 ]; do
+            dd if=/dev/urandom of=$MNTPT/y_b$((j % 6)) bs=65536 count=24 2>/dev/null
+            sync
+            rm -f $MNTPT/y_b$(((j + 3) % 6))
+            hammer2 bulkfree $MNTPT > /dev/null 2>&1
+            hammer2 bulkfree $MNTPT > /dev/null 2>&1
+            j=$((j + 1))
+        done
+    ) &
+    WPID=$!
+    while kill -0 $WPID 2>/dev/null; do
+        yscrub "$@"; rc=$?
+        nscrub=$((nscrub + 1))
+        r=$(yfield parity_repaired $OUT)
+        u=$(yfield parity_unlocatable $OUT)
+        bb=$(yfield brefs_bad $OUT)
+        ub=$(yfield brefs_unrepairable $OUT)
+        if [ $rc != 0 ] || [ "${r:-x}" != 0 ] || [ "${u:-x}" != 0 ] ||
+           [ "${bb:-x}" != 0 ] || [ "${ub:-x}" != 0 ]; then
+            ok=0
+            sed 's/^/      /' $OUT
+        fi
     done
-) &
-WPID=$!
-Y9OK=1
-while kill -0 $WPID 2>/dev/null; do
-    yscrub; Y9RC=$?
-    Y9R=$(yfield parity_repaired $OUT)
-    Y9U=$(yfield parity_unlocatable $OUT)
-    if [ $Y9RC != 0 ] || [ "${Y9R:-x}" != 0 ] || [ "${Y9U:-x}" != 0 ]; then
-        Y9OK=0
-        sed 's/^/      /' $OUT
-    fi
-done
-wait $WPID
-[ $Y9OK = 1 ] && result PASS "Y9: scrubs during bulkfree and row reuse, no false repairs" ||
-    result FAIL "Y9: false repair or error while bulkfree ran"
-sync; sync
-yscrub; ycheck "Y9: quiesced scrub clean" 0 pos 0 0 0 $?
-teardown
+    wait $WPID
+    [ $ok = 1 ] && result PASS "$label: $nscrub scrubs during bulkfree and row reuse, no false repairs or bad brefs" ||
+        result FAIL "$label: false repair, bad bref or error while bulkfree ran"
+    sync; sync
+    yscrub; ycheck "$label: quiesced scrub clean" 0 pos 0 0 0 $?
+    teardown
+}
+
+y9_run Y9
+# Y10: tree walks only (-t skips the parity pass), so many more of them
+# overlap the bulkfrees.
+y9_run Y10 -t
 
 summary

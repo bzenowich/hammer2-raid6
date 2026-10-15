@@ -4143,7 +4143,7 @@ index 4b3656b..2c05594 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24e..cc1ae0f 100644
+index 31be24e..6c22319 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,10 @@
@@ -5104,7 +5104,7 @@ index 31be24e..cc1ae0f 100644
  		return;
  	hammer2_adjwritecounter(dio->btype, dio->psize);
  }
-@@ -786,92 +1344,3520 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,94 +1344,3542 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -5297,6 +5297,8 @@ index 31be24e..cc1ae0f 100644
  
 -	count = hmp->iofree_count - dio_limit + 32;
 -	if (count <= 0)
+-		return;
+-	cleanbase = NULL;
 +	if (disk_idx < 0 || disk_idx >= HAMMER2_MAX_VOLUMES)
 +		return -1;
 +	w = &hmp->iowd[disk_idx];
@@ -8553,9 +8555,23 @@ index 31be24e..cc1ae0f 100644
 +	 */
 +	error = 0;
 +	if ((flags & HAMMER2_SCRUB_NOTREE) == 0) {
-+		vsnap = hammer2_chain_bulksnap(hmp);
-+		error = hammer2_scrub_walk(&ctx, vsnap);
-+		hammer2_chain_bulkdrop(vsnap);
++		/*
++		 * The walk follows brefs of the snapshot.  A bulkfree that
++		 * runs meanwhile frees blocks the live tree dropped, and a
++		 * write can reuse them, so the walk would find another
++		 * block's data and call it bad and unrepairable.  Hold
++		 * bflock shared for the walk: a bulkfree waits (it takes it
++		 * exclusive, first, before any other lock, so there is no
++		 * order problem; the syncer and writers never take it).  The
++		 * parity pass does not need it, it checks the free epoch.
++		 */
++		error = lockmgr(&hmp->bflock, LK_SHARED | LK_PCATCH);
++		if (error == 0) {
++			vsnap = hammer2_chain_bulksnap(hmp);
++			error = hammer2_scrub_walk(&ctx, vsnap);
++			hammer2_chain_bulkdrop(vsnap);
++			lockmgr(&hmp->bflock, LK_RELEASE);
++		}
 +	}
 +	kfree(ctx.rbuf, M_HAMMER2);
 +
@@ -8602,9 +8618,15 @@ index 31be24e..cc1ae0f 100644
 +static __inline hammer2_io_hash_t *
 +hammer2_io_hashv(hammer2_dev_t *hmp, hammer2_off_t pbase)
 +{
-+	int hv;
++	uint32_t hv;
 +
-+	hv = (int)pbase + (int)(pbase >> 16);
++	/*
++	 * A v3 data dio's pbase is (disk_idx << 56) | per-disk offset, and
++	 * the columns of a row share the offset.  Mix the disk in, or all
++	 * of a row's columns land in one bucket.
++	 */
++	hv = (uint32_t)pbase + (uint32_t)(pbase >> 16) +
++	     (uint32_t)(pbase >> 56) * 0x2F0B;
 +	return (&hmp->iohash[hv & HAMMER2_IOHASH_MASK]);
 +}
 +
@@ -8685,10 +8707,12 @@ index 31be24e..cc1ae0f 100644
 +
 +	count = hmp->iofree_count - dio_limit + 32;
 +	if (count <= 0)
- 		return;
- 	cleanbase = NULL;
++		return;
++	cleanbase = NULL;
  	cleanapp = &cleanbase;
-@@ -961,3 +4947,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
+ 
+ 	i = hmp->io_iterator++;
+@@ -961,3 +4967,81 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
  		}
  	}
  }
@@ -9537,7 +9561,7 @@ index 20e92bb..6287171 100644
  
  #endif /* !_VFS_HAMMER2_IOCTL_H_ */
 diff --git a/sys/vfs/hammer2/hammer2_ondisk.c b/sys/vfs/hammer2/hammer2_ondisk.c
-index 85a9d08..33a77e4 100644
+index 85a9d08..5d08833 100644
 --- a/sys/vfs/hammer2/hammer2_ondisk.c
 +++ b/sys/vfs/hammer2/hammer2_ondisk.c
 @@ -45,7 +45,13 @@
@@ -10640,7 +10664,7 @@ index 85a9d08..33a77e4 100644
  
  	return error;
  }
-@@ -738,3 +1478,2158 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
+@@ -738,3 +1478,2175 @@ hammer2_get_volume(hammer2_dev_t *hmp, hammer2_off_t offset)
  
  	return ret;
  }
@@ -11578,18 +11602,22 @@ index 85a9d08..33a77e4 100644
 +		}
 +		candidate = hammer2_raid6_pick_data_disk(hmp, r->p_disk,
 +		    r->q_disk, failed_mask | r->alloc_mask);
-+		if (candidate >= 0) {
-+			r->alloc_mask |= (1U << candidate);
-+			r->n_alloc++;
-+			if (!hammer2_raid6_row_can_take(hmp, r)) {
-+				TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
-+				r->packable = 0;
-+			}
-+			*phys_off_out = r->phys_off;
-+			*disk_idx_out = candidate;
-+			*row_out = r;
-+			return 1;
++		if (candidate < 0) {
++			/* every writable data disk is taken: the row is full */
++			TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
++			r->packable = 0;
++			continue;
 +		}
++		r->alloc_mask |= (1U << candidate);
++		r->n_alloc++;
++		if (!hammer2_raid6_row_can_take(hmp, r)) {
++			TAILQ_REMOVE(&hmp->open_rows_pack, r, pentry);
++			r->packable = 0;
++		}
++		*phys_off_out = r->phys_off;
++		*disk_idx_out = candidate;
++		*row_out = r;
++		return 1;
 +	}
 +	return 0;
 +}
@@ -12277,6 +12305,8 @@ index 85a9d08..33a77e4 100644
 +	hammer2_off_t phys_off;
 +	hammer2_off_t pack_off;
 +	int pack_disk_idx;
++	uint32_t failed_mask = 0;
++	int d, tries;
 +
 +	/*
 +	 * 6C packing: try to land in an existing open row first so a row
@@ -12294,14 +12324,36 @@ index 85a9d08..33a77e4 100644
 +	}
 +
 +	/*
-+	 * Next free data slot from the cursor, wrapping once.
++	 * Next free data slot from the cursor, wrapping once, with a data
++	 * disk that is not P, Q or failed (round-robin).  A failed disk
++	 * gets no data: a column there would only be rebuilt from parity
++	 * and discarded.  If P/Q of the slot leave no live data disk (two
++	 * data disks down), try the next slot: P/Q rotate, so one of any
++	 * ndisks slots has a live data disk unless too many are failed.
 +	 */
++	for (d = 0; d < rc->ndisks; d++) {
++		if (hmp->raid_failed[d])
++			failed_mask |= 1U << d;
++	}
 +	start = hmp->stripe_cursor;
 +	if (start >= max_stripes)
 +		start = 0;
-+	if (!hammer2_raid6_find_free_slot(hmp, start, max_stripes, &slot) &&
-+	    !hammer2_raid6_find_free_slot(hmp, 0, start, &slot))
-+		return ENOSPC;
++	for (tries = 0; ; tries++) {
++		if (tries >= rc->ndisks)
++			return ENOSPC;
++		if (!hammer2_raid6_find_free_slot(hmp, start, max_stripes,
++		    &slot) &&
++		    !hammer2_raid6_find_free_slot(hmp, 0, start, &slot))
++			return ENOSPC;
++		hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
++		disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk,
++		    failed_mask);
++		if (disk_idx >= 0)
++			break;
++		start = slot + 1;
++		if (start >= max_stripes)
++			start = 0;
++	}
 +	byte_idx = slot / 8;
 +	bit_idx  = (int)(slot % 8);
 +	hmp->stripe_bitmap[byte_idx] |= (uint8_t)(1 << bit_idx);
@@ -12310,17 +12362,6 @@ index 85a9d08..33a77e4 100644
 +		setbit(hmp->stripe_bf_new, slot);
 +	hmp->stripe_cursor = slot + 1;
 +
-+	/*
-+	 * Choose data disk (round-robin, skipping the P and Q disks for
-+	 * this stripe).
-+	 */
-+	hammer2_raid6_pq(slot, rc->ndisks, &p_disk, &q_disk);
-+	disk_idx = hammer2_raid6_pick_data_disk(hmp, p_disk, q_disk, 0);
-+	if (disk_idx < 0) {
-+		/* All disks are P or Q: can't happen for ndisks >= 4 */
-+		hmp->stripe_bitmap[byte_idx] &= ~(uint8_t)(1 << bit_idx);
-+		return ENOSPC;
-+	}
 +	phys_off = HAMMER2_ZONE_SEG64 + slot * stripe_unit;
 +	/*
 +	 * Register the newly-allocated row so subsequent allocations
