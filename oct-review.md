@@ -1662,3 +1662,22 @@ the mirrors, is 47-50 MB in every run). On the Pi (4 disks, 422 blocks x 64 KB) 
 Group P's `write-amp <= 12` check failed in 4 of the 8 runs (6 of 7 failing checks on layout 3).
 Next: P10b, make the number of flush passes during a small-file burst predictable (throttle or
 coalesce the limit-triggered syncer kicks), then re-measure layout 2 vs 3.
+
+*P10b result on the Pi (k52 = v4-rebuild 23b6603 + fix/p10b-flushpass 7def585, 2026-10-15; not
+merged).* The P10b design and the h2dev numbers are on branch `fix/p10b-flushpass` (oct-review
+P10, commits 143686d..7def585): no syncer trigger while `sync_pmp` runs, re-arm hysteresis,
+`vfs.hammer2.p10b_coalesce`. Pi, `P_ONLY=P2`, 8 runs alternating coalesce 1/0:
+
+| | P2 write-amp | P2 mf_blocks | dc_trigger | flush passes (`vs_pass`) |
+|---|---|---|---|---|
+| coalesce 1 | 5.68 8.44 7.68 6.76 (mean 7.1) | 290 601 531 359 | 3-22 (dc_skip 58-4092) | 5-7 |
+| coalesce 0 | 8.53 7.34 4.33 4.40 (mean 6.2) | 553 480 140 142 | 4-682 | 6 |
+
+Coalescing removes the repeated kicks but not the spread: the number of flush passes is 5-7
+either way, so the premise above ("mf_blocks follows the number of passes") is wrong. What
+varies is how many metadata blocks each pass carries (mf_blocks 140-601 for the same 6 passes),
+i.e. where the passes fall relative to the burst. Not merged: no gain on the Pi or h2dev for
+extra code. All 16 P2/P2c checks passed this time (write-amp 4.3-8.5) and P O W N passed 130/0
+on k52. Open: measure mf_blocks per pass (which inodes/indirect blocks each pass rewrites)
+before trying again; the `write-amp <= 12` limit stays. Side finding from the same branch:
+`deploy.sh` now runs `make depend` (f77e9c7), since the kmod build had no header dependencies.
