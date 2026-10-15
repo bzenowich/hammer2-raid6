@@ -856,7 +856,7 @@ and windowed Phase A part is in `e098809`; this finishes the other two items.
 - **Results (h2dev):** metadata zone 96 MB, Phase A copied 8.4 MB (skip_unalloc=1) vs the whole zone (skip_unalloc=0). X 83/83, R 18/18, D 44/44, G 10/10, K 10/10, A 5/5. X7a/b resumed at slot 3280 after 1504 rebuilt; X7c/d restarted at 0. A real `umount -f` (X2) hit the resilver before its first checkpoint, so resume after umount -f is covered by the stop hook plus X7b (umount, mount), not by X2.
   X7a-d (resume, remount, stale cursor, wiped disk) and X8/X8b added to group X.
 
-### P7. Degraded reads [V2]
+### P7. Degraded reads [V2] **[DONE 2026-10-15, fix/p7-degraded]**
 **Where:** `read_degraded_x` (`io.c:1808–1887`).
 
 **What happens.**
@@ -872,6 +872,21 @@ and windowed Phase A part is in `e098809`; this finishes the other two items.
 - Use a pooled scratch set.
 - Read the row once and try the erasure combinations in memory.
 - Skip reconstruction for NEW.
+
+**Done (P7).** Verified against the current code first: the line numbers had moved (`read_degraded_x` is now in `local_hammer2_io.c`), the ndisks x 64 KB M_ZERO kmalloc, the serial `read_sibling` and the always-read Q were all still there; "reconstructs again at :583" is the error block after the preempt path (`goto io_done` falls into `if (error && RAID6)`, which marked the disk failed again and ran a second `read_degraded`).
+- **Row object.** `hammer2_raid6_row_t` (header) holds the column map, `have`/`erased` masks and a scratch set from a per-mount pool of 4 (`rowpool`, no waiting: an empty pool just allocates, `dr_pool_miss` counts it; M_ZERO dropped, no recovery routine needs zeroed erased columns).
+- **Parallel reads.** `hammer2_raid6_row_read` starts every missing column together (buffer-cache hit, a read through the cache for a miss so the neighbours still find it, or a pbuf when another thread holds the buffer; all `GETBLK_NOWAIT`, so holding several at once cannot deadlock), then waits. `hammer2_pq_wait_slot` once per row.
+- **P only.** `hammer2_raid6_row_solve` plans from the erasures: data columns that survive, plus P for one data erasure, Q instead when P is gone, both for two. A read failure adds an erasure and re-plans (Q is then read in a second round). A data target no longer regenerates Q (the old dual_recov path did); parity is computed only when it is the wanted column.
+- **Self-heal.** `hammer2_raid6_selfheal_data` makes one row, solves the first candidate (only the target erased: ndata columns), and for the second-bad-column search solves each candidate in memory into work buffers (`wp`), reading only the columns not yet read. A heal now reads each column of the row at most once (was about 9 reads instead of 3 on 4 disks).
+- **Preempt NEW.** A NEW/NEWNZ on a failed disk that replaces the whole buffer, or any NEW/NEWNZ of a v3 data column, skips the reconstruction (zero as the healthy path does); the redundant second reconstruction after a failed preempt is gone (`preempted`).
+- **Counters** `vfs.hammer2.dr_reads` (rows reconstructed, degraded reads and heals), `dr_cols` (member columns read), `dr_q_reads`, `dr_ns`, `dr_pool_miss`.
+- **Tests.** Group P8 (`P_ONLY=P8 sh test_p_perfshape.sh`): 256 MB written healthy, then read cold with disk 0 failed and with disks 0+1 failed; INFO line with MB/s, member bytes per file byte, rows, columns, Q columns, us per row; asserts data identical, and for one failure `dr_q_reads == 0` and `dr_cols == dr_reads x ndata`. L1 asserts the same read count for the heal (no Q, ndata columns per row).
+- **Results (h2dev, 4 disks, cold sequential read of 256 MB; before = 14e58d2, two runs):**
+  | | before | after |
+  |---|---|---|
+  | 1 failed | 120.2 / 119.1 MB/s, 1.99 / 2.03 member bytes per file byte | 195.4 MB/s, 1.76 (2 columns per row, 0 Q, 344 us per row) |
+  | 2 failed | 91.8 / 92.8 MB/s, 1.83 / 1.79 | 162.0 MB/s, 1.75 (Q read for 2492 of 3479 rows, 392 us per row) |
+  The Pi (USB, latency per member) should gain more from the parallel reads; A/B there with `P_ONLY=P8 sh test_p_perfshape.sh` (the INFO lines).
 
 ### P8. Allocator data structures [V2]
 - **`stripe_alloc`** (`ondisk.c:2404–2434`) scans one bit at a time and calls `slot_is_data()` (a loop over `md_extents`) per slot, all under `stripe_bitmap_spin`. On a nearly full disk that is O(nslots) per new row: about 3.9M slots at 240 GB.
