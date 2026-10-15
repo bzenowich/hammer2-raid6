@@ -370,6 +370,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 	uint64_t nrefs;
 	int isgood;
 	int error;
+	int preempted = 0;
 	int hce;
 	int bflags;
 
@@ -505,7 +506,38 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				    HAMMER2_BREF_TYPE_FREEMAP_LEAF);
 			if (dio->bp)
 				bkvasync(dio->bp);
-			if (is_meta &&
+			int newbuf = 0;
+
+			/*
+			 * A NEW that replaces the whole buffer has no use
+			 * for the old contents, nor has a NEW/NEWNZ of a v3
+			 * data column (one chain's own 64K, see below), so
+			 * do not reconstruct what is about to be zeroed or
+			 * overwritten.
+			 */
+			if (op == HAMMER2_DOP_NEW || op == HAMMER2_DOP_NEWNZ) {
+				if (dio->psize == lsize)
+					newbuf = 1;
+				else if (hammer2_raid6_v3(hmp) &&
+					 (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+					  dio->btype == HAMMER2_BREF_TYPE_DIRENT))
+					newbuf = 2;
+			}
+			if (newbuf) {
+				if (newbuf == 2) {
+					int off = (int)(hammer2_io_data(dio,
+							lbase) - preempt_data);
+
+					if (op == HAMMER2_DOP_NEW) {
+						bzero(preempt_data, dio->psize);
+					} else {
+						bzero(preempt_data, off);
+						bzero(preempt_data + off + lsize,
+						      dio->psize - off - lsize);
+					}
+				}
+				error = 0;
+			} else if (is_meta &&
 			    hmp->voldata.version >=
 			     HAMMER2_VOL_VERSION_RAIDZ2) {
 				/*
@@ -544,6 +576,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 			}
 		}
 		dio->error = error;
+		preempted = 1;
 		goto io_done;
 	}
 
@@ -687,7 +720,7 @@ io_done:
 	 * RAID6: on read error, mark disk failed and attempt degraded
 	 * reconstruction from surviving disks + parity.
 	 */
-	if (error && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
+	if (error && !preempted && hmp->raid_type == HAMMER2_RAID_TYPE_RAID6) {
 		int injected = (dio->disk_idx >= 0 &&
 				hammer2_inject_eio(dio->disk_idx) != 0);
 		int merr = 0;
