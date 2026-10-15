@@ -4429,7 +4429,7 @@ index 4b3656b..2c05594 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24e..dbbe33b 100644
+index 31be24e..69e9c89 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,10 @@
@@ -6941,7 +6941,7 @@ index 31be24e..dbbe33b 100644
 +
 +		if (ext_col >= 0)
 +			er |= 1ULL << ext_col;
-+		nerased = __builtin_popcountll(er);
++		nerased = bitcount64(er);
 +		if (nerased == 1 || nerased == 2)
 +			atomic_add_64(&hmp->rs_degraded_read[nerased - 1], 1);
 +		bcopy(row.ptrs[tgt_col], buf, bytes);

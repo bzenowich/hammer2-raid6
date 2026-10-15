@@ -2830,7 +2830,7 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 
 		if (ext_col >= 0)
 			er |= 1ULL << ext_col;
-		nerased = __builtin_popcountll(er);
+		nerased = bitcount64(er);
 		if (nerased == 1 || nerased == 2)
 			atomic_add_64(&hmp->rs_degraded_read[nerased - 1], 1);
 		bcopy(row.ptrs[tgt_col], buf, bytes);
