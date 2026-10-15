@@ -751,6 +751,10 @@ hammer2_io_raid6_write_row(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 	}
 
 	/* P and Q go out together; the rebuild-target copies below too. */
+	if (pbp || p_mem)
+		HAMMER2_RSTAT_WR(hmp, p_disk, HAMMER2_RSC_P, stripe_unit);
+	if (qbp || q_mem)
+		HAMMER2_RSTAT_WR(hmp, q_disk, HAMMER2_RSC_Q, stripe_unit);
 	if (pbp) {
 		/* parity is never read back on the normal path: drop it */
 		pbp->b_flags |= B_RELBUF | B_NOCACHE;
@@ -1105,6 +1109,7 @@ hammer2_io_metadata_mirror_write(hammer2_dev_t *hmp, int primary,
 		    !vol->dev->open)
 			continue;
 
+		HAMMER2_RSTAT_WR(hmp, i, HAMMER2_RSC_MMIRROR, bytes);
 		if (hmp->raid_failed[i]) {
 			/* rebuilding; its result does not count here */
 			int e = hammer2_io_raid6_write_nowait(vol->dev->devvp,
@@ -1333,10 +1338,12 @@ hammer2_io_metadata_read_one(hammer2_dev_t *hmp, int disk_idx,
 	 */
 	if (!block)
 		return hammer2_io_raid6_read_bufcache(hmp, disk_idx,
-		    vol->dev->devvp, per_disk_off, buf, (int)bytes, 1);
+		    vol->dev->devvp, per_disk_off, buf, (int)bytes, 1,
+		    HAMMER2_RSC_META);
 	{
 		struct buf *bp = NULL;
 
+		HAMMER2_RSTAT_RD(hmp, disk_idx, HAMMER2_RSC_META, bytes);
 		error = bread(vol->dev->devvp, per_disk_off, (int)bytes, &bp);
 		if (error == 0) {
 			bkvasync(bp);

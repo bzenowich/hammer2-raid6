@@ -1860,6 +1860,7 @@ hammer2_sm_bwrite(hammer2_dev_t *hmp, int disk_idx, struct buf *bp)
 {
 	int error;
 
+	HAMMER2_RSTAT_WR(hmp, disk_idx, HAMMER2_RSC_VOLHDR, bp->b_bcount);
 	/* -1: not a fault injection point, as bwrite() was not */
 	if (hammer2_bwrite_start(bp, -1) == 0)
 		return 0;
@@ -2190,6 +2191,7 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			if (hmp->volumes[d].dev == NULL ||
 			    hmp->volumes[d].dev->devvp == NULL)
 				continue;
+			HAMMER2_RSTAT_WR(hmp, d, HAMMER2_RSC_ZERO, bytes);
 			if (hmp->raid_failed[d]) {
 				/* rebuilding disk: never wait on its bufs */
 				if (zbuf == NULL)
@@ -2240,6 +2242,7 @@ hammer2_raid6_row_io(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			if (hmp->volumes[d].dev == NULL ||
 			    hmp->volumes[d].dev->devvp == NULL)
 				continue;
+			HAMMER2_RSTAT_WR(hmp, d, HAMMER2_RSC_DATA, bytes);
 			werr = hammer2_io_raid6_write_nowait(
 			    hmp->volumes[d].dev->devvp, phys_off,
 			    cols[i].data, (int)bytes);
@@ -2571,6 +2574,7 @@ hammer2_raid6_open_row_add_data(hammer2_dev_t *hmp, hammer2_off_t phys_off,
 			wake = 1;
 		if (r->n_alloc >= r->ndata) {
 			hammer2_rz_seal_full++;
+			atomic_add_64(&hmp->rs_seal_full, 1);
 			hammer2_raid6_seal_row_locked_to_unlocked(hmp, r);
 		}
 	}
@@ -2689,8 +2693,11 @@ hammer2_raid6_seal_all_open_rows(hammer2_dev_t *hmp)
 				continue;
 			}
 			hammer2_rz_seal_flush++;
-			if (r->n_alloc < r->ndata)
+			atomic_add_64(&hmp->rs_seal_flush, 1);
+			if (r->n_alloc < r->ndata) {
 				hammer2_rz_seal_flush_short++;
+				atomic_add_64(&hmp->rs_seal_partial, 1);
+			}
 			hammer2_raid6_open_row_unlink_locked(hmp, r);
 			TAILQ_INSERT_TAIL(&sealq, r, entry);
 		}

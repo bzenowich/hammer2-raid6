@@ -258,7 +258,8 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
  * (hammer2_iowd_begin).
  */
 static int
-hammer2_io_devread(hammer2_io_t *dio, off_t dev_pbase, int bflags, int hce)
+hammer2_io_devread(hammer2_io_t *dio, off_t dev_pbase, int bflags, int hce,
+		   int isnew)
 {
 	off_t peof;
 	int gen;
@@ -267,6 +268,20 @@ hammer2_io_devread(hammer2_io_t *dio, off_t dev_pbase, int bflags, int hce)
 	if (dio->bp == NULL) {
 		dio->bp = getblk(dio->devvp, dev_pbase, dio->psize,
 				 (bflags & B_KVABIO) ? GETBLK_KVABIO : 0, 0);
+	}
+	if (dio->bp && (dio->bp->b_flags & B_CACHE) == 0) {
+		HAMMER2_RSTAT_RD(dio->hmp, dio->disk_idx,
+		    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+		     dio->btype == HAMMER2_BREF_TYPE_DIRENT) ?
+		    HAMMER2_RSC_DATA : HAMMER2_RSC_META, dio->psize);
+		if (isnew) {
+			if (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+			    dio->btype == HAMMER2_BREF_TYPE_DIRENT)
+				atomic_add_64(&dio->hmp->rs_new_preread, 1);
+			else
+				atomic_add_64(&dio->hmp->rs_new_preread_meta,
+				    1);
+		}
 	}
 	gen = hammer2_iowd_begin(dio->hmp, dio->disk_idx);
 	if (hce > 0) {
@@ -587,7 +602,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 				/* read from a mirror, or cached */
 			} else {
 				error = hammer2_io_devread(dio, dev_pbase,
-							   bflags, hce);
+							   bflags, hce, 0);
 			}
 			break;
 		}
@@ -628,7 +643,8 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, off_t lbase,
 		if (hammer2_io_meta_spread_read(dio, dev_pbase)) {
 			/* read from a mirror, or cached */
 		} else {
-			error = hammer2_io_devread(dio, dev_pbase, bflags, hce);
+			error = hammer2_io_devread(dio, dev_pbase, bflags, hce,
+						   op != HAMMER2_DOP_READ);
 		}
 		if (dio->bp) {
 			/*
@@ -965,6 +981,11 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 					    (intmax_t)pbase);
 				}
 
+				HAMMER2_RSTAT_WR(hmp, dio->disk_idx,
+				    (dio->btype == HAMMER2_BREF_TYPE_DATA ||
+				     dio->btype == HAMMER2_BREF_TYPE_DIRENT) ?
+				    HAMMER2_RSC_DATA : HAMMER2_RSC_META,
+				    psize);
 				if (hammer2_inject_wio(dio->disk_idx)) {
 					hammer2_inject_wio_dirty(bp);
 				} else if (dio->refs & HAMMER2_DIO_FLUSH) {
@@ -1876,6 +1897,7 @@ hammer2_io_repair_execute(hammer2_dev_t *hmp, hammer2_repair_req_t *req)
 		bcopy(req->data, (char *)bp->b_data + req->patch_off,
 		      req->patch_len);
 	}
+	HAMMER2_RSTAT_WR(hmp, req->disk_idx, req->cls, bp->b_bcount);
 	error = bwrite(bp);
 	if (error == 0) {
 		atomic_add_64(&hmp->repair_writes_done, 1);
@@ -2018,6 +2040,17 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 			      int patch_len, char *data, int chk_off,
 			      int chk_len, uint64_t chk_hash)
 {
+	hammer2_io_repair_enqueue_cls(hmp, disk_idx, base, bufsize, patch_off,
+	    patch_len, data, chk_off, chk_len, chk_hash,
+	    HAMMER2_RSC_SELFHEAL);
+}
+
+void
+hammer2_io_repair_enqueue_cls(hammer2_dev_t *hmp, int disk_idx,
+			      hammer2_off_t base, int bufsize, int patch_off,
+			      int patch_len, char *data, int chk_off,
+			      int chk_len, uint64_t chk_hash, int cls)
+{
 	hammer2_repair_req_t *req;
 	hammer2_repair_req_t *scan;
 
@@ -2035,6 +2068,7 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 	req->chk_off = chk_off;
 	req->chk_len = chk_len;
 	req->chk_hash = chk_hash;
+	req->cls = cls;
 
 	hammer2_spin_ex(&hmp->repair_spin);
 	if (hmp->repair_queue_count >= HAMMER2_REPAIR_QUEUE_MAX) {
@@ -2058,6 +2092,7 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 		}
 	}
 	TAILQ_INSERT_TAIL(&hmp->repair_queue, req, entry);
+	atomic_add_64(&hmp->rs_selfheal_queued, 1);
 	hmp->repair_queue_count++;
 	hammer2_spin_unex(&hmp->repair_spin);
 	wakeup(&hmp->repair_queue);
@@ -2082,7 +2117,7 @@ hammer2_io_repair_enqueue_chk(hammer2_dev_t *hmp, int disk_idx,
 int
 hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
 			       struct vnode *devvp, off_t off,
-			       void *dst, int bytes, int nocache)
+			       void *dst, int bytes, int nocache, int cls)
 {
 	struct buf *bp;
 	int gen;
@@ -2093,6 +2128,8 @@ hammer2_io_raid6_read_bufcache(hammer2_dev_t *hmp, int disk_idx,
 		return EWOULDBLOCK;
 	if (nocache && (bp->b_flags & (B_CACHE | B_DELWRI)) == 0)
 		bp->b_flags |= B_RELBUF | B_DIRECT;
+	if ((bp->b_flags & B_CACHE) == 0)
+		HAMMER2_RSTAT_RD(hmp, disk_idx, cls, bytes);
 	gen = hammer2_iowd_begin(hmp, disk_idx);
 	error = breadnx(devvp, off, bytes, 0, NULL, NULL, 0, &bp);
 	hammer2_iowd_end(hmp, disk_idx, gen);
@@ -2135,7 +2172,7 @@ hammer2_pbuf_read_start(struct vnode *devvp, off_t off, int bytes,
 int
 hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 			      struct vnode *devvp, off_t off,
-			      void *dst, int bytes, int nocache)
+			      void *dst, int bytes, int nocache, int cls)
 {
 	struct buf *bp;
 	int error;
@@ -2147,9 +2184,10 @@ hammer2_io_raid6_read_sibling(hammer2_dev_t *hmp, int disk_idx,
 	 */
 	hammer2_pq_wait_slot(hmp, off);
 	error = hammer2_io_raid6_read_bufcache(hmp, disk_idx, devvp, off,
-					       dst, bytes, nocache);
+					       dst, bytes, nocache, cls);
 	if (error != EWOULDBLOCK)
 		return error;
+	HAMMER2_RSTAT_RD(hmp, disk_idx, cls, bytes);
 
 	bp = hammer2_pbuf_read_start(devvp, off, bytes, 1, disk_idx);
 	error = hammer2_biowait_timed(bp, "h2sib");
@@ -2320,7 +2358,8 @@ hammer2_io_metadata_mirror_heal(hammer2_dev_t *hmp, int bad_disk_idx,
 		error = hammer2_inject_eio(i);
 		if (error == 0)
 			error = hammer2_io_raid6_read_sibling(hmp, i,
-			    vol->dev->devvp, dev_pbase, copy, psize, 0);
+			    vol->dev->devvp, dev_pbase, copy, psize, 0,
+			    HAMMER2_RSC_SELFHEAL);
 		if (error)
 			continue;
 		if (hammer2_bref_check_match(bref, copy + off, bytes)) {
@@ -2492,7 +2531,8 @@ hammer2_io_raid6_read_degraded_x(hammer2_dev_t *hmp,
 			if (lerror == 0)
 				lerror = hammer2_io_raid6_read_sibling(hmp,
 				    phys_disk, vol->dev->devvp, phys_off,
-				    col_bufs[col], (int)stripe_unit, 0);
+				    col_bufs[col], (int)stripe_unit, 0,
+				    HAMMER2_RSC_DEGRADED);
 			if (lerror) {
 				int injected = hammer2_inject_eio(phys_disk);
 				if (!injected) {
@@ -2533,6 +2573,8 @@ do_recovery:
 	/* Perform recovery */
 	if (error)
 		goto read_degraded_done;
+	if (nerased == 1 || nerased == 2)
+		atomic_add_64(&hmp->rs_degraded_read[nerased - 1], 1);
 	if (nerased > 2) {
 		error = EIO;
 		goto read_degraded_done;
@@ -2711,6 +2753,7 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 				rinj[i] = 1;
 				continue;
 			}
+			HAMMER2_RSTAT_RD(hmp, d, HAMMER2_RSC_RESILVER, su);
 			rb[i] = hammer2_resilver_read_start(
 			    hmp->volumes[d].dev->devvp, phys_off, (int)su);
 		}
@@ -2819,7 +2862,8 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 			if (lerror == 0)
 				lerror = hammer2_io_raid6_read_sibling(hmp, d,
 				    hmp->volumes[d].dev->devvp, phys_off,
-				    xbufs[1 + col - ndata], (int)su, 1);
+				    xbufs[1 + col - ndata], (int)su, 1,
+				    HAMMER2_RSC_RESILVER);
 			if (lerror) {
 				kprintf("hammer2: resilver stripe %llu: "
 					"unrecoverable I/O error on disk %d\n",
@@ -2842,6 +2886,10 @@ hammer2_resilver_pass(hammer2_dev_t *hmp, int failed_disk_idx,
 	 * Write the rebuilt columns to the new disk, then wait for them.
 	 */
 	if (error == 0) {
+		atomic_add_64(&hmp->rs_resilver_copied, nslots);
+		for (s = 0; s < nslots; s++)
+			HAMMER2_RSTAT_WR(hmp, failed_disk_idx,
+			    HAMMER2_RSC_RESILVER, su);
 		for (s = 0; s < nslots; s++)
 			wbp[s] = hammer2_col_write_start(new_devvp,
 			    (off_t)(HAMMER2_ZONE_SEG64 + slots[s] * su),
@@ -2919,7 +2967,8 @@ hammer2_resilver_md_read(hammer2_dev_t *hmp, int failed_disk_idx,
 			lerror = hammer2_inject_eio(i);
 			if (lerror == 0)
 				lerror = hammer2_io_raid6_read_sibling(hmp, i,
-				    vol->dev->devvp, off, buf, bytes, 1);
+				    vol->dev->devvp, off, buf, bytes, 1,
+				    HAMMER2_RSC_RESILVER);
 			if (lerror == 0)
 				break;
 		}
@@ -3365,10 +3414,14 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					    hmp->volumes[src].dev->devvp,
 					    (off_t)coff, FINDBLK_TEST))
 						src = -1;
-					if (src >= 0)
+					if (src >= 0) {
+						HAMMER2_RSTAT_RD(hmp, src,
+						    HAMMER2_RSC_RESILVER,
+						    clen[c]);
 						rbp[c] = hammer2_resilver_read_start(
 						    hmp->volumes[src].dev->devvp,
 						    (off_t)coff, (int)clen[c]);
+					}
 				}
 				for (c = 0; c < nch; c++) {
 					hammer2_off_t coff = mo + cidx[c];
@@ -3413,6 +3466,8 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 						hmp->resilver_running = 0;
 						return EIO;
 					}
+					HAMMER2_RSTAT_WR(hmp, failed_disk_idx,
+					    HAMMER2_RSC_RESILVER, clen[c]);
 					wbp[c] = hammer2_col_write_start(
 					    new_devvp, (off_t)coff,
 					    md_buf + (size_t)c * MD_CHUNK,
@@ -3551,6 +3606,7 @@ hammer2_io_raid6_resilver(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
 					continue;
 				slots[m++] = slots[i];
 			}
+			atomic_add_64(&hmp->rs_resilver_skipped, n - m);
 			n = m;
 		}
 		if (n > 0)
@@ -3732,7 +3788,7 @@ hammer2_scrub_verify_bref(struct hammer2_scrub_ctx *ctx,
 	    hammer2_io_raid6_read_bufcache(hmp, disk_idx,
 	     hmp->volumes[disk_idx].dev->devvp,
 	     (off_t)(lbase & ~HAMMER2_PBUFMASK64), ctx->rbuf,
-	     HAMMER2_PBUFSIZE, 1) == 0) {
+	     HAMMER2_PBUFSIZE, 1, HAMMER2_RSC_SCRUB) == 0) {
 		bdata = ctx->rbuf + (lbase & HAMMER2_PBUFMASK64);
 	}
 	if (bdata && hammer2_scrub_check_match(bref, bdata, lsize)) {
@@ -4080,8 +4136,8 @@ scrub_pq_queue(hammer2_dev_t *hmp, int disk, uint64_t slot, char *data,
 	    slot * hmp->raid_config.stripe_unit;
 	int su = (int)hmp->raid_config.stripe_unit;
 
-	hammer2_io_repair_enqueue_chk(hmp, disk, base, su, 0, su, data, 0, su,
-	    hammer2_io_repair_hash(bad, su));
+	hammer2_io_repair_enqueue_cls(hmp, disk, base, su, 0, su, data, 0, su,
+	    hammer2_io_repair_hash(bad, su), HAMMER2_RSC_SCRUB);
 }
 
 /*
@@ -4206,7 +4262,7 @@ scrub_pq_verify_row(struct hammer2_scrub_ctx *ctx, uint64_t slot,
 		for (tries = 0; tries < 50; tries++) {
 			err = hammer2_io_raid6_read_bufcache(hmp, d,
 			    hmp->volumes[d].dev->devvp, (off_t)phys_off,
-			    ctx->pq_col[d], (int)su, 1);
+			    ctx->pq_col[d], (int)su, 1, HAMMER2_RSC_SCRUB);
 			if (err != EWOULDBLOCK)
 				break;
 			tsleep(&ctx->pq_xp, 0, "h2pqbs", 1);
@@ -4595,6 +4651,7 @@ hammer2_scrub_parity(struct hammer2_scrub_ctx *ctx)
 					rslow[i] = 1;
 					continue;
 				}
+				HAMMER2_RSTAT_RD(hmp, d, HAMMER2_RSC_SCRUB, su);
 				rb[i] = hammer2_pbuf_read_start(
 				    hmp->volumes[d].dev->devvp, (off_t)off,
 				    (int)su, 1, d);
@@ -5037,7 +5094,8 @@ hammer2_pq_test_cmd(hammer2_dev_t *hmp, const char *cmd, char *res, size_t rlen)
 		relpbuf(bp, NULL);
 	} else if (strcmp(name, "col") == 0) {
 		error = hammer2_io_raid6_read_sibling(hmp, disk,
-		    hmp->volumes[disk].dev->devvp, (off_t)off, buf, (int)su, 0);
+		    hmp->volumes[disk].dev->devvp, (off_t)off, buf, (int)su, 0,
+		    HAMMER2_RSC_OTHER);
 	} else if (strcmp(name, "deg") == 0) {
 		error = hammer2_io_raid6_read_degraded(hmp, (hammer2_off_t)off,
 		    disk, buf, su, 1);
