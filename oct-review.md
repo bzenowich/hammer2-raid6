@@ -881,7 +881,7 @@ and windowed Phase A part is in `e098809`; this finishes the other two items.
 
 ### P9. Smaller items
 - **Data read-ahead on v3** reads neighbouring slots on the same disk, and half of those are P/Q (`io.c:488–520`). Use `hce = 0` for Path A dios and rely on logical read-ahead. Measured on the Pi on 2026-10-10 (kernel #16): a cold sequential read of 1 GB read about 170 MB/s across the four disks to deliver 78 MB/s of file data, about 2.2× read amplification. Fixing this should roughly double sequential reads. [V-measured]
-- **The dio hash drops the disk bits** (`io.c:2830`), so all columns of a row share a bucket. Mix in `pbase >> 56`. [V2]
+- **The dio hash drops the disk bits** (`io.c:2830`), so all columns of a row share a bucket. Mix in `pbase >> 56`. [V2] **Done 2026-10-15 (fix/small-fixes, commit FIX2):** `hammer2_io_hashv` adds `(pbase >> 56) * 0x2F0B` (the disk id; `pbase = disk_idx << 56 | per-disk offset`). The hash is only used to pick a bucket in `lookup`/`enter` (`iohash` is otherwise walked whole), so nothing depends on its value. Userland model, 4 disks x 20000 cached 64 KB rows in the 32768 buckets: before, 20000 buckets used, every chain 4 long; after, all 32768 used, max chain 3, mean chain seen by a lookup 2.58 (ideal for that load is about 2.4).
 - **Each data column costs a 64 KB `kmalloc` + `bcopy`** held until the seal (`io.c:779–784`). Large kmallocs cost TLB-shootdown IPIs on free. Use an objcache, or the fold-in accumulation in S3.
 
 ### P10. Small-file write amplification: every dirty metadata release mirrors 3 x 64 KB synchronously [V-measured]

@@ -4775,9 +4775,15 @@ hammer2_io_raid6_scrub(hammer2_dev_t *hmp, hammer2_pfs_t *pmp, uint32_t flags)
 static __inline hammer2_io_hash_t *
 hammer2_io_hashv(hammer2_dev_t *hmp, hammer2_off_t pbase)
 {
-	int hv;
+	uint32_t hv;
 
-	hv = (int)pbase + (int)(pbase >> 16);
+	/*
+	 * A v3 data dio's pbase is (disk_idx << 56) | per-disk offset, and
+	 * the columns of a row share the offset.  Mix the disk in, or all
+	 * of a row's columns land in one bucket.
+	 */
+	hv = (uint32_t)pbase + (uint32_t)(pbase >> 16) +
+	     (uint32_t)(pbase >> 56) * 0x2F0B;
 	return (&hmp->iohash[hv & HAMMER2_IOHASH_MASK]);
 }
 
