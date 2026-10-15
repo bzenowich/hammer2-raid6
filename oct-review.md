@@ -1032,6 +1032,7 @@ ioctl and printed by `hammer2 raid stats`:
 - **Userland deploy.** `deploy.sh build` runs `make` in `/usr/src/sbin/hammer2` and `fast`/`install` copy it to `/sbin/hammer2`; `tools/pi-h2deploy.sh` builds `sbin/hammer2` with `bin/arm-world` and pushes it to `/sbin/hammer2` on the Pi. Both therefore carry the new subcommand with no script change.
 - **Results (2026-10-15, h2dev, 4 disks):** ST 19/19 (default and `ASYNC_SEAL=0`; the first run: 64 MB written = 512 rows, data 64 MiB, P = Q = 32 MiB, `new_preread` 0, 509 `degraded_read_1` on the cold read with one disk failed). `ASYNC_SEAL=0` ST B D K L: 148/0. Full suite (A..Z, ST, R, M): 680 pass, 0 fail.
 - **Test ST (see results below).** ST2: 64 MB written: data write bytes >= file bytes, P and Q writes equal in ops and bytes, `new_preread == 0`, no degraded reads, data reads <= 1 MB, seals and metadata/mirror writes counted. ST3/ST4: cold read and scrub on a healthy array. ST5: `-z`. ST6: one disk failed, cold read: `degraded_read_1 > 0`, `degraded_read_2 == 0`, nothing read from the failed disk. ST7: replace: `resilver_slots_copied > 0`, resilver writes on that disk, healthy reads afterwards.
+- **Pi (k51 = v4-rebuild cb181b3, 2026-10-15):** ST 19/19 (64 MB: P = Q = 512 ops, new_preread 0, degraded read deg1 511 / deg2 0, failed disk not read, resilver 512 slots); full default suite 625/0 plus O+R 55/0, SoC at most 68.7 C. k51 is the Pi's kernel8-good.img.
 
 ---
 
