@@ -889,6 +889,7 @@ and windowed Phase A part is in `e098809`; this finishes the other two items.
   | 2 failed | 91.8 / 92.8 MB/s, 1.83 / 1.79 | 162.0 / 163.1 / 169.5 MB/s, 1.75-1.95 (Q read for about 2500 of 3500 rows, 390-460 us per row) |
   Full suite on the final build (groups X Z R G A B C D E F H I J K L N O P Q S T U V W Y, default async): **662 pass / 0 fail**; L D X A B with `ASYNC_SEAL=0`: 246 / 0. M was not run. G4 caught one mistake on the way: the preempt path's injected EIO used to be "healed" by the retry block that P7 removed, so injection is now skipped for a preempted dio.
   The Pi (USB, latency per member) should gain more from the parallel reads; A/B there with `P_ONLY=P8 sh test_p_perfshape.sh` (the INFO lines).
+  **Pi (k53 = v4-rebuild 3406a2f, merged with stats, 2026-10-15):** P8 5/5; 1 failed 76.6 MB/s, 1.76 member bytes per file byte, 0 Q, 760 us per row; 2 failed 63.7 MB/s, 1.79, Q for 2504 of 3431 rows, 840 us per row (healthy cold read on k50: 180 MB/s). No before-P7 Pi number (P8 is new). Full suite 631/0 plus O+R 55/0, SoC at most 68.7 C, no under-voltage; k53 is the Pi's kernel8-good.img.
 
 ### P8. Allocator data structures [V2]
 - **`stripe_alloc`** (`ondisk.c:2404–2434`) scans one bit at a time and calls `slot_is_data()` (a loop over `md_extents`) per slot, all under `stripe_bitmap_spin`. On a nearly full disk that is O(nslots) per new row: about 3.9M slots at 240 GB.
