@@ -135,6 +135,8 @@ holders() {
 # zero_heads: stale metadata of earlier arrays would look like copies
 zero_heads() {
     local d
+    # the previous array is about to be wiped: check its parity first
+    parity_check "array before zero_heads"
     for d in $DEVS; do
         dd if=/dev/zero of=$d bs=1m count=300 2>/dev/null || true
     done

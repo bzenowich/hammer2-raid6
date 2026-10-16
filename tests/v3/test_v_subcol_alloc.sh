@@ -329,6 +329,10 @@ if fail_disk "$DISK" "V7"; then
         result FAIL "V7: degraded mount refused"
     fi
 fi
+# V7 overwrote a second member's data zone, parity columns included; reads
+# heal the data they use, but an unread P/Q column stays garbage until a
+# parity scrub (group Y), so the parity check would flag that, not a bug.
+parity_skip "V7 leaves unread P/Q columns of a second member corrupt on purpose"
 kmsg_clear
 teardown "V7"
 setup_fresh

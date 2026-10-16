@@ -54,6 +54,8 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
 
 ## Test gaps
 
+- **Parity check after every group: done (2026-10-15).** `h2stripe_check` runs on the unmounted members after every array a group builds (`PARITY_CHECK=0|1|2`, oct-review 0.7 item 1); no mismatch found. Still open from 0.7: the crash test that can lose writes (item 2), write/flush error injection beyond W (item 3), counters that prove each path ran (item 6). A read-path gap it showed: a corrupt P or Q column that is never read is not repaired until a parity scrub (B6, U5, V7 are annotated `parity_skip`).
+
 - **`NDISKS=6` in a periodic matrix.** X6 only reports the disk count;
   the h2dev guest has vbd1..4, so a 6-disk run needs two more images
   and a harness change.

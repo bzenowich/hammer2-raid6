@@ -90,6 +90,11 @@ fi
 # The healed CHECK FAILs on disk SECOND are expected; the data
 # assertions above are what decide this test.
 kmsg_clear
+# B6 overwrote the first 100 MB of disk SECOND's data zone, parity
+# columns included.  A degraded read heals the data columns it reads, but
+# a Q (or P) column nobody reads stays garbage until a parity scrub
+# (group Y), so the end-of-test parity check would flag exactly that.
+parity_skip "B6 leaves unread P/Q columns of disk${SECOND} corrupt on purpose"
 teardown "$BD"
 
 summary

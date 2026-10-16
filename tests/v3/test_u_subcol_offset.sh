@@ -169,6 +169,10 @@ if fail_disk "$DISK" "U5"; then
         result FAIL "U5: degraded mount refused"
     fi
 fi
+# U5 overwrote a second member's data zone, parity columns included; reads
+# heal the data they use, but an unread P/Q column stays garbage until a
+# parity scrub (group Y), so the parity check would flag that, not a bug.
+parity_skip "U5 leaves unread P/Q columns of a second member corrupt on purpose"
 kmsg_clear
 teardown "U5"
 
