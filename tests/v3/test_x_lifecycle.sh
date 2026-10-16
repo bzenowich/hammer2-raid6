@@ -32,6 +32,8 @@
 #       skipped is never read as metadata
 #   X10 new rows put no data column on a failed disk (1 and 2 failed),
 #       degraded-written data reads back and survives a resilver
+#   X11 raid replace refuses a device overlapping a live member (the
+#       whole disk under a sliced member); Pi slices only
 #   X6  disk count: the number of vbd test disks the guest has against
 #       NDISKS (information; a 6-disk matrix needs a harness change)
 #
@@ -1114,7 +1116,45 @@ x10() {
     x10_round X10b 1 2
 }
 
-for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8 x9 x10}; do
+# ----------------------------------------------------------------
+# X11: raid replace refuses a device whose media overlaps a live member
+# (the whole disk under a sliced member); slices of one disk that do not
+# overlap are accepted (the NDISKS=6 matrix on the Pi replaces those).
+# Needs sliced members (DISK_SUFFIX=s1 on the Pi); skipped otherwise.
+# ----------------------------------------------------------------
+x11() {
+local m0 whole
+m0=$(disk_dev 0)
+whole=$(echo "$m0" | sed -n 's/s[0-9][0-9]*$//p')
+if [ -z "$whole" ] || [ ! -e "$whole" ]; then
+    echo "  info: X11: members are not slices; skipped"
+    return
+fi
+setup_fresh $X_SIZE
+if fail_disk $X_DISK X11; then
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" "$whole" \
+            > /var/tmp/x_replace.txt 2>&1; then
+        result FAIL "X11: replace onto $whole (overlaps member 0 $m0) accepted"
+    elif grep -q "busy" /var/tmp/x_replace.txt &&
+            disk_state_is 0 ONLINE; then
+        result PASS "X11: replace onto $whole refused (overlaps $m0)"
+    else
+        result FAIL "X11: replace onto $whole: unexpected result"
+        sed 's/^/      /' /var/tmp/x_replace.txt
+    fi
+    if hammer2 -s $MNTPT raid replace "$(disk_dev $X_DISK)" \
+            "$(disk_dev $X_DISK)" > /var/tmp/x_replace.txt 2>&1 &&
+            disk_state_is $X_DISK ONLINE; then
+        result PASS "X11: replace onto the failed member's own slice"
+    else
+        result FAIL "X11: replace onto the failed member's own slice"
+        sed 's/^/      /' /var/tmp/x_replace.txt
+    fi
+fi
+teardown "X11"
+}
+
+for t in ${X_TESTS:-x1 x2 x3 x4 x4b x5 x6 x7 x8 x9 x10 x11}; do
     $t
 done
 

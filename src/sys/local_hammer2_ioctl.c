@@ -1540,11 +1540,34 @@ hammer2_ioctl_raid_long(hammer2_inode_t *ip, void *data,
 }
 
 /*
+ * Do two devices share media?  Slices of one disk (da0s1, da0s2) do
+ * not when their ranges are disjoint; the whole disk overlaps every
+ * slice.  When the ranges cannot be read, assume they overlap.
+ */
+static int
+hammer2_raid6_dev_overlap(struct vnode *a, struct vnode *b)
+{
+	struct partinfo pa;
+	struct partinfo pb;
+
+	if (a->v_rdev->si_disk == NULL ||
+	    a->v_rdev->si_disk != b->v_rdev->si_disk)
+		return 0;
+	if (VOP_IOCTL(a, DIOCGPART, (void *)&pa, 0,
+		      curthread->td_ucred, NULL) != 0 ||
+	    VOP_IOCTL(b, DIOCGPART, (void *)&pb, 0,
+		      curthread->td_ucred, NULL) != 0)
+		return 1;
+	return (pa.media_offset < pb.media_offset + pb.media_size &&
+		pb.media_offset < pa.media_offset + pa.media_size);
+}
+
+/*
  * Check a device offered to raid replace for failed slot `slot`.  The
  * device is already open (ours); rebuild_lk is held exclusive, so the
  * members cannot change.  Returns 0, or:
  *
- *	EBUSY	another member (same vnode, same disk or same path), or
+ *	EBUSY	another member (same vnode, path or overlapping media), or
  *		mounted or open elsewhere: a resilver onto it would
  *		overwrite a live column
  *	ENOSPC	smaller than the member it replaces
@@ -1580,9 +1603,8 @@ hammer2_raid6_replace_check(hammer2_dev_t *hmp, int slot,
 		    (dev->devvp && (dev->devvp == new_devvp ||
 		     (dev->devvp->v_rdev &&
 		      (dev->devvp->v_rdev == new_devvp->v_rdev ||
-		       (dev->devvp->v_rdev->si_disk &&
-			dev->devvp->v_rdev->si_disk ==
-			new_devvp->v_rdev->si_disk)))))) {
+		       hammer2_raid6_dev_overlap(dev->devvp,
+						 new_devvp)))))) {
 			kprintf("hammer2: raid replace: %s is already "
 				"member %d of the array\n", new_path, i);
 			return EBUSY;
