@@ -4749,8 +4749,25 @@ scrub_pq_round(struct hammer2_scrub_ctx *ctx, const uint64_t *bad, int nbad)
 	int ncand = 0;
 	int i;
 
-	for (i = 0; i < nbad; i++)
+	for (i = 0; i < nbad; i++) {
+		/*
+		 * Whole-row candidates (P and Q both wrong) are capped
+		 * because each holds every column; when the cap is reached,
+		 * settle what is queued and go on, rather than count the
+		 * rest unlocatable.
+		 */
+		if (ncand) {
+			int j, n1 = 0;
+
+			for (j = 0; j < ncand; j++)
+				n1 += cands[j].kind;
+			if (n1 >= SCRUB_PQ_MAXPQ || ncand >= SCRUB_PQ_MAXBAD) {
+				scrub_pq_fix_data(ctx, cands, ncand);
+				ncand = 0;
+			}
+		}
 		scrub_pq_verify_row(ctx, bad[i], cands, &ncand);
+	}
 	if (ncand)
 		scrub_pq_fix_data(ctx, cands, ncand);
 }
