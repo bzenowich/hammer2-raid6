@@ -4429,7 +4429,7 @@ index 4b3656b..2c05594 100644
  			if (iter->relaxed == 0)
  				iter->relaxed = 1;
 diff --git a/sys/vfs/hammer2/hammer2_io.c b/sys/vfs/hammer2/hammer2_io.c
-index 31be24e..69e9c89 100644
+index 31be24e..251264f 100644
 --- a/sys/vfs/hammer2/hammer2_io.c
 +++ b/sys/vfs/hammer2/hammer2_io.c
 @@ -33,6 +33,10 @@
@@ -5461,7 +5461,7 @@ index 31be24e..69e9c89 100644
  		return;
  	hammer2_adjwritecounter(dio->btype, dio->psize);
  }
-@@ -786,82 +1408,3733 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+@@ -786,82 +1408,3750 @@ _hammer2_io_ref(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
  	atomic_add_64(&dio->refs, 1);
  }
  
@@ -8860,8 +8860,25 @@ index 31be24e..69e9c89 100644
 +	int ncand = 0;
 +	int i;
 +
-+	for (i = 0; i < nbad; i++)
++	for (i = 0; i < nbad; i++) {
++		/*
++		 * Whole-row candidates (P and Q both wrong) are capped
++		 * because each holds every column; when the cap is reached,
++		 * settle what is queued and go on, rather than count the
++		 * rest unlocatable.
++		 */
++		if (ncand) {
++			int j, n1 = 0;
++
++			for (j = 0; j < ncand; j++)
++				n1 += cands[j].kind;
++			if (n1 >= SCRUB_PQ_MAXPQ || ncand >= SCRUB_PQ_MAXBAD) {
++				scrub_pq_fix_data(ctx, cands, ncand);
++				ncand = 0;
++			}
++		}
 +		scrub_pq_verify_row(ctx, bad[i], cands, &ncand);
++	}
 +	if (ncand)
 +		scrub_pq_fix_data(ctx, cands, ncand);
 +}
@@ -9249,7 +9266,7 @@ index 31be24e..69e9c89 100644
  	hammer2_io_t *dio;
  	hammer2_io_t **diop;
  	hammer2_io_t **cleanapp;
-@@ -961,3 +5234,82 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
+@@ -961,3 +5251,82 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
  		}
  	}
  }
