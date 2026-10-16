@@ -16,6 +16,12 @@
 # DISK_SUFFIX: appended after the disk number (default none), to test on
 # slices of big disks: DISK_SUFFIX=s1 uses /dev/da0s1 ...
 
+# DISK_LIST: explicit member devices, space-separated; overrides the
+# three above and sets NDISKS.  For more members than disks, e.g. on the
+# Pi with two slices on two of the four SSDs:
+# DISK_LIST="/dev/da0s1 /dev/da1s1 /dev/da2s1 /dev/da3s1 /dev/da0s2 /dev/da2s2"
+DISK_LIST="${DISK_LIST:-}"
+[ -n "$DISK_LIST" ] && NDISKS=$(echo $DISK_LIST | wc -w | tr -d ' ')
 NDISKS="${NDISKS:-4}"
 DISK_BASE="${DISK_BASE:-1}"
 DISK_PREFIX="${DISK_PREFIX:-/dev/vbd}"
@@ -23,12 +29,21 @@ DISK_SUFFIX="${DISK_SUFFIX:-}"
 MNTPT=/mnt/v3test
 PASS=0; FAIL=0; TOTAL=0; ERRORS=""
 
+# Return the device path for disk index $1 (logical 0..NDISKS-1)
+disk_dev() {
+    if [ -n "$DISK_LIST" ]; then
+        echo "$DISK_LIST" | awk -v n="$1" '{ print $(n + 1) }'
+    else
+        echo "${DISK_PREFIX}$((DISK_BASE + $1))${DISK_SUFFIX}"
+    fi
+}
+
 # Build device list and colon-separated DEVSPEC
 DEVS=""
 DEVSPEC=""
 i=0
 while [ "$i" -lt "$NDISKS" ]; do
-    dev="${DISK_PREFIX}$((DISK_BASE + i))${DISK_SUFFIX}"
+    dev=$(disk_dev "$i")
     # Never newfs a disk something has mounted (the system disk, say).
     if mount | grep -v "@V3TEST " | grep -q "^${dev}[^0-9]"; then
         echo "common.sh: ${dev} is mounted; refusing to use it" >&2
@@ -50,10 +65,6 @@ PFSPATH="${DEVSPEC}@V3TEST"
 sysctl -w vfs.hammer2.async_seal="${ASYNC_SEAL:-1}" > /dev/null 2>&1 || true
 sysctl -w vfs.hammer2.inject_pq_defer_ms=0 > /dev/null 2>&1 || true
 
-# Return the device path for disk index $1 (logical 0..NDISKS-1)
-disk_dev() {
-    echo "${DISK_PREFIX}$((DISK_BASE + $1))${DISK_SUFFIX}"
-}
 
 # Build a DEVSPEC with disk index $1 excluded (for degraded mount)
 degraded_spec() {

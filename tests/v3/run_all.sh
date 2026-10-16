@@ -29,12 +29,13 @@
 #                    array a group builds: 0 off, 1 end of group only,
 #                    2 (default) also before each setup_fresh
 
+[ -n "${DISK_LIST:-}" ] && NDISKS=$(echo $DISK_LIST | wc -w | tr -d ' ')
 NDISKS="${NDISKS:-4}"
 export NDISKS
 
 SCRIPTDIR=$(dirname "$0")
 
-echo "v3 RAIDZ2-native test suite: NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
+echo "v3 RAIDZ2-native test suite: NDISKS=$NDISKS (${DISK_LIST:-${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX}} substrate)"
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -118,7 +119,7 @@ done
 echo ""
 echo "========================================="
 echo "  v3 RAIDZ2-native Integration Test Suite"
-echo "  NDISKS=$NDISKS (${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX} substrate)"
+echo "  NDISKS=$NDISKS (${DISK_LIST:-${DISK_PREFIX:-/dev/vbd}N${DISK_SUFFIX}} substrate)"
 echo "  Total: $TOTAL_PASS pass, $TOTAL_FAIL fail"
 echo "  Group times:$GROUP_TIMES"
 echo "  Parity check time (PARITY_CHECK=${PARITY_CHECK:-2}):${PARITY_TIMES:- none}"

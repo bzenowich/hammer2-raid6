@@ -666,6 +666,12 @@ fi
 # X6: how many test disks does the guest have?
 # ----------------------------------------------------------------
 x6() {
+if [ -n "$DISK_LIST" ]; then
+    n=0
+    for dev in $DISK_LIST; do [ -e "$dev" ] && n=$((n + 1)); done
+    echo "  info: X6: DISK_LIST present: $n disks (NDISKS=$NDISKS)"
+    return
+fi
 n=0
 d=$DISK_BASE
 while [ -e "${DISK_PREFIX}${d}${DISK_SUFFIX}" ]; do
