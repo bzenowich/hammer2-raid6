@@ -70,8 +70,10 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
   `flcrypt` (FlyNAS's own header, `dfly/overlay/usr/local/flynas/src/flcrypt`).
   Multi-core `dm_target_crypt`, NEON AES-XTS and Adiantum are on the fork's
   `dmcrypt-mp` branch; with `vfs.hammer2.spread_strategy` the Pi does
-  53 MB/s write / 124-156 read encrypted (plain 64 / 170-214). Left: the
-  FlyNAS unlock page and tests E2, E4, E8-E11, E13, E14 (§10).
+  53 MB/s write / 124-156 read encrypted (plain 64 / 170-214). The FlyNAS
+  unlock page is done and tested on h2dev (dfly e5369fb). Left: tests E2,
+  E4, E8-E11, E13, E14 (§10), the x86 build check, and merging the fork's
+  `dmcrypt-mp` branch (d13635aa58) into arm64.
 
 - Pi 4 hardware work (USB/UAS robustness, SMART -> auto-fail) is tracked
   in `dfly/docs/dfly-arm.md`.

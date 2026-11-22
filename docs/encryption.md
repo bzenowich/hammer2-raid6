@@ -642,8 +642,12 @@ table status shows it zeroed. Secrets live in `mlock`ed memory and are wiped aft
    logged to syslog as "storage unlock by <user>: ...". `GET /api/storage/encryption` reads
    `rc.d/flcrypt onestatus` (`state=unconfigured|locked|partial|unlocked`, members, open, need,
    mounted). The helper and rc.d paths are tested on the Pi as `nobody` (wrong and right
-   passphrase, already mounted, partial, too few members, bad user name); the Lua endpoints and
-   the WASM card build but await an h2dev run.
+   passphrase, already mounted, partial, too few members, bad user name). The Lua endpoints and
+   the card pass `dfly/tools/uitest/run-unlock.sh` on h2dev (2026-11-22; aes-xts there, the stock
+   module): locked card, empty and wrong passphrase, 400 on a newline, unlock → "4 of 4 members
+   open" and mounted, unlock while unlocked is a 200 no-op, 5 × 403 then 429. That run found the
+   UI's frame arena overrunning the Clay context once the Storage page listed 15 disks (the dm
+   mappings add four), fixed in `ui/main.c`.
 4. `flcrypt open` unlocks the members in parallel (one process per member, so the four 1 s KDFs
    take about 1 s on the Pi's four cores) and exits 0 when all opened, 3 when some did, 2 when
    none did (wrong passphrase). The rc script mounts when at least `flcrypt_min` members are open,
