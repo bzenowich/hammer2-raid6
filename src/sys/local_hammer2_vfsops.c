@@ -90,6 +90,7 @@ int hammer2_spread_workers;
 int hammer2_spread_strategy = 1;
 int hammer2_limit_saved_depth;
 int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
+int hammer2_quorum_force = 0;		/* v3 quorum: one-shot n-2 mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
 uint32_t hammer2_inject_eio_disk_mask = 0; /* v3 EIO injection bitmask */
 int hammer2_inject_eio_autofail = 0;	/* injected read EIO fails the disk */
@@ -248,6 +249,10 @@ SYSCTL_INT(_vfs_hammer2, OID_AUTO, j2_allow_rollback, CTLFLAG_RW,
 	   &hammer2_j2_allow_rollback, 0,
 	   "v3 RAID6: allow mount to roll back when no majority at "
 	   "the latest TXG (data between latest and majority is lost)");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, quorum_force, CTLFLAG_RW,
+	   &hammer2_quorum_force, 0,
+	   "v3 RAID6: let the next mount go ahead with only ndisks-2 members "
+	   "when the missing ones are not marked failed (one-shot)");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, j2_rollback_max, CTLFLAG_RW,
 	   &hammer2_j2_rollback_max, 0,
 	   "v3 RAID6: maximum TXGs to search backwards for a "

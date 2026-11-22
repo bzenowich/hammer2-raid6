@@ -136,4 +136,86 @@ else
 fi
 teardown "G5"
 
+# G6 (oct-review §9 item 8): two members missing at a cold mount and not
+# marked FAILED in any header.  The other n-2 are not a majority, so the
+# mount is refused (with a hint) unless vfs.hammer2.quorum_force=1, which
+# authorizes one mount and is cleared by it.  The missing pair is then
+# FAILED, and a full mount resilvers both.
+G6_A=1; G6_B=$((NDISKS - 1))
+g6_spec() {
+    local j=0 spec=""
+    while [ "$j" -lt "$NDISKS" ]; do
+        [ "$j" != "$G6_A" ] && [ "$j" != "$G6_B" ] &&
+            spec="${spec:+${spec}:}$(disk_dev "$j")"
+        j=$((j + 1))
+    done
+    echo "$spec@V3TEST"
+}
+setup_fresh
+check_v3
+write_ref_data "g6"
+sync; sync
+umount $MNTPT
+sysctl -w vfs.hammer2.quorum_force=0 > /dev/null
+kmsg_clear
+if mount -t hammer2 "$(g6_spec)" $MNTPT 2>/dev/null; then
+    result FAIL "G6: n-2 mount accepted without quorum_force"
+    umount $MNTPT
+elif kmsg | grep -q "set vfs.hammer2.quorum_force=1"; then
+    result PASS "G6: n-2 mount refused without quorum_force, with a hint"
+else
+    result FAIL "G6: n-2 mount refused but no quorum_force hint in dmesg"
+fi
+sysctl -w vfs.hammer2.quorum_force=1 > /dev/null
+if mount -t hammer2 "$(g6_spec)" $MNTPT 2>/var/tmp/g6_mnt.txt; then
+    result PASS "G6: n-2 mount with quorum_force"
+    if [ "$(sysctl -n vfs.hammer2.quorum_force)" = 0 ]; then
+        result PASS "G6: quorum_force cleared by the mount"
+    else
+        result FAIL "G6: quorum_force still set after the mount"
+    fi
+    verify_ref "G6: data read with two members missing" "g6"
+    write_ref_data "g6b"
+    sleep 2
+    sync; sync
+    umount $MNTPT
+    if mount -t hammer2 "$(g6_spec)" $MNTPT 2>/dev/null; then
+        result PASS "G6: second n-2 mount needs no force (pair recorded FAILED)"
+        umount $MNTPT
+    else
+        result FAIL "G6: second n-2 mount refused"
+    fi
+    mount -t hammer2 $PFSPATH $MNTPT
+    if disk_state_is "$G6_A" FAILED && disk_state_is "$G6_B" FAILED; then
+        result PASS "G6: both missing disks persisted as FAILED"
+    else
+        result FAIL "G6: missing disks not FAILED after full mount"
+        hammer2 -s $MNTPT raid status 2>&1 | sed 's/^/      /'
+    fi
+    g6ok=1
+    for d in $G6_A $G6_B; do
+        if ! hammer2 -s $MNTPT raid replace "$(disk_dev $d)" "$(disk_dev $d)" \
+                > /var/tmp/g6_repl.txt 2>&1 || ! disk_state_is "$d" ONLINE; then
+            g6ok=0; sed 's/^/      /' /var/tmp/g6_repl.txt
+        fi
+    done
+    [ $g6ok = 1 ] && result PASS "G6: both disks resilvered" ||
+        result FAIL "G6: resilver of the missing pair"
+    umount $MNTPT
+    if mount -t hammer2 "$(degraded_spec 0)@V3TEST" $MNTPT 2>/dev/null; then
+        verify_ref "G6: data intact after resilver (disk0 left out)" "g6b"
+        verify_ref "G6: pre-force data intact after resilver" "g6"
+        umount $MNTPT
+    else
+        result FAIL "G6: mount without disk0 after the resilver"
+    fi
+    mount -t hammer2 $PFSPATH $MNTPT
+else
+    result FAIL "G6: n-2 mount with quorum_force failed"
+    sed 's/^/      /' /var/tmp/g6_mnt.txt
+    kmsg | grep 'v3 quorum' | tail -3 | sed 's/^/      /'
+fi
+sysctl -w vfs.hammer2.quorum_force=0 > /dev/null
+teardown "G6"
+
 summary

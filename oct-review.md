@@ -1116,6 +1116,12 @@ Status as of 2026-10-13 (each bullet checked against the tree):
 
 ## 9. Suggested order of work
 
+**Status (2026-11-22): items 1-8 are all done.** Merge commits: R1 0c7a588, R2 b14f9f4, R3/R6/R7
+68d6170, R4/R5/R9 28ca685, R8/R10 ccdda50, R11 7e527c2, P3 (async seal), P4 4bae0d8, P6
+e098809 + 98b3746, P7 24eec22, P8 8be2768, P5/S9 b8cf3b8 + d526221, S-b/c/e/g + §8 8d09cd7,
+S-d 99de6a7, S-f 9f73589; item 8 below. Open work lives in `docs/outstanding.md` and the
+per-item "Not covered" notes.
+
 1. **Commit §1, and P1 (sub-64 KB NEW).** Small and same-family. Add group P with the devstat tool so this class can't come back.
 2. **Write repro tests R5, R6 and split-header R2.** Each is a few lines; they turn [R] into facts.
 3. **Correctness core, in one series:**
@@ -1140,6 +1146,21 @@ Status as of 2026-10-13 (each bullet checked against the tree):
    present agree on the newest TXG and at least n-2 are present, and mark the rest FAILED as in
    G5. Test: a group G case that mounts with two members left out. Details in
    `docs/encryption.md` §9.4.
+   **Done 2026-11-22 (kernel #58 on the Pi).** Checked first: an n-2 mount already works when the
+   two missing disks are FAILED in the newest header (they leave the electorate, so the majority
+   floor `ndisks - 2` applies). Only a cold mount with two members missing that no header calls
+   FAILED is refused, and that one cannot be made automatic safely: two halves of an array each
+   mounted alone (split brain) look exactly like it, and the next full mount keeps the newer half
+   and silently drops the other's writes. So it is authorized, not inferred:
+   `vfs.hammer2.quorum_force=1` (one-shot, cleared by the mount that uses it) lets the quorum vote
+   pass with the present members alone when at least `ndisks - 2` are present and every one of
+   them supports the chosen seq (the rollback limits still apply). The missing pair is marked
+   FAILED as in G5. Without the sysctl the refusal now prints a hint naming it
+   (`local_hammer2_ondisk.c`, quorum block). Group G6: refused with the hint without it; mounts
+   with it; sysctl back to 0; data read with two members missing; a second n-2 mount needs no
+   force (pair recorded FAILED); full mount shows both FAILED; both resilvered by `raid replace`;
+   data (before and after the forced mount) verified with disk 0 left out. Pi: G 19/19, S 38/38.
+   flcrypt's rc.d does not set it; an admin does, by hand.
 
 ---
 

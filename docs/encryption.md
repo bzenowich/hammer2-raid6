@@ -635,7 +635,15 @@ table status shows it zeroed. Secrets live in `mlock`ed memory and are wiped aft
 3. Locked: FlyNAS shows an **Unlock storage** page to an authenticated admin (TOTP login) and pauses
    everything that needs the array (app VMs, Seafile, snapshot and scrub cron jobs, backups). The
    passphrase goes over HTTPS to the setuid helper, which runs `flcrypt open -P -` with it on stdin
-   and then mounts. (**Not built yet**: the helper verb and the page.)
+   and then mounts. **Built 2026-11-22:** Storage page card "Encrypted storage" (state, members
+   open, passphrase box) → `POST /api/storage/unlock` (admins only, 5 failures per 5 min per user,
+   then 429) → `flynas-helper cryptunlock <user>` with the passphrase on stdin (never on a
+   command line) → `rc.d/flcrypt oneunlock` (exit 0 ok, 2 wrong passphrase, 3 too few members),
+   logged to syslog as "storage unlock by <user>: ...". `GET /api/storage/encryption` reads
+   `rc.d/flcrypt onestatus` (`state=unconfigured|locked|partial|unlocked`, members, open, need,
+   mounted). The helper and rc.d paths are tested on the Pi as `nobody` (wrong and right
+   passphrase, already mounted, partial, too few members, bad user name); the Lua endpoints and
+   the WASM card build but await an h2dev run.
 4. `flcrypt open` unlocks the members in parallel (one process per member, so the four 1 s KDFs
    take about 1 s on the Pi's four cores) and exits 0 when all opened, 3 when some did, 2 when
    none did (wrong passphrase). The rc script mounts when at least `flcrypt_min` members are open,
@@ -718,9 +726,15 @@ runs on the dm device and should see through a mapping to the slice (E13).
 - **Header quorum** (`volhdr_quorum.md`): HAMMER2 reads the volume headers through the mappings.
   An unmapped member is a missing member. A mount needs a majority of the headers (with 4 disks,
   3); with 2 of 4 it fails with "v3 quorum: no majority ... 2 disks seen of 4, need 3" (seen on
-  the Pi 2026-11-22). So a 4-disk array survives two dead disks while mounted, but cannot be
-  mounted again until one is back or replaced. Worth an oct-review item: allow a forced
-  mount of n-2 members whose headers agree on the same TXG.
+  the Pi 2026-11-22) when the two missing members are not marked FAILED in any header (a cold
+  mount with two members unplugged or not unlocked). If they failed while the array was mounted,
+  the headers record it and an n-2 mount needs nothing special. For the cold case,
+  `sysctl vfs.hammer2.quorum_force=1` lets the next mount go ahead with n-2 members that all agree
+  on the chosen TXG; the sysctl is cleared by that mount, the missing members are marked FAILED
+  and need `raid replace` (oct-review §9 item 8, group G6). It is deliberately not automatic and
+  the unlock page does not set it: if the missing pair was itself mounted alone earlier, the two
+  halves have diverged and one half's writes are lost at the next full mount. An admin sets it
+  by hand after checking that the missing disks are really gone.
 - **512-byte probes:** with `sector_size:4096` a mount logs `dm_target_crypt_strategy: can't really
   handle bp->b_bcount = 512 at 0` once per member (a probe of sector 0 at the 512-byte DEV_BSIZE).
   The probe fails and the mount carries on; harmless but noisy.

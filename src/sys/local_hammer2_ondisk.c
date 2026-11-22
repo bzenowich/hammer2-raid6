@@ -51,6 +51,7 @@
 #include "hammer2_raid6.h"
 
 extern int hammer2_j2_allow_rollback;
+extern int hammer2_quorum_force;
 extern int hammer2_j2_rollback_max;
 
 #define hprintf(X, ...)	kprintf("hammer2_ondisk: " X, ## __VA_ARGS__)
@@ -1245,6 +1246,7 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 		uint64_t chosen = target;
 		uint64_t lowest = (uint64_t)-1;
 		uint32_t seen_count = 0;
+		int forced = 0;
 		uint32_t rollback_max = (uint32_t)
 		    (hammer2_j2_rollback_max > 0 ?
 		     hammer2_j2_rollback_max : 8);
@@ -1275,6 +1277,31 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 				lowest = disk_seqs[j];
 		}
 
+		/*
+		 * Two members missing that no header calls FAILED (unplugged
+		 * or not unlocked while the array was down): the rest are
+		 * not a majority, and nothing here can tell whether the
+		 * missing pair went on without them (a split brain, if both
+		 * halves were mounted on their own).  RAID6 can still read
+		 * everything, so vfs.hammer2.quorum_force=1 lets one mount go
+		 * ahead, as long as ndisks - 2 members are present and all of
+		 * them support the chosen seq (the vote below then needs
+		 * every one of them).  The missing members are marked FAILED
+		 * as with any absent disk, so a later mount with them
+		 * resilvers them rather than trusting them.  The sysctl is
+		 * cleared here, so it authorizes one mount.
+		 */
+		if (seen_count < majority && seen_count >= ndisks - 2 &&
+		    hammer2_quorum_force) {
+			hammer2_quorum_force = 0;
+			forced = 1;
+			hprintf("v3 quorum: vfs.hammer2.quorum_force: mounting "
+				"with %u of %u disks (a majority is %u); the "
+				"missing disks will be marked failed\n",
+				seen_count, ndisks, majority);
+			majority = seen_count;
+		}
+
 		for (;;) {
 			nsupport = 0;
 			for (j = 0; j < HAMMER2_MAX_VOLUMES; j++) {
@@ -1294,6 +1321,14 @@ hammer2_init_volumes(struct mount *mp, hammer2_devvp_list_t *devvpl,
 					(uintmax_t)target,
 					(uintmax_t)lowest,
 					seen_count, ndisks, majority);
+				if (!forced && seen_count < majority &&
+				    seen_count >= ndisks - 2) {
+					hprintf("v3 quorum: if the missing "
+						"disks are gone and were not "
+						"mounted without these, set "
+						"vfs.hammer2.quorum_force=1 "
+						"and mount again\n");
+				}
 				error = ENXIO;
 				goto done;
 			}
