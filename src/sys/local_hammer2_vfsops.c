@@ -87,6 +87,7 @@ int hammer2_dio_count;
 int hammer2_dio_limit = 256;
 int hammer2_bulkfree_tps = 5000;
 int hammer2_spread_workers;
+int hammer2_spread_strategy = 1;
 int hammer2_limit_saved_depth;
 int hammer2_j2_allow_rollback = 0;	/* v3 quorum: allow rollback mount */
 int hammer2_j2_rollback_max = 8;	/* v3 quorum: max TXG rollback */
@@ -217,6 +218,9 @@ SYSCTL_LONG(_vfs_hammer2, OID_AUTO, debug_inode, CTLFLAG_RW,
 	   &hammer2_debug_inode, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_workers, CTLFLAG_RW,
 	   &hammer2_spread_workers, 0, "");
+SYSCTL_INT(_vfs_hammer2, OID_AUTO, spread_strategy, CTLFLAG_RW,
+	   &hammer2_spread_strategy, 0,
+	   "Spread file data I/O over all cpus (0 = the caller's cpu)");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, cluster_meta_read, CTLFLAG_RW,
 	   &hammer2_cluster_meta_read, 0, "");
 SYSCTL_INT(_vfs_hammer2, OID_AUTO, md_3copy_upgrade, CTLFLAG_RW,

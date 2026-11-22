@@ -1133,6 +1133,13 @@ Status as of 2026-10-13 (each bullet checked against the tree):
    - P8;
    - P5/S9 sub-column allocation last.
 7. **Cleanup:** S-a to S-g and §8, in any order.
+8. **(2026-11-22) Mount with n-2 members.** The header quorum needs a majority to mount, so a
+   4-disk array that has lost two disks keeps running but cannot be mounted again (Pi log: "v3
+   quorum: no majority within 8-TXG rollback limit (... 2 disks seen of 4, need 3)"). RAID6's
+   promise is two failures. Proposal: allow the mount (or require `-o force`) when the members
+   present agree on the newest TXG and at least n-2 are present, and mark the rest FAILED as in
+   G5. Test: a group G case that mounts with two members left out. Details in
+   `docs/encryption.md` §9.4.
 
 ---
 

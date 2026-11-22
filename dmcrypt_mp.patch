@@ -1,0 +1,2595 @@
+diff --git a/sys/conf/files b/sys/conf/files
+index ffe7591ad5..a432570ffc 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -2258,6 +2259,7 @@ crypto/blake2/blake2s.c			optional crypto
+ crypto/blowfish/bf_skey.c		optional crypto
+ crypto/camellia/camellia.c		optional crypto
+ crypto/camellia/camellia-api.c		optional crypto
++crypto/adiantum/adiantum.c		optional crypto
+ crypto/chacha20/chacha.c		optional crypto
+ crypto/crypto.c				optional crypto
+ crypto/chachapoly.c			optional crypto
+diff --git a/sys/crypto/Makefile b/sys/crypto/Makefile
+index 28819c9631..fcb9f3ef3a 100644
+--- a/sys/crypto/Makefile
++++ b/sys/crypto/Makefile
+@@ -39,6 +39,25 @@ SRCS+=	rijndael-alg-fst.c rijndael-api.c
+ SRCS+=	aesencdec_${MACHINE_ARCH}.S aeskeys_${MACHINE_ARCH}.S aesni_wrap.c
+ .endif
+ 
++.PATH:	${.CURDIR}/adiantum
++SRCS+=	adiantum.c
++
++# NEON ciphers: these files use the SIMD registers, which the rest of the
++# kernel is compiled without (-mgeneral-regs-only); callers bracket them
++# with kernel_fpu_begin()/kernel_fpu_end().
++.if ${MACHINE_ARCH} == "aarch64"
++.PATH:	${.CURDIR}/aes_neon
++SRCS+=	aes_neon.c adiantum_neon.c
++# <arm_neon.h> is a compiler header, which -nostdinc hides
++CLANG_RESDIR!=	${CC} -print-resource-dir
++MKDEP+=		-isystem ${CLANG_RESDIR}/include
++NEON_CFLAGS=	${CFLAGS:N-mgeneral-regs-only} -isystem ${CLANG_RESDIR}/include
++aes_neon.o: aes_neon.c
++	${CC} ${NEON_CFLAGS} -c ${.IMPSRC} -o ${.TARGET}
++adiantum_neon.o: adiantum_neon.c
++	${CC} ${NEON_CFLAGS} -c ${.IMPSRC} -o ${.TARGET}
++.endif
++
+ .PATH:	${.CURDIR}/serpent
+ SRCS+=	serpent.c
+ 
+diff --git a/sys/crypto/cryptoapi/cryptoapi.c b/sys/crypto/cryptoapi/cryptoapi.c
+index b734a0cb6b..40a1edf6e2 100644
+--- a/sys/crypto/cryptoapi/cryptoapi.c
++++ b/sys/crypto/cryptoapi/cryptoapi.c
+@@ -92,6 +92,23 @@ SYSCTL_INT(_hw, OID_AUTO, aesni_disable, CTLFLAG_RW, &aesni_disable, 0,
+ #define HAVE_AESNI
+ #endif
+ 
++#ifdef _KERNEL
++/* Adiantum is kernel-only: tcplay doesn't speak it */
++#include <crypto/adiantum/adiantum.h>
++#define HAVE_ADIANTUM
++#endif
++
++#if defined(_KERNEL) && defined(__aarch64__)
++#include <machine/md_var.h>	/* kernel_fpu_begin/end */
++#include <crypto/aes_neon/aes_neon.h>
++static int neon_crypto_disable = 0;
++TUNABLE_INT("hw.neon_crypto_disable", &neon_crypto_disable);
++SYSCTL_INT(_hw, OID_AUTO, neon_crypto_disable, CTLFLAG_RW,
++    &neon_crypto_disable, 0,
++    "Use the portable C ciphers instead of NEON (new sessions)");
++#define HAVE_NEON_CRYPTO
++#endif
++
+ /**
+  * --------------------------------------
+  *  cryptoapi session (header)
+@@ -374,7 +391,6 @@ const struct cryptoapi_cipher_spec cipher_aes_cbc = {
+ struct aes_xts_ctx {
+ 	rijndael_ctx key1;
+ 	rijndael_ctx key2;
+-	uint8_t tweak[AES_XTS_BLOCK_LEN];
+ };
+ 
+ static bool
+@@ -414,7 +430,7 @@ aes_xts_setkey(void *_ctx, const uint8_t *keydata, int keylen_in_bytes)
+ }
+ 
+ static inline void
+-aes_xts_reinit(struct aes_xts_ctx *ctx, const uint8_t *iv)
++aes_xts_reinit(struct aes_xts_ctx *ctx, uint8_t *tweak, const uint8_t *iv)
+ {
+ #if 0
+ 	/*
+@@ -423,12 +439,12 @@ aes_xts_reinit(struct aes_xts_ctx *ctx, const uint8_t *iv)
+ 	 */
+ 	/* XXX: possibly use htole64? */
+ #endif
+-	memcpy(ctx->tweak, iv, AES_XTS_IV_LEN);
++	memcpy(tweak, iv, AES_XTS_IV_LEN);
+ 
+ 	/* Last 64 bits of IV are always zero */
+-	bzero(ctx->tweak + AES_XTS_IV_LEN, AES_XTS_IV_LEN);
++	bzero(tweak + AES_XTS_IV_LEN, AES_XTS_IV_LEN);
+ 
+-	rijndael_encrypt(&ctx->key2, ctx->tweak, ctx->tweak);
++	rijndael_encrypt(&ctx->key2, tweak, tweak);
+ }
+ 
+ static void
+@@ -436,11 +452,12 @@ aes_xts_crypt(void *_ctx, uint8_t *data, int datalen, const uint8_t *iv,
+     bool encrypt)
+ {
+ 	uint8_t block[AES_XTS_BLOCK_LEN];
++	uint8_t tweak[AES_XTS_BLOCK_LEN];	/* per call: ctx is shared */
+ 	struct aes_xts_ctx *ctx = _ctx;
+ 
+-	aes_xts_reinit(ctx, iv);
++	aes_xts_reinit(ctx, tweak, iv);
+ 
+-	crypt_data_xts(&ctx->key1, data, datalen, ctx->tweak,
++	crypt_data_xts(&ctx->key1, data, datalen, tweak,
+ 	    encrypt ? rijndael_encrypt_wrap : rijndael_decrypt_wrap, block,
+ 	    AES_XTS_BLOCK_LEN, AES_XTS_ALPHA);
+ }
+@@ -459,6 +476,112 @@ const struct cryptoapi_cipher_spec cipher_aes_xts = {
+ 	.crypt = aes_xts_crypt,
+ };
+ 
++/**
++ * --------------------------------------
++ * AES-XTS with NEON (arm64 without the Crypto Extensions)
++ * --------------------------------------
++ */
++
++#ifdef HAVE_NEON_CRYPTO
++
++static int aes_neon_selftest_result = -1;	/* -1 not run, 0 ok, 1 bad */
++
++/*
++ * Compare against the generic code once, at the first probe: a sector
++ * each way under AES-128 and AES-256 keys.  The NEON code is never used
++ * if it disagrees.
++ */
++static int
++aes_neon_selftest(void)
++{
++	struct {
++		struct aes_neon_xts_ctx n;
++		struct aes_xts_ctx g;
++		uint8_t key[64], a[512], b[512], iv[16];
++	} *t;
++	int kb, i, bad = 0;
++
++	t = kmalloc(sizeof(*t), M_CRYPTOAPI, M_WAITOK);
++	for (kb = 32; kb <= 64; kb += 32) {
++		for (i = 0; i < 64; ++i)
++			t->key[i] = i * 7 + 3 + kb;
++		for (i = 0; i < 512; ++i)
++			t->a[i] = i * 13 + 1;
++		memset(t->iv, 0, sizeof(t->iv));
++		t->iv[0] = 0x5a; t->iv[3] = kb;
++		memcpy(t->b, t->a, sizeof(t->a));
++		aes_xts_setkey(&t->g, t->key, kb);
++		aes_xts_crypt(&t->g, t->a, 512, t->iv, true);
++		kernel_fpu_begin();
++		aes_neon_xts_setkey(&t->n, t->key, kb);
++		aes_neon_xts_crypt(&t->n, t->b, 512, t->iv, 1);
++		kernel_fpu_end();
++		if (memcmp(t->a, t->b, 512) != 0)
++			bad = 1;
++		kernel_fpu_begin();
++		aes_neon_xts_crypt(&t->n, t->b, 512, t->iv, 0);
++		kernel_fpu_end();
++		aes_xts_crypt(&t->g, t->a, 512, t->iv, false);
++		if (memcmp(t->a, t->b, 512) != 0)
++			bad = 1;
++	}
++	explicit_bzero(t, sizeof(*t));
++	kfree(t, M_CRYPTOAPI);
++	if (bad)
++		kprintf("cryptoapi: NEON AES-XTS self-test FAILED, not using it\n");
++	return bad;
++}
++
++static int
++aes_neon_xts_probe(int keysize_in_bits)
++{
++	if (neon_crypto_disable)
++		return (-1);
++	if (keysize_in_bits != 256 && keysize_in_bits != 512)
++		return (-1);
++	if (aes_neon_selftest_result < 0)
++		aes_neon_selftest_result = aes_neon_selftest();
++	return (aes_neon_selftest_result ? -1 : 0);
++}
++
++static int
++aes_neon_xts_setkey_api(void *_ctx, const uint8_t *keydata,
++    int keylen_in_bytes)
++{
++	int error;
++
++	if (keylen_in_bytes != 32 && keylen_in_bytes != 64)
++		return (EINVAL);
++	/* the key schedule is in a SIMD-compiled file too */
++	kernel_fpu_begin();
++	error = aes_neon_xts_setkey(_ctx, keydata, keylen_in_bytes);
++	kernel_fpu_end();
++	return (error ? EINVAL : 0);
++}
++
++static void
++aes_neon_xts_crypt_api(void *_ctx, uint8_t *data, int datalen,
++    const uint8_t *iv, bool encrypt)
++{
++	kernel_fpu_begin();
++	aes_neon_xts_crypt(_ctx, data, datalen, iv, encrypt);
++	kernel_fpu_end();
++}
++
++const struct cryptoapi_cipher_spec cipher_aes_neon_xts = {
++	.ciphername = "aes-xts",
++	.description = "AES-XTS (NEON, bitsliced)",
++	.blocksize = AES_XTS_BLOCK_LEN,
++	.ivsize = AES_XTS_IV_LEN,
++	.ctxsize = sizeof(struct aes_neon_xts_ctx),
++	.ctxalign = 16,
++	.probe = aes_neon_xts_probe,
++	.setkey = aes_neon_xts_setkey_api,
++	.crypt = aes_neon_xts_crypt_api,
++};
++
++#endif /* HAVE_NEON_CRYPTO */
++
+ /**
+  * --------------------------------------
+  * AES-CBC in hardware (AES-NI)
+@@ -646,6 +769,180 @@ const struct cryptoapi_cipher_spec cipher_aesni_xts = {
+ 
+ #endif
+ 
++/**
++ * --------------------------------------
++ * Adiantum (XChaCha12 + AES-256 + NH-Poly1305)
++ * --------------------------------------
++ */
++
++#ifdef HAVE_ADIANTUM
++
++/*
++ * The tweak is the 16-byte IV zero-extended to 32 bytes, which with the
++ * plain64 IV generator is Linux's "xchacha12,aes-adiantum-plain64".
++ * Any length >= 16 works; blocksize only keeps dm's sectors whole.
++ */
++#define ADIANTUM_IV_LEN		16
++
++static int adiantum_selftest_result = -1;
++
++/* google/adiantum test_vectors/ours: 128-byte message, 32-byte tweak */
++static const uint8_t adiantum_kat_key[32] = {
++	0xa5, 0x28, 0x24, 0x34, 0x1a, 0x3c, 0xd8, 0xf7,
++	0x05, 0x91, 0x8f, 0xee, 0x85, 0x1f, 0x35, 0x7f,
++	0x80, 0x3d, 0xfc, 0x9b, 0x94, 0xf6, 0xfc, 0x9e,
++	0x19, 0x09, 0x00, 0xa9, 0x04, 0x31, 0x4f, 0x11,
++};
++static const uint8_t adiantum_kat_tweak[32] = {
++	0xa1, 0xba, 0x49, 0x95, 0xff, 0x34, 0x6d, 0xb8,
++	0xcd, 0x87, 0x5d, 0x5e, 0xfd, 0xea, 0x85, 0xdb,
++	0x8a, 0x7b, 0x5e, 0xb2, 0x5d, 0x57, 0xdd, 0x62,
++	0xac, 0xa9, 0x8c, 0x41, 0x42, 0x94, 0x75, 0xb7,
++};
++static const uint8_t adiantum_kat_pt[128] = {
++	0x69, 0xb4, 0xe8, 0x8c, 0x37, 0xe8, 0x67, 0x82,
++	0xf1, 0xec, 0x5d, 0x04, 0xe5, 0x14, 0x91, 0x13,
++	0xdf, 0xf2, 0x87, 0x1b, 0x69, 0x81, 0x1d, 0x71,
++	0x70, 0x9e, 0x9c, 0x3b, 0xde, 0x49, 0x70, 0x11,
++	0xa0, 0xa3, 0xdb, 0x0d, 0x54, 0x4f, 0x66, 0x69,
++	0xd7, 0xdb, 0x80, 0xa7, 0x70, 0x92, 0x68, 0xce,
++	0x81, 0x04, 0x2c, 0xc6, 0xab, 0xae, 0xe5, 0x60,
++	0x15, 0xe9, 0x6f, 0xef, 0xaa, 0x8f, 0xa7, 0xa7,
++	0x63, 0x8f, 0xf2, 0xf0, 0x77, 0xf1, 0xa8, 0xea,
++	0xe1, 0xb7, 0x1f, 0x9e, 0xab, 0x9e, 0x4b, 0x3f,
++	0x07, 0x87, 0x5b, 0x6f, 0xcd, 0xa8, 0xaf, 0xb9,
++	0xfa, 0x70, 0x0b, 0x52, 0xb8, 0xa8, 0xa7, 0x9e,
++	0x07, 0x5f, 0xa6, 0x0e, 0xb3, 0x9b, 0x79, 0x13,
++	0x79, 0xc3, 0x3e, 0x8d, 0x1c, 0x2c, 0x68, 0xc8,
++	0x51, 0x1d, 0x3c, 0x7b, 0x7d, 0x79, 0x77, 0x2a,
++	0x56, 0x65, 0xc5, 0x54, 0x23, 0x28, 0xb0, 0x03,
++};
++static const uint8_t adiantum_kat_ct[128] = {
++	0x9e, 0x16, 0xab, 0xed, 0x4b, 0xa7, 0x42, 0x5a,
++	0xc6, 0xfb, 0x4e, 0x76, 0xff, 0xbe, 0x03, 0xa0,
++	0x0f, 0xe3, 0xad, 0xba, 0xe4, 0x98, 0x2b, 0x0e,
++	0x21, 0x48, 0xa0, 0xb8, 0x65, 0x48, 0x27, 0x48,
++	0x84, 0x54, 0x54, 0xb2, 0x9a, 0x94, 0x7b, 0xe6,
++	0x4b, 0x29, 0xe9, 0xcf, 0x05, 0x91, 0x80, 0x1a,
++	0x3a, 0xf3, 0x41, 0x96, 0x85, 0x1d, 0x9f, 0x74,
++	0x51, 0x56, 0x63, 0xfa, 0x7c, 0x28, 0x85, 0x49,
++	0xf7, 0x2f, 0xf9, 0xf2, 0x18, 0x46, 0xf5, 0x33,
++	0x80, 0xa3, 0x3c, 0xce, 0xb2, 0x57, 0x93, 0xf5,
++	0xae, 0xbd, 0xa9, 0xf5, 0x7b, 0x30, 0xc4, 0x93,
++	0x66, 0xe0, 0x30, 0x77, 0x16, 0xe4, 0xa0, 0x31,
++	0xba, 0x70, 0xbc, 0x68, 0x13, 0xf5, 0xb0, 0x9a,
++	0xc1, 0xfc, 0x7e, 0xfe, 0x55, 0x80, 0x5c, 0x48,
++	0x74, 0xa6, 0xaa, 0xa3, 0xac, 0xdc, 0xc2, 0xf5,
++	0x8d, 0xde, 0x34, 0x86, 0x78, 0x60, 0x75, 0x8d,
++};
++
++static int
++adiantum_selftest(void)
++{
++	struct {
++		struct adiantum_ctx ctx;
++		uint8_t a[1600], b[1600];
++	} *t;
++	int bad = 0, i;
++
++	t = kmalloc(sizeof(*t), M_CRYPTOAPI, M_WAITOK);
++	adiantum_setkey(&t->ctx, adiantum_kat_key);
++	memcpy(t->a, adiantum_kat_pt, 128);
++	adiantum_crypt(&t->ctx, &adiantum_generic_ops, t->a, 128,
++	    adiantum_kat_tweak, 32, 1);
++	if (memcmp(t->a, adiantum_kat_ct, 128) != 0)
++		bad = 1;
++	adiantum_crypt(&t->ctx, &adiantum_generic_ops, t->a, 128,
++	    adiantum_kat_tweak, 32, 0);
++	if (memcmp(t->a, adiantum_kat_pt, 128) != 0)
++		bad = 1;
++#ifdef HAVE_NEON_CRYPTO
++	/* NEON == C over more than one NH chunk and a ChaCha tail */
++	for (i = 0; i < (int)sizeof(t->a); ++i)
++		t->a[i] = i * 29 + 7;
++	memcpy(t->b, t->a, sizeof(t->a));
++	adiantum_crypt(&t->ctx, &adiantum_generic_ops, t->a, 1552,
++	    adiantum_kat_tweak, 32, 1);
++	kernel_fpu_begin();
++	adiantum_crypt(&t->ctx, &adiantum_neon_ops, t->b, 1552,
++	    adiantum_kat_tweak, 32, 1);
++	kernel_fpu_end();
++	if (memcmp(t->a, t->b, 1552) != 0)
++		bad = 2;
++#else
++	(void)i;
++#endif
++	explicit_bzero(t, sizeof(*t));
++	kfree(t, M_CRYPTOAPI);
++	if (bad)
++		kprintf("cryptoapi: Adiantum self-test FAILED (%s)\n",
++		    bad == 1 ? "known answer" : "NEON vs C");
++	return bad;
++}
++
++static int
++adiantum_probe(int keysize_in_bits)
++{
++	if (keysize_in_bits != 8 * ADIANTUM_KEY_SIZE)
++		return (-1);
++	if (adiantum_selftest_result < 0)
++		adiantum_selftest_result = adiantum_selftest();
++	return (adiantum_selftest_result == 1 ? -1 : 0);
++}
++
++struct adiantum_session {
++	struct adiantum_ctx ctx;
++	int use_neon;
++};
++
++static int
++adiantum_setkey_api(void *_ctx, const uint8_t *keydata, int keylen_in_bytes)
++{
++	struct adiantum_session *s = _ctx;
++
++	if (keylen_in_bytes != ADIANTUM_KEY_SIZE)
++		return (EINVAL);
++	adiantum_setkey(&s->ctx, keydata);
++	s->use_neon = 0;
++#ifdef HAVE_NEON_CRYPTO
++	s->use_neon = !neon_crypto_disable && adiantum_selftest_result == 0;
++#endif
++	return (0);
++}
++
++static void
++adiantum_crypt_api(void *_ctx, uint8_t *data, int datalen, const uint8_t *iv,
++    bool encrypt)
++{
++	struct adiantum_session *s = _ctx;
++
++#ifdef HAVE_NEON_CRYPTO
++	if (s->use_neon) {
++		kernel_fpu_begin();
++		adiantum_crypt(&s->ctx, &adiantum_neon_ops, data, datalen,
++		    iv, ADIANTUM_IV_LEN, encrypt);
++		kernel_fpu_end();
++		return;
++	}
++#endif
++	adiantum_crypt(&s->ctx, &adiantum_generic_ops, data, datalen,
++	    iv, ADIANTUM_IV_LEN, encrypt);
++}
++
++const struct cryptoapi_cipher_spec cipher_adiantum = {
++	.ciphername = "adiantum",
++	.description = "Adiantum XChaCha12/AES-256",
++	.blocksize = 16,
++	.ivsize = ADIANTUM_IV_LEN,
++	.ctxsize = sizeof(struct adiantum_session),
++	.ctxalign = 16,
++	.probe = adiantum_probe,
++	.setkey = adiantum_setkey_api,
++	.crypt = adiantum_crypt_api,
++};
++
++#endif /* HAVE_ADIANTUM */
++
+ /**
+  * --------------------------------------
+  * TWOFISH-CBC
+@@ -729,11 +1026,10 @@ const struct cryptoapi_cipher_spec cipher_twofish_cbc = {
+ struct twofish_xts_ctx {
+ 	twofish_ctx key1;
+ 	twofish_ctx key2;
+-	uint8_t tweak[TWOFISH_XTS_BLOCK_LEN];
+ };
+ 
+ static inline void
+-twofish_xts_reinit(struct twofish_xts_ctx *ctx, const uint8_t *iv)
++twofish_xts_reinit(struct twofish_xts_ctx *ctx, uint8_t *tweak, const uint8_t *iv)
+ {
+ #if 0
+ 	u_int64_t blocknum;
+@@ -746,12 +1042,12 @@ twofish_xts_reinit(struct twofish_xts_ctx *ctx, const uint8_t *iv)
+ 	 */
+ 	/* XXX: possibly use htole64? */
+ #endif
+-	memcpy(ctx->tweak, iv, TWOFISH_XTS_IV_LEN);
++	memcpy(tweak, iv, TWOFISH_XTS_IV_LEN);
+ 
+ 	/* Last 64 bits of IV are always zero */
+-	bzero(ctx->tweak + TWOFISH_XTS_IV_LEN, TWOFISH_XTS_IV_LEN);
++	bzero(tweak + TWOFISH_XTS_IV_LEN, TWOFISH_XTS_IV_LEN);
+ 
+-	twofish_encrypt(&ctx->key2, ctx->tweak, ctx->tweak);
++	twofish_encrypt(&ctx->key2, tweak, tweak);
+ }
+ 
+ static int
+@@ -786,11 +1082,12 @@ twofish_xts_crypt(void *_ctx, uint8_t *data, int datalen, const uint8_t *iv,
+     bool encrypt)
+ {
+ 	uint8_t block[TWOFISH_XTS_BLOCK_LEN];
++	uint8_t tweak[TWOFISH_XTS_BLOCK_LEN];	/* per call: ctx is shared */
+ 	struct twofish_xts_ctx *ctx = _ctx;
+ 
+-	twofish_xts_reinit(ctx, iv);
++	twofish_xts_reinit(ctx, tweak, iv);
+ 
+-	crypt_data_xts(&ctx->key1, data, datalen, ctx->tweak,
++	crypt_data_xts(&ctx->key1, data, datalen, tweak,
+ 	    encrypt ? twofish_encrypt_wrap : twofish_decrypt_wrap, block,
+ 	    TWOFISH_XTS_BLOCK_LEN, AES_XTS_ALPHA);
+ }
+@@ -892,11 +1189,10 @@ const struct cryptoapi_cipher_spec cipher_serpent_cbc = {
+ struct serpent_xts_ctx {
+ 	serpent_ctx key1;
+ 	serpent_ctx key2;
+-	uint8_t tweak[SERPENT_XTS_BLOCK_LEN];
+ };
+ 
+ static inline void
+-serpent_xts_reinit(struct serpent_xts_ctx *ctx, const uint8_t *iv)
++serpent_xts_reinit(struct serpent_xts_ctx *ctx, uint8_t *tweak, const uint8_t *iv)
+ {
+ #if 0
+ 	u_int64_t blocknum;
+@@ -911,12 +1207,12 @@ serpent_xts_reinit(struct serpent_xts_ctx *ctx, const uint8_t *iv)
+ 	/* XXX: possibly use htole64? */
+ #endif
+ 
+-	memcpy(ctx->tweak, iv, SERPENT_XTS_IV_LEN);
++	memcpy(tweak, iv, SERPENT_XTS_IV_LEN);
+ 
+ 	/* Last 64 bits of IV are always zero */
+-	bzero(ctx->tweak + SERPENT_XTS_IV_LEN, SERPENT_XTS_IV_LEN);
++	bzero(tweak + SERPENT_XTS_IV_LEN, SERPENT_XTS_IV_LEN);
+ 
+-	serpent_encrypt(&ctx->key2, ctx->tweak, ctx->tweak);
++	serpent_encrypt(&ctx->key2, tweak, tweak);
+ }
+ 
+ static int
+@@ -951,11 +1247,12 @@ serpent_xts_crypt(void *_ctx, uint8_t *data, int datalen, const uint8_t *iv,
+     bool encrypt)
+ {
+ 	uint8_t block[SERPENT_XTS_BLOCK_LEN];
++	uint8_t tweak[SERPENT_XTS_BLOCK_LEN];	/* per call: ctx is shared */
+ 	struct serpent_xts_ctx *ctx = _ctx;
+ 
+-	serpent_xts_reinit(ctx, iv);
++	serpent_xts_reinit(ctx, tweak, iv);
+ 
+-	crypt_data_xts(&ctx->key1, data, datalen, ctx->tweak,
++	crypt_data_xts(&ctx->key1, data, datalen, tweak,
+ 	    encrypt ? serpent_encrypt_wrap : serpent_decrypt_wrap, block,
+ 	    SERPENT_XTS_BLOCK_LEN, AES_XTS_ALPHA);
+ }
+@@ -987,9 +1284,16 @@ static cryptoapi_cipher_t cryptoapi_ciphers[] = {
+ 	&cipher_aesni_xts,
+ #endif
+ 
++#ifdef HAVE_NEON_CRYPTO
++	&cipher_aes_neon_xts,
++#endif
++
+ 	/* AES in software */
+ 	&cipher_aes_cbc,
+ 	&cipher_aes_xts,
++#ifdef HAVE_ADIANTUM
++	&cipher_adiantum,
++#endif
+ 
+ 	&cipher_twofish_cbc,
+ 	&cipher_twofish_xts,
+diff --git a/sys/dev/disk/dm/crypt/dm_target_crypt.c b/sys/dev/disk/dm/crypt/dm_target_crypt.c
+index 9eb5d552c2..5171b20080 100644
+--- a/sys/dev/disk/dm/crypt/dm_target_crypt.c
++++ b/sys/dev/disk/dm/crypt/dm_target_crypt.c
+@@ -52,9 +52,92 @@
+ #include <sys/proc.h>
+ #include <sys/types.h>
+ #include <sys/mpipe.h>
++#include <sys/kthread.h>
++#include <sys/spinlock.h>
++#include <sys/spinlock2.h>
++#include <sys/sysctl.h>
++#include <sys/queue.h>
+ 
+ MALLOC_DEFINE(M_DMCRYPT, "dm_crypt", "Device Mapper Target Crypt");
+ 
++/*
++ * Multi-core encryption.
++ *
++ * The cipher used to run in whatever thread issued the I/O (writes, in
++ * dmstrategy) or completed it (reads, in biodone, usually the disk
++ * controller's interrupt thread).  When every I/O comes from or completes
++ * in one thread, encryption is limited to one core no matter how many
++ * disks or CPUs there are.
++ *
++ * Instead, each bio's buffer is split into sector-aligned pieces of at
++ * least dmtc_piece_min bytes, and the pieces go on one shared queue served
++ * by a worker thread per CPU.  XTS, Adiantum and the plain/plain64/essiv
++ * IVs depend only on the sector number, so the pieces are independent.
++ * The worker that finishes the last piece completes the request: for a
++ * write it issues the encrypted buffer to the underlying device, for a
++ * read it completes the original bio.
++ *
++ * The queue is shared, rather than one per worker, because the CPUs are
++ * not equally free: the thread issuing the writes (a HAMMER2 XOP thread)
++ * or completing the reads (the disk interrupt thread) keeps its own CPU
++ * busy, and a worker bound to that CPU would get its share of pieces
++ * late.  The dispatcher wakes idle workers on other CPUs first; any worker
++ * that finishes a piece takes the next one.
++ *
++ * The per-request state lives in the mpipe buffer itself, after the
++ * DMTC_BUF_SIZE data area, so nothing is allocated in the I/O path
++ * beyond the mpipe buffer the old code already used.
++ *
++ * kern.dm_crypt.mp=0 restores the old single-threaded path (for A/B
++ * measurements).  Crash dumps always use the synchronous path.
++ */
++#define DMTC_MAXPIECES	16
++
++struct dmtc_req;
++
++struct dmtc_piece {
++	TAILQ_ENTRY(dmtc_piece) entry;
++	struct dmtc_req	*req;
++	int		off;		/* byte offset in the buffer */
++	int		len;		/* bytes, a multiple of the sector size */
++};
++
++struct dmtc_req {
++	struct bio	*bio;
++	struct target_crypt_config *priv;
++	struct malloc_pipe *mpipe;
++	uint8_t		*data_buf;	/* the mpipe buffer (work copy) */
++	uint8_t		*src;		/* the caller's b_data */
++	int		mode;		/* CRYPTOAPI_CIPHER_{EN,DE}CRYPT */
++	int		remaining;	/* pieces not yet done */
++	int		error;		/* first error from any piece */
++	struct dmtc_piece pieces[DMTC_MAXPIECES];
++};
++
++struct dmtc_worker {
++	struct thread	*td;
++	int		idle;		/* asleep on the worker; dmtc_spin */
++} __cachealign;
++
++static struct spinlock dmtc_spin;	/* dmtc_queue and every w->idle */
++static TAILQ_HEAD(, dmtc_piece) dmtc_queue;
++static struct dmtc_worker *dmtc_workers;
++static int dmtc_nworkers;
++static int dmtc_stopping;
++static u_int dmtc_rr;
++static struct krate dmtc_krate = { .freq = 1 };
++
++static int dmtc_mp = 1;
++static int dmtc_piece_min = 4096;
++
++SYSCTL_NODE(_kern, OID_AUTO, dm_crypt, CTLFLAG_RW, 0, "dm_target_crypt");
++SYSCTL_INT(_kern_dm_crypt, OID_AUTO, mp, CTLFLAG_RW, &dmtc_mp, 0,
++    "Encrypt/decrypt in per-CPU worker threads (0 = in the I/O thread)");
++SYSCTL_INT(_kern_dm_crypt, OID_AUTO, piece_min, CTLFLAG_RW,
++    &dmtc_piece_min, 0, "Smallest piece of a bio given to one worker");
++SYSCTL_INT(_kern_dm_crypt, OID_AUTO, workers, CTLFLAG_RD,
++    &dmtc_nworkers, 0, "Number of worker threads");
++
+ 
+ struct target_crypt_config;
+ 
+@@ -88,6 +171,9 @@ typedef struct target_crypt_config {
+ 
+ 	u_int64_t	block_offset;
+ 	int64_t		iv_offset;
++	int		sector_size;	/* encryption unit: 512 .. 4096 bytes */
++	int		sector_shift;	/* log2(sector_size / DEV_BSIZE) */
++	int		iv_large;	/* IV counts sector_size units */
+ 	SHA512_CTX	essivsha512_ctx;
+ 
+ 	struct iv_generator	*ivgen;
+@@ -115,6 +201,9 @@ dmtc_find_crypto_cipher(const char *crypto_alg, const char *crypto_mode,
+     int klen_in_bits);
+ 
+ #define DMTC_BUF_SIZE (MAXPHYS)
++/* mpipe element: the data area, then the request header */
++#define DMTC_HDR_SIZE	roundup2(sizeof(struct dmtc_req), 64)
++#define DMTC_ELEM_SIZE	(DMTC_BUF_SIZE + DMTC_HDR_SIZE)
+ 
+ static void dmtc_bio_read_done(struct bio *bio);
+ 
+@@ -141,6 +230,10 @@ static int dmtc_bio_encdec(dm_target_crypt_config_t *priv, uint8_t *data_buf,
+ static void dmtc_crypto_dump(dm_target_crypt_config_t *priv,
+     struct dmtc_dump_helper *dump_helper);
+ 
++static int dmtc_dispatch(dm_target_crypt_config_t *priv, struct bio *bio,
++    uint8_t *data_buf, struct malloc_pipe *mpipe, int mode);
++static void dmtc_req_done(struct dmtc_req *req);
++
+ static ivgen_ctor_t	essiv_ivgen_ctor;
+ static ivgen_dtor_t	essiv_ivgen_dtor;
+ static ivgen_t		essiv_ivgen;
+@@ -190,11 +283,11 @@ dmtc_init_mpipe(struct target_crypt_config *priv)
+ 	kprintf("dm_target_crypt: Setting %d mpipe read buffers\n", nmax_read);
+ 	kprintf("dm_target_crypt: Setting %d mpipe write buffers\n", nmax_write);
+ 
+-	mpipe_init(&priv->read_mpipe, M_DMCRYPT, DMTC_BUF_SIZE,
++	mpipe_init(&priv->read_mpipe, M_DMCRYPT, DMTC_ELEM_SIZE,
+ 		nmax_read, nmax_read, MPF_NOZERO | MPF_CALLBACK,
+ 		NULL, dmtc_zero_mpipe_buffer, NULL);
+ 
+-	mpipe_init(&priv->write_mpipe, M_DMCRYPT, DMTC_BUF_SIZE,
++	mpipe_init(&priv->write_mpipe, M_DMCRYPT, DMTC_ELEM_SIZE,
+ 		nmax_write, nmax_write, MPF_NOZERO | MPF_CALLBACK,
+ 		NULL, dmtc_zero_mpipe_buffer, NULL);
+ }
+@@ -349,7 +442,7 @@ essiv_ivgen(dm_target_crypt_config_t *priv, u_int8_t *iv,
+ 	KKASSERT(ivpriv != NULL);
+ 
+ 	bzero(iv, iv_len);
+-	*((off_t *)iv) = htole64(sector + priv->iv_offset);
++	*((off_t *)iv) = htole64(sector);
+ 
+ 	cryptoapi_cipher_iv iv2;
+ 	bzero(iv2, sizeof(iv2));
+@@ -373,7 +466,7 @@ plain_ivgen(dm_target_crypt_config_t *priv, u_int8_t *iv,
+ 	    size_t iv_len, off_t sector)
+ {
+ 	bzero(iv, iv_len);
+-	*((uint32_t *)iv) = htole32((uint32_t)(sector + priv->iv_offset));
++	*((uint32_t *)iv) = htole32((uint32_t)sector);
+ }
+ 
+ static void
+@@ -381,13 +474,22 @@ plain64_ivgen(dm_target_crypt_config_t *priv, u_int8_t *iv,
+     size_t iv_len, off_t sector)
+ {
+ 	bzero(iv, iv_len);
+-	*((uint64_t *)iv) = htole64((uint64_t)(sector + priv->iv_offset));
++	*((uint64_t *)iv) = htole64((uint64_t)sector);
+ }
+ 
+ /*
+  * Init function called from dm_table_load_ioctl.
+  * cryptsetup actually passes us this:
+  * aes-cbc-essiv:sha256 7997f8af... 0 /dev/ad0s0a 8
++ *
++ * Optional parameters follow, as in Linux's dm-crypt:
++ * <#opt_params> [sector_size:<bytes>] [iv_large_sectors]
++ *
++ * sector_size (512, 1024, 2048 or 4096) is the unit the cipher is applied
++ * to; I/O must be aligned to it.  The IV is still the 512-byte sector
++ * number of each unit's start unless iv_large_sectors is given, in which
++ * case it counts sector_size units.  Both match Linux, so volumes are
++ * interchangeable.
+  */
+ static int
+ hex2key(char *hex, size_t key_len, u_int8_t *key)
+@@ -437,6 +539,10 @@ dmtc_find_crypto_cipher(const char *crypto_alg, const char *crypto_mode,
+ 	if (ALGO_MODE_EQ("serpent", "xts"))
+ 		return cryptoapi_cipher_find("serpent-xts", klen_in_bits);
+ 
++	/* Linux's name: "xchacha12,aes-adiantum-plain64" */
++	if (ALGO_MODE_EQ("xchacha12,aes", "adiantum"))
++		return cryptoapi_cipher_find("adiantum", klen_in_bits);
++
+ 	kprintf("dm_target_crypt: unsupported algo: %s and mode: %s\n",
+ 	    crypto_alg, crypto_mode);
+ 
+@@ -450,21 +556,58 @@ dm_target_crypt_init(dm_table_entry_t *table_en, int argc, char **argv)
+ 	size_t len;
+ 	char *crypto_alg, *crypto_mode, *iv_mode, *iv_opt, *hex_key, *dev;
+ 	char *status_str;
+-	int i, klen_in_bits, error;
++	int i, klen_in_bits, error, nopt, sector_size, iv_large;
+ 	uint64_t iv_offset, block_offset;
++	char opt_str[48];
+ 
+-	if (argc != 5) {
++	if (argc < 5) {
+ 		kprintf("dm_target_crypt: not enough arguments, "
+-			"need exactly 5\n");
++			"need at least 5\n");
+ 		return EINVAL;
+ 	}
++	sector_size = DEV_BSIZE;
++	iv_large = 0;
++	nopt = 0;
++	if (argc > 5) {
++		nopt = strtoul(argv[5], NULL, 10);
++		if (argc != 6 + nopt) {
++			kprintf("dm_target_crypt: %d optional parameters "
++			    "announced, %d given\n", nopt, argc - 6);
++			return EINVAL;
++		}
++	}
++	for (i = 6; i < 6 + nopt; i++) {
++		if (strncmp(argv[i], "sector_size:", 12) == 0) {
++			sector_size = strtoul(argv[i] + 12, NULL, 10);
++			if (sector_size < DEV_BSIZE || sector_size > PAGE_SIZE ||
++			    !powerof2(sector_size)) {
++				kprintf("dm_target_crypt: bad %s\n", argv[i]);
++				return EINVAL;
++			}
++		} else if (strcmp(argv[i], "iv_large_sectors") == 0) {
++			iv_large = 1;
++		} else {
++			kprintf("dm_target_crypt: unknown option %s\n",
++			    argv[i]);
++			return EINVAL;
++		}
++	}
++	if (sector_size == DEV_BSIZE)
++		iv_large = 0;
++	opt_str[0] = 0;
++	if (sector_size != DEV_BSIZE) {
++		ksnprintf(opt_str, sizeof(opt_str), " %d sector_size:%d%s",
++		    iv_large ? 2 : 1, sector_size,
++		    iv_large ? " iv_large_sectors" : "");
++	}
+ 
+ 	len = 0;
+ 	for (i = 0; i < argc; i++) {
+ 		len += strlen(argv[i]);
+ 		len++;
+ 	}
+-	/* len is strlen() of input string +1 */
++	/* len is strlen() of input string +1, plus room for the options */
++	len += sizeof(opt_str);
+ 	status_str = kmalloc(len, M_DMCRYPT, M_WAITOK);
+ 
+ 	crypto_alg = strsep(&argv[0], "-");
+@@ -475,6 +618,11 @@ dm_target_crypt_init(dm_table_entry_t *table_en, int argc, char **argv)
+ 	iv_offset = strtouq(argv[2], NULL, 0);
+ 	dev = argv[3];
+ 	block_offset = strtouq(argv[4], NULL, 0);
++	if (iv_large && (iv_offset & (sector_size / DEV_BSIZE - 1))) {
++		kprintf("dm_target_crypt: iv_offset not a multiple of "
++		    "sector_size\n");
++		return EINVAL;
++	}
+ 	/* hex_key is specified in hex, so one hex char == 4 bits */
+ 	klen_in_bits = strlen(hex_key) * 4;
+ 
+@@ -507,6 +655,9 @@ dm_target_crypt_init(dm_table_entry_t *table_en, int argc, char **argv)
+ 	priv->params_len = len;
+ 	priv->block_offset = block_offset;
+ 	priv->iv_offset = iv_offset - block_offset;
++	priv->sector_size = sector_size;
++	priv->sector_shift = ffs(sector_size / DEV_BSIZE) - 1;
++	priv->iv_large = iv_large;
+ 
+ 	dm_table_add_deps(table_en, priv->pdev);
+ 
+@@ -566,13 +717,13 @@ dm_target_crypt_init(dm_table_entry_t *table_en, int argc, char **argv)
+ 
+ 	memset(hex_key, '0', strlen(hex_key));
+ 	if (iv_opt) {
+-		ksprintf(status_str, "%s-%s-%s:%s %s %ju %s %ju",
++		ksprintf(status_str, "%s-%s-%s:%s %s %ju %s %ju%s",
+ 		    crypto_alg, crypto_mode, iv_mode, iv_opt,
+-		    hex_key, iv_offset, dev, block_offset);
++		    hex_key, iv_offset, dev, block_offset, opt_str);
+ 	} else {
+-		ksprintf(status_str, "%s-%s-%s %s %ju %s %ju",
++		ksprintf(status_str, "%s-%s-%s %s %ju %s %ju%s",
+ 		    crypto_alg, crypto_mode, iv_mode,
+-		    hex_key, iv_offset, dev, block_offset);
++		    hex_key, iv_offset, dev, block_offset, opt_str);
+ 	}
+ 	priv->status_str = status_str;
+ 
+@@ -677,12 +828,14 @@ dm_target_crypt_strategy(dm_table_entry_t *table_en, struct buf *bp)
+ 	/* Get rid of stuff we can't really handle */
+ 	if ((bp->b_cmd == BUF_CMD_READ) ||
+ 	    (bp->b_cmd == BUF_CMD_WRITE)) {
+-		if (((bp->b_bcount % DEV_BSIZE) != 0) ||
++		if (((bp->b_bcount % priv->sector_size) != 0) ||
++		    (bp->b_bio1.bio_offset % priv->sector_size) != 0 ||
+ 		    (bp->b_bcount == 0)) {
+-			kprintf(
++			krateprintf(&dmtc_krate,
+ 			    "dm_target_crypt_strategy: can't really "
+-			    "handle bp->b_bcount = %d\n",
+-			    bp->b_bcount);
++			    "handle bp->b_bcount = %d at %jd (sector size %d)\n",
++			    bp->b_bcount, (intmax_t)bp->b_bio1.bio_offset,
++			    priv->sector_size);
+ 			bp->b_error = EINVAL;
+ 			bp->b_flags |= B_ERROR | B_INVAL;
+ 			biodone(&bp->b_bio1);
+@@ -764,6 +917,9 @@ dmtc_bio_read_decrypt_start(struct bio *bio)
+ 		return;
+ 
+ 	bio->bio_caller_info3.ptr = &priv->read_mpipe;
++	if (dmtc_dispatch(priv, bio, data_buf, &priv->read_mpipe,
++	    CRYPTOAPI_CIPHER_DECRYPT))
++		return;
+ 	dmtc_bio_read_decrypt(bio, data_buf, DMTC_BUF_SIZE);
+ }
+ 
+@@ -862,6 +1018,9 @@ dmtc_bio_write_encrypt_start(struct bio *bio)
+ 		return;
+ 
+ 	bio->bio_caller_info3.ptr = &priv->write_mpipe;
++	if (dmtc_dispatch(priv, bio, data_buf, &priv->write_mpipe,
++	    CRYPTOAPI_CIPHER_ENCRYPT))
++		return;
+ 	dmtc_bio_write_encrypt(bio, data_buf, DMTC_BUF_SIZE);
+ }
+ 
+@@ -960,24 +1119,24 @@ dmtc_bio_encdec(dm_target_crypt_config_t *priv, uint8_t *data_buf, int bytes,
+     off_t offset, cryptoapi_cipher_mode mode)
+ {
+ 	cryptoapi_cipher_iv iv;
+-	int sectors = bytes / DEV_BSIZE;    /* Number of sectors */
+-	off_t isector = offset / DEV_BSIZE; /* ivgen salt base? */
++	int ss = priv->sector_size;
++	int sectors = bytes / ss;	/* encryption units */
++	/* 512-byte sector number relative to the target, plus iv_offset */
++	off_t isector = offset / DEV_BSIZE + priv->iv_offset;
++	off_t ivsec;
+ 	int error = 0;
+ 
+-	KKASSERT((sectors * DEV_BSIZE) == bytes);
++	KKASSERT((sectors * ss) == bytes);
+ 
+ 	for (int i = 0; i < sectors; i++) {
+-		/*
+-		 * Note: last argument is used to generate salt(?) and
+-		 * is a 64 bit value, but the original code passed an
+-		 *	 int.  Changing it now will break pre-existing
+-		 *	 crypt volumes.
+-		 */
+-		priv->ivgen->gen_iv(priv, iv, sizeof(iv), isector + i);
++		ivsec = isector + ((off_t)i << priv->sector_shift);
++		if (priv->iv_large)
++			ivsec >>= priv->sector_shift;
++		priv->ivgen->gen_iv(priv, iv, sizeof(iv), ivsec);
+ 
+ 		error = cryptoapi_cipher_crypt(priv->crypto_session,
+-				data_buf + i * DEV_BSIZE,
+-				DEV_BSIZE, iv, sizeof(iv), mode);
++				data_buf + i * ss,
++				ss, iv, sizeof(iv), mode);
+ 
+ 		if (error) {
+ 			break;
+@@ -989,6 +1148,245 @@ dmtc_bio_encdec(dm_target_crypt_config_t *priv, uint8_t *data_buf, int bytes,
+ 
+ 	return (error);
+ }
++
++/************************************************************************
++ * MULTI-CORE WORKERS
++ ************************************************************************/
++
++/*
++ * Split the bio into pieces and queue them to the workers.  Returns 0
++ * if the caller should do the work synchronously instead (workers off
++ * or not running), 1 if the request was queued; the last piece to
++ * finish then calls dmtc_req_done().
++ */
++static int
++dmtc_dispatch(dm_target_crypt_config_t *priv, struct bio *bio,
++    uint8_t *data_buf, struct malloc_pipe *mpipe, int mode)
++{
++	struct dmtc_req *req;
++	struct dmtc_worker *w;
++	struct dmtc_worker *wake[DMTC_MAXPIECES];
++	struct dmtc_piece *p;
++	int bytes, sectors, npieces, per, off, i, k, pass, pmin, nw, nwake;
++	int me, start;
++
++	nw = dmtc_nworkers;
++	cpu_ccfence();
++	if (dmtc_mp == 0 || nw == 0 || dmtc_stopping)
++		return 0;
++
++	bytes = bio->bio_buf->b_bcount;
++	if (__predict_false(bytes > DMTC_BUF_SIZE))
++		panic("dmtc: Allocated data buffer is too small");
++
++	pmin = dmtc_piece_min;
++	if (pmin < priv->sector_size)
++		pmin = priv->sector_size;
++	npieces = bytes / pmin;
++	if (npieces > nw)
++		npieces = nw;
++	if (npieces > DMTC_MAXPIECES)
++		npieces = DMTC_MAXPIECES;
++	if (npieces < 1)
++		npieces = 1;
++
++	req = (struct dmtc_req *)(data_buf + DMTC_BUF_SIZE);
++	req->bio = bio;
++	req->priv = priv;
++	req->mpipe = mpipe;
++	req->data_buf = data_buf;
++	req->src = bio->bio_buf->b_data;
++	req->mode = mode;
++	req->error = 0;
++	req->remaining = npieces;
++
++	/* sector-aligned pieces; the last one takes the remainder */
++	sectors = bytes / priv->sector_size;
++	per = sectors / npieces;
++	off = 0;
++	for (i = 0; i < npieces; ++i) {
++		p = &req->pieces[i];
++		p->req = req;
++		p->off = off;
++		p->len = (i == npieces - 1) ? bytes - off :
++		    per * priv->sector_size;
++		off += p->len;
++	}
++
++	/*
++	 * Queue them and pick up to npieces idle workers to wake, those on
++	 * other CPUs first.  Nothing in req may be touched once the lock is
++	 * dropped: a worker may already have completed it.
++	 */
++	me = mycpuid;
++	start = atomic_fetchadd_int(&dmtc_rr, 1);
++	nwake = 0;
++	spin_lock(&dmtc_spin);
++	for (i = 0; i < npieces; ++i)
++		TAILQ_INSERT_TAIL(&dmtc_queue, &req->pieces[i], entry);
++	for (pass = 0; pass < 2 && nwake < npieces; ++pass) {
++		for (k = 0; k < nw && nwake < npieces; ++k) {
++			i = (start + k) % nw;
++			w = &dmtc_workers[i];
++			if (w->idle == 0 || (pass == 0 && i == me))
++				continue;
++			w->idle = 0;
++			wake[nwake++] = w;
++		}
++	}
++	spin_unlock(&dmtc_spin);
++	for (i = 0; i < nwake; ++i)
++		wakeup(wake[i]);
++	return 1;
++}
++
++static void
++dmtc_piece_run(struct dmtc_piece *p)
++{
++	struct dmtc_req *req = p->req;
++	uint8_t *work = req->data_buf + p->off;
++	uint8_t *src = req->src + p->off;
++	int error;
++
++	/*
++	 * Never en/decrypt the caller's buffer in place: writes must not
++	 * change it, and a read buffer can have bogus pages.
++	 */
++	memcpy(work, src, p->len);
++	error = dmtc_bio_encdec(req->priv, work, p->len,
++	    req->bio->bio_offset + p->off, req->mode);
++	if (error == 0 && req->mode == CRYPTOAPI_CIPHER_DECRYPT)
++		memcpy(src, work, p->len);
++	if (error)
++		atomic_cmpset_int(&req->error, 0, error);
++
++	if (atomic_fetchadd_int(&req->remaining, -1) == 1)
++		dmtc_req_done(req);
++}
++
++/*
++ * All pieces are done.  Same completion as the synchronous
++ * dmtc_bio_write_encrypt() and dmtc_bio_read_decrypt().
++ */
++static void
++dmtc_req_done(struct dmtc_req *req)
++{
++	struct bio *bio = req->bio;
++	struct bio *obio;
++	struct malloc_pipe *mpipe = req->mpipe;
++	uint8_t *data_buf = req->data_buf;
++	dm_target_crypt_config_t *priv = req->priv;
++	int error = req->error;
++
++	if (req->mode == CRYPTOAPI_CIPHER_ENCRYPT) {
++		if (error) {
++			kprintf("dm_target_crypt: dmtc_bio_write_encrypt "
++			    "error = %d\n", error);
++			bio->bio_buf->b_error = error;
++			bio->bio_buf->b_flags |= B_ERROR;
++			mpipe_free(mpipe, data_buf);
++			obio = pop_bio(bio);
++			biodone(obio);
++			return;
++		}
++		bio->bio_buf->b_error = 0;
++		bio->bio_caller_info2.ptr = bio->bio_buf->b_data; /* orig_buf */
++		bio->bio_buf->b_data = data_buf;
++		bio->bio_done = dmtc_bio_write_done;
++		vn_strategy(priv->pdev->pdev_vnode, bio);
++	} else {
++		bio->bio_buf->b_error = error;
++		if (error) {
++			kprintf("dm_target_crypt: dmtc_bio_read_decrypt "
++			    "error = %d\n", error);
++			bio->bio_buf->b_flags |= B_ERROR;
++		}
++		obio = pop_bio(bio);
++		biodone(obio);
++		mpipe_free(mpipe, data_buf);
++	}
++}
++
++static void
++dmtc_worker_main(void *arg)
++{
++	struct dmtc_worker *w = arg;
++	struct dmtc_piece *p;
++
++	spin_lock(&dmtc_spin);
++	for (;;) {
++		p = TAILQ_FIRST(&dmtc_queue);
++		if (p == NULL) {
++			if (dmtc_stopping)
++				break;
++			w->idle = 1;
++			ssleep(w, &dmtc_spin, 0, "dmtcw", 0);
++			w->idle = 0;
++			continue;
++		}
++		TAILQ_REMOVE(&dmtc_queue, p, entry);
++		spin_unlock(&dmtc_spin);
++		dmtc_piece_run(p);
++		spin_lock(&dmtc_spin);
++	}
++	w->idle = 0;
++	w->td = NULL;
++	spin_unlock(&dmtc_spin);
++	wakeup(&dmtc_workers);
++	kthread_exit();
++}
++
++static void
++dmtc_workers_start(void)
++{
++	struct dmtc_worker *w;
++	int i;
++
++	dmtc_stopping = 0;
++	spin_init(&dmtc_spin, "dmtcq");
++	TAILQ_INIT(&dmtc_queue);
++	dmtc_workers = kmalloc(sizeof(*dmtc_workers) * ncpus, M_DMCRYPT,
++	    M_WAITOK | M_ZERO);
++	for (i = 0; i < ncpus; ++i) {
++		w = &dmtc_workers[i];
++		if (kthread_create_cpu(dmtc_worker_main, w, &w->td, i,
++		    "dmtc %d", i) != 0) {
++			kprintf("dm_target_crypt: no worker on cpu %d\n", i);
++			break;
++		}
++		dmtc_nworkers = i + 1;
++	}
++	kprintf("dm_target_crypt: %d worker threads\n", dmtc_nworkers);
++}
++
++/*
++ * Called once no crypt target exists any more, so every queue is
++ * empty; the workers just have to be told to exit.
++ */
++static void
++dmtc_workers_stop(void)
++{
++	struct dmtc_worker *w;
++	int i, n;
++
++	n = dmtc_nworkers;
++	dmtc_stopping = 1;
++	dmtc_nworkers = 0;
++	for (i = 0; i < n; ++i) {
++		w = &dmtc_workers[i];
++		spin_lock(&dmtc_spin);
++		while (w->td != NULL) {
++			spin_unlock(&dmtc_spin);
++			wakeup(w);
++			tsleep(&dmtc_workers, 0, "dmtcx", hz / 10);
++			spin_lock(&dmtc_spin);
++		}
++		spin_unlock(&dmtc_spin);
++	}
++	spin_uninit(&dmtc_spin);
++	kfree(dmtc_workers, M_DMCRYPT);
++	dmtc_workers = NULL;
++}
+ /* DUMPING MAGIC */
+ 
+ extern int tsleep_crypto_dump;
+@@ -1024,6 +1422,10 @@ dm_target_crypt_dump(dm_table_entry_t *table_en, void *data, size_t length, off_
+ 		return 0;
+ 	}
+ 
++	if ((length | offset) & (priv->sector_size - 1)) {
++		tsleep_crypto_dump = 0;
++		return EINVAL;
++	}
+ 	bzero(&dump_helper, sizeof(dump_helper));
+ 	dump_helper.priv = priv;
+ 	dump_helper.data = data;
+@@ -1083,14 +1485,18 @@ dmtc_mod_handler(module_t mod, int type, void *unused)
+ 		dmt->table = &dm_target_crypt_table;
+ 		dmt->dump = &dm_target_crypt_dump;
+ 
++		dmtc_workers_start();
+ 		err = dm_target_insert(dmt);
+ 		if (!err)
+ 			kprintf("dm_target_crypt: Successfully initialized\n");
++		else
++			dmtc_workers_stop();
+ 		break;
+ 
+ 	case MOD_UNLOAD:
+ 		err = dm_target_remove("crypt");
+ 		if (err == 0) {
++			dmtc_workers_stop();
+ 			kprintf("dm_target_crypt: unloaded\n");
+ 		}
+ 		break;
+diff --git a/sys/platform/arm64/conf/files b/sys/platform/arm64/conf/files
+index 76d320ff73..18f43266b8 100644
+--- a/sys/platform/arm64/conf/files
++++ b/sys/platform/arm64/conf/files
+@@ -81,3 +81,7 @@
+ dev/disk/sdhci/sdhci_fdt_bcm.c		optional sdhci_bcm sdhci bcmmbox
+ dev/powermng/bcmtemp/bcmtemp.c		optional bcmtemp
+ vfs/hammer2/hammer2_raid6_neon.S	optional hammer2
++crypto/aes_neon/aes_neon.c		optional crypto			\
++	compile-with	"${CC} -c ${CFLAGS:N-mgeneral-regs-only} -isystem ${:!${CC} -print-resource-dir!}/include ${.IMPSRC}"
++crypto/adiantum/adiantum_neon.c		optional crypto			\
++	compile-with	"${CC} -c ${CFLAGS:N-mgeneral-regs-only} -isystem ${:!${CC} -print-resource-dir!}/include ${.IMPSRC}"
+diff --git a/sys/crypto/adiantum/adiantum.c b/sys/crypto/adiantum/adiantum.c
+new file mode 100644
+index 0000000000..82b68ead88
+--- /dev/null
++++ b/sys/crypto/adiantum/adiantum.c
+@@ -0,0 +1,449 @@
++/*
++ * Copyright (c) 2026 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * Adiantum, portable C.  Written from the paper and Google's MIT-licensed
++ * Python reference (github.com/google/adiantum), and checked against its
++ * test vectors.
++ *
++ *   key setup:  XChaCha12(K, nonce 1 || 0^23) gives K_E (32 bytes, AES-256),
++ *               K_T, K_M (16 each, clamped Poly1305 r) and K_N (1072, NH)
++ *   H(T, X) =   Poly1305_{K_T}(le128(8 * |X|) || T)
++ *             + Poly1305_{K_M}(NH(X) per 1 KB chunk)        (no final "+ s")
++ *   encrypt:    P = P_L || P_R, P_R the last 16 bytes
++ *               P_M = P_R + H(T, P_L)              (mod 2^128, little-endian)
++ *               C_M = AES_{K_E}(P_M)
++ *               C_L = P_L ^ XChaCha12(K, nonce C_M || 1 || 0^7)
++ *               C_R = C_M - H(T, C_L)
++ */
++
++#ifdef _KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#include <strings.h>
++#endif
++
++#include <crypto/adiantum/adiantum.h>
++
++static inline uint32_t
++ld32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint64_t
++ld64(const uint8_t *p)
++{
++	return (uint64_t)ld32(p) | ((uint64_t)ld32(p + 4) << 32);
++}
++
++static inline void
++st32(uint8_t *p, uint32_t v)
++{
++	p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
++}
++
++static inline void
++st64(uint8_t *p, uint64_t v)
++{
++	st32(p, (uint32_t)v);
++	st32(p + 4, (uint32_t)(v >> 32));
++}
++
++/************************************************************************
++ * ChaCha12 / HChaCha12 / XChaCha12
++ ************************************************************************/
++
++#define ROTL32(v, n)	(((v) << (n)) | ((v) >> (32 - (n))))
++#define QR(a, b, c, d) do {						\
++	a += b; d ^= a; d = ROTL32(d, 16);				\
++	c += d; b ^= c; b = ROTL32(b, 12);				\
++	a += b; d ^= a; d = ROTL32(d, 8);				\
++	c += d; b ^= c; b = ROTL32(b, 7);				\
++} while (0)
++
++static const uint32_t chacha_const[4] = {
++	0x61707865, 0x3320646e, 0x79622d32, 0x6b206574	/* "expand 32-byte k" */
++};
++
++static void
++chacha12_rounds(uint32_t x[16])
++{
++	int i;
++
++	for (i = 0; i < 6; ++i) {
++		QR(x[0], x[4], x[8], x[12]);
++		QR(x[1], x[5], x[9], x[13]);
++		QR(x[2], x[6], x[10], x[14]);
++		QR(x[3], x[7], x[11], x[15]);
++		QR(x[0], x[5], x[10], x[15]);
++		QR(x[1], x[6], x[11], x[12]);
++		QR(x[2], x[7], x[8], x[13]);
++		QR(x[3], x[4], x[9], x[14]);
++	}
++}
++
++void
++adiantum_hchacha12(const uint32_t key[8], const uint8_t nonce[16],
++    uint32_t out[8])
++{
++	uint32_t x[16];
++	int i;
++
++	for (i = 0; i < 4; ++i)
++		x[i] = chacha_const[i];
++	for (i = 0; i < 8; ++i)
++		x[4 + i] = key[i];
++	for (i = 0; i < 4; ++i)
++		x[12 + i] = ld32(nonce + 4 * i);
++	chacha12_rounds(x);
++	for (i = 0; i < 4; ++i) {
++		out[i] = x[i];
++		out[4 + i] = x[12 + i];
++	}
++	explicit_bzero(x, sizeof(x));
++}
++
++static void
++generic_chacha12_xor(const uint32_t key[8], const uint8_t nonce[8],
++    uint8_t *data, size_t len)
++{
++	uint32_t s[16], x[16];
++	uint8_t ks[64];
++	uint64_t ctr = 0;
++	size_t n, i;
++
++	for (i = 0; i < 4; ++i)
++		s[i] = chacha_const[i];
++	for (i = 0; i < 8; ++i)
++		s[4 + i] = key[i];
++	s[14] = ld32(nonce);
++	s[15] = ld32(nonce + 4);
++	while (len > 0) {
++		s[12] = (uint32_t)ctr;
++		s[13] = (uint32_t)(ctr >> 32);
++		memcpy(x, s, sizeof(x));
++		chacha12_rounds(x);
++		for (i = 0; i < 16; ++i)
++			st32(ks + 4 * i, x[i] + s[i]);
++		n = len < 64 ? len : 64;
++		for (i = 0; i < n; ++i)
++			data[i] ^= ks[i];
++		data += n;
++		len -= n;
++		++ctr;
++	}
++	explicit_bzero(x, sizeof(x));
++	explicit_bzero(ks, sizeof(ks));
++}
++
++/* data ^= XChaCha12(key, nonce16 || nonce8) */
++static void
++xchacha12_xor(const struct adiantum_ops *ops, const uint32_t key[8],
++    const uint8_t nonce16[16], const uint8_t nonce8[8], uint8_t *data,
++    size_t len)
++{
++	uint32_t subkey[8];
++
++	adiantum_hchacha12(key, nonce16, subkey);
++	ops->chacha12_xor(subkey, nonce8, data, len);
++	explicit_bzero(subkey, sizeof(subkey));
++}
++
++/************************************************************************
++ * Poly1305 without the final addition (44-bit limbs, 64x64->128 products)
++ ************************************************************************/
++
++#define M44	0xfffffffffffULL
++#define M42	0x3ffffffffffULL
++
++typedef unsigned __int128 u128;
++
++static void
++poly_setr(uint64_t r[3], const uint8_t k[16])
++{
++	uint64_t t0 = ld64(k), t1 = ld64(k + 8);
++
++	r[0] = t0 & 0xffc0fffffffULL;
++	r[1] = ((t0 >> 44) | (t1 << 20)) & 0xfffffc0ffffULL;
++	r[2] = (t1 >> 24) & 0x00ffffffc0fULL;
++}
++
++/* full 16-byte blocks get 2^128 added (hibit 1 << 40 in limb 2) */
++static void
++poly_blocks(uint64_t h[3], const uint64_t r[3], const uint8_t *m,
++    size_t nblocks, uint64_t hibit)
++{
++	uint64_t r0 = r[0], r1 = r[1], r2 = r[2];
++	uint64_t s1 = r1 * (5 << 2), s2 = r2 * (5 << 2);
++	uint64_t h0 = h[0], h1 = h[1], h2 = h[2], c, t0, t1;
++	u128 d0, d1, d2;
++
++	while (nblocks-- > 0) {
++		t0 = ld64(m);
++		t1 = ld64(m + 8);
++		h0 += t0 & M44;
++		h1 += ((t0 >> 44) | (t1 << 20)) & M44;
++		h2 += ((t1 >> 24) & M42) | hibit;
++
++		d0 = (u128)h0 * r0 + (u128)h1 * s2 + (u128)h2 * s1;
++		d1 = (u128)h0 * r1 + (u128)h1 * r0 + (u128)h2 * s2;
++		d2 = (u128)h0 * r2 + (u128)h1 * r1 + (u128)h2 * r0;
++
++		c = (uint64_t)(d0 >> 44); h0 = (uint64_t)d0 & M44;
++		d1 += c;
++		c = (uint64_t)(d1 >> 44); h1 = (uint64_t)d1 & M44;
++		d2 += c;
++		c = (uint64_t)(d2 >> 42); h2 = (uint64_t)d2 & M42;
++		h0 += c * 5;
++		c = h0 >> 44; h0 &= M44;
++		h1 += c;
++		m += 16;
++	}
++	h[0] = h0; h[1] = h1; h[2] = h2;
++}
++
++/* any length; a partial last block is padded with 1, 0... and no hibit */
++static void
++poly_update(uint64_t h[3], const uint64_t r[3], const uint8_t *m, size_t len)
++{
++	uint8_t buf[16];
++	size_t n = len / 16;
++
++	if (n > 0)
++		poly_blocks(h, r, m, n, 1ULL << 40);
++	len -= n * 16;
++	if (len > 0) {
++		memset(buf, 0, sizeof(buf));
++		memcpy(buf, m + n * 16, len);
++		buf[len] = 1;
++		poly_blocks(h, r, buf, 1, 0);
++	}
++}
++
++/* h mod 2^130-5, then its low 128 bits */
++static void
++poly_emit(const uint64_t hin[3], uint64_t out[2])
++{
++	uint64_t h0 = hin[0], h1 = hin[1], h2 = hin[2];
++	uint64_t g0, g1, g2, c, mask;
++
++	c = h1 >> 44; h1 &= M44; h2 += c;
++	c = h2 >> 42; h2 &= M42; h0 += c * 5;
++	c = h0 >> 44; h0 &= M44; h1 += c;
++	c = h1 >> 44; h1 &= M44; h2 += c;
++	c = h2 >> 42; h2 &= M42; h0 += c * 5;
++	c = h0 >> 44; h0 &= M44; h1 += c;
++
++	/* g = h + 5 - 2^130; use it if it didn't go negative */
++	g0 = h0 + 5; c = g0 >> 44; g0 &= M44;
++	g1 = h1 + c; c = g1 >> 44; g1 &= M44;
++	g2 = h2 + c - (1ULL << 42);
++	mask = (g2 >> 63) - 1;		/* all ones if g2 >= 0 */
++	h0 = (h0 & ~mask) | (g0 & mask);
++	h1 = (h1 & ~mask) | (g1 & mask);
++	h2 = (h2 & ~mask) | (g2 & mask);
++
++	out[0] = h0 | (h1 << 44);
++	out[1] = (h1 >> 20) | (h2 << 24);
++}
++
++/************************************************************************
++ * NH (4 passes, stride 2, 32-bit words)
++ ************************************************************************/
++
++static void
++generic_nh(const uint32_t *key, const uint8_t *msg, size_t len,
++    uint64_t sums[4])
++{
++	uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++	uint32_t m0, m1, m2, m3;
++
++	for (; len >= 16; len -= 16, msg += 16, key += 4) {
++		m0 = ld32(msg); m1 = ld32(msg + 4);
++		m2 = ld32(msg + 8); m3 = ld32(msg + 12);
++#define NHP(s, o)							\
++		s += (uint64_t)(uint32_t)(m0 + key[o + 0]) *		\
++		    (uint32_t)(m2 + key[o + 2]);			\
++		s += (uint64_t)(uint32_t)(m1 + key[o + 1]) *		\
++		    (uint32_t)(m3 + key[o + 3]);
++		NHP(s0, 0)
++		NHP(s1, 4)
++		NHP(s2, 8)
++		NHP(s3, 12)
++#undef NHP
++	}
++	sums[0] = s0; sums[1] = s1; sums[2] = s2; sums[3] = s3;
++}
++
++const struct adiantum_ops adiantum_generic_ops = {
++	.chacha12_xor = generic_chacha12_xor,
++	.nh = generic_nh,
++};
++
++/************************************************************************
++ * Adiantum
++ ************************************************************************/
++
++void
++adiantum_setkey(struct adiantum_ctx *ctx, const uint8_t key[ADIANTUM_KEY_SIZE])
++{
++	uint8_t ks[32 + 16 + 16 + 4 * ADIANTUM_NH_KEY_WORDS];
++	uint8_t nonce16[16], nonce8[8];
++	int i;
++
++	for (i = 0; i < 8; ++i)
++		ctx->stream_key[i] = ld32(key + 4 * i);
++	memset(nonce16, 0, sizeof(nonce16));
++	memset(nonce8, 0, sizeof(nonce8));
++	nonce16[0] = 1;
++	memset(ks, 0, sizeof(ks));
++	xchacha12_xor(&adiantum_generic_ops, ctx->stream_key, nonce16, nonce8,
++	    ks, sizeof(ks));
++
++	rijndael_set_key(&ctx->aes, ks, 256);
++	poly_setr(ctx->rt, ks + 32);
++	poly_setr(ctx->rm, ks + 48);
++	for (i = 0; i < ADIANTUM_NH_KEY_WORDS; ++i)
++		ctx->nh_key[i] = ld32(ks + 64 + 4 * i);
++	explicit_bzero(ks, sizeof(ks));
++}
++
++/* Poly1305_{K_M} over the NH hash of each 1 KB chunk of msg */
++static void
++hash_msg(const struct adiantum_ctx *ctx, const struct adiantum_ops *ops,
++    const uint8_t *msg, size_t len, uint64_t out[2])
++{
++	uint64_t h[3] = { 0, 0, 0 }, sums[4], tail[4];
++	uint8_t nhout[32], pad[16];
++	size_t n, full;
++	int i;
++
++	while (len > 0) {
++		n = len < ADIANTUM_NH_CHUNK ? len : ADIANTUM_NH_CHUNK;
++		full = n & ~(size_t)15;
++		if (full > 0) {
++			ops->nh(ctx->nh_key, msg, full, sums);
++		} else {
++			sums[0] = sums[1] = sums[2] = sums[3] = 0;
++		}
++		if (n > full) {
++			/* zero-padded partial unit, only in the last chunk */
++			memset(pad, 0, sizeof(pad));
++			memcpy(pad, msg + full, n - full);
++			generic_nh(ctx->nh_key + full / 4, pad, 16, tail);
++			for (i = 0; i < 4; ++i)
++				sums[i] += tail[i];
++		}
++		for (i = 0; i < 4; ++i)
++			st64(nhout + 8 * i, sums[i]);
++		poly_blocks(h, ctx->rm, nhout, 2, 1ULL << 40);
++		msg += n;
++		len -= n;
++	}
++	poly_emit(h, out);
++}
++
++/* Poly1305_{K_T}(le128(8 * msglen) || tweak) */
++static void
++hash_tweak(const struct adiantum_ctx *ctx, size_t msglen,
++    const uint8_t *tweak, size_t tweaklen, uint64_t out[2])
++{
++	uint64_t h[3] = { 0, 0, 0 };
++	uint8_t lenblk[16];
++
++	memset(lenblk, 0, sizeof(lenblk));
++	st64(lenblk, (uint64_t)msglen * 8);
++	poly_blocks(h, ctx->rt, lenblk, 1, 1ULL << 40);
++	poly_update(h, ctx->rt, tweak, tweaklen);
++	poly_emit(h, out);
++}
++
++/* blk (le128) += sign * (a + b) */
++static void
++blk_addsub(uint8_t blk[16], const uint64_t a[2], const uint64_t b[2],
++    int subtract)
++{
++	uint64_t lo, hi, x0, x1, c;
++
++	/* v = a + b mod 2^128 */
++	lo = a[0] + b[0];
++	c = lo < a[0];
++	hi = a[1] + b[1] + c;
++	x0 = ld64(blk);
++	x1 = ld64(blk + 8);
++	if (subtract) {
++		c = x0 < lo;
++		x0 -= lo;
++		x1 = x1 - hi - c;
++	} else {
++		x0 += lo;
++		c = x0 < lo;
++		x1 = x1 + hi + c;
++	}
++	st64(blk, x0);
++	st64(blk + 8, x1);
++}
++
++void
++adiantum_crypt(const struct adiantum_ctx *ctx, const struct adiantum_ops *ops,
++    uint8_t *data, size_t len, const uint8_t *tweak, size_t tweaklen,
++    int encrypt)
++{
++	static const uint8_t nonce8[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };
++	size_t bulk = len - 16;
++	uint8_t *right = data + bulk;
++	uint8_t mid[16];
++	uint64_t ht[2], hm[2];
++
++	hash_tweak(ctx, bulk, tweak, tweaklen, ht);
++
++	/* the right block plus the hash of the left part, as it is now */
++	hash_msg(ctx, ops, data, bulk, hm);
++	memcpy(mid, right, 16);
++	blk_addsub(mid, ht, hm, 0);
++
++	/* P_M -> C_M or C_M -> P_M; the stream always uses C_M */
++	if (encrypt) {
++		rijndael_encrypt(&ctx->aes, mid, mid);
++		xchacha12_xor(ops, ctx->stream_key, mid, nonce8, data, bulk);
++	} else {
++		xchacha12_xor(ops, ctx->stream_key, mid, nonce8, data, bulk);
++		rijndael_decrypt(&ctx->aes, mid, mid);
++	}
++
++	/* minus the hash of the left part as it is after the stream */
++	hash_msg(ctx, ops, data, bulk, hm);
++	blk_addsub(mid, ht, hm, 1);
++	memcpy(right, mid, 16);
++	explicit_bzero(mid, sizeof(mid));
++}
+diff --git a/sys/crypto/adiantum/adiantum.h b/sys/crypto/adiantum/adiantum.h
+new file mode 100644
+index 0000000000..2bc74bcaef
+--- /dev/null
++++ b/sys/crypto/adiantum/adiantum.h
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (c) 2026 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * Adiantum: length-preserving encryption for processors without AES
++ * instructions (Crowley and Biggers, IACR ToSC 2018(4)).  An HBSH
++ * construction: NH + Poly1305 hash, one AES-256 block, XChaCha12 for the
++ * bulk.  Wide-block, so changing any bit of a sector changes all of its
++ * ciphertext, unlike XTS's 16-byte granularity.  Byte-compatible with
++ * Linux's "xchacha12,aes-adiantum-plain64" when the tweak is the 16-byte
++ * IV zero-extended to 32 bytes.
++ */
++
++#ifndef _CRYPTO_ADIANTUM_H_
++#define _CRYPTO_ADIANTUM_H_
++
++#include <sys/types.h>
++#include <crypto/rijndael/rijndael.h>
++
++#define ADIANTUM_KEY_SIZE	32
++#define ADIANTUM_TWEAK_SIZE	32
++#define ADIANTUM_NH_KEY_WORDS	268	/* (1024 + 3 * 16) / 4 */
++#define ADIANTUM_NH_CHUNK	1024
++
++struct adiantum_ctx {
++	uint32_t	stream_key[8];	/* the user key, for XChaCha12 */
++	uint64_t	rt[3];		/* Poly1305 r for the tweak (44-bit limbs) */
++	uint64_t	rm[3];		/* Poly1305 r for the NH hashes */
++	uint32_t	nh_key[ADIANTUM_NH_KEY_WORDS];
++	rijndael_ctx	aes;		/* K_E, AES-256 */
++} __attribute__((aligned(16)));
++
++/*
++ * The bulk primitives, portable or NEON.
++ *  chacha12_xor: data ^= ChaCha12(key, nonce, counter 0..), len any.
++ *  nh: the four 64-bit NH sums over len bytes (a multiple of 16, at most
++ *      ADIANTUM_NH_CHUNK), key advancing 4 words per 16-byte unit.
++ */
++struct adiantum_ops {
++	void	(*chacha12_xor)(const uint32_t key[8], const uint8_t nonce[8],
++		    uint8_t *data, size_t len);
++	void	(*nh)(const uint32_t *key, const uint8_t *msg, size_t len,
++		    uint64_t sums[4]);
++};
++
++extern const struct adiantum_ops adiantum_generic_ops;
++#if defined(__aarch64__)
++/* compiled with SIMD; in the kernel bracket calls with kernel_fpu_begin/end */
++extern const struct adiantum_ops adiantum_neon_ops;
++#endif
++
++void	adiantum_setkey(struct adiantum_ctx *ctx,
++	    const uint8_t key[ADIANTUM_KEY_SIZE]);
++/* len >= 16; tweaklen at most ADIANTUM_TWEAK_SIZE */
++void	adiantum_crypt(const struct adiantum_ctx *ctx,
++	    const struct adiantum_ops *ops, uint8_t *data, size_t len,
++	    const uint8_t *tweak, size_t tweaklen, int encrypt);
++
++/* exposed for tests */
++void	adiantum_hchacha12(const uint32_t key[8], const uint8_t nonce[16],
++	    uint32_t out[8]);
++
++#endif /* _CRYPTO_ADIANTUM_H_ */
+diff --git a/sys/crypto/adiantum/adiantum_neon.c b/sys/crypto/adiantum/adiantum_neon.c
+new file mode 100644
+index 0000000000..e993a4b2ec
+--- /dev/null
++++ b/sys/crypto/adiantum/adiantum_neon.c
+@@ -0,0 +1,192 @@
++/*
++ * Copyright (c) 2026 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * NEON versions of Adiantum's bulk primitives: ChaCha12 four blocks at a
++ * time (one block per 32-bit lane) and NH with widening multiply-adds.
++ * Compiled with SIMD enabled; in the kernel the caller brackets each
++ * adiantum_crypt() with kernel_fpu_begin()/kernel_fpu_end().
++ */
++
++#ifdef _KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#include <strings.h>
++#endif
++#include <arm_neon.h>
++
++#include <crypto/adiantum/adiantum.h>
++
++static const uint8_t rot8_idx[16] __attribute__((aligned(16))) = {
++	3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14
++};
++
++#define ROT16(v)  vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v)))
++#define ROT8(v)   vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(v), r8))
++#define ROTL(v, n) vsriq_n_u32(vshlq_n_u32(v, n), v, 32 - (n))
++
++#define VQR(a, b, c, d) do {						\
++	a = vaddq_u32(a, b); d = veorq_u32(d, a); d = ROT16(d);		\
++	c = vaddq_u32(c, d); b = veorq_u32(b, c); b = ROTL(b, 12);	\
++	a = vaddq_u32(a, b); d = veorq_u32(d, a); d = ROT8(d);		\
++	c = vaddq_u32(c, d); b = veorq_u32(b, c); b = ROTL(b, 7);	\
++} while (0)
++
++/* out[4] = lane b of a,b,c,d for each block b: a 4x4 transpose */
++#define TRANSPOSE4(a, b, c, d) do {					\
++	uint32x4_t t0_ = vtrn1q_u32(a, b), t1_ = vtrn2q_u32(a, b);	\
++	uint32x4_t t2_ = vtrn1q_u32(c, d), t3_ = vtrn2q_u32(c, d);	\
++	a = vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t0_),	\
++	    vreinterpretq_u64_u32(t2_)));				\
++	b = vreinterpretq_u32_u64(vtrn1q_u64(vreinterpretq_u64_u32(t1_),	\
++	    vreinterpretq_u64_u32(t3_)));				\
++	c = vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t0_),	\
++	    vreinterpretq_u64_u32(t2_)));				\
++	d = vreinterpretq_u32_u64(vtrn2q_u64(vreinterpretq_u64_u32(t1_),	\
++	    vreinterpretq_u64_u32(t3_)));				\
++} while (0)
++
++/* 256 bytes of keystream for counters ctr..ctr+3, XORed into out */
++static inline void
++chacha12_4blk(const uint32_t s[16], uint64_t ctr, const uint8_t *in,
++    uint8_t *out)
++{
++	const uint8x16_t r8 = vld1q_u8(rot8_idx);
++	uint32_t lo[4], hi[4];
++	uint32x4_t x[16], o[16];
++	int i;
++
++	for (i = 0; i < 4; ++i) {
++		lo[i] = (uint32_t)(ctr + i);
++		hi[i] = (uint32_t)((ctr + i) >> 32);
++	}
++	for (i = 0; i < 16; ++i)
++		o[i] = vdupq_n_u32(s[i]);
++	o[12] = vld1q_u32(lo);
++	o[13] = vld1q_u32(hi);
++	for (i = 0; i < 16; ++i)
++		x[i] = o[i];
++
++	for (i = 0; i < 6; ++i) {
++		VQR(x[0], x[4], x[8], x[12]);
++		VQR(x[1], x[5], x[9], x[13]);
++		VQR(x[2], x[6], x[10], x[14]);
++		VQR(x[3], x[7], x[11], x[15]);
++		VQR(x[0], x[5], x[10], x[15]);
++		VQR(x[1], x[6], x[11], x[12]);
++		VQR(x[2], x[7], x[8], x[13]);
++		VQR(x[3], x[4], x[9], x[14]);
++	}
++	for (i = 0; i < 16; ++i)
++		x[i] = vaddq_u32(x[i], o[i]);
++	TRANSPOSE4(x[0], x[1], x[2], x[3]);
++	TRANSPOSE4(x[4], x[5], x[6], x[7]);
++	TRANSPOSE4(x[8], x[9], x[10], x[11]);
++	TRANSPOSE4(x[12], x[13], x[14], x[15]);
++
++	/* block b is x[b], x[4+b], x[8+b], x[12+b] */
++	for (i = 0; i < 16; ++i) {
++		int off = 64 * (i & 3) + 16 * (i >> 2);
++
++		vst1q_u8(out + off, veorq_u8(vld1q_u8(in + off),
++		    vreinterpretq_u8_u32(x[i])));
++	}
++}
++
++static void
++neon_chacha12_xor(const uint32_t key[8], const uint8_t nonce[8],
++    uint8_t *data, size_t len)
++{
++	static const uint32_t cst[4] = {
++		0x61707865, 0x3320646e, 0x79622d32, 0x6b206574
++	};
++	uint8_t buf[256] __attribute__((aligned(16)));
++	uint32_t s[16];
++	uint64_t ctr = 0;
++	int i;
++
++	for (i = 0; i < 4; ++i)
++		s[i] = cst[i];
++	for (i = 0; i < 8; ++i)
++		s[4 + i] = key[i];
++	s[12] = s[13] = 0;
++	memcpy(&s[14], nonce, 8);	/* little-endian host */
++
++	for (; len >= 256; len -= 256, data += 256, ctr += 4)
++		chacha12_4blk(s, ctr, data, data);
++	if (len > 0) {
++		memset(buf, 0, sizeof(buf));
++		memcpy(buf, data, len);
++		chacha12_4blk(s, ctr, buf, buf);
++		memcpy(data, buf, len);
++		explicit_bzero(buf, sizeof(buf));
++	}
++}
++
++/*
++ * NH: for 16-byte unit u and pass p, t = m + key[4(u+p) .. 4(u+p)+3];
++ * sum_p += t0 * t2 + t1 * t3.  vmlal_u32 of the low and high halves gives
++ * those two products in two 64-bit lanes, added together at the end.
++ */
++static void
++neon_nh(const uint32_t *key, const uint8_t *msg, size_t len, uint64_t sums[4])
++{
++	uint64x2_t a0 = vdupq_n_u64(0), a1 = a0, a2 = a0, a3 = a0;
++	uint32x4_t k0 = vld1q_u32(key), k1 = vld1q_u32(key + 4);
++	uint32x4_t k2 = vld1q_u32(key + 8), k3, m, t;
++
++	key += 12;
++	for (; len >= 16; len -= 16, msg += 16) {
++		k3 = vld1q_u32(key);
++		key += 4;
++		m = vreinterpretq_u32_u8(vld1q_u8(msg));
++		t = vaddq_u32(m, k0);
++		a0 = vmlal_u32(a0, vget_low_u32(t), vget_high_u32(t));
++		t = vaddq_u32(m, k1);
++		a1 = vmlal_u32(a1, vget_low_u32(t), vget_high_u32(t));
++		t = vaddq_u32(m, k2);
++		a2 = vmlal_u32(a2, vget_low_u32(t), vget_high_u32(t));
++		t = vaddq_u32(m, k3);
++		a3 = vmlal_u32(a3, vget_low_u32(t), vget_high_u32(t));
++		k0 = k1;
++		k1 = k2;
++		k2 = k3;
++	}
++	sums[0] = vaddvq_u64(a0);
++	sums[1] = vaddvq_u64(a1);
++	sums[2] = vaddvq_u64(a2);
++	sums[3] = vaddvq_u64(a3);
++}
++
++const struct adiantum_ops adiantum_neon_ops = {
++	.chacha12_xor = neon_chacha12_xor,
++	.nh = neon_nh,
++};
+diff --git a/sys/crypto/aes_neon/aes_neon.c b/sys/crypto/aes_neon/aes_neon.c
+new file mode 100644
+index 0000000000..f63b070bea
+--- /dev/null
++++ b/sys/crypto/aes_neon/aes_neon.c
+@@ -0,0 +1,585 @@
++/*
++ * Copyright (c) 2026 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * AES-128/256 and XTS with NEON, for cores without the ARMv8 Crypto
++ * Extensions.  Both paths are constant-time: no data-dependent loads.
++ *
++ * Single blocks (the XTS tweak, the block API): SubBytes is four TBL/TBX
++ * lookups into the S-box held in 16 vector registers, ShiftRows one TBL,
++ * MixColumns a byte rotation within each column, an xtime and XORs.
++ * On a Cortex-A72 that runs at ~35 cycles/byte for AES-256, slower than
++ * the T-table C code (~25), because the 4-register TBL is expensive.
++ *
++ * Bulk XTS: bitsliced, eight blocks at a time (below), ~19 cycles/byte
++ * for AES-256 and ~14 for AES-128, bound by the A72's ~1.4 128-bit
++ * logic ops per cycle.
++ *
++ * Must be compiled with SIMD enabled (no -mgeneral-regs-only); see
++ * aes_neon.h for the kernel bracketing rule.
++ */
++
++#ifdef _KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#endif
++#include <arm_neon.h>
++
++#include <crypto/aes_neon/aes_neon.h>
++
++static const uint8_t aes_sbox[256] __attribute__((aligned(64))) = {
++	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
++	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
++	0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
++	0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
++	0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
++	0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
++	0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
++	0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
++	0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
++	0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
++	0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
++	0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
++	0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
++	0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
++	0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
++	0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
++};
++
++static const uint8_t aes_isbox[256] __attribute__((aligned(64))) = {
++	0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
++	0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
++	0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
++	0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
++	0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
++	0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
++	0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
++	0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
++	0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
++	0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
++	0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
++	0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
++	0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
++	0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
++	0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
++	0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
++};
++
++/* byte index tables, state is column-major: byte 4*c + r */
++static const uint8_t shiftrows_idx[16] __attribute__((aligned(16))) = {
++	0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11
++};
++static const uint8_t invshiftrows_idx[16] __attribute__((aligned(16))) = {
++	0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3
++};
++/* row r of each column takes row r+1: a 32-bit rotate right by 8 */
++static const uint8_t ror8_idx[16] __attribute__((aligned(16))) = {
++	1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12
++};
++
++/************************************************************************
++ * Key schedule (scalar)
++ ************************************************************************/
++
++int
++aes_neon_setkey(struct aes_neon_key *k, const uint8_t *key, int keybytes)
++{
++	uint8_t *w = k->rk;
++	uint8_t t[4], tmp, rcon = 1;
++	int nk, nw, i;
++
++	if (keybytes == 16)
++		k->nr = 10;
++	else if (keybytes == 32)
++		k->nr = 14;
++	else
++		return -1;
++	nk = keybytes / 4;
++	nw = 4 * (k->nr + 1);
++	memcpy(w, key, keybytes);
++	for (i = nk; i < nw; ++i) {
++		memcpy(t, w + 4 * (i - 1), 4);
++		if (i % nk == 0) {
++			tmp = t[0];
++			t[0] = aes_sbox[t[1]] ^ rcon;
++			t[1] = aes_sbox[t[2]];
++			t[2] = aes_sbox[t[3]];
++			t[3] = aes_sbox[tmp];
++			rcon = (rcon << 1) ^ ((rcon & 0x80) ? 0x1b : 0);
++		} else if (nk > 6 && i % nk == 4) {
++			t[0] = aes_sbox[t[0]];
++			t[1] = aes_sbox[t[1]];
++			t[2] = aes_sbox[t[2]];
++			t[3] = aes_sbox[t[3]];
++		}
++		w[4 * i + 0] = w[4 * (i - nk) + 0] ^ t[0];
++		w[4 * i + 1] = w[4 * (i - nk) + 1] ^ t[1];
++		w[4 * i + 2] = w[4 * (i - nk) + 2] ^ t[2];
++		w[4 * i + 3] = w[4 * (i - nk) + 3] ^ t[3];
++	}
++	return 0;
++}
++
++/************************************************************************
++ * Round primitives
++ ************************************************************************/
++
++struct aes_tabs {
++	uint8x16x4_t	s[4];		/* the S-box or inverse S-box */
++	uint8x16_t	sr;		/* (inv)shiftrows permutation */
++	uint8x16_t	ror8;
++};
++
++static inline uint8x16_t
++sub_bytes(const struct aes_tabs *t, uint8x16_t x)
++{
++	const uint8x16_t c40 = vdupq_n_u8(0x40);
++	uint8x16_t y;
++
++	/* out-of-range indexes leave the lane alone in TBX */
++	y = vqtbl4q_u8(t->s[0], x);
++	x = vsubq_u8(x, c40);
++	y = vqtbx4q_u8(y, t->s[1], x);
++	x = vsubq_u8(x, c40);
++	y = vqtbx4q_u8(y, t->s[2], x);
++	x = vsubq_u8(x, c40);
++	y = vqtbx4q_u8(y, t->s[3], x);
++	return y;
++}
++
++static inline uint8x16_t
++xtime(uint8x16_t x)
++{
++	uint8x16_t hi = vreinterpretq_u8_s8(vshrq_n_s8(vreinterpretq_s8_u8(x), 7));
++
++	return veorq_u8(vshlq_n_u8(x, 1), vandq_u8(hi, vdupq_n_u8(0x1b)));
++}
++
++static inline uint8x16_t
++rot16(uint8x16_t x)		/* row r takes row r+2 */
++{
++	return vreinterpretq_u8_u16(vrev32q_u16(vreinterpretq_u16_u8(x)));
++}
++
++/* b_r = 2a_r ^ 3a_{r+1} ^ a_{r+2} ^ a_{r+3} = xtime(a_r^a_{r+1}) ^ ... */
++static inline uint8x16_t
++mix_columns(const struct aes_tabs *t, uint8x16_t a)
++{
++	uint8x16_t r1 = vqtbl1q_u8(a, t->ror8);
++	uint8x16_t s = veorq_u8(a, r1);
++
++	return veorq_u8(veorq_u8(xtime(s), r1), rot16(s));
++}
++
++/* InvMixColumns = MixColumns after a_r ^= 4(a_r ^ a_{r+2}) */
++static inline uint8x16_t
++inv_mix_columns(const struct aes_tabs *t, uint8x16_t a)
++{
++	uint8x16_t w = xtime(xtime(veorq_u8(a, rot16(a))));
++
++	return mix_columns(t, veorq_u8(a, w));
++}
++
++static inline void
++load_tabs(struct aes_tabs *t, int decrypt)
++{
++	const uint8_t *s = decrypt ? aes_isbox : aes_sbox;
++
++	t->s[0] = vld1q_u8_x4(s);
++	t->s[1] = vld1q_u8_x4(s + 64);
++	t->s[2] = vld1q_u8_x4(s + 128);
++	t->s[3] = vld1q_u8_x4(s + 192);
++	t->sr = vld1q_u8(decrypt ? invshiftrows_idx : shiftrows_idx);
++	t->ror8 = vld1q_u8(ror8_idx);
++}
++
++/************************************************************************
++ * One and four blocks
++ ************************************************************************/
++
++static inline uint8x16_t
++enc1(const struct aes_tabs *t, const struct aes_neon_key *k, uint8x16_t x)
++{
++	const uint8_t *rk = k->rk;
++	int r;
++
++	x = veorq_u8(x, vld1q_u8(rk));
++	for (r = 1; r < k->nr; ++r) {
++		x = sub_bytes(t, vqtbl1q_u8(x, t->sr));
++		x = veorq_u8(mix_columns(t, x), vld1q_u8(rk + 16 * r));
++	}
++	x = sub_bytes(t, vqtbl1q_u8(x, t->sr));
++	return veorq_u8(x, vld1q_u8(rk + 16 * k->nr));
++}
++
++static inline uint8x16_t
++dec1(const struct aes_tabs *t, const struct aes_neon_key *k, uint8x16_t x)
++{
++	const uint8_t *rk = k->rk;
++	int r;
++
++	x = veorq_u8(x, vld1q_u8(rk + 16 * k->nr));
++	for (r = k->nr - 1; r > 0; --r) {
++		x = sub_bytes(t, vqtbl1q_u8(x, t->sr));
++		x = inv_mix_columns(t, veorq_u8(x, vld1q_u8(rk + 16 * r)));
++	}
++	x = sub_bytes(t, vqtbl1q_u8(x, t->sr));
++	return veorq_u8(x, vld1q_u8(rk));
++}
++
++void
++aes_neon_encrypt_block(const struct aes_neon_key *k, uint8_t blk[16])
++{
++	struct aes_tabs t;
++
++	load_tabs(&t, 0);
++	vst1q_u8(blk, enc1(&t, k, vld1q_u8(blk)));
++}
++
++void
++aes_neon_decrypt_block(const struct aes_neon_key *k, uint8_t blk[16])
++{
++	struct aes_tabs t;
++
++	load_tabs(&t, 1);
++	vst1q_u8(blk, dec1(&t, k, vld1q_u8(blk)));
++}
++
++/************************************************************************
++ * Bitsliced AES, eight blocks at a time
++ *
++ * Eight 16-byte blocks are 1024 bits; they are held as eight registers
++ * b[0..7] where b[i] byte lane p holds bit i of state byte p of each
++ * block (block j in bit j).  Byte lanes keep the state layout, so
++ * ShiftRows and the MixColumns rotations are the same TBL/REV byte
++ * permutations as in the one-block code, xtime is a renaming of the
++ * registers plus three XORs, and SubBytes is the Boyar-Peralta 113-gate
++ * circuit (J. Boyar, R. Peralta, "A depth-16 circuit for the AES S-box",
++ * 2011) evaluated on all 128 bytes at once.  The inverse S-box is the
++ * forward one between two inverse-affine maps: S^-1(y) = L(S(L(y) ^ 5)) ^ 5
++ * with L the linear part of the inverse affine transform.
++ ************************************************************************/
++
++typedef uint8x16_t v128;
++
++#define X(a, b)	veorq_u8(a, b)
++#define A(a, b)	vandq_u8(a, b)
++#define N(a)	vmvnq_u8(a)
++
++#define SWAPMOVE(lo, hi, n, m) do {					\
++	v128 t_ = A(X(vshrq_n_u8(lo, n), hi), vdupq_n_u8(m));		\
++	hi = X(hi, t_);							\
++	lo = X(lo, vshlq_n_u8(t_, n));					\
++} while (0)
++
++/* blocks <-> bit planes; an 8x8 bit transpose per byte lane, an involution */
++static inline void
++bitslice(v128 x[8])
++{
++	SWAPMOVE(x[0], x[1], 1, 0x55); SWAPMOVE(x[2], x[3], 1, 0x55);
++	SWAPMOVE(x[4], x[5], 1, 0x55); SWAPMOVE(x[6], x[7], 1, 0x55);
++	SWAPMOVE(x[0], x[2], 2, 0x33); SWAPMOVE(x[1], x[3], 2, 0x33);
++	SWAPMOVE(x[4], x[6], 2, 0x33); SWAPMOVE(x[5], x[7], 2, 0x33);
++	SWAPMOVE(x[0], x[4], 4, 0x0f); SWAPMOVE(x[1], x[5], 4, 0x0f);
++	SWAPMOVE(x[2], x[6], 4, 0x0f); SWAPMOVE(x[3], x[7], 4, 0x0f);
++}
++
++static inline void
++bs_sbox(v128 q[8])
++{
++	v128 x0 = q[7], x1 = q[6], x2 = q[5], x3 = q[4];
++	v128 x4 = q[3], x5 = q[2], x6 = q[1], x7 = q[0];
++	v128 y1, y2, y3, y4, y5, y6, y7, y8, y9, y10, y11, y12, y13, y14;
++	v128 y15, y16, y17, y18, y19, y20, y21;
++	v128 z0, z1, z2, z3, z4, z5, z6, z7, z8, z9, z10, z11, z12, z13;
++	v128 z14, z15, z16, z17;
++	v128 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13;
++	v128 t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25;
++	v128 t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37;
++	v128 t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48, t49;
++	v128 t50, t51, t52, t53, t54, t55, t56, t57, t58, t59, t60, t61;
++	v128 t62, t63, t64, t65, t66, t67;
++	v128 s0, s1, s2, s3, s4, s5, s6, s7;
++
++	/* top linear transformation */
++	y14 = X(x3, x5);	y13 = X(x0, x6);	y9 = X(x0, x3);
++	y8 = X(x0, x5);		t0 = X(x1, x2);		y1 = X(t0, x7);
++	y4 = X(y1, x3);		y12 = X(y13, y14);	y2 = X(y1, x0);
++	y5 = X(y1, x6);		y3 = X(y5, y8);		t1 = X(x4, y12);
++	y15 = X(t1, x5);	y20 = X(t1, x1);	y6 = X(y15, x7);
++	y10 = X(y15, t0);	y11 = X(y20, y9);	y7 = X(x7, y11);
++	y17 = X(y10, y11);	y19 = X(y10, y8);	y16 = X(t0, y11);
++	y21 = X(y13, y16);	y18 = X(x0, y16);
++
++	/* non-linear middle */
++	t2 = A(y12, y15);	t3 = A(y3, y6);		t4 = X(t3, t2);
++	t5 = A(y4, x7);		t6 = X(t5, t2);		t7 = A(y13, y16);
++	t8 = A(y5, y1);		t9 = X(t8, t7);		t10 = A(y2, y7);
++	t11 = X(t10, t7);	t12 = A(y9, y11);	t13 = A(y14, y17);
++	t14 = X(t13, t12);	t15 = A(y8, y10);	t16 = X(t15, t12);
++	t17 = X(t4, t14);	t18 = X(t6, t16);	t19 = X(t9, t14);
++	t20 = X(t11, t16);	t21 = X(t17, y20);	t22 = X(t18, y19);
++	t23 = X(t19, y21);	t24 = X(t20, y18);
++
++	t25 = X(t21, t22);	t26 = A(t21, t23);	t27 = X(t24, t26);
++	t28 = A(t25, t27);	t29 = X(t28, t22);	t30 = X(t23, t24);
++	t31 = X(t22, t26);	t32 = A(t31, t30);	t33 = X(t32, t24);
++	t34 = X(t23, t33);	t35 = X(t27, t33);	t36 = A(t24, t35);
++	t37 = X(t36, t34);	t38 = X(t27, t36);	t39 = A(t29, t38);
++	t40 = X(t25, t39);
++
++	t41 = X(t40, t37);	t42 = X(t29, t33);	t43 = X(t29, t40);
++	t44 = X(t33, t37);	t45 = X(t42, t41);
++	z0 = A(t44, y15);	z1 = A(t37, y6);	z2 = A(t33, x7);
++	z3 = A(t43, y16);	z4 = A(t40, y1);	z5 = A(t29, y7);
++	z6 = A(t42, y11);	z7 = A(t45, y17);	z8 = A(t41, y10);
++	z9 = A(t44, y12);	z10 = A(t37, y3);	z11 = A(t33, y4);
++	z12 = A(t43, y13);	z13 = A(t40, y5);	z14 = A(t29, y2);
++	z15 = A(t42, y9);	z16 = A(t45, y14);	z17 = A(t41, y8);
++
++	/* bottom linear transformation */
++	t46 = X(z15, z16);	t47 = X(z10, z11);	t48 = X(z5, z13);
++	t49 = X(z9, z10);	t50 = X(z2, z12);	t51 = X(z2, z5);
++	t52 = X(z7, z8);	t53 = X(z0, z3);	t54 = X(z6, z7);
++	t55 = X(z16, z17);	t56 = X(z12, t48);	t57 = X(t50, t53);
++	t58 = X(z4, t46);	t59 = X(z3, t54);	t60 = X(t46, t57);
++	t61 = X(z14, t57);	t62 = X(t52, t58);	t63 = X(t49, t58);
++	t64 = X(z4, t59);	t65 = X(t61, t62);	t66 = X(z1, t63);
++	s0 = X(t59, t63);	s6 = X(t56, N(t62));	s7 = X(t48, N(t60));
++	t67 = X(t64, t65);	s3 = X(t53, t66);	s4 = X(t51, t66);
++	s5 = X(t47, t65);	s1 = X(t64, N(s3));	s2 = X(t55, N(t67));
++
++	q[7] = s0; q[6] = s1; q[5] = s2; q[4] = s3;
++	q[3] = s4; q[2] = s5; q[1] = s6; q[0] = s7;
++}
++
++/* q = L(q) ^ 0x05, the inverse affine transform */
++static inline void
++bs_inv_affine(v128 q[8])
++{
++	v128 o[8];
++	int i;
++
++	for (i = 0; i < 8; ++i)
++		o[i] = X(X(q[(i + 2) & 7], q[(i + 5) & 7]), q[(i + 7) & 7]);
++	q[0] = N(o[0]); q[1] = o[1]; q[2] = N(o[2]); q[3] = o[3];
++	q[4] = o[4]; q[5] = o[5]; q[6] = o[6]; q[7] = o[7];
++}
++
++static inline void
++bs_inv_sbox(v128 q[8])
++{
++	bs_inv_affine(q);
++	bs_sbox(q);
++	bs_inv_affine(q);
++}
++
++static inline void
++bs_xtime(const v128 a[8], v128 o[8])
++{
++	o[0] = a[7];
++	o[1] = X(a[0], a[7]);
++	o[2] = a[1];
++	o[3] = X(a[2], a[7]);
++	o[4] = X(a[3], a[7]);
++	o[5] = a[4];
++	o[6] = a[5];
++	o[7] = a[6];
++}
++
++static inline void
++bs_mix_columns(v128 q[8], uint8x16_t ror8)
++{
++	v128 r[8], s[8], xs[8];
++	int i;
++
++	for (i = 0; i < 8; ++i) {
++		r[i] = vqtbl1q_u8(q[i], ror8);
++		s[i] = X(q[i], r[i]);
++	}
++	bs_xtime(s, xs);
++	for (i = 0; i < 8; ++i)
++		q[i] = X(X(xs[i], r[i]), rot16(s[i]));
++}
++
++static inline void
++bs_inv_mix_columns(v128 q[8], uint8x16_t ror8)
++{
++	v128 u[8], w1[8], w2[8];
++	int i;
++
++	for (i = 0; i < 8; ++i)
++		u[i] = X(q[i], rot16(q[i]));
++	bs_xtime(u, w1);
++	bs_xtime(w1, w2);
++	for (i = 0; i < 8; ++i)
++		q[i] = X(q[i], w2[i]);
++	bs_mix_columns(q, ror8);
++}
++
++static inline void
++bs_shift(v128 q[8], uint8x16_t idx)
++{
++	int i;
++
++	for (i = 0; i < 8; ++i)
++		q[i] = vqtbl1q_u8(q[i], idx);
++}
++
++static inline void
++bs_ark(v128 q[8], const uint8_t *bk)
++{
++	int i;
++
++	for (i = 0; i < 8; ++i)
++		q[i] = X(q[i], vld1q_u8(bk + 16 * i));
++}
++
++/* q is bitsliced; bk the bitsliced round keys (128 bytes per round) */
++static void
++bs_encrypt(v128 q[8], const uint8_t *bk, int nr)
++{
++	const uint8x16_t sr = vld1q_u8(shiftrows_idx);
++	const uint8x16_t ror8 = vld1q_u8(ror8_idx);
++	int r;
++
++	bs_ark(q, bk);
++	for (r = 1; r < nr; ++r) {
++		bs_shift(q, sr);
++		bs_sbox(q);
++		bs_mix_columns(q, ror8);
++		bs_ark(q, bk + 128 * r);
++	}
++	bs_shift(q, sr);
++	bs_sbox(q);
++	bs_ark(q, bk + 128 * nr);
++}
++
++static void
++bs_decrypt(v128 q[8], const uint8_t *bk, int nr)
++{
++	const uint8x16_t isr = vld1q_u8(invshiftrows_idx);
++	const uint8x16_t ror8 = vld1q_u8(ror8_idx);
++	int r;
++
++	bs_ark(q, bk + 128 * nr);
++	for (r = nr - 1; r > 0; --r) {
++		bs_shift(q, isr);
++		bs_inv_sbox(q);
++		bs_ark(q, bk + 128 * r);
++		bs_inv_mix_columns(q, ror8);
++	}
++	bs_shift(q, isr);
++	bs_inv_sbox(q);
++	bs_ark(q, bk);
++}
++
++/************************************************************************
++ * XTS
++ ************************************************************************/
++
++int
++aes_neon_xts_setkey(struct aes_neon_xts_ctx *ctx, const uint8_t *key,
++    int keybytes)
++{
++	int half = keybytes / 2, r, i, p;
++	const uint8_t *rk;
++	uint8_t *bk;
++
++	if (aes_neon_setkey(&ctx->k1, key, half) != 0 ||
++	    aes_neon_setkey(&ctx->k2, key + half, half) != 0)
++		return -1;
++	/* bit i of round-key byte p, broadcast to every block */
++	for (r = 0; r <= ctx->k1.nr; ++r) {
++		rk = ctx->k1.rk + 16 * r;
++		bk = ctx->bk + 128 * r;
++		for (i = 0; i < 8; ++i)
++			for (p = 0; p < 16; ++p)
++				bk[16 * i + p] = -((rk[p] >> i) & 1);
++	}
++	return 0;
++}
++
++/*
++ * Multiply the tweak by x in GF(2^128), little-endian (IEEE P1619):
++ * shift the 128-bit value left by one, folding bit 127 back as 0x87.
++ */
++static inline uint8x16_t
++xts_mulx(uint8x16_t t)
++{
++	static const uint64_t cst[2] __attribute__((aligned(16))) = { 1, 0x87 };
++	uint64x2_t v = vreinterpretq_u64_u8(t);
++	uint64x2_t top = vreinterpretq_u64_s64(
++	    vshrq_n_s64(vreinterpretq_s64_u64(v), 63));
++	uint64x2_t c = vandq_u64(top, vld1q_u64(cst));
++
++	/* lane 0 gets 0x87 from lane 1's top bit, lane 1 gets lane 0's carry */
++	c = vextq_u64(c, c, 1);
++	return vreinterpretq_u8_u64(veorq_u64(vshlq_n_u64(v, 1), c));
++}
++
++void
++aes_neon_xts_crypt(const struct aes_neon_xts_ctx *ctx, uint8_t *data,
++    size_t len, const uint8_t iv[16], int encrypt)
++{
++	struct aes_tabs t;
++	uint8_t tw[16] __attribute__((aligned(16)));
++	uint8x16_t T, tt[8], x[8];
++	size_t nblk = len / 16, n, i;
++
++	memcpy(tw, iv, 8);
++	memset(tw + 8, 0, 8);
++	load_tabs(&t, 0);
++	T = enc1(&t, &ctx->k2, vld1q_u8(tw));
++
++	while (nblk > 0) {
++		n = nblk < 8 ? nblk : 8;
++		for (i = 0; i < 8; ++i) {
++			tt[i] = T;
++			if (i < n) {
++				x[i] = X(vld1q_u8(data + 16 * i), T);
++				T = xts_mulx(T);
++			} else {
++				x[i] = vdupq_n_u8(0);
++			}
++		}
++		bitslice(x);
++		if (encrypt)
++			bs_encrypt(x, ctx->bk, ctx->k1.nr);
++		else
++			bs_decrypt(x, ctx->bk, ctx->k1.nr);
++		bitslice(x);
++		for (i = 0; i < n; ++i)
++			vst1q_u8(data + 16 * i, X(x[i], tt[i]));
++		data += 16 * n;
++		nblk -= n;
++	}
++}
+diff --git a/sys/crypto/aes_neon/aes_neon.h b/sys/crypto/aes_neon/aes_neon.h
+new file mode 100644
+index 0000000000..cabfcf1754
+--- /dev/null
++++ b/sys/crypto/aes_neon/aes_neon.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright (c) 2026 The DragonFly Project.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE
++ * COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * AES with ARMv8 Advanced SIMD (NEON), for cores without the ARMv8
++ * Cryptography Extensions (the Raspberry Pi 4's Cortex-A72).
++ *
++ * Everything in aes_neon.c is compiled with the SIMD registers enabled,
++ * so in the kernel every call must be bracketed by kernel_fpu_begin()
++ * and kernel_fpu_end(), key setup included.
++ */
++
++#ifndef _CRYPTO_AES_NEON_H_
++#define _CRYPTO_AES_NEON_H_
++
++#include <sys/types.h>
++
++#define AES_NEON_MAXNR	14
++
++struct aes_neon_key {
++	uint8_t	rk[16 * (AES_NEON_MAXNR + 1)];	/* encryption round keys */
++	int	nr;				/* 10 or 14 */
++} __attribute__((aligned(16)));
++
++struct aes_neon_xts_ctx {
++	struct aes_neon_key k1;		/* data key */
++	struct aes_neon_key k2;		/* tweak key */
++	uint8_t	bk[128 * (AES_NEON_MAXNR + 1)];	/* k1 bitsliced */
++} __attribute__((aligned(16)));
++
++/* keybytes 16 or 32; returns 0 or EINVAL-like -1 */
++int	aes_neon_setkey(struct aes_neon_key *k, const uint8_t *key,
++	    int keybytes);
++void	aes_neon_encrypt_block(const struct aes_neon_key *k, uint8_t blk[16]);
++void	aes_neon_decrypt_block(const struct aes_neon_key *k, uint8_t blk[16]);
++/* keybytes 32 (AES-128) or 64 (AES-256), the two keys concatenated */
++int	aes_neon_xts_setkey(struct aes_neon_xts_ctx *ctx, const uint8_t *key,
++	    int keybytes);
++/*
++ * XTS over len bytes (a multiple of 16) in place.  As in the generic
++ * cryptoapi code, only the first 8 bytes of iv are used (the sector
++ * number); the other 8 are taken as zero.
++ */
++void	aes_neon_xts_crypt(const struct aes_neon_xts_ctx *ctx, uint8_t *data,
++	    size_t len, const uint8_t iv[16], int encrypt);
++
++#endif /* _CRYPTO_AES_NEON_H_ */
