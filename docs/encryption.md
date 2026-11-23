@@ -802,6 +802,22 @@ clean and the file read back without member 0), and the rc.d locked, keyfile and
 the Pi, `format` calibrated 236k PBKDF2-SHA512 iterations for 1 s and took 5 s for four members;
 `open` of four members takes 1-2 s (one process per member).
 
+**Pi end to end (2026-11-23, kernels #62 and #63).** On da0s1-da3s1 (r6pi's slices, so r6pi is gone):
+`test_hdr.sh` 61/0 (tamper tests skipped, no python3), `test_dm.sh` 37/0 three times. The FlyNAS
+helper path, which the UI's create, unlock and delete call, run as root (no FlyNAS install on the Pi):
+`cryptcreate` refuses a short passphrase, 3 disks and a second array; creates in 6 s with Adiantum
+(`xchacha12,aes-adiantum-plain64`, `sector_size:4096`), members by `/dev/serno`, no fstab line;
+`cryptstatus`, `onestop`, wrong passphrase (exit 2, nothing mapped), recovery key and passphrase both
+unlock in 1 s with the data intact; after a reboot the array comes up locked and the passphrase
+unlocks it; `voldestroy` leaves no config, mapping, rc.conf entry or mountpoint (headers stay) (19/0
+plus the reboot and delete checks). The browser UI test itself still runs only on h2dev.
+
+One `test_dm.sh` run on #62 crashed the Pi at `close -a` after the resilver: a NULL dereference in
+`devstat_remove_entry` from `dm_dev_destroy`. The devstat list had no lock, and `flcrypt open`
+creates its mappings from four processes at once through dm's MPSAFE ioctl, so an insert could be
+lost and its later remove walked off the list (a parallel open / close loop lost one at round 42).
+Fixed in the fork (35fd1697c1, a spinlock in `subr_devstat.c`, kernel #63): 150 rounds clean.
+
 E14 is cheap: `DISK_LIST` (5eb700f) already names the members explicitly, and nothing in the suite
 should care what kind of device a member is. The exceptions to check: group P (devstat is per
 physical disk) and tests that write to member media directly to corrupt it (they would corrupt
