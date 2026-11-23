@@ -689,6 +689,20 @@ never written, `dd if=/dev/zero of=/dev/mapper/h2cN bs=1m` after `open` writes A
 over the whole data area (about 16 GB / 200 MB/s = 80 s per 16 GB slice per core). RAID6 needs at
 least 4 members. An existing unencrypted array has to be copied off, re-created, and copied back.
 
+**From the FlyNAS UI (2026-11-22):** the Storage page's create form has an *Encrypt* toggle (shown
+while no flcrypt array is configured; one per box) with two masked passphrase fields (16 to 1024
+characters). `POST /api/volumes {encrypt, passphrase}` (admins only) runs `flynas-helper
+cryptcreate <label> <disks>` with the passphrase on stdin: `flcrypt format -f -r` on the disks'
+`/dev/serno` paths, `open`, `newfs_hammer2 -R 6` on the mappings, mount on `/data/<label>`, then
+`/etc/rc.conf.d/flcrypt` (`flcrypt_devices`, `flcrypt_mount="<label> /data/<label>"`) and
+`flcrypt_enable="YES"`; no fstab line. The cipher is Adiantum when the loaded `dm_target_crypt` has
+`kern.dm_crypt` (the FlyNAS kernel), else AES-XTS with 512-byte sectors (a stock kernel, e.g.
+h2dev). The reply carries the recovery key once; the page shows it in a card until the admin
+dismisses it, and nothing stores it. Deleting the volume unmounts it, closes the mappings and
+removes the config; the headers stay on the disks (a later create formats over them). Tested by
+`dfly/tools/uitest/test-storage.mjs` on h2dev (XTS); the Adiantum choice checked on the Pi only as
+far as the probe, since its disks hold r6pi.
+
 ### 9.2 Recovery kit
 
 - The **recovery key** printed by `format -r` (or `addkey -r`), written down and kept off the box.
