@@ -19,8 +19,9 @@ and metadata on 3 copies (layout 3, section 12).  What is left:
   A real USB unplug on the Pi is not yet tested; it needs the user
   present.
 - **CAM `xpt_bus_flush` fix.** The fix for the fork
-  (`sys/bus/cam/cam_xpt.c`) is written but waits for a disconnect test
-  with the user present.
+  (`sys/bus/cam/cam_xpt.c`) is written, committed on the fork's branch
+  `cam-bus-flush` (f4a9adea31, off `arm64`), and waits for a disconnect
+  test with the user present before it is merged.
 - **A USB WRITE timeout on da0 (Pi)** happened once, during group N on
   2026-10-13, and never before in full runs. Not explained; if it
   returns, capture the Pi console around it.
